@@ -1,0 +1,3 @@
+[submodule "app/ingest/xhs_spider"]
+	path = app/ingest/xhs_spider
+	url = https://github.com/lipomzx/Spider_XHS

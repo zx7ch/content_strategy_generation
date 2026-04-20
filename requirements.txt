@@ -1,0 +1,30 @@
+# Core runtime (install latest release)
+fastapi
+uvicorn[standard]
+aiosqlite
+psycopg[binary]
+chromadb
+langchain
+langgraph
+pydantic
+pydantic-settings
+httpx
+python-dotenv
+
+# LLM providers
+openai
+anthropic
+
+# Data / logging
+numpy
+sentence-transformers
+structlog
+loguru
+
+# Dev / test
+pytest
+pytest-asyncio
+pytest-cov
+black
+ruff
+mypy
