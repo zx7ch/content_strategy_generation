@@ -767,6 +767,56 @@ async def _generate_single(slot_id: int, pool: ProposalPool):
   自动派生必须服从最新生命周期与用户暂停意图。
 - 同一 `session_id` 任意时刻最多一个 `running` 任务（防竞态）。
   保证单会话执行顺序稳定，避免并发竞争导致状态混乱。
+    - 先保持“多 session 并行、单 session 串行”，把吞吐提升放在 session 之间，而不是 session 内部。
+    - 给 session_id 做分片或 worker 亲和，让同一 session 的 job 尽量落到同一条执行 lane，减少跨 worker 竞态。
+      - 分片的核心是：把“同一个会话相关的所有 job”尽量固定分到某一部分执行资源上，而不是让所有 worker 都去抢。最常见的做法是按 session_id 做哈希：
+      - 为什么分片：1 减少竞争：同一个 session 不会被多个 worker 频繁同时碰到。2 更容易保证顺序：这个 session 的 job 天然按一个方向排队。3 更容易扩展：不同 session 可以并行跑，吞吐靠横向扩 worker 提升。
+    - worker亲和：尽量让同一 session 回到同一个 worker，分片是“按规则分配到某个池子” 亲和是“尽量回到同一个执行者”。
+      - 少重复加载上下文，性能更好。减少跨 worker 的状态同步成本。对“一个 session 连续多步处理”的任务特别友好。
+
+    - 再把“单 running”从查询约束升级成更强的数据库约束或 session 级 lease，避免只靠扫描判断。
+      - 因为“先查一下，再决定要不要跑”这种模式，本质上是有竞态窗口的。如果存在：换成更高并发的数据库，worker 变多，任务来源变多，代码里某个路径忘了加同样的扫描条件
+      - 数据库约束：比如 jobs(session_id) 上加一个“只允许一个 running”的唯一约束或部分唯一索引。
+      - session 级 lease：单独建一张 session_locks / session_leases 表，谁先拿到这个 session 的 lease，谁才允许推进该 session 的 job。
+    - 如果未来真的要让单 session 内也并发，就不要直接放开整个 session，而是把 job 拆成不同 lane/step，只让关键临界区保持互斥。
+      - 不是所有工作都必须串行。我们只让“会互相冲突的那一小段”互斥，其他部分尽量并行。
+      
+        你可以把一个 job 想成流水线：
+        step 1: 读取 session 数据
+        step 2: 生成候选方案
+        step 3: 校验相似度
+        step 4: 写回最终结果
+
+        其中有些步骤其实可以并发，但有些步骤必须串行：
+        可以并行的：多个候选方案生成、多个外部查询、多个独立计算
+        必须互斥的：更新同一个 session 的最终状态、提交最终选中结果、推进 stage
+
+        这时候就可以把任务拆成不同 lane：
+        compute lane：做重计算、可并行
+        io lane：拉数据、查 RAG、查外部资源
+        commit lane：只负责最后写 session 状态，强互斥
+        - 场景1:
+          一个 generate job 可能拆成：
+          lane A：并行生成 10 个 proposal
+          lane B：并行做相似度检查
+          lane C：最后选 top-5，写入 generated_notes，更新 stage
+          这里 lane C 就是关键临界区，只允许一个写入者；lane A/B 可以放开并行，不互相挡。
+        - 场景2:
+          两个不同的 job 都在处理同一个 session：
+          job 1 在做 spider 数据预处理
+          job 2 在做最终发布写库
+          如果完全并行，可能都想改 generated_note_ids、stage、last_activity_at，就会打架。
+
+          如果拆成 lane：
+          预处理放到一个可并行 lane
+          最终写回放到 commit lane
+          commit lane 永远串行
+
+      - 什么时候该放开并行，什么时候必须互斥？
+        - 只读或生成中间结果，通常可以并行。
+        - 会修改同一份 session/job 终态的数据，就应该互斥。
+        - 会推进状态机边界的步骤，最好放到互斥 lane。
+
 
 **实现方案**：
 
