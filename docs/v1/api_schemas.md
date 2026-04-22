@@ -107,6 +107,49 @@ class IntentSnapshot(BaseModel):
     planning_brief: str
 ```
 
+### 1.4.1 SearchIntent (探索搜索意图)
+```python
+class SearchIntent(BaseModel):
+    query: str
+    platform: str | None = None
+    goal: str
+    subject_type: Literal["brand", "category", "audience", "topic"]
+    seed_entities: list[str] = Field(default_factory=list)
+    aliases: list[str] = Field(default_factory=list)
+    known_urls: list[str] = Field(default_factory=list)
+    session_id: str | None = None
+    workflow_stage: str | None = None
+    coverage_goal: list[str] = Field(default_factory=list)
+    exploration_hypotheses: list[str] = Field(default_factory=list)
+    freshness_policy: Literal["prefer_fresh", "balanced", "prefer_stable"] = "balanced"
+    diversity_policy: Literal["narrow", "balanced", "broad"] = "balanced"
+    risk_policy: Literal["strict", "balanced", "permissive"] = "balanced"
+    budget: dict = Field(default_factory=dict)
+    constraints: dict = Field(default_factory=dict)
+```
+
+**SearchIntent 字段说明**
+
+| 字段 | 作用 | 例子 | 对 SearchWorker 的影响 |
+|---|---|---|---|
+| `query` | 用户的原始检索表达，保留自然语言意图和关键词锚点 | `“帮我了解高端护肤品牌XXX适合谁”` | 作为初始检索入口和 query rewrite 的基底，不直接决定边界模板 |
+| `platform` | 指定或暗示优先搜索的平台范围 | `['xhs', 'weibo']` | 决定 provider 候选集、fallback 顺序和平台配额；为空时由 Orchestrator 按能力和配置选路 |
+| `goal` | 本轮探索的总目标，描述“要理解什么” | `understand_brand_positioning` | 决定是偏 direct hits、adjacent leads 还是 contrast signals；影响停止条件和摘要粒度 |
+| `subject_type` | 识别搜索对象类型 | `brand` / `category` / `audience` | 决定默认边界模板、桶划分和停止阈值；是 SearchWorker 进行空间建模的第一层输入 |
+| `seed_entities` | 核心实体种子，用于锚定搜索空间 | `['XXX', 'XXX 官方', 'XXX 旗舰店']` | 作为高优先级召回锚点，优先进入 core bucket；用于去重、聚类和候选命名 |
+| `aliases` | 别名、简称、俗称、竞品名、行业叫法 | `['XXX 小绿瓶', 'XXX serum']` | 扩展召回面，补足漏搜；同时用于 query expansion 和跨平台实体对齐 |
+| `known_urls` | 已知的官方页、竞品页、重点内容页 | `['https://.../brand', 'https://.../product']` | 优先触发 fetch / capture 型 provider，补强事实核验和内容抓取，不再把这些页面当作待发现对象 |
+| `session_id` | 将搜索行为绑定到当前会话/分支 | `sess_20260421_001` | 决定证据持久化和恢复锚点；同一 session 内复用历史 evidence refs 与 turn snapshot |
+| `workflow_stage` | 当前流程阶段 | `exploring` / `strategy` | 决定搜索深度、输出格式和停搜阈值；探索阶段允许更强的扩展和推荐，后续阶段更保守 |
+| `coverage_goal` | 声明本轮必须覆盖的信息面 | `['定位', '目标人群', '价格带', '核心诉求']` | 直接参与 coverage_score 计算；决定每个 bucket 的最低覆盖要求和是否需要补搜 |
+| `exploration_hypotheses` | 待验证的假设集合 | `['主打通勤场景', '用户更看重成分安全']` | 驱动验证式检索与 contrast 搜索；若假设持续被反证，会促使 SearchWorker 改写边界或降权原路径 |
+| `freshness_policy` | 新鲜度偏好和时间窗策略 | `recent_90d` / `balanced` / `stable` | 决定时间窗过滤、旧证据保留比例和趋势桶权重；影响搜索结果的时效性排序 |
+| `diversity_policy` | 多样性偏好和去同质化力度 | `narrow` / `balanced` / `broad` | 决定同源/同观点结果的保留上限与 rerank 强度；越宽越鼓励跨平台、跨角度证据 |
+| `risk_policy` | 风险控制和可信度约束 | `strict` / `balanced` / `permissive` | 决定低可信、营销化、搬运、疑似重复证据的降权或剔除力度；影响 confidence_score 下限 |
+| `budget` | 轮次、请求数、时长、扩展次数等预算 | `{'rounds': 2, 'max_queries': 8, 'max_latency_ms': 15000}` | 决定是否继续扩搜、是否提前收敛，以及 degraded / zero-result 的触发时机 |
+| `constraints` | 附加约束，覆盖地域、语言、内容形态等限制 | `{'region': 'CN', 'content_type': ['post', 'video']}` | 约束 provider 选择、查询改写和结果裁剪；也是最后一层防止搜索空间过宽或失焦的过滤器 |
+
+
 ### 1.5 EvidenceSummary (证据摘要)
 ```python
 class EvidenceRef(BaseModel):
@@ -126,6 +169,11 @@ class EvidenceSummary(BaseModel):
     refs: list[EvidenceRef] = Field(default_factory=list)
 ```
 
+**EvidenceSummary 语义**
+- `summaries` 承载压缩后的 cluster summary、adjacent leads、contrast signals 和 gap prompts。
+- `refs` 承载可回溯的证据引用，不承载完整原始结果。
+- `coverage_score` 和 `diversity_score` 用于判断当前证据是否足以进入收敛。
+
 ### 1.6 TopicCandidate (探索候选卡片)
 ```python
 class TopicCandidate(BaseModel):
@@ -141,6 +189,11 @@ class TopicCandidate(BaseModel):
     recommended_next_step: str
 ```
 
+**TopicCandidate 语义**
+- `recommended_next_step` 用于承载下一步建议文案。
+- `evidence_refs` 用于追溯候选来源。
+- `fit_score / confidence_score / competition_score / novelty_score` 只用于候选比较，不用于替代证据质量判断。
+
 ### 1.6.1 SearchPlan (探索搜索计划)
 ```python
 class SearchPlan(BaseModel):
@@ -149,6 +202,13 @@ class SearchPlan(BaseModel):
     intent_delta: str | None = None
     provider_hints: list[str] = Field(default_factory=list)
 ```
+
+**SearchPlan 语义**
+- `initial` 用于首次建立搜索空间。
+- `refine` 用于在当前意图上缩小、澄清或补强。
+- `refresh` 用于对同一意图重新抓取最新结果。
+- `intent_delta` 记录相对上一轮的意图变化。
+- `provider_hints` 用于提示推荐 provider，但不暴露具体调度逻辑。
 
 ### 1.6.2 SearchStats (搜索统计)
 ```python
@@ -192,6 +252,13 @@ class ExplorationTurn(BaseModel):
     rewrite_suggestions: list[RewriteSuggestion] = Field(default_factory=list)
     search_stats: SearchStats | None = None
 ```
+
+**EvidenceSummary / TopicCandidate 语义补充**
+- `EvidenceSummary` 只承载压缩后的证据视图，不承载全量原始结果。
+- `coverage_score` 表示当前证据是否足以支撑后续合成。
+- `diversity_score` 表示当前证据是否覆盖足够多的角度。
+- `TopicCandidate` 必须可追溯到具体 `evidence_refs`，否则不能视为可交付候选。
+- `fit_score`、`confidence_score`、`competition_score`、`novelty_score` 用于候选比较，不替代证据质量判断。
 
 ### 1.6.4 BranchSummary (探索分支摘要)
 ```python
