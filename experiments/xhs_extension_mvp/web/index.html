@@ -1,0 +1,562 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>XHS MVP 仪表盘</title>
+    <style>
+      :root {
+        --bg: #f3f0ea;
+        --bg-strong: #ebe6de;
+        --panel: rgba(255, 255, 255, 0.92);
+        --panel-soft: rgba(250, 248, 244, 0.92);
+        --ink: #1e2421;
+        --muted: #67706c;
+        --line: rgba(113, 124, 117, 0.18);
+        --accent: #48655c;
+        --accent-soft: rgba(72, 101, 92, 0.1);
+        --accent-strong: #2f4a42;
+        --shadow: 0 18px 50px rgba(45, 52, 48, 0.08);
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        color: var(--ink);
+        font-family: "PingFang SC", "Noto Sans SC", sans-serif;
+        background:
+          radial-gradient(circle at top left, rgba(255, 255, 255, 0.9), transparent 28%),
+          linear-gradient(180deg, #faf7f2 0%, var(--bg) 45%, var(--bg-strong) 100%);
+      }
+      a { color: inherit; }
+      main {
+        max-width: 1320px;
+        margin: 0 auto;
+        padding: 28px 18px 40px;
+      }
+      .page-head {
+        display: grid;
+        gap: 8px;
+        margin-bottom: 18px;
+      }
+      .page-head h1 {
+        margin: 0;
+        font-size: 36px;
+        line-height: 1.08;
+        letter-spacing: -0.03em;
+      }
+      .page-head p {
+        margin: 0;
+        max-width: 780px;
+        color: var(--muted);
+        line-height: 1.65;
+      }
+      .dashboard {
+        display: grid;
+        gap: 18px;
+      }
+      .two-col {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 18px;
+        align-items: start;
+      }
+      .panel {
+        display: flex;
+        flex-direction: column;
+        gap: 16px;
+        padding: 20px;
+        border: 1px solid var(--line);
+        border-radius: 24px;
+        background: var(--panel);
+        box-shadow: var(--shadow);
+        backdrop-filter: blur(12px);
+      }
+      .panel--soft {
+        background: linear-gradient(180deg, var(--panel) 0%, var(--panel-soft) 100%);
+      }
+      .panel-head {
+        display: flex;
+        justify-content: space-between;
+        gap: 16px;
+        align-items: flex-start;
+        flex-wrap: wrap;
+      }
+      .panel-head h2 {
+        margin: 0;
+        font-size: 18px;
+      }
+      .panel-head p {
+        margin: 6px 0 0;
+        max-width: 680px;
+        color: var(--muted);
+        font-size: 13px;
+        line-height: 1.65;
+      }
+      .panel-tools {
+        display: flex;
+        gap: 10px;
+        align-items: center;
+        flex-wrap: wrap;
+      }
+      .pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 8px 12px;
+        border-radius: 999px;
+        border: 1px solid var(--line);
+        background: rgba(255, 255, 255, 0.8);
+        color: var(--muted);
+        font-size: 12px;
+      }
+      .status {
+        min-height: 22px;
+        padding: 12px 14px;
+        border-radius: 16px;
+        border: 1px solid var(--line);
+        background: rgba(255, 255, 255, 0.72);
+        color: var(--muted);
+        font-size: 13px;
+        line-height: 1.6;
+      }
+      .status.is-strong {
+        color: var(--accent-strong);
+        background: var(--accent-soft);
+      }
+      .field-grid,
+      .task-grid,
+      .manual-block,
+      .query-groups,
+      .hotspot-grid,
+      .recommend-grid {
+        display: grid;
+        gap: 14px;
+        align-content: start;
+      }
+      .task-grid {
+        grid-template-columns: minmax(0, 1.2fr) minmax(280px, 0.8fr);
+      }
+      .topic-quick {
+        display: grid;
+        gap: 12px;
+      }
+      .topic-quick-card {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 12px;
+        flex-wrap: wrap;
+        padding: 14px;
+        border: 1px solid var(--line);
+        border-radius: 18px;
+        background: rgba(255, 255, 255, 0.78);
+      }
+      .topic-quick-copy {
+        display: grid;
+        gap: 6px;
+      }
+      .topic-quick-copy strong {
+        font-size: 15px;
+      }
+      .field {
+        display: grid;
+        gap: 8px;
+        align-content: start;
+      }
+      label,
+      .field-label {
+        font-size: 12px;
+        font-weight: 600;
+        color: var(--muted);
+      }
+      textarea,
+      input[type="text"] {
+        width: 100%;
+        padding: 12px 14px;
+        border: 1px solid var(--line);
+        border-radius: 16px;
+        background: rgba(255, 255, 255, 0.92);
+        color: var(--ink);
+        font: inherit;
+      }
+      textarea {
+        min-height: 110px;
+        resize: vertical;
+      }
+      textarea.small {
+        min-height: 94px;
+      }
+      textarea:focus,
+      input[type="text"]:focus {
+        outline: none;
+        border-color: rgba(72, 101, 92, 0.45);
+        box-shadow: 0 0 0 4px rgba(72, 101, 92, 0.12);
+      }
+      button,
+      .link-button {
+        appearance: none;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 8px;
+        padding: 10px 14px;
+        border-radius: 999px;
+        border: 1px solid var(--accent);
+        background: var(--accent);
+        color: #fff;
+        font: inherit;
+        text-decoration: none;
+        cursor: pointer;
+      }
+      button.secondary,
+      .link-button.secondary {
+        background: rgba(255, 255, 255, 0.84);
+        color: var(--accent-strong);
+        border-color: rgba(72, 101, 92, 0.22);
+      }
+      button.ghost {
+        background: transparent;
+        color: var(--muted);
+        border-color: var(--line);
+      }
+      .button-row {
+        display: flex;
+        gap: 10px;
+        flex-wrap: wrap;
+      }
+      .meta-grid,
+      .summary-grid {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 12px;
+      }
+      .meta-card,
+      .summary-card,
+      .query-card,
+      .hotspot-card,
+      .recommend-card,
+      .helper-card {
+        border: 1px solid var(--line);
+        border-radius: 18px;
+        background: rgba(255, 255, 255, 0.78);
+      }
+      .meta-card,
+      .summary-card {
+        padding: 14px;
+      }
+      .meta-card span,
+      .summary-card span {
+        display: block;
+        color: var(--muted);
+        font-size: 12px;
+      }
+      .meta-card strong,
+      .summary-card strong {
+        display: block;
+        margin-top: 6px;
+        font-size: 24px;
+      }
+      .helper-card {
+        padding: 14px;
+        color: var(--muted);
+        font-size: 13px;
+        line-height: 1.65;
+      }
+      .query-groups {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+      .query-group {
+        display: grid;
+        gap: 12px;
+        align-content: start;
+      }
+      .query-group h3 {
+        margin: 0;
+        font-size: 14px;
+      }
+      .query-list {
+        display: grid;
+        gap: 10px;
+      }
+      .query-card {
+        display: grid;
+        gap: 10px;
+        padding: 14px;
+      }
+      .query-card strong {
+        font-size: 14px;
+        line-height: 1.5;
+      }
+      .query-row {
+        display: flex;
+        justify-content: space-between;
+        gap: 10px;
+        align-items: center;
+        flex-wrap: wrap;
+      }
+      .query-tags,
+      .hotspot-tags,
+      .metric-row {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+      .tag,
+      .metric-chip {
+        display: inline-flex;
+        align-items: center;
+        padding: 6px 10px;
+        border-radius: 999px;
+        background: var(--accent-soft);
+        color: var(--accent-strong);
+        font-size: 12px;
+      }
+      .hotspot-grid {
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+      }
+      .hotspot-card {
+        display: grid;
+        gap: 12px;
+        padding: 16px;
+        align-content: start;
+      }
+      .hotspot-card h3 {
+        margin: 0;
+        font-size: 15px;
+      }
+      .hotspot-list,
+      .recommend-grid {
+        display: grid;
+        gap: 12px;
+      }
+      .hotspot-item,
+      .recommend-card {
+        display: grid;
+        gap: 10px;
+        padding: 14px;
+      }
+      .hotspot-item {
+        border: 1px solid var(--line);
+        border-radius: 16px;
+        background: rgba(249, 247, 243, 0.88);
+      }
+      .hotspot-rank {
+        display: inline-flex;
+        width: 26px;
+        height: 26px;
+        align-items: center;
+        justify-content: center;
+        border-radius: 999px;
+        background: var(--accent);
+        color: #fff;
+        font-size: 12px;
+        font-weight: 700;
+      }
+      .hotspot-title,
+      .recommend-title {
+        font-size: 15px;
+        line-height: 1.55;
+        text-decoration: none;
+      }
+      .hotspot-metrics {
+        display: flex;
+        justify-content: space-between;
+        align-items: flex-start;
+        gap: 10px;
+      }
+      .subtle {
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1.6;
+      }
+      .recommend-card {
+        background: linear-gradient(180deg, rgba(255,255,255,0.92), rgba(246, 244, 239, 0.92));
+      }
+      .recommend-head {
+        display: flex;
+        justify-content: space-between;
+        gap: 12px;
+        align-items: flex-start;
+      }
+      .score-badge {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 88px;
+        padding: 8px 12px;
+        border-radius: 999px;
+        background: var(--accent);
+        color: #fff;
+        font-size: 12px;
+        font-weight: 700;
+      }
+      .recommend-block {
+        display: grid;
+        gap: 6px;
+      }
+      .recommend-block h3 {
+        margin: 0;
+        font-size: 13px;
+      }
+      .recommend-block p {
+        margin: 0;
+        line-height: 1.65;
+      }
+      .empty-note {
+        padding: 16px;
+        border-radius: 16px;
+        border: 1px dashed var(--line);
+        color: var(--muted);
+        font-size: 13px;
+        line-height: 1.65;
+      }
+      @media (max-width: 1080px) {
+        .two-col,
+        .task-grid,
+        .query-groups,
+        .hotspot-grid,
+        .meta-grid,
+        .summary-grid {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header class="page-head">
+        <h1>XHS 搜索与采集仪表盘</h1>
+        <p>围绕同一个搜索主题，把操作、拓展搜索、热点追踪、采集概览和推荐笔记拆成独立模块。任何一个模块刷新失败，都不会影响其他区域继续使用。</p>
+      </header>
+
+      <div class="dashboard">
+        <section class="two-col">
+          <section class="panel panel--soft">
+            <div class="panel-head">
+              <div>
+                <h2>用户操作区域</h2>
+                <p>输入主题并创建任务。插件会自动识别当前任务，采集后工作台会自动刷新快照。</p>
+              </div>
+            </div>
+            <div class="task-grid">
+              <div class="field">
+                <label for="topic-input">搜索主题</label>
+                <textarea id="topic-input" placeholder="例如：通勤户外穿搭、敏感肌修护精华"></textarea>
+                <div class="button-row">
+                  <button id="create-task-button">创建任务</button>
+                  <a id="topic-search-link" class="link-button secondary" href="https://www.xiaohongshu.com/search_result" target="_blank" rel="noopener">打开原始搜索</a>
+                </div>
+              </div>
+            </div>
+            <div class="topic-quick">
+              <div id="topic-quick-card" class="topic-quick-card">
+                <div class="topic-quick-copy">
+                  <span class="field-label">当前搜索词</span>
+                  <strong>未创建</strong>
+                </div>
+                <div class="subtle">这里始终保留用户原始输入的搜索入口。</div>
+              </div>
+              <div id="task-snapshot-status" class="status">创建任务后会自动监听采集结果变化。</div>
+            </div>
+            <div id="task-status" class="status">先输入主题并创建任务。</div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-head">
+              <div>
+                <h2>自动拓展搜索区域</h2>
+                <p>自动展示 5 条默认拓展搜索词，并支持继续维护自定义词。这里只有独立的 query 模块，不受采集和热点状态影响。</p>
+              </div>
+            </div>
+            <div class="query-groups">
+              <section class="query-group">
+                <h3>默认拓展搜索</h3>
+                <div id="query-auto-list" class="query-list">
+                  <div class="empty-note">创建任务后，这里会出现默认的 5 条拓展搜索词。</div>
+                </div>
+              </section>
+              <section class="query-group">
+                <h3>自定义拓展搜索</h3>
+                <div class="field">
+                  <label for="custom-query-input">每行一条</label>
+                  <textarea id="custom-query-input" class="small" placeholder="例如：
+通勤穿搭小个子
+敏感肌修护精华推荐"></textarea>
+                  <button id="add-custom-query-button" class="secondary">添加自定义拓展词</button>
+                </div>
+                <div id="query-custom-list" class="query-list">
+                  <div class="empty-note">你添加的自定义搜索词会显示在这里。</div>
+                </div>
+              </section>
+            </div>
+            <div id="query-status" class="status">默认拓展词和自定义拓展词会分别维护。</div>
+          </section>
+        </section>
+
+        <section class="panel panel--soft">
+          <div class="panel-head">
+            <div>
+              <h2>热点追踪区域</h2>
+              <p>基于用户原始搜索词，直接调用 spider 的真实排序接口拉取“最多点赞 / 最多评论 / 最多收藏”结果。创建任务后会自动刷新一次，失败时保留上次成功结果。</p>
+            </div>
+            <div class="panel-tools">
+              <span id="hotspot-updated-at" class="pill">最近更新：--</span>
+              <button id="hotspot-refresh-button" class="secondary">更新热点</button>
+            </div>
+          </div>
+          <div id="hotspot-status" class="status">创建任务后会自动拉一次热点，也可以手动更新。</div>
+          <div id="hotspot-lists" class="hotspot-grid">
+            <div class="empty-note">热点榜会在这里按三种指标分别展示。</div>
+          </div>
+        </section>
+
+        <section class="two-col">
+          <section class="panel">
+            <div class="panel-head">
+              <div>
+                <h2>采集结果呈现区域</h2>
+                <p>左侧只看采集次数、累计保留内容和手动补充入口，不与热点抓取互相影响。</p>
+              </div>
+            </div>
+            <div id="collection-summary" class="summary-grid">
+              <div class="summary-card">
+                <span>采集次数</span>
+                <strong>0</strong>
+              </div>
+              <div class="summary-card">
+                <span>累计内容</span>
+                <strong>0</strong>
+              </div>
+              <div class="summary-card">
+                <span>手动补充</span>
+                <strong>0</strong>
+              </div>
+            </div>
+            <div class="manual-block">
+              <div class="field">
+                <label for="manual-input">手动补充采集</label>
+                <textarea id="manual-input" placeholder="每行一条链接或一条文本线索。这里的补充只影响采集与推荐模块，不影响热点榜缓存。"></textarea>
+                <button id="manual-import-button" class="secondary">导入手动补充</button>
+              </div>
+            </div>
+            <div id="collection-status" class="status">采集完成后，这里会实时显示累计结果。</div>
+          </section>
+
+          <section class="panel panel--soft">
+            <div class="panel-head">
+              <div>
+                <h2>最值得查看的 5 条笔记</h2>
+                <p>根据当前主题、query 覆盖和互动信号做规则排序，优先列出更值得直接打开看的笔记卡片。</p>
+              </div>
+            </div>
+            <div id="recommendation-status" class="status">采集后会在这里生成推荐卡片。</div>
+            <div id="recommendation-list" class="recommend-grid">
+              <div class="empty-note">当前还没有推荐笔记。</div>
+            </div>
+          </section>
+        </section>
+      </div>
+    </main>
+    <script src="/static/app.js"></script>
+  </body>
+</html>

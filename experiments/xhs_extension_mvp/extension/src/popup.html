@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <title>XHS MVP Status</title>
+    <style>
+      body {
+        width: 340px;
+        margin: 0;
+        padding: 14px;
+        font-family: "PingFang SC", "Noto Sans SC", sans-serif;
+        background: #faf6ef;
+        color: #231c17;
+      }
+      h1 {
+        margin: 0 0 12px;
+        font-size: 18px;
+      }
+      .eyebrow {
+        margin: 0 0 4px;
+        color: #786f68;
+        font-size: 12px;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+      .subtitle {
+        margin: -6px 0 14px;
+        color: #786f68;
+        font-size: 13px;
+        line-height: 1.45;
+      }
+      label {
+        display: block;
+        margin: 12px 0 6px;
+        font-weight: 600;
+      }
+      input {
+        width: 100%;
+        box-sizing: border-box;
+        padding: 10px 12px;
+        border-radius: 12px;
+        border: 1px solid #d9cbbb;
+        background: #fff;
+        font: inherit;
+      }
+      button {
+        width: 100%;
+        margin-top: 14px;
+        padding: 11px 14px;
+        border: 0;
+        border-radius: 999px;
+        background: #b4472e;
+        color: #fffaf4;
+        font: inherit;
+        cursor: pointer;
+      }
+      button.secondary {
+        background: #fffaf4;
+        color: #8a3c29;
+        border: 1px solid #d9cbbb;
+      }
+      .status {
+        margin-top: 12px;
+        min-height: 20px;
+        color: #8a3c29;
+        font-size: 13px;
+      }
+      .hint {
+        margin-top: 10px;
+        font-size: 12px;
+        color: #786f68;
+        line-height: 1.5;
+      }
+      .runtime-card {
+        display: grid;
+        gap: 8px;
+        margin-top: 12px;
+        padding: 12px;
+        border: 1px solid #d9cbbb;
+        border-radius: 16px;
+        background: rgba(255, 255, 255, 0.7);
+        font-size: 13px;
+      }
+      .runtime-card strong {
+        display: block;
+        color: #4c3329;
+      }
+      details {
+        margin-top: 12px;
+        border: 1px solid #eadfd2;
+        border-radius: 14px;
+        padding: 10px 12px;
+        background: rgba(255, 255, 255, 0.58);
+      }
+      summary {
+        cursor: pointer;
+        color: #786f68;
+        font-size: 13px;
+        font-weight: 600;
+      }
+    </style>
+  </head>
+  <body>
+    <p class="eyebrow">XHS Extension MVP</p>
+    <h1>Runtime Status</h1>
+    <p class="subtitle">Use this popup to check connection, task, and page state. Capture from the Xiaohongshu page panel.</p>
+
+    <div class="runtime-card">
+      <div>Server: <strong id="connection-state">checking...</strong></div>
+      <div>Current active task: <strong id="active-task">syncing...</strong></div>
+      <div>Current page: <strong id="page-state">checking...</strong></div>
+      <div>Visible notes: <strong id="visible-count">checking...</strong></div>
+    </div>
+
+    <button id="open-workbench-button" type="button">Open Workbench</button>
+    <button id="resync-button" class="secondary" type="button">Resync Active Task</button>
+    <div class="status" id="status"></div>
+    <details>
+      <summary>Advanced connection settings</summary>
+      <label for="server-url">Server URL</label>
+      <input id="server-url" type="text" value="http://127.0.0.1:8010" />
+    </details>
+    <div class="hint">
+      If there is no active task, return to the workbench and create one. If the local service is offline, start the MVP server and retry connection.
+    </div>
+    <script src="./popup.js"></script>
+  </body>
+  </html>

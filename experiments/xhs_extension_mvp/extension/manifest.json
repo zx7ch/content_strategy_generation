@@ -1,0 +1,25 @@
+{
+  "manifest_version": 3,
+  "name": "XHS Extension MVP",
+  "version": "0.1.0",
+  "description": "Manual capture helper for the isolated XHS extension MVP.",
+  "permissions": ["activeTab", "storage", "tabs", "scripting"],
+  "host_permissions": [
+    "https://*.xiaohongshu.com/*",
+    "http://127.0.0.1/*",
+    "http://localhost/*"
+  ],
+  "action": {
+    "default_popup": "src/popup.html"
+  },
+  "background": {
+    "service_worker": "src/background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://*.xiaohongshu.com/*"],
+      "js": ["src/content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
