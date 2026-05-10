@@ -89,6 +89,7 @@ class MasterDataService:
         target_audience: dict[str, Any] | None = None,
         brand_voice: dict[str, Any] | None = None,
         goals: dict[str, Any] | None = None,
+        is_demo: bool = False,
     ) -> BrandRecord:
         self._require_workspace(workspace_id)
         now = utcnow()
@@ -101,10 +102,18 @@ class MasterDataService:
             target_audience=target_audience or {},
             brand_voice=brand_voice or {},
             goals=goals or {},
+            is_demo=is_demo,
             created_at=now,
             updated_at=now,
         )
         return self._store.save_brand(brand)
+
+    def delete_brand(self, *, workspace_id: str, brand_id: str) -> bool:
+        self._require_brand_scope(workspace_id=workspace_id, brand_id=brand_id)
+        self._store.delete_state_snapshots(brand_id)
+        self._store.delete_policy_configs(brand_id)
+        self._store.delete_brand_channels(brand_id)
+        return self._store.delete_brand(brand_id)
 
     def update_brand(
         self,

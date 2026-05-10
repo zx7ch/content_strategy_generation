@@ -4,6 +4,7 @@ XHS Spider Service - Wrapper for third-party Spider_XHS
 
 import asyncio
 from dataclasses import dataclass
+from datetime import datetime
 import os
 from pathlib import Path
 import threading
@@ -27,6 +28,53 @@ class XHSPost(BaseModel):
     share_count: int
     note_url: str
     images: List[str]
+
+
+class XHSNoteDetail(BaseModel):
+    note_id: str
+    note_url: str
+    note_type: str = ""
+    user_id: str = ""
+    home_url: str = ""
+    nickname: str = ""
+    avatar: str = ""
+    title: str = ""
+    desc: str = ""
+    liked_count: int = 0
+    collected_count: int = 0
+    comment_count: int = 0
+    share_count: int = 0
+    video_cover: str | None = None
+    video_addr: str | None = None
+    image_list: List[str] = []
+    tags: List[str] = []
+    upload_time: str = ""
+    ip_location: str = ""
+
+    @property
+    def upload_datetime(self) -> datetime | None:
+        text = self.upload_time.strip()
+        if not text:
+            return None
+        try:
+            return datetime.strptime(text, "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return None
+
+
+class XHSUserProfile(BaseModel):
+    user_id: str
+    home_url: str = ""
+    nickname: str = ""
+    avatar: str = ""
+    red_id: str = ""
+    gender: str = ""
+    ip_location: str = ""
+    desc: str = ""
+    follows: int = 0
+    fans: int = 0
+    interaction: int = 0
+    tags: List[str] = []
 
 
 class SpiderError(Exception):
@@ -158,6 +206,28 @@ class XHSSpiderClient:
                     f"Error: {e}"
                 )
         return self._api
+
+    def _get_data_spider(self):
+        try:
+            import sys
+
+            if str(self._submodule_path) not in sys.path:
+                sys.path.insert(0, str(self._submodule_path))
+            self._configure_node_path()
+            original_dir = os.getcwd()
+            os.chdir(str(self._submodule_path))
+            try:
+                from main import Data_Spider
+
+                return Data_Spider()
+            finally:
+                os.chdir(original_dir)
+        except ImportError as e:
+            raise SpiderPermanentError(
+                f"XHS Spider submodule not available. "
+                f"Please run: git submodule update --init\n"
+                f"Error: {e}"
+            )
     
     def _classify_error(self, error_msg: str) -> SpiderError:
         """分类错误类型"""
@@ -288,6 +358,39 @@ class XHSSpiderClient:
         raise SpiderPermanentError(
             f"Spider failed after {self.max_retries} retries. Last error: {last_error}"
         )
+
+    def fetch_note_detail(self, note_url: str) -> XHSNoteDetail:
+        spider = self._get_data_spider()
+        try:
+            success, msg, note_info = self._run_in_submodule_cwd(
+                spider.spider_note,
+                note_url,
+                self.cookies,
+            )
+        except Exception as exc:
+            raise self._classify_error(str(exc))
+        if not success or not isinstance(note_info, dict):
+            raise self._classify_error(msg or "failed to fetch note detail")
+        return XHSNoteDetail.model_validate(note_info)
+
+    def fetch_user_profile(self, user_id: str) -> XHSUserProfile:
+        if not user_id.strip():
+            raise SpiderPermanentError("user_id is required")
+        api = self._get_api()
+        try:
+            success, msg, user_info = self._run_in_submodule_cwd(
+                api.get_user_info,
+                user_id,
+                self.cookies,
+            )
+            if not success or not isinstance(user_info, dict):
+                raise self._classify_error(msg or "failed to fetch user profile")
+            from xhs_utils.data_util import handle_user_info
+
+            payload = handle_user_info(user_info["data"], user_id)
+        except Exception as exc:
+            raise self._classify_error(str(exc))
+        return XHSUserProfile.model_validate(payload)
 
     @staticmethod
     def _safe_str(value: Any, default: str = "") -> str:

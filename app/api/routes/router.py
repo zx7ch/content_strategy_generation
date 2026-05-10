@@ -198,6 +198,7 @@ def _brand_to_response(brand) -> V2BrandResponse:
         target_audience=brand.target_audience,
         brand_voice=brand.brand_voice,
         goals=brand.goals,
+        is_demo=brand.is_demo,
         created_at=brand.created_at.isoformat(),
         updated_at=brand.updated_at.isoformat(),
     )
@@ -478,7 +479,7 @@ def _decision_review_to_response(result) -> V2DecisionBatchItemReviewResponse:
     )
 
 
-def _publish_record_to_response(record) -> V2PublishRecordResponse:
+def _publish_record_to_response(record, *, is_demo: bool = False) -> V2PublishRecordResponse:
     return V2PublishRecordResponse(
         publish_record_id=record.publish_record_id,
         brand_id=record.brand_id,
@@ -492,11 +493,12 @@ def _publish_record_to_response(record) -> V2PublishRecordResponse:
         publish_status=record.publish_status,
         published_at=record.published_at.isoformat() if record.published_at else None,
         creative_variant=record.creative_variant,
+        is_demo=is_demo,
         created_at=record.created_at.isoformat(),
     )
 
 
-def _performance_snapshot_to_response(snapshot) -> V2PerformanceSnapshotResponse:
+def _performance_snapshot_to_response(snapshot, *, is_demo: bool = False) -> V2PerformanceSnapshotResponse:
     return V2PerformanceSnapshotResponse(
         performance_snapshot_id=snapshot.performance_snapshot_id,
         publish_record_id=snapshot.publish_record_id,
@@ -510,6 +512,7 @@ def _performance_snapshot_to_response(snapshot) -> V2PerformanceSnapshotResponse
         conversion_proxy_label=snapshot.conversion_proxy_label,
         short_term_reward=snapshot.short_term_reward,
         composite_reward=snapshot.composite_reward,
+        is_demo=is_demo,
     )
 
 

@@ -73,6 +73,7 @@ CREATE TABLE brands (
     target_audience JSONB NOT NULL DEFAULT '{}'::jsonb,
     brand_voice JSONB NOT NULL DEFAULT '{}'::jsonb,
     goals JSONB NOT NULL DEFAULT '{}'::jsonb,
+    is_demo BOOLEAN NOT NULL DEFAULT FALSE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -569,4 +570,11 @@ ADD COLUMN IF NOT EXISTS profile_url TEXT;
 
 ALTER TABLE brand_channels
 DROP COLUMN IF EXISTS account_handle;
+""".strip()
+
+
+def build_p1_s2_6_demo_column_sql() -> str:
+    return """
+ALTER TABLE brands
+ADD COLUMN IF NOT EXISTS is_demo BOOLEAN NOT NULL DEFAULT FALSE;
 """.strip()

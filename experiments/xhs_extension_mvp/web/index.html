@@ -420,10 +420,23 @@
           grid-template-columns: 1fr;
         }
       }
+      .banner {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding: 10px 18px;
+        font-size: 13px;
+      }
+      .banner--warn { background: #fff8e1; border-bottom: 1px solid #ffe082; color: #5d4037; }
+      .status--inline { padding: 4px 10px; border-radius: 10px; font-size: 12px; background: var(--accent-soft); color: var(--accent-strong); }
     </style>
   </head>
   <body>
     <main>
+      <div id="scraper-banner" class="banner banner--warn" hidden>
+        <span>⚠️ 采集器未登录小红书，请按 README 完成登录后刷新本页。</span>
+        <a href="./README.md" target="_blank">查看 README</a>
+      </div>
       <header class="page-head">
         <h1>XHS 搜索与采集仪表盘</h1>
         <p>围绕同一个搜索主题，把操作、拓展搜索、热点追踪、采集概览和推荐笔记拆成独立模块。任何一个模块刷新失败，都不会影响其他区域继续使用。</p>
@@ -546,7 +559,7 @@
             <div class="panel-head">
               <div>
                 <h2>最值得查看的 5 条笔记</h2>
-                <p>根据当前主题、query 覆盖和互动信号做规则排序，优先列出更值得直接打开看的笔记卡片。</p>
+                <p>先做硬性筛选，再结合 LLM 分析产出更值得优先查看的笔记。</p>
               </div>
             </div>
             <div id="recommendation-status" class="status">采集后会在这里生成推荐卡片。</div>

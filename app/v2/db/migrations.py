@@ -11,6 +11,7 @@ from app.v2.db.schema import (
     build_p1_2_schema_sql,
     build_p1_5_schema_sql,
     build_p1_6_remove_account_handle_sql,
+    build_p1_s2_6_demo_column_sql,
 )
 
 
@@ -60,5 +61,16 @@ def get_p1_5_migrations() -> tuple[MigrationStep, ...]:
             migration_id="v2_p1_5_feedback_eval",
             description="Create V2 Phase 1 feedback and evaluation tables",
             sql=build_p1_5_schema_sql(),
+        ),
+    )
+
+
+@lru_cache(maxsize=1)
+def get_p1_s2_6_migrations() -> tuple[MigrationStep, ...]:
+    return get_p1_5_migrations() + (
+        MigrationStep(
+            migration_id="v2_p1_s2_6_brands_is_demo",
+            description="Add is_demo column to brands table for demo dataset provenance",
+            sql=build_p1_s2_6_demo_column_sql(),
         ),
     )

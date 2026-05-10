@@ -38,6 +38,8 @@ class FeedbackStore(Protocol):
 
     def list_evaluation_run_slices(self, evaluation_run_id: str) -> list[EvaluationRunSliceRecord]: ...
 
+    def delete_by_brand(self, brand_id: str) -> int: ...
+
 
 class InMemoryFeedbackStore:
     def __init__(self) -> None:
@@ -99,3 +101,26 @@ class InMemoryFeedbackStore:
         ]
         rows.sort(key=lambda item: (item.slice_key, item.slice_value))
         return rows
+
+    def delete_by_brand(self, brand_id: str) -> int:
+        count = 0
+        perf_ids = [pid for pid, p in self._performance_snapshots.items() if p.brand_id == brand_id]
+        for pid in perf_ids:
+            del self._performance_snapshots[pid]
+            count += 1
+        pub_ids = [pid for pid, p in self._publish_records.items() if p.brand_id == brand_id]
+        for pid in pub_ids:
+            del self._publish_records[pid]
+            count += 1
+        fb_ids = [fid for fid, f in self._feedback_events.items() if f.brand_id == brand_id]
+        for fid in fb_ids:
+            del self._feedback_events[fid]
+            count += 1
+        eval_ids = [eid for eid, e in self._evaluation_runs.items() if e.brand_id == brand_id]
+        for eid in eval_ids:
+            slice_ids = [sid for sid, s in self._evaluation_run_slices.items() if s.evaluation_run_id == eid]
+            for sid in slice_ids:
+                del self._evaluation_run_slices[sid]
+            del self._evaluation_runs[eid]
+            count += 1
+        return count

@@ -378,6 +378,7 @@ class V2BrandResponse(BaseModel):
     target_audience: Dict[str, Any] = Field(default_factory=dict)
     brand_voice: Dict[str, Any] = Field(default_factory=dict)
     goals: Dict[str, Any] = Field(default_factory=dict)
+    is_demo: bool = False
     created_at: str
     updated_at: str
 
@@ -704,6 +705,7 @@ class V2TopicPoolItemResponse(BaseModel):
     final_score: float
     score_breakdown: Dict[str, Any] = Field(default_factory=dict)
     evidence_provenance: List[Dict[str, Any]] = Field(default_factory=list)
+    is_demo: bool = False
     updated_at: str
 
 
@@ -733,6 +735,7 @@ class V2DecisionBatchItemResponse(BaseModel):
     reason_codes: List[str] = Field(default_factory=list)
     review_notes: Optional[str] = None
     reviewed_at: Optional[str] = None
+    is_demo: bool = False
 
 
 class V2DecisionRunResponse(BaseModel):
@@ -802,6 +805,7 @@ class V2PublishRecordResponse(BaseModel):
     publish_status: str
     published_at: Optional[str] = None
     creative_variant: Optional[str] = None
+    is_demo: bool = False
     created_at: str
 
 
@@ -841,6 +845,7 @@ class V2PerformanceSnapshotResponse(BaseModel):
     conversion_proxy_label: str
     short_term_reward: float
     composite_reward: float
+    is_demo: bool = False
 
 
 class V2PerformanceSnapshotListResponse(BaseModel):
@@ -933,3 +938,11 @@ class RAGDocument(BaseModel):
     tags: List[str] = Field(default_factory=list)
     embedding_vector: Optional[List[float]] = None
     engagement_score: float = 0.0
+
+
+class V2DemoDatasetStateResponse(BaseModel):
+    loaded: bool
+    brand_id: Optional[str] = None
+    loaded_at: Optional[str] = None
+    dataset_version: str
+    summary_counts: Optional[Dict[str, int]] = None

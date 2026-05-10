@@ -32,6 +32,7 @@ class BrandRecord:
     target_audience: dict[str, Any]
     brand_voice: dict[str, Any]
     goals: dict[str, Any]
+    is_demo: bool = False
     created_at: datetime = field(default_factory=utcnow)
     updated_at: datetime = field(default_factory=utcnow)
 

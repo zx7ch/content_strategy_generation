@@ -118,6 +118,12 @@ class IngestionStore(Protocol):
 
     def save_comment(self, comment: CommentRecord) -> CommentRecord: ...
 
+    def delete_content_items_by_brand(self, brand_id: str) -> int: ...
+
+    def delete_ingestion_runs_by_brand(self, brand_id: str) -> int: ...
+
+    def delete_topics_by_brand(self, brand_id: str) -> int: ...
+
 
 class InMemoryIngestionStore:
     def __init__(self) -> None:
@@ -334,3 +340,41 @@ class InMemoryIngestionStore:
         self._comments[comment.id] = comment
         self._comments_by_identity[identity] = comment.id
         return comment
+
+    def delete_content_items_by_brand(self, brand_id: str) -> int:
+        item_ids = [iid for iid, item in self._content_items.items() if item.brand_id == brand_id]
+        for iid in item_ids:
+            item = self._content_items.pop(iid)
+            self._content_platform_index.pop((item.workspace_id, item.platform, item.platform_content_id), None)
+            nurl = item.metadata.get("normalized_source_url")
+            if isinstance(nurl, str) and nurl:
+                self._content_url_index.pop((item.workspace_id, item.platform, nurl), None)
+            if item.content_hash:
+                self._content_hash_index.pop((item.workspace_id, item.content_hash), None)
+            comment_ids = [cid for cid, c in self._comments.items() if c.content_item_id == iid]
+            for cid in comment_ids:
+                c = self._comments.pop(cid)
+                self._comments_by_identity.pop((c.workspace_id, c.content_item_id, c.platform_comment_id), None)
+            metric_ids = [mid for mid, m in self._metrics.items() if m.content_item_id == iid]
+            for mid in metric_ids:
+                m = self._metrics.pop(mid)
+                self._metrics_by_item_and_time.pop((m.content_item_id, m.snapshot_at.isoformat()), None)
+        return len(item_ids)
+
+    def delete_ingestion_runs_by_brand(self, brand_id: str) -> int:
+        run_ids = [rid for rid, r in self._runs.items() if r.brand_id == brand_id]
+        for rid in run_ids:
+            self._runs.pop(rid)
+        session_ids = [sid for sid, s in self._capture_sessions.items() if s.brand_id == brand_id]
+        for sid in session_ids:
+            self._capture_sessions.pop(sid)
+        preview_ids = [pid for pid, p in self._import_previews.items() if p.brand_id == brand_id]
+        for pid in preview_ids:
+            self._import_previews.pop(pid)
+        return len(run_ids)
+
+    def delete_topics_by_brand(self, brand_id: str) -> int:
+        topic_ids = [tid for tid, t in self._topics.items() if t.brand_id == brand_id]
+        for tid in topic_ids:
+            self._topics.pop(tid)
+        return len(topic_ids)

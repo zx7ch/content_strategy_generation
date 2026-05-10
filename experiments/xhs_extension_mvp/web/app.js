@@ -21,6 +21,12 @@ const state = {
     isLoading: false,
     timerId: null,
   },
+  scraper: {
+    readiness: null,
+    activeQueryId: null,
+    activeScrapeStatus: null,
+    pollTimerId: null,
+  },
 };
 
 const QUERY_CATEGORY_LABELS = {
@@ -56,6 +62,7 @@ const recommendationList = document.getElementById("recommendation-list");
 const hotspotStatus = document.getElementById("hotspot-status");
 const hotspotUpdatedAt = document.getElementById("hotspot-updated-at");
 const hotspotLists = document.getElementById("hotspot-lists");
+const scraperBanner = document.getElementById("scraper-banner");
 
 document.getElementById("create-task-button").addEventListener("click", createTask);
 document.getElementById("add-custom-query-button").addEventListener("click", addCustomQueries);
@@ -69,6 +76,7 @@ renderQueryModule();
 renderCollectionModule();
 renderRecommendationModule();
 renderHotspotModule();
+void initScraperReadiness();
 
 async function createTask() {
   const topic = topicInput.value.trim();
@@ -92,7 +100,9 @@ async function createTask() {
   state.taskId = data.task_id;
   await refreshTaskSnapshot({ silent: true });
   startTaskSnapshotPolling();
-  setTaskStatus("任务已创建，插件会自动识别当前任务；采集后工作台会自动刷新。");
+  setTaskStatus(data.query_generation_notice
+    ? `任务已创建，插件会自动识别当前任务；采集后工作台会自动刷新。${data.query_generation_notice}`
+    : "任务已创建，插件会自动识别当前任务；采集后工作台会自动刷新。");
   state.hotspots.snapshot = null;
   state.hotspots.status = "idle";
   renderHotspotModule();
@@ -269,7 +279,7 @@ function renderTaskModule() {
       <span class="field-label">当前搜索词</span>
       <strong>${escapeHtml(snapshot.topic)}</strong>
     </div>
-    <div class="subtle">当前任务：已采集 ${formatCount(snapshot.capture_count)} 次，候选方向 ${formatCount(snapshot.candidate_count)} 个，最近更新 ${formatDateTime(snapshot.updated_at)}。</div>
+    <div class="subtle">当前任务：已采集 ${formatCount(snapshot.capture_count)} 次，候选方向 ${formatCount(snapshot.candidate_count)} 个，最近更新 ${formatDateTime(snapshot.updated_at)}。${formatQueryGenerationStatus(snapshot)}</div>
   `;
   renderTaskSnapshotStatus();
 }
@@ -297,6 +307,13 @@ function renderQueryModule() {
 
   queryCustomList.querySelectorAll("[data-delete-query-id]").forEach((button) => {
     button.addEventListener("click", () => deleteCustomQuery(button.getAttribute("data-delete-query-id")));
+  });
+  [queryAutoList, queryCustomList].forEach((list) => {
+    list.querySelectorAll("[data-auto-scrape]").forEach((btn) => {
+      btn.addEventListener("click", () =>
+        void triggerAutoScrape(btn.getAttribute("data-auto-scrape"), btn.getAttribute("data-query-text"))
+      );
+    });
   });
 }
 
@@ -333,13 +350,33 @@ function renderCollectionModule() {
 function renderRecommendationModule() {
   const snapshot = state.task.snapshot;
   const notes = snapshot?.recommended_notes || [];
+  const diagnostics = snapshot?.recommended_notes_diagnostics || {};
+  const totalCount = Number(diagnostics.total_note_count || 0);
+  const passCount = Number(diagnostics.hard_filter_pass_count || 0);
+  const recommendedCount = Number(diagnostics.llm_recommended_count || notes.length || 0);
+  const llmExcludedCount = Number(diagnostics.llm_excluded_count || 0);
+  const filterReasons = Array.isArray(diagnostics.hard_filter_reasons) ? diagnostics.hard_filter_reasons : [];
   if (!notes.length) {
-    recommendationStatus.textContent = "当前还没有推荐笔记。";
+    recommendationStatus.textContent = buildRecommendationStatus({
+      totalCount,
+      passCount,
+      recommendedCount,
+      llmExcludedCount,
+      filterReasons,
+      hasNotes: false,
+    });
     recommendationList.innerHTML = `<div class="empty-note">当前还没有推荐笔记。先去采集一些结果，或手动补充线索。</div>`;
     return;
   }
 
-  recommendationStatus.textContent = `已按当前任务推荐 ${notes.length} 条更值得先看的笔记。`;
+  recommendationStatus.textContent = buildRecommendationStatus({
+    totalCount,
+    passCount,
+    recommendedCount,
+    llmExcludedCount,
+    filterReasons,
+    hasNotes: true,
+  });
   recommendationList.innerHTML = notes.map((note) => `
     <article class="recommend-card">
       <div class="recommend-head">
@@ -365,6 +402,36 @@ function renderRecommendationModule() {
       <div class="subtle">作者：${escapeHtml(note.author || "未知作者")}</div>
     </article>
   `).join("");
+}
+
+function buildRecommendationStatus({
+  totalCount,
+  passCount,
+  recommendedCount,
+  llmExcludedCount,
+  filterReasons,
+  hasNotes,
+}) {
+  if (!totalCount) {
+    return hasNotes ? `当前展示 ${recommendedCount} 条推荐笔记。` : "当前还没有推荐笔记。";
+  }
+
+  const parts = [
+    `共看了 ${totalCount} 条候选`,
+    `通过硬筛 ${passCount} 条`,
+    `最终推荐 ${recommendedCount} 条`,
+  ];
+  const hardFilteredCount = Math.max(totalCount - passCount, 0);
+  if (hardFilteredCount > 0 && filterReasons.length) {
+    const reasonText = filterReasons
+      .slice(0, 3)
+      .map((reason) => `${reason.label} ${reason.count} 条`)
+      .join("，");
+    parts.push(`硬筛排除 ${hardFilteredCount} 条：${reasonText}`);
+  } else if (llmExcludedCount > 0) {
+    parts.push(`LLM 复核后排除 ${llmExcludedCount} 条`);
+  }
+  return parts.join("；") + "。";
 }
 
 function renderHotspotModule() {
@@ -407,7 +474,77 @@ function renderHotspotModule() {
   `).join("");
 }
 
+async function initScraperReadiness() {
+  const resp = await fetch("/api/scraper/readiness").catch(() => null);
+  if (!resp?.ok) return;
+  state.scraper.readiness = await resp.json();
+  renderScraperBanner();
+}
+
+function renderScraperBanner() {
+  const r = state.scraper.readiness;
+  scraperBanner.hidden = !r || r.logged_in;
+}
+
+async function triggerAutoScrape(queryId, queryText) {
+  if (!state.taskId || state.scraper.activeQueryId) return;
+  const resp = await fetch(`/api/tasks/${state.taskId}/auto-scrape`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ keyword: queryText, scroll_count: 5 }),
+  }).catch(() => null);
+  if (!resp?.ok) { setQueryStatus("自动采集触发失败。"); return; }
+  state.scraper.activeQueryId = queryId;
+  state.scraper.activeScrapeStatus = null;
+  renderQueryModule();
+  startScrapeStatusPolling();
+}
+
+function startScrapeStatusPolling() {
+  stopScrapeStatusPolling();
+  state.scraper.pollTimerId = window.setInterval(pollScrapeStatus, 1000);
+}
+
+function stopScrapeStatusPolling() {
+  if (state.scraper.pollTimerId) {
+    window.clearInterval(state.scraper.pollTimerId);
+    state.scraper.pollTimerId = null;
+  }
+}
+
+async function pollScrapeStatus() {
+  if (!state.taskId || !state.scraper.activeQueryId) return;
+  const resp = await fetch(`/api/tasks/${state.taskId}/scrape-status`).catch(() => null);
+  if (!resp?.ok) return;
+  const status = await resp.json();
+  state.scraper.activeScrapeStatus = status;
+  const el = document.querySelector(`[data-scrape-status="${state.scraper.activeQueryId}"]`);
+  if (el) { el.hidden = false; el.textContent = formatScrapePhase(status); }
+  if (["done", "error", "login_required"].includes(status.phase)) {
+    stopScrapeStatusPolling();
+    state.scraper.activeQueryId = null;
+    renderQueryModule();
+    if (status.phase === "done") {
+      void refreshTaskFromCandidateDirections();
+      setTaskStatus("自动采集完成，候选方向已更新。");
+    }
+  }
+}
+
+function formatScrapePhase(s) {
+  if (!s) return "正在启动...";
+  if (s.phase === "scrolling") return `滚动 ${s.scroll_index}/${s.scroll_total}，已采集 ${s.items_count} 条`;
+  if (s.phase === "done") return `✅ 采集完成，共 ${s.items_count} 条`;
+  if (s.phase === "error") return `❌ 失败：${s.error_message}`;
+  if (s.phase === "login_required") return "⚠️ 采集器未登录，请完成登录";
+  if (s.phase === "navigating") return "正在打开小红书搜索页...";
+  return "正在启动采集器...";
+}
+
 function renderQueryCard(query, { deletable }) {
+  const isBusy = !!state.scraper.activeQueryId;
+  const isActive = state.scraper.activeQueryId === query.query_id;
+  const statusText = isActive ? escapeHtml(formatScrapePhase(state.scraper.activeScrapeStatus)) : "";
   return `
     <article class="query-card">
       <div class="query-row">
@@ -416,10 +553,12 @@ function renderQueryCard(query, { deletable }) {
         </div>
         <div class="button-row">
           <a class="link-button secondary" href="${buildXhsSearchUrl(query.query_text)}" target="_blank" rel="noopener">打开小红书搜索</a>
+          <button class="secondary" type="button" data-auto-scrape="${escapeAttribute(query.query_id)}" data-query-text="${escapeAttribute(query.query_text)}" ${!state.taskId || isBusy ? "disabled" : ""}>🔄 自动采集</button>
           ${deletable ? `<button class="ghost" type="button" data-delete-query-id="${escapeAttribute(query.query_id)}">删除</button>` : ""}
         </div>
       </div>
       <strong>${escapeHtml(query.query_text)}</strong>
+      <div class="status--inline" data-scrape-status="${escapeAttribute(query.query_id)}" ${isActive ? "" : "hidden"}>${statusText}</div>
     </article>
   `;
 }
@@ -584,6 +723,18 @@ function formatDateTime(value) {
   } catch {
     return "--";
   }
+}
+
+function formatQueryGenerationStatus(snapshot) {
+  if (!snapshot?.query_generation_source) {
+    return "";
+  }
+  if (snapshot.query_generation_source === "llm") {
+    return " 默认拓展词来源：AI 生成。";
+  }
+  return snapshot.query_generation_notice
+    ? ` 默认拓展词来源：规则降级。${snapshot.query_generation_notice}`
+    : " 默认拓展词来源：规则降级。";
 }
 
 async function buildHttpErrorMessage(response, fallback) {

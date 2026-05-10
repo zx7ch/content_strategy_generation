@@ -49,6 +49,8 @@ class DecisionStore(Protocol):
         decision_batch_id: str | None = None,
     ) -> list[CandidateSetSnapshotRecord]: ...
 
+    def delete_by_brand(self, brand_id: str) -> int: ...
+
 
 class InMemoryDecisionStore:
     def __init__(self) -> None:
@@ -124,3 +126,23 @@ class InMemoryDecisionStore:
             snapshots = [snapshot for snapshot in snapshots if snapshot.decision_batch_id == decision_batch_id]
         snapshots.sort(key=lambda item: (item.created_at, item.slot_index or -1), reverse=True)
         return snapshots
+
+    def delete_by_brand(self, brand_id: str) -> int:
+        count = 0
+        batch_ids = {bid for bid, b in self._batches.items() if b.brand_id == brand_id}
+        item_keys = [k for k in self._batch_items if k[0] in batch_ids]
+        for k in item_keys:
+            del self._batch_items[k]
+            count += 1
+        snap_ids = [sid for sid, s in self._snapshots.items() if s.brand_id == brand_id]
+        for sid in snap_ids:
+            del self._snapshots[sid]
+            count += 1
+        event_ids = [eid for eid, e in self._events.items() if e.brand_id == brand_id]
+        for eid in event_ids:
+            del self._events[eid]
+            count += 1
+        for bid in batch_ids:
+            del self._batches[bid]
+            count += 1
+        return count

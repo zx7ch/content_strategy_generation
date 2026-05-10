@@ -34,6 +34,20 @@ class JsonFormatter(logging.Formatter):
             payload["imported_count"] = record.imported_count
         if hasattr(record, "detail"):
             payload["detail"] = record.detail
+        if hasattr(record, "provider"):
+            payload["provider"] = record.provider
+        if hasattr(record, "base_url"):
+            payload["base_url"] = record.base_url
+        if hasattr(record, "model"):
+            payload["model"] = record.model
+        if hasattr(record, "failure_stage"):
+            payload["failure_stage"] = record.failure_stage
+        if hasattr(record, "error_type"):
+            payload["error_type"] = record.error_type
+        if hasattr(record, "error_message"):
+            payload["error_message"] = record.error_message
+        if hasattr(record, "query_generation_source"):
+            payload["query_generation_source"] = record.query_generation_source
         return json.dumps(payload, ensure_ascii=False)
 
 

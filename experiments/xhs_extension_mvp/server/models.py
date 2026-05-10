@@ -5,6 +5,8 @@ from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
 
+from experiments.xhs_extension_mvp.server.scraper_models import ScrapePhase
+
 
 PageType = Literal["search_result", "note_detail", "manual"]
 QueryCategory = Literal["core", "crowd", "scenario", "problem", "compare", "decision", "custom"]
@@ -69,6 +71,22 @@ class RecommendedNote(BaseModel):
     query_coverage_count: int = 0
 
 
+class RecommendedNotesFilterReason(BaseModel):
+    code: str
+    label: str
+    count: int = 0
+
+
+class RecommendedNotesDiagnostics(BaseModel):
+    total_note_count: int = 0
+    hard_filter_pass_count: int = 0
+    llm_recommended_count: int = 0
+    llm_excluded_count: int = 0
+    analysis_source: Literal["llm", "fallback_rule"] = "fallback_rule"
+    analysis_notice: Optional[str] = None
+    hard_filter_reasons: list[RecommendedNotesFilterReason] = Field(default_factory=list)
+
+
 class HotspotItem(BaseModel):
     note_id: Optional[str] = None
     title: str
@@ -122,6 +140,8 @@ class CreateTaskResponse(BaseModel):
     task_id: str
     topic: str
     expanded_queries: list[ExpandedQuery]
+    query_generation_source: Literal["llm", "fallback_rule"] = "fallback_rule"
+    query_generation_notice: Optional[str] = None
 
 
 class ErrorSummary(BaseModel):
@@ -218,6 +238,8 @@ class TaskSnapshotResponse(BaseModel):
     topic: str
     created_at: datetime
     updated_at: datetime
+    query_generation_source: Literal["llm", "fallback_rule"] = "fallback_rule"
+    query_generation_notice: Optional[str] = None
     snapshot_version: int = 0
     candidate_count: int = 0
     capture_count: int = 0
@@ -226,6 +248,7 @@ class TaskSnapshotResponse(BaseModel):
     imported_item_count: int = 0
     collection_summary: CollectionSummary = Field(default_factory=CollectionSummary)
     recommended_notes: list[RecommendedNote] = Field(default_factory=list)
+    recommended_notes_diagnostics: RecommendedNotesDiagnostics = Field(default_factory=RecommendedNotesDiagnostics)
     candidates: list[Candidate] = Field(default_factory=list)
 
 
@@ -235,3 +258,33 @@ class TaskSnapshotVersionResponse(BaseModel):
     updated_at: datetime
     candidate_count: int
     capture_count: int
+
+
+class AutoScrapeRequest(BaseModel):
+    keyword: str = Field(min_length=1, max_length=200)
+    scroll_count: int = Field(default=5, ge=1, le=10)
+
+
+class AutoScrapeResponse(BaseModel):
+    task_id: str
+    accepted: bool
+    started_at: datetime
+
+
+class ScrapeStatusResponse(BaseModel):
+    task_id: str
+    keyword: str
+    phase: ScrapePhase
+    scroll_index: int
+    scroll_total: int
+    items_count: int
+    error_message: str = ""
+    started_at: datetime
+    finished_at: Optional[datetime] = None
+
+
+class ScraperReadinessResponse(BaseModel):
+    profile_exists: bool
+    logged_in: bool
+    last_checked_at: datetime
+    detail: str = ""

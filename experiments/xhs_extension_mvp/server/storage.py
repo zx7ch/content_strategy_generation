@@ -14,6 +14,12 @@ from typing import Any
 from experiments.xhs_extension_mvp.server.candidate_builder import NormalizedItem, build_candidates
 from experiments.xhs_extension_mvp.server.hotspot_service import build_hotspot_snapshot
 from experiments.xhs_extension_mvp.server.logging_utils import get_logger
+from experiments.xhs_extension_mvp.server.llm_client import MVPLLMConfigError, load_llm_config
+from experiments.xhs_extension_mvp.server.llm_note_recommender import (
+    LLMRecommendedNoteAnalyzer,
+    LLMRecommendedNotesFailure,
+)
+from experiments.xhs_extension_mvp.server.llm_query_expander import LLMExpansionFailure, LLMQueryExpander
 from experiments.xhs_extension_mvp.server.models import (
     ActiveSearchContext,
     ActiveTask,
@@ -30,6 +36,7 @@ from experiments.xhs_extension_mvp.server.models import (
     HotspotSnapshotResponse,
     QueryCategory,
     RecommendedNote,
+    RecommendedNotesDiagnostics,
     TaskSnapshotResponse,
     TaskSnapshotVersionResponse,
 )
@@ -63,7 +70,9 @@ class MVPStorage:
                 CREATE TABLE IF NOT EXISTS mvp_tasks (
                     task_id TEXT PRIMARY KEY,
                     topic TEXT NOT NULL,
-                    created_at TEXT NOT NULL
+                    created_at TEXT NOT NULL,
+                    query_generation_source TEXT NOT NULL DEFAULT 'fallback_rule',
+                    query_generation_notice TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS mvp_queries (
@@ -193,24 +202,40 @@ class MVPStorage:
                     created_at TEXT NOT NULL,
                     FOREIGN KEY(task_id) REFERENCES mvp_tasks(task_id)
                 );
+
+                CREATE TABLE IF NOT EXISTS mvp_recommended_note_cache (
+                    task_id TEXT PRIMARY KEY,
+                    snapshot_version INTEGER NOT NULL,
+                    notes_json TEXT NOT NULL,
+                    diagnostics_json TEXT NOT NULL DEFAULT '{}',
+                    analysis_source TEXT NOT NULL DEFAULT 'fallback_rule',
+                    analysis_notice TEXT,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(task_id) REFERENCES mvp_tasks(task_id)
+                );
                 """
             )
             self._ensure_capture_item_columns(conn)
             self._ensure_candidate_columns(conn)
+            self._ensure_task_columns(conn)
+            self._ensure_recommended_note_cache_columns(conn)
             conn.commit()
         self._logger.info(
             "Initialized MVP storage schema",
             extra={"event_name": "mvp_storage_initialized", "detail": str(self.db_path)},
         )
 
-    def create_task(self, topic: str) -> tuple[str, list[ExpandedQuery]]:
+    def create_task(self, topic: str) -> tuple[str, list[ExpandedQuery], str, str | None]:
         task_id = str(uuid.uuid4())
         created_at = iso_now()
-        expansions = expand_topic(topic)
+        expansions, generation_source, generation_notice = self._build_queries_for_task(task_id=task_id, topic=topic)
         with self._connect() as conn:
             conn.execute(
-                "INSERT INTO mvp_tasks (task_id, topic, created_at) VALUES (?, ?, ?)",
-                (task_id, topic.strip(), created_at),
+                """
+                INSERT INTO mvp_tasks (task_id, topic, created_at, query_generation_source, query_generation_notice)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (task_id, topic.strip(), created_at, generation_source, generation_notice),
             )
             for index, expansion in enumerate(expansions):
                 conn.execute(
@@ -228,9 +253,10 @@ class MVPStorage:
                 "task_id": task_id,
                 "candidate_count": 0,
                 "detail": topic.strip(),
+                "query_generation_source": generation_source,
             },
         )
-        return task_id, self._load_queries(task_id)
+        return task_id, self._load_queries(task_id), generation_source, generation_notice
 
     def add_custom_queries(self, *, task_id: str, text: str) -> tuple[int, int]:
         lines = [self._normalize_query_line(line) for line in text.splitlines()]
@@ -311,7 +337,11 @@ class MVPStorage:
     def get_task_snapshot(self, task_id: str) -> TaskSnapshotResponse | None:
         with self._connect() as conn:
             task_row = conn.execute(
-                "SELECT task_id, topic, created_at FROM mvp_tasks WHERE task_id = ?",
+                """
+                SELECT task_id, topic, created_at, query_generation_source, query_generation_notice
+                FROM mvp_tasks
+                WHERE task_id = ?
+                """,
                 (task_id,),
             ).fetchone()
             if task_row is None:
@@ -348,12 +378,27 @@ class MVPStorage:
             recommendation_items = self._load_normalized_items(conn, task_id)
             query_hits = self._load_item_query_hits(conn, task_id)
             updated_at = self._load_task_updated_at(conn, task_id, task_row["created_at"])
+            cached_recommended_bundle = self._load_cached_recommended_notes(conn, task_id, capture_batch_count)
+
+        recommended_notes, recommended_notes_diagnostics = (
+            cached_recommended_bundle
+            if cached_recommended_bundle is not None
+            else self._build_and_cache_recommended_notes(
+                task_id=task_id,
+                topic=task_row["topic"],
+                items=recommendation_items,
+                query_hits=query_hits,
+                snapshot_version=capture_batch_count,
+            )
+        )
 
         return TaskSnapshotResponse(
             task_id=task_row["task_id"],
             topic=task_row["topic"],
             created_at=datetime.fromisoformat(task_row["created_at"]),
             updated_at=updated_at,
+            query_generation_source=task_row["query_generation_source"] or "fallback_rule",
+            query_generation_notice=task_row["query_generation_notice"],
             snapshot_version=capture_batch_count,
             candidate_count=len(candidate_rows),
             capture_count=capture_batch_count,
@@ -365,12 +410,8 @@ class MVPStorage:
                 deduped_item_count=imported_item_count,
                 manual_seed_count=manual_seed_count,
             ),
-            recommended_notes=build_recommended_notes(
-                task_row["topic"],
-                recommendation_items,
-                query_hits_by_item_id=query_hits,
-                limit=5,
-            ),
+            recommended_notes=recommended_notes,
+            recommended_notes_diagnostics=recommended_notes_diagnostics,
             candidates=[
                 Candidate(
                     candidate_id=row["candidate_id"],
@@ -779,6 +820,30 @@ class MVPStorage:
         )
         return imported_count, candidates
 
+    def ingest_scraper_items(
+        self,
+        *,
+        task_id: str,
+        keyword: str,
+        items: list[CaptureItemIn],
+    ) -> tuple[int, int]:
+        """Ingest server-initiated scraper items via the existing capture pipeline.
+
+        No token validation — access control happens at the endpoint layer.
+        Returns (captured_count, new_count).
+        """
+        captured_count = len(items)
+        if captured_count == 0:
+            return 0, 0
+        imported_count, _ = self.ingest_capture(
+            task_id=task_id,
+            page_type="search_result",
+            query_text=keyword,
+            items=items,
+            capture_mode="scraper",
+        )
+        return captured_count, imported_count
+
     def rebuild_candidates(self, task_id: str) -> list[Candidate]:
         snapshot = self.get_task_snapshot(task_id)
         if snapshot is None:
@@ -1179,6 +1244,336 @@ class MVPStorage:
         for name, ddl in required.items():
             if name not in existing:
                 conn.execute(f"ALTER TABLE mvp_candidates ADD COLUMN {name} {ddl}")
+
+    def _ensure_task_columns(self, conn: sqlite3.Connection) -> None:
+        rows = conn.execute("PRAGMA table_info(mvp_tasks)").fetchall()
+        existing = {row["name"] for row in rows}
+        required = {
+            "query_generation_source": "TEXT NOT NULL DEFAULT 'fallback_rule'",
+            "query_generation_notice": "TEXT DEFAULT NULL",
+        }
+        for name, ddl in required.items():
+            if name not in existing:
+                conn.execute(f"ALTER TABLE mvp_tasks ADD COLUMN {name} {ddl}")
+
+    def _ensure_recommended_note_cache_columns(self, conn: sqlite3.Connection) -> None:
+        rows = conn.execute("PRAGMA table_info(mvp_recommended_note_cache)").fetchall()
+        existing = {row["name"] for row in rows}
+        required = {
+            "diagnostics_json": "TEXT NOT NULL DEFAULT '{}'",
+        }
+        for name, ddl in required.items():
+            if name not in existing:
+                conn.execute(f"ALTER TABLE mvp_recommended_note_cache ADD COLUMN {name} {ddl}")
+
+    def _load_cached_recommended_notes(
+        self,
+        conn: sqlite3.Connection,
+        task_id: str,
+        snapshot_version: int,
+    ) -> tuple[list[RecommendedNote], RecommendedNotesDiagnostics] | None:
+        row = conn.execute(
+            """
+            SELECT notes_json, diagnostics_json
+            FROM mvp_recommended_note_cache
+            WHERE task_id = ? AND snapshot_version = ?
+            """,
+            (task_id, snapshot_version),
+        ).fetchone()
+        if row is None:
+            return None
+        diagnostics_json = row["diagnostics_json"] if "diagnostics_json" in row.keys() else ""
+        diagnostics = RecommendedNotesDiagnostics.model_validate(json.loads(diagnostics_json)) if diagnostics_json else RecommendedNotesDiagnostics()
+        return [RecommendedNote.model_validate(entry) for entry in json.loads(row["notes_json"])], diagnostics
+
+    def _persist_recommended_notes_cache(
+        self,
+        *,
+        task_id: str,
+        snapshot_version: int,
+        notes: list[RecommendedNote],
+        diagnostics: RecommendedNotesDiagnostics,
+        analysis_source: str,
+        analysis_notice: str | None,
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO mvp_recommended_note_cache
+                    (task_id, snapshot_version, notes_json, diagnostics_json, analysis_source, analysis_notice, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(task_id) DO UPDATE SET
+                    snapshot_version = excluded.snapshot_version,
+                    notes_json = excluded.notes_json,
+                    diagnostics_json = excluded.diagnostics_json,
+                    analysis_source = excluded.analysis_source,
+                    analysis_notice = excluded.analysis_notice,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    task_id,
+                    snapshot_version,
+                    json.dumps([note.model_dump() for note in notes], ensure_ascii=False),
+                    json.dumps(diagnostics.model_dump(), ensure_ascii=False),
+                    analysis_source,
+                    analysis_notice,
+                    iso_now(),
+                ),
+            )
+            conn.commit()
+
+    def _build_and_cache_recommended_notes(
+        self,
+        *,
+        task_id: str,
+        topic: str,
+        items: list[NormalizedItem],
+        query_hits: dict[str, set[str]],
+        snapshot_version: int,
+    ) -> tuple[list[RecommendedNote], RecommendedNotesDiagnostics]:
+        if not items:
+            diagnostics = RecommendedNotesDiagnostics()
+            self._persist_recommended_notes_cache(
+                task_id=task_id,
+                snapshot_version=snapshot_version,
+                notes=[],
+                diagnostics=diagnostics,
+                analysis_source="fallback_rule",
+                analysis_notice=None,
+            )
+            return [], diagnostics
+
+        try:
+            config = load_llm_config()
+            self._logger.info(
+                "Starting MVP recommended notes LLM analysis",
+                extra={
+                    "event_name": "mvp_recommended_notes_llm_started",
+                    "task_id": task_id,
+                    "detail": topic.strip(),
+                    "provider": "openai_compatible",
+                    "base_url": self._sanitize_base_url(config.base_url),
+                    "model": config.model,
+                },
+            )
+            analysis = LLMRecommendedNoteAnalyzer().analyze(
+                topic,
+                items,
+                query_hits_by_item_id=query_hits,
+                limit=5,
+            )
+            self._logger.info(
+                "MVP recommended notes LLM analysis succeeded",
+                extra={
+                    "event_name": "mvp_recommended_notes_llm_succeeded",
+                    "task_id": task_id,
+                    "detail": topic.strip(),
+                    "provider": "openai_compatible",
+                    "base_url": self._sanitize_base_url(config.base_url),
+                    "model": config.model,
+                },
+            )
+            self._persist_recommended_notes_cache(
+                task_id=task_id,
+                snapshot_version=snapshot_version,
+                notes=analysis.notes,
+                diagnostics=analysis.diagnostics,
+                analysis_source="llm",
+                analysis_notice=None,
+            )
+            return analysis.notes, analysis.diagnostics
+        except MVPLLMConfigError as exc:
+            config = self._read_llm_config_for_logging()
+            self._logger.warning(
+                "MVP recommended notes LLM analysis failed",
+                extra={
+                    "event_name": "mvp_recommended_notes_llm_failed",
+                    "task_id": task_id,
+                    "detail": topic.strip(),
+                    "provider": "openai_compatible",
+                    "base_url": config["base_url"],
+                    "model": config["model"],
+                    "failure_stage": "config_missing",
+                    "error_type": type(exc).__name__,
+                    "error_message": self._truncate_error(str(exc)),
+                },
+            )
+            diagnostics = RecommendedNotesDiagnostics(total_note_count=len([item for item in items if item.note_id]))
+        except LLMRecommendedNotesFailure as exc:
+            config = self._read_llm_config_for_logging()
+            self._logger.warning(
+                "MVP recommended notes LLM analysis failed",
+                extra={
+                    "event_name": "mvp_recommended_notes_llm_failed",
+                    "task_id": task_id,
+                    "detail": topic.strip(),
+                    "provider": "openai_compatible",
+                    "base_url": config["base_url"],
+                    "model": config["model"],
+                    "failure_stage": exc.stage,
+                    "error_type": type(exc).__name__,
+                    "error_message": self._truncate_error(str(exc)),
+                },
+            )
+            diagnostics = exc.diagnostics or RecommendedNotesDiagnostics(total_note_count=len([item for item in items if item.note_id]))
+
+        fallback_notes = build_recommended_notes(
+            topic,
+            items,
+            query_hits_by_item_id=query_hits,
+            limit=5,
+        )
+        diagnostics.llm_recommended_count = len(fallback_notes)
+        diagnostics.analysis_source = "fallback_rule"
+        self._logger.info(
+            "MVP recommended notes fallback used",
+            extra={
+                "event_name": "mvp_recommended_notes_fallback_used",
+                "task_id": task_id,
+                "detail": topic.strip(),
+                "query_generation_source": "fallback_rule",
+            },
+        )
+        self._persist_recommended_notes_cache(
+            task_id=task_id,
+            snapshot_version=snapshot_version,
+            notes=fallback_notes,
+            diagnostics=diagnostics,
+            analysis_source="fallback_rule",
+            analysis_notice=None,
+        )
+        return fallback_notes, diagnostics
+
+    def _build_queries_for_task(self, *, task_id: str, topic: str) -> tuple[list[ExpandedQuery], str, str | None]:
+        try:
+            config = load_llm_config()
+            self._logger.info(
+                "Starting MVP LLM query expansion",
+                extra={
+                    "event_name": "mvp_query_expansion_llm_started",
+                    "task_id": task_id,
+                    "detail": topic.strip(),
+                    "provider": "openai_compatible",
+                    "base_url": self._sanitize_base_url(config.base_url),
+                    "model": config.model,
+                },
+            )
+            expansions = LLMQueryExpander().expand_topic(topic)
+            self._logger.info(
+                "MVP LLM query expansion succeeded",
+                extra={
+                    "event_name": "mvp_query_expansion_llm_succeeded",
+                    "task_id": task_id,
+                    "detail": topic.strip(),
+                    "provider": "openai_compatible",
+                    "base_url": self._sanitize_base_url(config.base_url),
+                    "model": config.model,
+                    "query_generation_source": "llm",
+                },
+            )
+            return self._to_expanded_queries(expansions), "llm", None
+        except MVPLLMConfigError as exc:
+            config = self._read_llm_config_for_logging()
+            notice = self._notice_for_failure_stage("config_missing")
+            self._logger.warning(
+                "MVP LLM query expansion failed",
+                extra={
+                    "event_name": "mvp_query_expansion_llm_failed",
+                    "task_id": task_id,
+                    "detail": topic.strip(),
+                    "provider": "openai_compatible",
+                    "base_url": config["base_url"],
+                    "model": config["model"],
+                    "failure_stage": "config_missing",
+                    "error_type": type(exc).__name__,
+                    "error_message": self._truncate_error(str(exc)),
+                },
+            )
+            fallback = self._to_expanded_queries(expand_topic(topic))
+            self._logger.info(
+                "MVP query expansion fallback used",
+                extra={
+                    "event_name": "mvp_query_expansion_fallback_used",
+                    "task_id": task_id,
+                    "detail": topic.strip(),
+                    "provider": "openai_compatible",
+                    "base_url": config["base_url"],
+                    "model": config["model"],
+                    "failure_stage": "config_missing",
+                    "query_generation_source": "fallback_rule",
+                },
+            )
+            return fallback, "fallback_rule", notice
+        except LLMExpansionFailure as exc:
+            notice = self._notice_for_failure_stage(exc.stage)
+            config = self._read_llm_config_for_logging()
+            self._logger.warning(
+                "MVP LLM query expansion failed",
+                extra={
+                    "event_name": "mvp_query_expansion_llm_failed",
+                    "task_id": task_id,
+                    "detail": topic.strip(),
+                    "provider": "openai_compatible",
+                    "base_url": config["base_url"],
+                    "model": config["model"],
+                    "failure_stage": exc.stage,
+                    "error_type": type(exc).__name__,
+                    "error_message": self._truncate_error(str(exc)),
+                },
+            )
+            fallback = self._to_expanded_queries(expand_topic(topic))
+            self._logger.info(
+                "MVP query expansion fallback used",
+                extra={
+                    "event_name": "mvp_query_expansion_fallback_used",
+                    "task_id": task_id,
+                    "detail": topic.strip(),
+                    "provider": "openai_compatible",
+                    "base_url": config["base_url"],
+                    "model": config["model"],
+                    "failure_stage": exc.stage,
+                    "query_generation_source": "fallback_rule",
+                },
+            )
+            return fallback, "fallback_rule", notice
+
+    def _to_expanded_queries(self, expansions: list[Any]) -> list[ExpandedQuery]:
+        return [
+            ExpandedQuery(
+                query_id=str(uuid.uuid4()),
+                category=expansion.category,
+                query_text=expansion.query_text,
+                order=index,
+            )
+            for index, expansion in enumerate(expansions)
+        ]
+
+    def _notice_for_failure_stage(self, stage: str) -> str:
+        if stage == "config_missing":
+            return "AI 拓展词未启用，已使用规则生成。"
+        return "AI 拓展词暂时不可用，已自动降级为规则生成。"
+
+    def _truncate_error(self, message: str, *, limit: int = 240) -> str:
+        text = (message or "").strip()
+        if len(text) <= limit:
+            return text
+        return f"{text[: limit - 3]}..."
+
+    def _read_llm_config_for_logging(self) -> dict[str, str]:
+        try:
+            config = load_llm_config()
+            return {
+                "model": config.model,
+                "base_url": self._sanitize_base_url(config.base_url),
+            }
+        except Exception:  # noqa: BLE001
+            return {"model": "", "base_url": ""}
+
+    def _sanitize_base_url(self, value: str) -> str:
+        text = (value or "").strip()
+        if not text:
+            return ""
+        return text.split("?", 1)[0].split("#", 1)[0]
 
     def _build_dedupe_key(self, item: CaptureItemIn) -> str:
         note_id = item.note_id.strip()

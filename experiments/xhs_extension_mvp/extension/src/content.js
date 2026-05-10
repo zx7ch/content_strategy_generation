@@ -816,4 +816,18 @@ function parseMetric(text) {
   const numeric = parseInt(cleaned, 10);
   return Number.isNaN(numeric) ? 0 : numeric;
 }
+
+// Expose extractor pure functions to globalThis for server-side Playwright reuse.
+// The Chrome Extension flow remains unchanged (still IIFE-wrapped); the scraper
+// `page.evaluate` call reads `globalThis.__XHS_EXTRACTOR__` after injecting this
+// file as a string. Decision 2 in improvements.md.
+globalThis.__XHS_EXTRACTOR__ = {
+  extractSearchResultItems,
+  extractNoteDetailItem,
+  extractItemFromRoot,
+  detectPageType,
+  resolveBestSourceUrl,
+  normalizeXhsUrl,
+  extractSearchKeyword,
+};
 })();

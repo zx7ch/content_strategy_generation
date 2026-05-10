@@ -27,19 +27,27 @@ class MasterDataStore(Protocol):
 
     def list_brands(self, workspace_id: str) -> list[BrandRecord]: ...
 
+    def delete_brand(self, brand_id: str) -> bool: ...
+
     def save_brand_channel(self, channel: BrandChannelRecord) -> BrandChannelRecord: ...
 
     def get_brand_channel(self, channel_id: str) -> BrandChannelRecord | None: ...
 
     def list_brand_channels(self, brand_id: str) -> list[BrandChannelRecord]: ...
 
+    def delete_brand_channels(self, brand_id: str) -> int: ...
+
     def save_policy_config(self, policy: BrandPolicyConfigRecord) -> BrandPolicyConfigRecord: ...
 
     def list_policy_configs(self, brand_id: str) -> list[BrandPolicyConfigRecord]: ...
 
+    def delete_policy_configs(self, brand_id: str) -> int: ...
+
     def save_state_snapshot(self, snapshot: BrandStateSnapshotRecord) -> BrandStateSnapshotRecord: ...
 
     def list_state_snapshots(self, brand_id: str) -> list[BrandStateSnapshotRecord]: ...
+
+    def delete_state_snapshots(self, brand_id: str) -> int: ...
 
 
 class InMemoryMasterDataStore:
@@ -80,6 +88,9 @@ class InMemoryMasterDataStore:
         brands.sort(key=lambda item: item.created_at)
         return brands
 
+    def delete_brand(self, brand_id: str) -> bool:
+        return self._brands.pop(brand_id, None) is not None
+
     def save_brand_channel(self, channel: BrandChannelRecord) -> BrandChannelRecord:
         self._channels[channel.id] = channel
         return channel
@@ -92,6 +103,12 @@ class InMemoryMasterDataStore:
         channels.sort(key=lambda item: item.created_at)
         return channels
 
+    def delete_brand_channels(self, brand_id: str) -> int:
+        to_delete = [cid for cid, c in self._channels.items() if c.brand_id == brand_id]
+        for cid in to_delete:
+            del self._channels[cid]
+        return len(to_delete)
+
     def save_policy_config(self, policy: BrandPolicyConfigRecord) -> BrandPolicyConfigRecord:
         if policy.is_active:
             for existing_id, existing in list(self._policies.items()):
@@ -103,6 +120,12 @@ class InMemoryMasterDataStore:
     def list_policy_configs(self, brand_id: str) -> list[BrandPolicyConfigRecord]:
         return [policy for policy in self._policies.values() if policy.brand_id == brand_id]
 
+    def delete_policy_configs(self, brand_id: str) -> int:
+        to_delete = [pid for pid, p in self._policies.items() if p.brand_id == brand_id]
+        for pid in to_delete:
+            del self._policies[pid]
+        return len(to_delete)
+
     def save_state_snapshot(self, snapshot: BrandStateSnapshotRecord) -> BrandStateSnapshotRecord:
         self._snapshots[snapshot.id] = snapshot
         return snapshot
@@ -111,3 +134,9 @@ class InMemoryMasterDataStore:
         snapshots = [item for item in self._snapshots.values() if item.brand_id == brand_id]
         snapshots.sort(key=lambda item: item.valid_from)
         return snapshots
+
+    def delete_state_snapshots(self, brand_id: str) -> int:
+        to_delete = [sid for sid, s in self._snapshots.items() if s.brand_id == brand_id]
+        for sid in to_delete:
+            del self._snapshots[sid]
+        return len(to_delete)

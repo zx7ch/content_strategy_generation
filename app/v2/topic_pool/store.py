@@ -22,6 +22,8 @@ class TopicPoolStore(Protocol):
         include_archived: bool = False,
     ) -> list[TopicPoolItemRecord]: ...
 
+    def delete_topic_pool_items(self, brand_id: str) -> int: ...
+
 
 class InMemoryTopicPoolStore:
     def __init__(self) -> None:
@@ -62,3 +64,10 @@ class InMemoryTopicPoolStore:
             items = [item for item in items if item.status != "archived"]
         items.sort(key=lambda item: (-item.final_score, item.updated_at.isoformat(), item.title))
         return items
+
+    def delete_topic_pool_items(self, brand_id: str) -> int:
+        to_delete = [iid for iid, item in self._items.items() if item.brand_id == brand_id]
+        for iid in to_delete:
+            item = self._items.pop(iid)
+            self._by_brand_topic.pop((item.brand_id, item.topic_id), None)
+        return len(to_delete)

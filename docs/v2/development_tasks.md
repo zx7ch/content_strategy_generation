@@ -547,6 +547,45 @@ Completion standard:
 - Phase 1 guides can be used as implementation inputs without having to reinterpret outdated type names or duplicated rules
 - frontend type contracts, API helper naming, route ownership, and guide terminology are consistent with the current spec
 
+#### 2.11.6 P1-S2-6 Demo Dataset And Test Case Entry
+
+Goal:
+
+- provide an end-to-end validation path that does not depend on real browser-extension capture or real spreadsheet upload, so the Phase 1 closed loop can be exercised, demoed, and regression-tested before `P1-S2-1` ingestion productization is finished
+- only the data is synthetic; every other runtime path (ingestion contract, topic-pool normalizer, scorer, decision engine, publish, performance, evaluation) must be the formal one
+
+Delivery:
+
+- ship a fixture-backed apparel-brand demo dataset covering the full Phase 1 loop:
+  - one demo `brand` with matching `brand_policy_config` and `brand_state_snapshot`
+  - approximately 30 demo `content_items` with realistic apparel-domain titles, tags, and authors
+  - associated `comments` and `content_metrics_snapshots`
+  - at least one historical `publish_record` plus `performance_snapshot` so the feedback-driven second-batch effect is reproducible
+  - dataset is generated once and committed as a fixture, not regenerated randomly per click
+- backend loader endpoint such as `POST /workspaces/{id}/demo-datasets/load`:
+  - writes through the same service / store boundaries used by real ingestion, topic-pool, decision, publish, and feedback paths
+  - is idempotent: repeated calls reset and reload the demo brand rather than accumulating duplicates
+  - exposes a paired reset / unload action through the same surface
+- demo provenance marking:
+  - add an `is_demo` boolean (or equivalent canonical marker) on the demo `brand` row, propagated by FK lookup to derived rows
+  - alternatively mark at `source_sync` / `ingestion_run` granularity — choice must be recorded in spec before implementation
+- frontend `Test Case` entry on the program landing page (the first page the operator sees on `/`):
+  - prominent button labeled `加载示例数据集` / `Test Case`
+  - production workspaces are allowed, but clicking shows an explicit confirmation dialog before write
+  - paired action to reset / remove demo data
+- frontend `示例` tag rendering across `/topic-pool`, `/decisions`, `/publish`, `/performance`, and any list / detail surface that exposes derived rows belonging to the demo brand
+- the loader must not introduce a parallel mock-render branch in the frontend; demo records reach the UI through the same loaders as real records
+
+Completion standard:
+
+- after one button click, an operator can walk the full Phase 1 loop without any extension capture or file upload: ingestion -> topic pool -> decision batch -> publish record -> performance import -> second decision batch
+- every record produced by the demo dataset is visibly tagged `示例` in operator-facing surfaces
+- the loader path uses the same service / store contracts as real ingestion; no mock fallback or demo-only render branch is introduced
+- the dataset content is fixed and committed, so acceptance and regression runs are reproducible
+- demo data can be reset / unloaded through the same entry point
+- the loader is allowed in production workspaces but only after explicit confirmation
+- spec section covering schema (`is_demo` marker), API contract, and frontend tag rendering is updated before implementation lands
+
 ### 2.12 Phase 1 Final Closure Gate
 
 Phase 1 should be considered fully closed only when:
@@ -559,11 +598,11 @@ Phase 1 should be considered fully closed only when:
 
 Recommended completion order:
 
-1. `P1-S2-1 Data Intake Workspace Productization`
-2. `P1-S2-2 Topic Pool Explainability And Scorer Completion`
-3. `P1-S2-3 Feedback-Driven Second-Batch Closure`
-4. `P1-S2-4 Postgres Runtime Convergence`
-5. `P1-S2-5 Frontend Contract And Guide Reconciliation`
+1. close any remaining gaps in `P1-S2-2`, `P1-S2-3`, `P1-S2-4`, `P1-S2-5` (these tasks are mostly already landed and are prerequisites for `P1-S2-6` because the demo loader must write through their finished contracts)
+2. `P1-S2-6 Demo Dataset And Test Case Entry`
+3. `P1-S2-1 Data Intake Workspace Productization`
+
+`P1-S2-6` is sequenced before `P1-S2-1` so the Phase 1 closed loop can be validated end-to-end against a deterministic synthetic dataset before the real extension-capture and spreadsheet-upload bridges are productized. It is sequenced after `P1-S2-2..S2-5` because the demo loader is required to write through the same formal service / store contracts those tasks deliver, not bypass them.
 
 ## 3. Phase 2
 

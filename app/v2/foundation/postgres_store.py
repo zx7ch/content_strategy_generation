@@ -87,9 +87,9 @@ class PostgresMasterDataStore:
         row = self._fetchone(
             """
             INSERT INTO brands (
-                id, workspace_id, name, category, stage, target_audience, brand_voice, goals, created_at, updated_at
+                id, workspace_id, name, category, stage, target_audience, brand_voice, goals, is_demo, created_at, updated_at
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (id) DO UPDATE SET
                 name = EXCLUDED.name,
                 category = EXCLUDED.category,
@@ -97,8 +97,9 @@ class PostgresMasterDataStore:
                 target_audience = EXCLUDED.target_audience,
                 brand_voice = EXCLUDED.brand_voice,
                 goals = EXCLUDED.goals,
+                is_demo = EXCLUDED.is_demo,
                 updated_at = EXCLUDED.updated_at
-            RETURNING id, workspace_id, name, category, stage, target_audience, brand_voice, goals, created_at, updated_at
+            RETURNING id, workspace_id, name, category, stage, target_audience, brand_voice, goals, is_demo, created_at, updated_at
             """,
             (
                 brand.id,
@@ -109,6 +110,7 @@ class PostgresMasterDataStore:
                 self._jsonb(brand.target_audience),
                 self._jsonb(brand.brand_voice),
                 self._jsonb(brand.goals),
+                brand.is_demo,
                 brand.created_at,
                 brand.updated_at,
             ),
@@ -118,7 +120,7 @@ class PostgresMasterDataStore:
     def get_brand(self, brand_id: str) -> BrandRecord | None:
         row = self._fetchone(
             """
-            SELECT id, workspace_id, name, category, stage, target_audience, brand_voice, goals, created_at, updated_at
+            SELECT id, workspace_id, name, category, stage, target_audience, brand_voice, goals, is_demo, created_at, updated_at
             FROM brands
             WHERE id = %s
             """,
@@ -129,7 +131,7 @@ class PostgresMasterDataStore:
     def list_brands(self, workspace_id: str) -> list[BrandRecord]:
         rows = self._fetchall(
             """
-            SELECT id, workspace_id, name, category, stage, target_audience, brand_voice, goals, created_at, updated_at
+            SELECT id, workspace_id, name, category, stage, target_audience, brand_voice, goals, is_demo, created_at, updated_at
             FROM brands
             WHERE workspace_id = %s
             ORDER BY created_at ASC
@@ -137,6 +139,13 @@ class PostgresMasterDataStore:
             (workspace_id,),
         )
         return [self._brand_from_row(row) for row in rows]
+
+    def delete_brand(self, brand_id: str) -> bool:
+        row = self._fetchone(
+            "DELETE FROM brands WHERE id = %s RETURNING id",
+            (brand_id,),
+        )
+        return row is not None
 
     def save_brand_channel(self, channel: BrandChannelRecord) -> BrandChannelRecord:
         row = self._fetchone(
@@ -192,6 +201,13 @@ class PostgresMasterDataStore:
             (brand_id,),
         )
         return [self._channel_from_row(row) for row in rows]
+
+    def delete_brand_channels(self, brand_id: str) -> int:
+        row = self._fetchone(
+            "WITH deleted AS (DELETE FROM brand_channels WHERE brand_id = %s RETURNING id) SELECT count(*) AS cnt FROM deleted",
+            (brand_id,),
+        )
+        return int(row["cnt"]) if row else 0
 
     def save_policy_config(self, policy: BrandPolicyConfigRecord) -> BrandPolicyConfigRecord:
         with self._connector(self._dsn) as connection:
@@ -254,6 +270,13 @@ class PostgresMasterDataStore:
         )
         return [self._policy_from_row(row) for row in rows]
 
+    def delete_policy_configs(self, brand_id: str) -> int:
+        row = self._fetchone(
+            "WITH deleted AS (DELETE FROM brand_policy_configs WHERE brand_id = %s RETURNING id) SELECT count(*) AS cnt FROM deleted",
+            (brand_id,),
+        )
+        return int(row["cnt"]) if row else 0
+
     def save_state_snapshot(self, snapshot: BrandStateSnapshotRecord) -> BrandStateSnapshotRecord:
         row = self._fetchone(
             """
@@ -294,6 +317,13 @@ class PostgresMasterDataStore:
             (brand_id,),
         )
         return [self._state_snapshot_from_row(row) for row in rows]
+
+    def delete_state_snapshots(self, brand_id: str) -> int:
+        row = self._fetchone(
+            "WITH deleted AS (DELETE FROM brand_state_snapshots WHERE brand_id = %s RETURNING id) SELECT count(*) AS cnt FROM deleted",
+            (brand_id,),
+        )
+        return int(row["cnt"]) if row else 0
 
     def _fetchone(self, query: str, params: tuple[Any, ...]) -> dict[str, Any] | None:
         with self._connector(self._dsn) as connection:

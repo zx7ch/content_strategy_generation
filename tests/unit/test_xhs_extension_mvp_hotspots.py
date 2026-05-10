@@ -90,7 +90,7 @@ async def test_build_hotspot_snapshot_merges_query_sources_and_sorts() -> None:
 async def test_storage_refresh_hotspots_returns_error_with_last_successful_lists(tmp_path) -> None:
     storage = MVPStorage(tmp_path / "mvp.db", secret="secret")
     storage.init_db()
-    task_id, _ = storage.create_task("敏感肌修护")
+    task_id, _, _, _ = storage.create_task("敏感肌修护")
 
     good_spider = FakeSpiderClient(
         {
@@ -140,7 +140,7 @@ async def test_storage_refresh_hotspots_returns_error_with_last_successful_lists
 async def test_storage_refresh_hotspots_uses_topic_only(tmp_path) -> None:
     storage = MVPStorage(tmp_path / "mvp.db", secret="secret")
     storage.init_db()
-    task_id, _ = storage.create_task("通勤穿搭")
+    task_id, _, _, _ = storage.create_task("通勤穿搭")
     storage.add_custom_queries(task_id=task_id, text="小个子通勤穿搭\n通勤穿搭春夏")
 
     spider = FakeSpiderClient(

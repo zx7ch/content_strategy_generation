@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Optional
 
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -12,6 +13,8 @@ from experiments.xhs_extension_mvp.server.logging_utils import configure_logging
 from experiments.xhs_extension_mvp.server.models import (
     ActiveSearchContextRequest,
     ActiveTaskResponse,
+    AutoScrapeRequest,
+    AutoScrapeResponse,
     CreateTaskRequest,
     CreateTaskResponse,
     CustomQueryRequest,
@@ -23,9 +26,16 @@ from experiments.xhs_extension_mvp.server.models import (
     HotspotSnapshotResponse,
     ManualSeedRequest,
     ManualSeedResponse,
+    ScraperReadinessResponse,
+    ScrapeStatusResponse,
     TaskSnapshotResponse,
     TaskSnapshotVersionResponse,
 )
+from experiments.xhs_extension_mvp.server.scraper import scrape_search_feed
+from experiments.xhs_extension_mvp.server.scraper_login import is_logged_in
+from experiments.xhs_extension_mvp.server.scraper_models import ScrapePhase, ScrapeProgress
+from experiments.xhs_extension_mvp.server.scraper_runtime import ScraperRuntime
+from experiments.xhs_extension_mvp.server.scraper_state import ScrapeStateRegistry
 from experiments.xhs_extension_mvp.server.storage import (
     InvalidCaptureToken,
     MVPStorage,
@@ -43,17 +53,100 @@ NO_CACHE_HEADERS = {
     "Expires": "0",
 }
 
+_PROFILE_DIR_DEFAULT = Path("data/chrome-profile")
 
-def create_app(*, database_path: str | Path | None = None, secret: str | None = None) -> FastAPI:
+
+class _ReadinessCache:
+    """Short-lived in-process cache for scraper readiness probes (single-worker)."""
+
+    def __init__(self, ttl_seconds: int = 60) -> None:
+        self._ttl = ttl_seconds
+        self._value: Optional[ScraperReadinessResponse] = None
+
+    def get_fresh(self) -> Optional[ScraperReadinessResponse]:
+        if self._value is None:
+            return None
+        age = (utc_now() - self._value.last_checked_at).total_seconds()
+        return self._value if age <= self._ttl else None
+
+    def put(self, value: ScraperReadinessResponse) -> None:
+        self._value = value
+
+
+async def _run_scrape_background(
+    *,
+    runtime: ScraperRuntime,
+    registry: ScrapeStateRegistry,
+    storage: MVPStorage,
+    task_id: str,
+    keyword: str,
+    scroll_count: int,
+) -> None:
+    """Drive scrape, push progress into registry, ingest results into SQLite."""
+    logger = get_logger()
+
+    async def _on_progress(progress: ScrapeProgress) -> None:
+        await registry.update(task_id, progress)
+
+    try:
+        items = await scrape_search_feed(
+            keyword,
+            runtime=runtime,
+            scroll_count=scroll_count,
+            on_progress=_on_progress,
+        )
+        if items:
+            captured, imported = storage.ingest_scraper_items(
+                task_id=task_id,
+                keyword=keyword,
+                items=items,
+            )
+            logger.info(
+                "Scraper ingested items",
+                extra={
+                    "event_name": "mvp_scraper_ingested",
+                    "task_id": task_id,
+                    "captured": captured,
+                    "imported": imported,
+                },
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Background scrape failed", extra={"task_id": task_id})
+        current = registry.get(task_id)
+        error_progress = (
+            current.progress if current is not None else ScrapeProgress(scroll_total=scroll_count)
+        )
+        await registry.update(
+            task_id,
+            error_progress.with_phase(ScrapePhase.ERROR, error_message=str(exc)),
+        )
+    finally:
+        await registry.release(task_id)
+
+
+def create_app(
+    *,
+    database_path: str | Path | None = None,
+    secret: str | None = None,
+    profile_dir: Path | None = None,
+) -> FastAPI:
     logger = configure_logging(force=True)
     storage = MVPStorage(database_path or default_mvp_db_path(), secret=secret or default_secret())
     storage.init_db()
+    _profile_dir = Path(profile_dir) if profile_dir is not None else _PROFILE_DIR_DEFAULT
 
     @asynccontextmanager
     async def lifespan(application: FastAPI):
+        scraper_runtime = ScraperRuntime(profile_dir=_profile_dir)
+        scrape_registry = ScrapeStateRegistry()
+        readiness_cache = _ReadinessCache(ttl_seconds=60)
         application.state.mvp_storage = storage
+        application.state.scraper_runtime = scraper_runtime
+        application.state.scrape_state_registry = scrape_registry
+        application.state.readiness_cache = readiness_cache
         logger.info("Started XHS extension MVP app", extra={"event_name": "mvp_app_started"})
         yield
+        await scraper_runtime.shutdown()
         logger.info("Stopped XHS extension MVP app", extra={"event_name": "mvp_app_stopped"})
 
     app = FastAPI(
@@ -136,7 +229,7 @@ def create_app(*, database_path: str | Path | None = None, secret: str | None = 
 
     @app.post("/mvp/tasks", response_model=CreateTaskResponse)
     async def create_task(payload: CreateTaskRequest) -> CreateTaskResponse:
-        task_id, queries = storage.create_task(payload.topic)
+        task_id, queries, query_generation_source, query_generation_notice = storage.create_task(payload.topic)
         token, expires_at = storage.create_capture_token(task_id)
         storage.set_active_task(task_id=task_id, capture_token=token, token_expires_at=expires_at)
         logger.info(
@@ -147,6 +240,8 @@ def create_app(*, database_path: str | Path | None = None, secret: str | None = 
             task_id=task_id,
             topic=payload.topic.strip(),
             expanded_queries=queries,
+            query_generation_source=query_generation_source,
+            query_generation_notice=query_generation_notice,
         )
 
     @app.get("/mvp/tasks/{task_id}", response_model=TaskSnapshotResponse)
@@ -257,6 +352,132 @@ def create_app(*, database_path: str | Path | None = None, secret: str | None = 
                 extra={"event_name": "mvp_hotspots_refresh_task_missing", "task_id": task_id},
             )
             raise HTTPException(status_code=404, detail="Task not found") from exc
+
+    @app.get("/api/scraper/readiness", response_model=ScraperReadinessResponse)
+    async def get_scraper_readiness(request: Request) -> ScraperReadinessResponse:
+        """Detect whether the persistent Chrome profile exists and is logged in.
+
+        Caches result for 60 s to avoid spawning a probe page on every poll cycle.
+        Does not trigger login — returns logged_in=False when not authenticated.
+        """
+        runtime: ScraperRuntime = request.app.state.scraper_runtime
+        cache: _ReadinessCache = request.app.state.readiness_cache
+
+        cached = cache.get_fresh()
+        if cached is not None:
+            return cached
+
+        profile_exists = runtime._profile_dir.exists() and any(runtime._profile_dir.iterdir())
+        if not profile_exists:
+            result = ScraperReadinessResponse(
+                profile_exists=False,
+                logged_in=False,
+                last_checked_at=utc_now(),
+                detail="profile dir is empty; complete first-time login per README",
+            )
+            cache.put(result)
+            return result
+
+        try:
+            page = await runtime.acquire_page()
+            try:
+                await page.goto(
+                    "https://www.xiaohongshu.com/",
+                    wait_until="domcontentloaded",
+                    timeout=15000,
+                )
+                logged_in = await is_logged_in(page)
+            finally:
+                await page.close()
+        except Exception as exc:  # noqa: BLE001
+            result = ScraperReadinessResponse(
+                profile_exists=True,
+                logged_in=False,
+                last_checked_at=utc_now(),
+                detail=f"login probe failed: {exc}",
+            )
+            cache.put(result)
+            return result
+
+        result = ScraperReadinessResponse(
+            profile_exists=True,
+            logged_in=logged_in,
+            last_checked_at=utc_now(),
+            detail="ok" if logged_in else "not logged in; complete login per README",
+        )
+        cache.put(result)
+        return result
+
+    @app.post(
+        "/api/tasks/{task_id}/auto-scrape",
+        status_code=202,
+        response_model=AutoScrapeResponse,
+    )
+    async def trigger_auto_scrape(
+        task_id: str,
+        payload: AutoScrapeRequest,
+        request: Request,
+        background_tasks: BackgroundTasks,
+    ) -> AutoScrapeResponse:
+        task_storage: MVPStorage = request.app.state.mvp_storage
+        registry: ScrapeStateRegistry = request.app.state.scrape_state_registry
+        runtime: ScraperRuntime = request.app.state.scraper_runtime
+
+        if not task_storage.task_exists(task_id):
+            raise HTTPException(status_code=404, detail="Task not found")
+
+        state = await registry.try_acquire(
+            task_id=task_id,
+            keyword=payload.keyword,
+            scroll_total=payload.scroll_count,
+        )
+        if state is None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"another scrape already running (active: {registry.active_task_id})",
+            )
+
+        background_tasks.add_task(
+            _run_scrape_background,
+            runtime=runtime,
+            registry=registry,
+            storage=task_storage,
+            task_id=task_id,
+            keyword=payload.keyword,
+            scroll_count=payload.scroll_count,
+        )
+        logger.info(
+            "Auto-scrape accepted",
+            extra={
+                "event_name": "mvp_auto_scrape_accepted",
+                "task_id": task_id,
+                "keyword": payload.keyword,
+                "scroll_count": payload.scroll_count,
+            },
+        )
+        return AutoScrapeResponse(
+            task_id=task_id,
+            accepted=True,
+            started_at=state.started_at,
+        )
+
+    @app.get("/api/tasks/{task_id}/scrape-status", response_model=ScrapeStatusResponse)
+    async def get_scrape_status(task_id: str, request: Request) -> ScrapeStatusResponse:
+        registry: ScrapeStateRegistry = request.app.state.scrape_state_registry
+        state = registry.get(task_id)
+        if state is None:
+            raise HTTPException(status_code=404, detail="No scrape recorded for this task")
+        return ScrapeStatusResponse(
+            task_id=state.task_id,
+            keyword=state.keyword,
+            phase=state.progress.phase,
+            scroll_index=state.progress.scroll_index,
+            scroll_total=state.progress.scroll_total,
+            items_count=state.progress.items_count,
+            error_message=state.progress.error_message,
+            started_at=state.started_at,
+            finished_at=state.finished_at,
+        )
 
     return app
 
