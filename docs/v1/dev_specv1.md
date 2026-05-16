@@ -3,7 +3,7 @@
 ## 1. System Architecture
 
 ### 1.1 Overview
-Multi-agent system for Xiaohongshu content strategy, topic exploration, and post generation. Supports two first-class modes: EDITING MODE (data-driven strategy + generation) and EXPLORATION MODE (research planner for topic discovery). 轻量，单机部署。
+Multi-agent system for Xiaohongshu content strategy, topic exploration, and post generation. Supports two first-class modes: EDITING MODE (data-driven strategy + generation) and EXPLORATION MODE (research planner for topic discovery). The deployment-state ground truth is [Deployment Spec §1 Product & Deployment Definition](../deployment/deployment_spec.md#1-product--deployment-definition).
 
 Current frontend alignment:
 
@@ -11,6 +11,13 @@ Current frontend alignment:
 - The Creator Workbench MVP uses `EDITING MODE` first: `session -> strategy -> generation -> SSE progress -> generated notes`.
 - `EXPLORATION MODE` remains a designed capability but is not part of the initial Creator Workbench MVP surface. It should be introduced later as a dedicated "topic exploration" sub-mode with candidate cards, refine/refresh, and confirm-to-strategy handoff.
 - V1 acts as the Local Agent Runtime in the deployment architecture defined in `docs/deployment/deployment_spec.md`.
+
+Deployment alignment notes:
+
+- Earlier `轻量，单机部署` wording is superseded by [Deployment Spec §1.2 Core Positioning](../deployment/deployment_spec.md#12-core-positioning): V1 is the local Agent Runtime in a cloud UI + local runtime + cloud LLM inference architecture.
+- Any V1 mention of Redis, Celery, Gunicorn workers, PostgreSQL, sharding, or object storage is future migration context only. The MVP runtime decisions are defined by [Deployment Spec §6 Technical Decisions](../deployment/deployment_spec.md#6-technical-decisions).
+- The local API boundary, loopback binding, browser-to-local-runtime call path, and CORS/PNA constraints are defined by [Deployment Spec §3.1 Cloud Frontend Modules](../deployment/deployment_spec.md#31-cloud-frontend-modules), [§7.1 PNA and Browser Access to Localhost](../deployment/deployment_spec.md#71-pna-and-browser-access-to-localhost), and [§7.2 CORS and Local Security Boundary](../deployment/deployment_spec.md#72-cors-and-local-security-boundary).
+- Chroma is a local vector index owned by the local runtime. It must not be described as a separate deployed service on the same `127.0.0.1:8000` API port; see [Deployment Spec §1.4 Deployment Model](../deployment/deployment_spec.md#14-deployment-model).
 
 ### 1.2 High-Level Architecture
 
@@ -237,7 +244,7 @@ When exploration is introduced, it must be a distinct Creator Workbench sub-mode
 | 长任务触发 | API 入队 + Worker 执行 | 避免请求阻塞，进程重启后任务可恢复 |
 | 流式协议 | SSE | 比 WebSocket 简单，适合单向推送任务进度 |
 | 重连游标 | `Last-Event-ID` | 遵循 SSE 标准，客户端自动重连兼容性最好 |
-| 部署方式 | 单进程 Uvicorn | MVP 阶段简单，后续可扩展为 Gunicorn + Uvicorn workers |
+| 部署方式 | 本地 FastAPI Runtime | 端口、loopback 绑定、CORS/PNA 与浏览器直连路径以 [Deployment Spec §8.1](../deployment/deployment_spec.md#81-phase-1-cloud-frontend-connects-to-local-runtime) 为准 |
 
 **实现方案**：
 ```python
@@ -263,7 +270,7 @@ async def execute_strategy(session_id: str):
 - **SSE 重连标准化**：仅 `Last-Event-ID`，服务端补发未消费事件后再进入实时流
 
 **未来可优化**：
-- **任务队列外置**：后续可迁移至 Redis + arq/Celery（多机扩展）
+- **任务队列迁移**：Redis/arq/Celery 只属于未来协作或多机迁移选项；MVP 继续遵循 [Deployment Spec §6](../deployment/deployment_spec.md#6-technical-decisions) 的 SQLite Queue + Worker。
 - **流式细化**：增加 token 级别生成事件，提升交互细粒度
 
 ---
@@ -313,7 +320,7 @@ while True:
 ```
 
 **未来可优化**：
-- **PostgreSQL Checkpointer**：SQLite 高并发（>100 QPS）时写入瓶颈，生产环境可切换至 PostgreSQL
+- **PostgreSQL Checkpointer**：仅作为未来协作云 Runtime 迁移路径；MVP 不要求 Postgres，详见 [Deployment Spec §1.3 Non-Goals](../deployment/deployment_spec.md#13-non-goals) 与 [§10 Project Positioning Statement](../deployment/deployment_spec.md#10-project-positioning-statement)。
 - **State 分片**：超大 State（如 1000+ notes）可拆分为多个 checkpoint 分页
 
 ---
@@ -969,9 +976,9 @@ class SessionDataStore:
 **详细 SQL Schema**：§7.4.1
 
 **未来可优化**：
-- **PostgreSQL 迁移**：并发 >100 QPS 时，PostgreSQL 比 SQLite 吞吐高 10 倍
-- **分表分库**：按 user_id 分片，支持水平扩展
-- **冷热分离**：30 天前数据归档至对象存储（S3），热库只保留活跃数据
+- **PostgreSQL 迁移**：仅作为未来协作云 Runtime 路径；MVP 系统记录仍是本地 SQLite，详见 [Deployment Spec §6](../deployment/deployment_spec.md#6-technical-decisions)。
+- **分表分库**：仅在未来云协作、多工作区吞吐成为目标时评估；不属于 V1 MVP 部署要求。
+- **冷热分离**：对象存储归档属于未来云同步/云协作能力；默认 MVP 不自动同步本地数据，详见 [Deployment Spec §3.4 Optional Cloud Sync Module](../deployment/deployment_spec.md#34-optional-cloud-sync-module)。
 
 ---
 
@@ -1003,7 +1010,7 @@ class SessionDataStore:
 **未来可优化**：
 - **代理池**：多 IP 轮换（住宅代理 + 数据中心代理），成功率从 85% 提升至 99%
 - **无头浏览器**：Selenium/Playwright 模拟真人行为，绕过部分风控
-- **缓存层**：Redis 缓存热门查询结果，命中率预计 40%
+- **缓存层**：Redis 只属于未来扩展选项；MVP 不引入 Redis，详见 [Deployment Spec §1.3 Non-Goals](../deployment/deployment_spec.md#13-non-goals)。
 
 ### 1.5.9 Logging (日志与可观测性)
 
@@ -3398,8 +3405,6 @@ JOB_QUEUE_CONFIG = {
 
 # Chroma 配置
 CHROMA_CONFIG = {
-    "host": "localhost",
-    "port": 8000,
     "persist_directory": "./data/chroma",
 }
 

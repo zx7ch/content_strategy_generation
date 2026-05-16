@@ -84,7 +84,8 @@ Recorded on `2026-04-19` after `P1-S2-5` reconciliation:
 
 Delivery:
 
-- Postgres schema and migrations
+- SQLite-backed MVP schema aligned with the V2 domain model
+- Postgres-compatible schema notes only where they support the future Collaborative Cloud Runtime migration path in [Deployment Spec §10](../deployment/deployment_spec.md#10-project-positioning-statement)
 - `workspaces`
 - `brands`
 - `brand_channels`
@@ -96,7 +97,7 @@ Delivery:
 - `performance_snapshots`
 - `feedback_events`
 - `scorer_configs`
-- basic authentication
+- local-first workspace resolution; basic authentication is deferred until the Collaborative Cloud Runtime or explicit auth milestone
 - `workspace`-scoped isolation
 - brand-level config read/write
 - frontend app scaffold with `Next.js 14+`, App Router, `TypeScript`, and `Tailwind CSS`
@@ -500,26 +501,29 @@ Completion standard:
 - acceptance artifacts show a first recommendation batch, a feedback write-back step, and a second batch with observable downstream change
 - the release gate proves that the system is not merely logging feedback, but incorporating it into later decisions
 
-#### 2.11.4 P1-S2-4 Postgres Runtime Convergence
+#### 2.11.4 P1-S2-4 Deployment Runtime Convergence
 
 Goal:
 
-- remove the remaining gap between Phase 1 contract proof and production runtime expectations by making Postgres-backed persistence the default shipped path
+- remove the remaining gap between Phase 1 contract proof and the active deployment target defined in [Deployment Spec §1.4 Deployment Model](../deployment/deployment_spec.md#14-deployment-model)
+- keep Postgres work scoped to the future Collaborative Cloud Runtime migration path described in [Deployment Spec §10 Project Positioning Statement](../deployment/deployment_spec.md#10-project-positioning-statement)
 
 Delivery:
 
-- complete Postgres-backed runtime support across:
+- complete local-first runtime support across:
   - foundation
   - ingestion
   - topic pool
   - decision
   - feedback / evaluation
-- keep in-memory stores available for tests and local acceptance where appropriate, but not as the default shipped runtime contract
-- run schema, migration, and task-scoped validation against the Postgres-backed path
+- keep SQLite-backed persistence as the default shipped MVP runtime contract
+- keep in-memory stores available only for tests and isolated local acceptance where appropriate
+- keep Postgres schema/migration work as future migration preparation, not a Phase 1 launch blocker
+- run schema, migration, and task-scoped validation against the local-first path
 
 Completion standard:
 
-- `Postgres` is the default runtime source of truth for shipped Phase 1 behavior
+- SQLite is the default local-first runtime source of truth for shipped Phase 1 behavior
 - migrations, runtime DDL, and service/store contracts remain in parity
 - full-loop validation can run without depending on in-memory-only behavior
 
@@ -554,7 +558,7 @@ Phase 1 should be considered fully closed only when:
 - the shipped runtime uses the formal ingestion workspace across `品牌配置 -> 数据源 -> 数据处理`
 - topic pool scoring and explainability use the real Phase 1 scorer contract
 - a second recommendation batch after feedback shows downstream state change
-- Postgres-backed runtime behavior is the default shipped path
+- local-first SQLite-backed runtime behavior is the default shipped path, with Postgres kept as future Collaborative Cloud Runtime migration work
 - Phase 1 guides, frontend contracts, and the canonical spec no longer drift in terminology or ownership
 
 Recommended completion order:
@@ -562,7 +566,7 @@ Recommended completion order:
 1. `P1-S2-1 Data Intake Workspace Productization`
 2. `P1-S2-2 Topic Pool Explainability And Scorer Completion`
 3. `P1-S2-3 Feedback-Driven Second-Batch Closure`
-4. `P1-S2-4 Postgres Runtime Convergence`
+4. `P1-S2-4 Deployment Runtime Convergence`
 5. `P1-S2-5 Frontend Contract And Guide Reconciliation`
 
 ## 3. Phase 2
@@ -753,7 +757,7 @@ Phase 3 is considered complete only when it can:
 
 ### AUTH-1: 用户登录与多租户身份管理
 
-**背景**：当前实现仍采用单部署模式，SSR 页面与客户端页面统一通过 `GET /workspaces/default` 解析当前默认 workspace。现有本地开发/验收流程中包含默认 workspace seed 与示例数据补齐，但这属于联调与验收便利，不代表正式产品的多租户与品牌初始化规范。
+**背景**：当前实现采用 [Deployment Spec §1.2 Core Positioning](../deployment/deployment_spec.md#12-core-positioning) 定义的 local-first MVP 部署模型。SSR 页面不得读取用户本地 Agent Runtime；任何仍通过 SSR 或 `server-api.ts` 调用 `localhost` 的页面必须按 [Deployment Spec §7.3](../deployment/deployment_spec.md#73-server-components-accessing-local-api) 改为浏览器侧 runtime API。现有本地开发/验收流程中包含默认 workspace seed 与示例数据补齐，但这属于联调与验收便利，不代表正式产品的多租户与品牌初始化规范。
 
 **触发条件**：当有多个品牌团队需要使用同一套部署，或需要区分用户操作权限时实施。
 
@@ -762,10 +766,11 @@ Phase 3 is considered complete only when it can:
 - JWT/Session 签发与校验，替换当前 header-based workspace 声明
 - `workspace_members` 表写入与查询，用于 workspace 归属校验
 - 前端登录页、token 存储、自动刷新
-- `WorkspaceProvider` 与 SSR workspace resolver 改为从 auth token 解析 workspace_id/user_id，替换当前 `/workspaces/default` 拉取方式
+- `WorkspaceProvider` 与浏览器侧 workspace resolver 改为从 auth token 解析 workspace_id/user_id，替换当前 `/workspaces/default` 拉取方式；SSR resolver 只可用于不依赖本地 Agent Runtime 的云端/静态内容
 
 **改动范围**：
 - `app/v2/auth.py`：`resolve_workspace_principal` 改为从 JWT payload 解析
 - `app/v2/foundation/bootstrap.py`：移除默认 workspace / demo data seed；`GET /workspaces/default` 替换为标准 auth 端点
 - `frontend/src/components/providers/WorkspaceProvider.tsx`：改为 auth context，从 token 获取 workspace/user
-- `frontend/src/lib/api.ts` / `frontend/src/lib/server-api.ts`：default workspace resolver 替换为从 auth context 读取
+- `frontend/src/lib/api.ts`：default workspace resolver 替换为从 auth context 读取
+- `frontend/src/lib/server-api.ts`：不得调用用户本地 Agent Runtime；仅保留静态或云端自有数据读取职责

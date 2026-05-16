@@ -52,7 +52,16 @@ Provide:
 
 ### 2.2 Deployment Model
 
-V2 supports two deployment profiles:
+The deployment-state ground truth is [Deployment Spec §1 Product & Deployment Definition](../deployment/deployment_spec.md#1-product--deployment-definition). V2 describes the product/runtime shape under that ground truth and keeps future collaboration migration notes explicitly separated from the MVP deployment state.
+
+Deployment alignment notes:
+
+- The active MVP deployment is [Deployment Spec §1.2 Core Positioning](../deployment/deployment_spec.md#12-core-positioning): cloud-hosted UI, browser-side calls to the local Agent Runtime, local SQLite/Chroma/Worker, and cloud LLM inference.
+- Any previous wording that implies a required cloud SaaS Agent service, cloud Postgres, Redis, hosted vector database, or cloud worker fleet for MVP is superseded by [Deployment Spec §1.3 Non-Goals](../deployment/deployment_spec.md#13-non-goals).
+- Workspace Console pages that depend on local runtime data must use browser-side data fetching, not Vercel Server Components calling `localhost`; see [Deployment Spec §3.1 Cloud Frontend Modules](../deployment/deployment_spec.md#31-cloud-frontend-modules) and [§7.3 Server Components Accessing Local API](../deployment/deployment_spec.md#73-server-components-accessing-local-api).
+- Postgres, pgvector, Redis, cloud workers, authentication, and multi-user collaboration are future `Collaborative Cloud Runtime` migration concerns unless a later deployment spec revision promotes them into the active deployment state.
+
+V2 supports two deployment profiles, but only the first profile is the active MVP deployment target:
 
 1. `Local-first MVP`
 
@@ -75,7 +84,7 @@ V2 supports two deployment profiles:
 
 The current frontend implementation targets the `Local-first MVP` profile first. In that profile, the V2 console is the operator-facing workbench for local runtime data.
 
-`Postgres` is the production system of record for the `Collaborative Cloud Runtime` profile. It is not a blocker for the local-first MVP deployment.
+`Postgres` is the system of record only for the future `Collaborative Cloud Runtime` profile. It is not a blocker for the local-first MVP deployment and must not be treated as the default runtime dependency unless [Deployment Spec §10 Project Positioning Statement](../deployment/deployment_spec.md#10-project-positioning-statement) is revised.
 
 ### 2.3 Multi-User Model
 
@@ -3927,7 +3936,7 @@ Implementation phases, rollout scope, and backlog sequencing are tracked in:
 
 ## 11. Non-Negotiable V2 Rules
 
-1. `Postgres` is the production source of truth.
+1. Runtime deployment dependencies must follow [Deployment Spec §1.4 Deployment Model](../deployment/deployment_spec.md#14-deployment-model) and [§6 Technical Decisions](../deployment/deployment_spec.md#6-technical-decisions). `Postgres` is required only for the future `Collaborative Cloud Runtime` profile, not for the active local-first MVP.
 2. Every business row must be scoped by `workspace_id`.
 3. Brand decision rows must also be scoped by `brand_id`.
 4. Every policy-controlled decision must log candidate set, chosen action, and full propensity distribution.
