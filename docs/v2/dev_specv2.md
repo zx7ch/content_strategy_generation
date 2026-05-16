@@ -52,15 +52,30 @@ Provide:
 
 ### 2.2 Deployment Model
 
-V2 is single-node by default, but multi-user capable.
+V2 supports two deployment profiles:
 
-- API: `FastAPI`
-- Primary database: `Postgres`
-- Queue / background execution: Postgres-backed jobs or a worker queue backed by Postgres
-- Vector store: optional `pgvector` or separate vector store if needed later
-- Cache: optional Redis only if required by throughput
+1. `Local-first MVP`
 
-`Postgres` is the only production system of record.
+- Cloud-hosted Next.js frontend
+- Browser-side calls to the local Agent Runtime
+- Local FastAPI API
+- Local SQLite system of record for the MVP runtime
+- Local Chroma vector index
+- Cloud LLM inference only
+- Single-user or personal workspace by default
+
+2. `Collaborative Cloud Runtime`
+
+- Cloud API
+- `Postgres` system of record
+- Postgres-backed jobs or a dedicated worker queue
+- Optional `pgvector` or separate vector store
+- Optional Redis only if required by throughput
+- Multi-user workspace collaboration and role-based access
+
+The current frontend implementation targets the `Local-first MVP` profile first. In that profile, the V2 console is the operator-facing workbench for local runtime data.
+
+`Postgres` is the production system of record for the `Collaborative Cloud Runtime` profile. It is not a blocker for the local-first MVP deployment.
 
 ### 2.3 Multi-User Model
 
@@ -99,6 +114,13 @@ The frontend is the primary human-facing control surface for:
 - publish record management
 - performance feedback review
 - offline evaluation review
+
+Current frontend alignment:
+
+- V2 maps to the `Workspace Console`: `/brands`, `/brands/{id}`, `/data-sources`, `/data-processing`, `/topic-pool`, `/decisions`, `/publish`, `/performance`, and `/evaluation`.
+- V1 maps to the `Creator Workbench` (`/creator`) and is intentionally separate from the V2 console loop.
+- In the local-first deployment profile, all runtime API reads and writes must happen from browser-side client code. Vercel Server Components must not fetch `http://localhost:8000` because that address resolves inside the Vercel runtime, not on the user's machine.
+- Server-rendered pages may be used only for static or cloud-owned content that does not depend on the local Agent Runtime.
 
 The console routes, route-level workflow, runtime data rules, and operator interaction requirements are defined centrally in `9.7 Frontend Console Direction` and must remain consistent with the backend lifecycle defined in this spec.
 

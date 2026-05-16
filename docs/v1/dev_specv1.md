@@ -5,6 +5,13 @@
 ### 1.1 Overview
 Multi-agent system for Xiaohongshu content strategy, topic exploration, and post generation. Supports two first-class modes: EDITING MODE (data-driven strategy + generation) and EXPLORATION MODE (research planner for topic discovery). 轻量，单机部署。
 
+Current frontend alignment:
+
+- The current product frontend maps V1 primarily to the `Creator Workbench` (`/creator`).
+- The Creator Workbench MVP uses `EDITING MODE` first: `session -> strategy -> generation -> SSE progress -> generated notes`.
+- `EXPLORATION MODE` remains a designed capability but is not part of the initial Creator Workbench MVP surface. It should be introduced later as a dedicated "topic exploration" sub-mode with candidate cards, refine/refresh, and confirm-to-strategy handoff.
+- V1 acts as the Local Agent Runtime in the deployment architecture defined in `docs/deployment/deployment_spec.md`.
+
 ### 1.2 High-Level Architecture
 
 ```
@@ -184,6 +191,26 @@ API Router → JobStore → JobWorker → Orchestrator → [ExplorationPlanner |
                               ↓
               [EngagementAnalyzer | LLMClient]
 ```
+
+### 1.4.1 Frontend Coverage and MVP Scope
+
+The current frontend maps V1 capabilities to the Creator Workbench, not to the V2 growth console.
+
+MVP scope for `/creator`:
+
+- Create or reuse a workflow session.
+- Enqueue strategy and generation jobs.
+- Subscribe to session/job events through SSE.
+- Keep the chat input available while long-running jobs execute.
+- Render generated strategy, generated notes, job state, and failure/degraded states.
+
+Deferred V1 capabilities:
+
+- `EXPLORATION MODE` and its branch/roll/candidate model.
+- `ExplorationPlanner`, `ExplorationStateStore`, `SearchWorker`, and `SynthesisWorker` as user-facing creator features.
+- Exploration candidate cards, refine/refresh actions, multi-branch history, and confirm-to-strategy handoff.
+
+When exploration is introduced, it must be a distinct Creator Workbench sub-mode. It must not be treated as already covered by the current chat-and-generation MVP.
 
 ---
 
