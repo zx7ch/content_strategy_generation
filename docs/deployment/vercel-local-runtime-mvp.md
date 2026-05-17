@@ -82,3 +82,63 @@ Before shipping an installer update, include:
 - Whether the Vercel frontend requires this runtime version.
 
 Automatic updates, Electron/Tauri shells, pairing tokens, and full installer pipelines are later phases.
+
+---
+
+## Building the Local Runtime Executable
+
+The local runtime is packaged with PyInstaller into a self-contained folder (`dist/xhs-runtime/`).
+
+### Prerequisites
+
+- Python 3.10–3.12 with all project dependencies installed (`pip install -r requirements.txt`)
+- `pyinstaller` (installed automatically by the build script if missing)
+- Internet access during the build step to pre-download the embedding model
+
+### Build
+
+```bash
+./scripts/build_runtime.sh
+# or with a clean rebuild:
+./scripts/build_runtime.sh --clean
+```
+
+The script:
+1. Pre-downloads `BAAI/bge-base-zh-v1.5` (~400 MB) into the HuggingFace cache so it is bundled into the exe.
+2. Runs `pyinstaller runtime_main.spec`.
+3. Outputs `dist/xhs-runtime/` (~600–800 MB).
+
+### Distributing
+
+Zip and distribute the entire `dist/xhs-runtime/` folder. Users run:
+
+```bash
+# macOS / Linux
+./xhs-runtime/xhs-runtime
+
+# Windows
+xhs-runtime\xhs-runtime.exe
+```
+
+On first run the runtime creates `data/xhs_agent.db`, `data/xhs_agent_discovery.db`, and `data/chroma/` next to the executable.
+
+Users configure their API keys by placing a `.env` file next to the executable:
+
+```bash
+ANTHROPIC_API_KEY=sk-ant-...
+XHS_CORS_ALLOWED_ORIGINS=https://your-app.vercel.app
+```
+
+### Key files
+
+| File | Purpose |
+|---|---|
+| `runtime_main.py` | Executable entry point — starts uvicorn on `127.0.0.1:8000` |
+| `runtime_main.spec` | PyInstaller build spec |
+| `scripts/build_runtime.sh` | Build helper script |
+
+### Notes
+
+- The output is a **folder** (`dist/xhs-runtime/`), not a single file. PyInstaller's `--onefile` mode is avoided because ChromaDB's native extensions do not extract reliably under some OS security policies.
+- Embedding model inference requires a CPU with AVX2 support (standard on any machine from ~2013 onward).
+- Data files (`data/`) are never inside the exe folder — they live next to it and persist across runtime upgrades.

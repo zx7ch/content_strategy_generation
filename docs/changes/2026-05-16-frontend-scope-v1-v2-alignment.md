@@ -847,11 +847,11 @@ Remaining open items are deferred follow-up gaps, not blockers for the current
 local-first Creator Workbench MVP.
 
 Open checklist entries: 8.
-Unique open issues: 7 (`TD-ALIGN5-1` and `TD-ALIGN6-1` describe the same
+Unique open issues: 7 (`TD-ALIGN5-1` and `TD-ALIGN6-1` describe the sames
 running-job soft pause gap from different task sections).
 
 - `TD-ALIGN4-1` — workflow still creates a new session on every start; session reuse is not implemented.
-- `TD-ALIGN5-1` / `TD-ALIGN6-1` — running job soft pause is not implemented; pause only applies to queued/retrying jobs, while running jobs should use cancel for the MVP.
+- `TD-ALIGN5-1` / `TD-ALIGN6-1` — running job soft pause is not implemented; pause only applies to queued/retrying job, while running jobs should use cancel for the MVP.
 - `TD-ALIGN5-2` — `add_constraint` only persists the message; it does not trigger strategy replanning for an already running job.
 - `TD-ALIGN5-3` — rule-based intent classification has known keyword false positives; context-aware/model classification is deferred.
 - `TD-ALIGN5-4` — `redirect_job` intent is missing; changing task direction does not cancel and restart workflow automatically.
