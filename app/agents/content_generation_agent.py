@@ -5,7 +5,9 @@ import difflib
 import json
 import uuid
 from dataclasses import dataclass
-from typing import Any, Iterable, List, Optional
+from typing import Any, Awaitable, Callable, Iterable, List, Optional
+
+ProgressCallback = Callable[[str], Awaitable[None]]
 
 from pydantic import BaseModel
 
@@ -355,7 +357,14 @@ class ContentGenerationAgent:
 
         raise ContentGenerationError("Generation retry limit exceeded for slot.")
 
-    async def execute(self, session_id: str) -> GenerationExecutionResult:
+    async def execute(self, session_id: str, *, progress_callback: Optional[ProgressCallback] = None) -> GenerationExecutionResult:
+        async def _notify(message: str) -> None:
+            if progress_callback is not None:
+                try:
+                    await progress_callback(message)
+                except Exception:
+                    pass
+
         async with self.session_manager as manager:
             session = await manager.get_session(session_id)
             if session is None:
@@ -397,6 +406,7 @@ class ContentGenerationAgent:
                     output_language="zh-CN",
                     budget=budget,
                 )
+                await _notify(f"已规划 {len(proposals)} 个创作方案，筛选最优...")
             except BudgetExceededError:
                 log_event(
                     self._logger,
@@ -449,6 +459,7 @@ class ContentGenerationAgent:
                     budget_remaining=budget.remaining,
                     token_budget=budget.session_budget,
                 )
+            await _notify(f"开始生成 {len(selected)} 篇笔记内容...")
             notes = await self._parallel_generate(
                 proposals=selected,
                 content_strategy=session.content_strategy,

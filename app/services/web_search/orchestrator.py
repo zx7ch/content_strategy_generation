@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 from app.services.web_search.models import CapabilityRequest, Evidence, EvidenceBatch, SearchIntent
 from app.services.web_search.providers.xhs_spider import XhsSpiderDiscoverProvider
@@ -19,7 +19,7 @@ class SearchOrchestrator:
         self.providers = list(providers or [])
         self._provider_map = {provider.describe().provider_name: provider for provider in self.providers}
 
-    async def discover(self, intent: SearchIntent, *, limit: int = 50) -> EvidenceBatch:
+    async def discover(self, intent: SearchIntent, *, limit: int = 50, on_page: Optional[Callable] = None) -> EvidenceBatch:
         traces = []
         batch_items: list[Evidence] = []
         failure_reason: Optional[str] = "empty_result"
@@ -28,7 +28,8 @@ class SearchOrchestrator:
             if not provider.supports("discover", intent):
                 continue
             result = await provider.execute(
-                CapabilityRequest(capability="discover", intent=intent, limit=limit)
+                CapabilityRequest(capability="discover", intent=intent, limit=limit),
+                on_page=on_page,
             )
             traces.extend(result.trace)
             if result.items:

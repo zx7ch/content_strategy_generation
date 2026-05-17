@@ -7,6 +7,7 @@ from app.agents.orchestrator import Orchestrator
 from app.api.routes.router import app
 from app.config import settings
 from app.memory.job_store import JobStore
+from app.memory.thread_store import ThreadStore
 from app.v2.discovery.bootstrap import build_discovery_runtime
 from app.v2.decision.bootstrap import build_decision_runtime
 from app.v2.feedback.bootstrap import build_feedback_runtime
@@ -21,6 +22,8 @@ from app.workers.job_worker import JobWorker
 async def _worker_lifespan(application):
     job_store = JobStore(settings.SQLITE_DB_PATH)
     await job_store.connect()
+    thread_store = ThreadStore()
+    await thread_store.connect()
     orchestrator = Orchestrator(db_path=settings.SQLITE_DB_PATH)
     worker = JobWorker(job_store=job_store, orchestrator=orchestrator)
     v2_master_data_store, v2_master_data_service = build_master_data_runtime(settings)
@@ -69,6 +72,7 @@ async def _worker_lifespan(application):
     application.state.v2_decision_service = v2_decision_service
     application.state.v2_feedback_store = v2_feedback_store
     application.state.v2_feedback_service = v2_feedback_service
+    application.state.thread_store = thread_store
 
     try:
         yield
@@ -84,6 +88,7 @@ async def _worker_lifespan(application):
                 pass
 
         await job_store.close()
+        await thread_store.close()
         application.state.worker_started = False
 
 

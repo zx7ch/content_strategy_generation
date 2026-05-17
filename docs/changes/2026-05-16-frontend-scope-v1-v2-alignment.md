@@ -123,6 +123,7 @@ Each task below must record progress with:
 - `Progress`: `Pending | In Progress | Done | Blocked`
 - `Owner`: `Unassigned` until assigned
 - `Last Updated`: empty until work starts
+- `Checklist`: AC 和交付物的逐条完成状态，标记规则：`[x]` 已完成 · `[ ]` 未完成 · `[-]` 有遗漏问题待解决
 - `Bugfix Log`: `None` until a bugfix entry is needed
 
 Bugfix entries must use this format:
@@ -175,9 +176,15 @@ YYYY-MM-DD - [severity] symptom -> root cause -> fix -> regression test
 
 完成进展：
 
-- `Progress`: Pending
-- `Owner`: Unassigned
-- `Last Updated`:
+- `Progress`: Done
+- `Owner`: claude-sonnet-4-6
+- `Last Updated`: 2026-05-16
+- `Checklist`:
+  - [x] `frontend/src/lib/api.ts` — 统一导出 `RUNTIME_BASE_URL`，替换三处重复 env var 读取
+  - [x] `frontend/src/lib/api.ts` — `initializeWorkspaceContext()` 先调 `/health` 再调 `/workspaces/default`
+  - [x] `frontend/src/components/providers/WorkspaceProvider.tsx` — 连接状态文案更新
+  - [x] `app/api/routes/router.py` — CORS 从 `allow_origin_regex` 改为 `allow_origins=["*"]`（`allow_credentials=False`）
+  - [x] `frontend/src/lib/api.test.ts` — 新增 5 个测试覆盖 health check 成功/失败/网络错误路径，更新 1 个已有测试的错误断言
 - `Bugfix Log`: None
 
 ### ALIGN-2 Server Component API 读取迁移
@@ -224,9 +231,14 @@ YYYY-MM-DD - [severity] symptom -> root cause -> fix -> regression test
 
 完成进展：
 
-- `Progress`: Pending
-- `Owner`: Unassigned
-- `Last Updated`:
+- `Progress`: Done
+- `Owner`: claude-sonnet-4-6
+- `Last Updated`: 2026-05-16
+- `Checklist`:
+  - [x] `frontend/src/app/brands/page.tsx` — 改为 Client Component，`useEffect` + `useState` 加载，错误态使用 `LiveApiErrorState`
+  - [x] `frontend/src/app/brands/[id]/page.tsx` — 改为 Client Component，同上模式
+  - [x] `frontend/src/lib/api.ts` — `getApiConfig()` 使用 `RUNTIME_BASE_URL` 常量
+  - [x] `npm run build` — 通过，无 Server/Client 边界错误
 - `Bugfix Log`: None
 
 ### ALIGN-3 SQLite Thread / Message Store
@@ -282,10 +294,18 @@ YYYY-MM-DD - [severity] symptom -> root cause -> fix -> regression test
 
 完成进展：
 
-- `Progress`: Pending
-- `Owner`: Unassigned
-- `Last Updated`:
-- `Bugfix Log`: None
+- `Progress`: Done
+- `Owner`: claude-sonnet-4-6
+- `Last Updated`: 2026-05-16
+- `Checklist`:
+  - [x] `app/memory/thread_store.py` — ThreadStore 类，aiosqlite，`creator_threads` + `creator_messages` 两张表，8 个方法
+  - [x] `app/models/schemas.py` — 追加 9 个 Pydantic 模型（CreatorThread*/CreatorMessage*）
+  - [x] `app/main.py` — lifespan 中初始化 ThreadStore，赋值 `application.state.thread_store`，finally 中 `close()`
+  - [x] `app/api/routes/router.py` — `_get_thread_store()` helper + 4 个端点（POST/GET /threads，GET /threads/{id}，POST /threads/{id}/messages）
+  - [x] `tests/unit/test_thread_store.py` — 7 个 async 单测，全部通过
+  - [x] `tests/e2e/test_creator_thread_api.py` — 7 个 e2e 测试，全部通过
+  - [x] `tests/e2e/conftest.py` — mock `langgraph.checkpoint.sqlite.aio`（venv 中 langgraph 1.1.10 缺失该子模块）
+- `Bugfix Log`: 2026-05-16 - [medium] e2e tests fail at collection with ModuleNotFoundError: langgraph.checkpoint.sqlite -> langgraph 1.1.10 omits checkpoint.sqlite submodule; app.memory.session_state imports AsyncSqliteSaver at module level -> created tests/e2e/conftest.py to mock the module before app imports -> all 7 e2e tests now pass
 
 ### ALIGN-4 Creator Workflow API
 
@@ -334,10 +354,20 @@ YYYY-MM-DD - [severity] symptom -> root cause -> fix -> regression test
 
 完成进展：
 
-- `Progress`: Pending
-- `Owner`: Unassigned
-- `Last Updated`:
-- `Bugfix Log`: None
+- `Progress`: Done
+- `Owner`: claude-sonnet-4-6
+- `Last Updated`: 2026-05-16
+- `Checklist`:
+  - [x] `app/models/schemas.py` — 追加 `CreatorWorkflowRequest`、`CreatorWorkflowResponse`
+  - [x] `app/api/routes/router.py` — 新增 `_get_job_store()` helper + `POST /threads/{id}/workflow` 端点
+  - [x] `frontend/src/lib/api.ts` — 新增 `listThreads`、`createThread`、`appendThreadMessage`、`startThreadWorkflow`、`getJobStatus`、`enqueueGenerate` 6 个函数及对应 interface
+  - [x] `frontend/src/app/creator/page.tsx` — 接入真实 API：线程列表从后端加载，消息持久化，workflow 启动返回真实 session_id/job_id，job 状态 3s 轮询触发 generate
+  - [x] `tests/e2e/test_creator_workflow_api.py` — 4 个 e2e 测试，全部通过
+  - [x] `npm run build` — 通过，/creator 为静态渲染（Client Component）
+  - [x] 线程切换不加载历史消息（TD-ALIGN4-2）：已在 ALIGN-9 通过 `selectThread -> getThread()` 加载真实历史消息，并恢复 task 状态
+  - [-] 每次 workflow 新建 session，不复用（TD-ALIGN4-1）：仍未实现 session 复用；需单独排期，不再归属当前 MVP 必做项
+  - [x] job 状态检测用 3s 轮询（TD-ALIGN4-3）：已在 ALIGN-7 替换为 subscribeThreadEvents EventSource，pollingRef 和 getJobStatus 调用已移除
+- `Bugfix Log`: 2026-05-16 - [medium] POST /threads/{id}/workflow 缺少 session 事件写入和 stage 更新时序不完整 -> workflow 端点在 create_session 后直接调 update_session(stage=STRATEGY)，漏掉了 touch_user_activity、两条 append_session_event（session created + stage_changed）以及 log_event，导致 SSE 事件流里看不到 workflow 启动事件 -> 参照 _enqueue_with_stage 和 create_session 的完整模式补全两阶段写入 -> tests/e2e/test_creator_workflow_api.py 11/11 通过
 
 ### ALIGN-5 Rule-based Intent Router
 
@@ -386,9 +416,20 @@ YYYY-MM-DD - [severity] symptom -> root cause -> fix -> regression test
 
 完成进展：
 
-- `Progress`: Pending
-- `Owner`: Unassigned
-- `Last Updated`:
+- `Progress`: Done
+- `Owner`: claude-sonnet-4-6
+- `Last Updated`: 2026-05-16
+- `Checklist`:
+  - [x] `app/services/creator_intent_router.py` — 新增 `IntentContext` dataclass（`has_active_job`, `active_job_status`）、`ACTIVE_JOB_STATUSES`、`async classify_intent()`，优先级：pause > resume > cancel > ask_status > add_constraint > free_chat
+  - [x] `app/api/routes/router.py` — `POST /threads/{id}/messages` 接入 intent router：读取 thread active_job_id → classify intent → 执行 pause/resume/cancel/ask_status job-control → 落库 message（带 intent + linked_session_id + linked_job_id）→ 返回 intent + job_action_result
+  - [x] `frontend/src/lib/api.ts` — `appendThreadMessage` 返回 `{ intent, job_action_result }` 替换 `void`
+  - [x] `frontend/src/app/creator/page.tsx` — `sendMessage` 读取 intent 并更新 task 状态（pause → paused / resume → running / cancel → cancelled / ask_status → 文本回显）
+  - [x] `tests/unit/test_creator_intent_router.py` — 9 个单测，覆盖全部 6 种 intent 路径 + 优先级规则 + ACTIVE_JOB_STATUSES 常量
+  - [x] `tests/e2e/test_creator_message_intent_api.py` — 4 个 e2e 测试，覆盖 free_chat / add_constraint / pause_job / ask_status 场景
+  - [-] `pause_job` 只影响 queued/retrying，无法抢占 running job（TD-ALIGN5-1，ALIGN-6 部分关闭）：cancel 的 worker stage boundary guard 已在 ALIGN-6 实现；pause 对 running job 仍需 jobs 表新增 pause_requested 列，记为 TD-ALIGN6-1，待排期
+  - [-] `add_constraint` 只落库，不触发 strategy agent 重规划（TD-ALIGN5-2）：实时重规划无对应 ALIGN 任务，需单独排期
+  - [-] 规则分类存在关键词误命中（TD-ALIGN5-3，例如"继续努力" → resume_job）：async 接口设计保留模型替换空间，ML 分类无对应 ALIGN 任务，需单独排期
+  - [-] 缺少 `redirect_job` 意图（TD-ALIGN5-4）：用户说"帮我改一下方向"等改变任务目标的表述时，正确语义是取消当前任务 + 以新 user_query 重新启动 workflow（cancel current session jobs → POST /threads/{id}/workflow with updated query → update thread active session/job）；现在该类消息被分类为 add_constraint 后仅落库，任务继续跑，用户无反馈。需新增 `redirect_job` intent、对应正则规则（或模型分类）和 router handler；无对应 ALIGN 任务，需单独排期
 - `Bugfix Log`: None
 
 ### ALIGN-6 Job Control API
@@ -448,9 +489,17 @@ YYYY-MM-DD - [severity] symptom -> root cause -> fix -> regression test
 
 完成进展：
 
-- `Progress`: Pending
-- `Owner`: Unassigned
-- `Last Updated`:
+- `Progress`: Done
+- `Owner`: claude-sonnet-4-6
+- `Last Updated`: 2026-05-16
+- `Checklist`:
+  - [x] `app/memory/job_store.py` — 新增 `pause_job`, `resume_job`, `cancel_job` 3 个 job-level 方法（queued/retrying 可直接暂停；cancel 覆盖全部活跃状态含 running）
+  - [x] `app/models/schemas.py` — 新增 `JobControlResponse(job_id, session_id, status)`
+  - [x] `app/api/routes/router.py` — 新增 `_TERMINAL_JOB_STATUSES` + 3 个端点（prefetch 模式，404/409 错误处理完整）
+  - [x] `app/workers/job_worker.py` — `_execute_job` cancel guard：`orchestrator.run_job` 返回后，写 `mark_succeeded` 前重新 fetch job 状态，若已 cancelled 则 emit `task_cancelled` 事件并跳过成功写入
+  - [x] `tests/unit/test_job_store.py` — 新增 6 个单测，覆盖 pause/resume/cancel 全部状态转移
+  - [x] `tests/e2e/test_job_control_api.py` — 新建，6 个 e2e 测试（pause/resume/cancel 200 + 404 + 409 路径）
+  - [-] running job 软暂停未实现（TD-ALIGN6-1）：pause 对 running job 返回 409；正式方案需给 jobs 表加 `pause_requested` 列，无对应 ALIGN 任务，需单独排期
 - `Bugfix Log`: None
 
 ### ALIGN-7 Thread-scoped Events
@@ -501,10 +550,21 @@ YYYY-MM-DD - [severity] symptom -> root cause -> fix -> regression test
 
 完成进展：
 
-- `Progress`: Pending
-- `Owner`: Unassigned
-- `Last Updated`:
-- `Bugfix Log`: None
+- `Progress`: Done
+- `Owner`: claude-sonnet-4-6
+- `Last Updated`: 2026-05-16
+- `Checklist`:
+  - [x] `app/api/routes/router.py` — 新增 `_SESSION_TO_THREAD_EVENT` 映射常量、`_format_sse_thread_event` 序列化 helper、`_thread_event_stream` 异步生成器（replay + live poll + heartbeat）、`GET /threads/{thread_id}/events` 端点（404/空流处理完整）；新增 `import json` 到 stdlib 导入块
+  - [x] `frontend/src/lib/api.ts` — 新增 `ThreadEventData` interface + `subscribeThreadEvents` 函数（注册 workflow_task_progress/completed/failed/cancelled/stage_changed 5 个事件 handler，返回 EventSource 实例）
+  - [x] `frontend/src/app/creator/page.tsx` — 移除 `getJobStatus` import 和 `pollingRef`；新增 `taskRef = useRef` + sync effect 解决 stale closure；用 `subscribeThreadEvents` useEffect 替换 3s 轮询 useEffect（TD-ALIGN4-3 关闭）
+  - [x] `tests/integration/test_thread_events.py` — 新建，4 个集成测试：replay 映射事件名 / 404 无效 thread / 无 active session 空流 / Last-Event-ID replay 过滤
+  - [x] `tests/integration/conftest.py` — 新建，mock langgraph.checkpoint.sqlite（与 e2e/conftest.py 相同模式）
+  - [x] `tests/e2e/test_creator_thread_api.py` — fixture 补注入 `job_store`（ALIGN-5 给 POST /threads/{id}/messages 加了 `_get_job_store` 调用，原 fixture 只注入了 `thread_store`，导致 2 个测试在回归中变为 500）
+  - [x] `_thread_event_stream` 订阅固定绑定到 `thread.active_workflow_session_id`；thread 切换新 workflow 时前端需靠 `task?.sessionId` 变化重建 EventSource，无自动切换（TD-ALIGN7-1）：已在 ALIGN-9 通过 `subscribedThreadId` + `subscribedSessionId` stale event guard 和 `task.sessionId` 依赖重建 EventSource 关闭
+  - [-] `GET /threads/{id}/events` 无鉴权，任何客户端可订阅任意 thread 的事件流（TD-ALIGN7-2）：local-first 单用户可接受，云部署需补鉴权，无对应 ALIGN 任务
+- `Bugfix Log`:
+  - 2026-05-16 - [low] `tests/integration/` 缺少 conftest.py → `test_thread_events.py` collect 时 ModuleNotFoundError: langgraph.checkpoint.sqlite -> 新建 tests/integration/conftest.py mock 该模块 -> 4 个测试通过
+  - 2026-05-16 - [low] tests 2/3 用假 lifespan 注入 app.state 无效 → `ASGITransport` 不触发 lifespan，`app.state.thread_store` 为 None 返回 500 -> 改为在 async with JobStore/ThreadStore 上下文中直接赋值 `app.state` -> 全部通过
 
 ### ALIGN-8 Manual Complete / Publish Candidate
 
@@ -560,9 +620,19 @@ YYYY-MM-DD - [severity] symptom -> root cause -> fix -> regression test
 
 完成进展：
 
-- `Progress`: Pending
-- `Owner`: Unassigned
-- `Last Updated`:
+- `Progress`: Done
+- `Owner`: claude-sonnet-4-6
+- `Last Updated`: 2026-05-16
+- `Checklist`:
+  - [x] `app/models/schemas.py` — 新增 `PublishCandidate`, `CompleteThreadResponse`, `PublishCandidatesResponse`, `GeneratedNoteItem`, `ThreadResultResponse` 5 个 schema 类
+  - [x] `app/memory/thread_store.py` — `_init_tables` 新增 `publish_candidates` 表及索引；新增 `complete_thread`, `save_publish_candidates`, `count_publish_candidates`, `list_publish_candidates` 4 个方法
+  - [x] `app/api/routes/router.py` — 新增 `POST /threads/{id}/complete`（幂等，跨 DB 读取 generated notes，写入候选）、`GET /publish-candidates`、`GET /threads/{id}/result` 3 个端点；补充 5 个 schema 导入
+  - [x] `frontend/src/lib/api.ts` — 新增 `PublishCandidate`, `CompleteThreadResponse`, `GeneratedNoteItem`, `ThreadResult` 4 个类型；新增 `completeThread`, `getPublishCandidates`, `getThreadResult` 3 个函数
+  - [x] `frontend/src/app/creator/page.tsx` — 新增 `generatedResult` / `isAccepted` state；generation 完成后调 `getThreadResult` 展示策略定位 + 生成笔记；新增「完成 — 加入发布候选」按钮，点击调 `completeThread`
+  - [x] `frontend/src/app/publish/page.tsx` — 新增 Creator 发布候选 section，`useEffect` 加载 `getPublishCandidates`，列表展示笔记标题/内容/标签
+  - [x] `tests/e2e/test_creator_publish_candidate.py` — 新建，4 个 e2e 测试：complete 成功 / 幂等 / 404 / 候选列表空返回
+  - [x] `GET /threads/{id}/result` 不在原始 API contract 表格内（TD-ALIGN8-1），已补充到 Backend API Contract Additions
+  - [-] `GET /publish-candidates` 无分页（TD-ALIGN8-2）：MVP 候选量小，可接受，无对应 ALIGN 任务
 - `Bugfix Log`: None
 
 ## Backend API Contract Additions
@@ -578,6 +648,14 @@ The MVP backend contracts are fixed as follows:
 
 - `GET /threads/{thread_id}`
   - response: `{ "thread": ThreadDetail, "messages": CreatorMessage[] }`
+
+- `PATCH /threads/{thread_id}`
+  - request: `{ "title": string }`
+  - response: `{ "thread_id": string, "title": string, "status": string, "active_workflow_session_id"?: string, "active_job_id"?: string }`
+
+- `DELETE /threads/{thread_id}`
+  - response: `{ "thread_id": string, "deleted": true }`
+  - Added by ALIGN-9; if the thread has an active workflow session, unfinished jobs are cancelled before deleting thread data.
 
 - `POST /threads/{thread_id}/messages`
   - request: `{ "text": string }`
@@ -600,6 +678,10 @@ The MVP backend contracts are fixed as follows:
 
 - `GET /publish-candidates`
   - response: `{ "items": PublishCandidate[] }`
+
+- `GET /threads/{thread_id}/result`
+  - response: `{ "thread_id": string, "session_id": string|null, "strategy": object|null, "notes": GeneratedNoteItem[] }`
+  - Added by ALIGN-8 for frontend result display; not in original contract section.
 
 ## Testing and Acceptance Gate
 
@@ -636,24 +718,149 @@ Global acceptance gate:
 - Workspace Console local runtime reads happen from the browser side.
 - No UI copy or route claims V1 Exploration Mode support.
 
+### ALIGN-9 Creator Chat 基础交互完善
+
+任务目标：
+
+- 补齐 Creator Workbench chat 基础交互和 thread 状态恢复问题，使用户能按主流 AI chat 习惯停止任务、管理对话，并在切换 thread 后继续看到正确的 workflow 状态。
+
+满足的 UI 体验：
+
+- 点击历史对话后，能看到该对话的真实历史消息，而不是欢迎语。
+- 输入框随内容自动撑高，不截断多行输入。
+- 发送消息后焦点自动回到输入框，无需手动点击。
+- 运行中任务有显眼的停止入口，不要求用户输入"停止/取消"才能触发控制。
+- 重命名/删除对话是真实持久化能力，不是空菜单。
+- 切换 thread 后，SSE 订阅和任务状态以新 thread 的 active workflow 为准，不继续订阅旧 session。
+
+任务范围：
+
+- TD-ALIGN4-2：切换对话加载历史消息（GET /threads/{id} 端点已就绪，补前端调用）。
+- UX-4：输入框高度随输入内容自动增长，上限 `max-h-36`，触达后内部滚动。
+- UX-5：`sendMessage` 完成后 `inputRef.current?.focus()`，保持输入连贯。
+- 切换对话时同步恢复 task 状态：读取 thread 的 `active_job_id`，判断是否有进行中任务并恢复 task strip。
+- UX-9-1：显眼停止按钮，调用真实 job-control/intent 路径，禁止只改本地状态。
+- UX-9-2：重命名/删除对话补真实 API、store 方法、前端调用和回归测试。
+- UX-9-3：thread 切换后 EventSource 跟随当前 thread/session；旧 SSE 回调不能污染新对话。
+- UX-9-4：切换对话后 task 状态恢复依赖 TD-ALIGN4-2，一起修复。
+
+依赖与修复顺序：
+
+1. 先修 UX-9-4 / UX-9-3：切换 thread 必须先恢复当前 thread 的 `active_workflow_session_id` / `active_job_id`，再建立对应 EventSource；否则停止按钮和状态展示可能操作旧 job。
+2. 再修 UX-9-1：停止按钮复用已恢复的当前 `task.jobId`，调用 `POST /jobs/{job_id}/cancel`，失败时回退到 `POST /threads/{id}/messages` 的 `cancel_job` intent。
+3. 最后修 UX-9-2：重命名/删除是独立管理能力，但删除运行中 thread 时必须先取消该 thread 的 unfinished session jobs，再删除 thread/message/candidate 数据。
+
+不在本次范围：
+
+- markdown 渲染、时间分组等 P2/P3 项留后续任务。
+- 不为了前端效果修改 V1 workflow/job 后端执行语义；只补 thread 管理 API 与前端状态衔接。
+
+修改文件：
+
+- `frontend/src/app/creator/page.tsx`
+- `frontend/src/lib/api.ts`
+- `app/memory/thread_store.py`
+- `app/models/schemas.py`
+- `app/api/routes/router.py`
+- `tests/unit/test_thread_store.py`
+- `tests/e2e/test_creator_thread_api.py`
+
+关键修改点：
+
+- `selectThread`：调 `GET /threads/{id}` 拿 messages，映射为 `ChatMessage[]` 替换欢迎语；读 `active_job_id` 和 `GET /jobs/{id}` 恢复 task strip。
+- SSE effect：订阅时固定 `subscribedThreadId` + `subscribedSessionId`，回调丢弃 stale event；stage_changed(generate) 更新 generation jobId。
+- 停止按钮：运行中显示按钮，调用 `cancelJob(task.jobId)`，不依赖用户打字触发 intent。
+- 重命名/删除：新增 `PATCH /threads/{id}`、`DELETE /threads/{id}`；删除时取消 active session unfinished jobs。
+- `textarea`：绑定 `ref`，`onInput` 时 `el.style.height = "auto"; el.style.height = el.scrollHeight + "px"`。
+- `sendMessage`：完成后 `inputRef.current?.focus()`。
+- `inputRef`：新增 `useRef<HTMLTextAreaElement>(null)`。
+
+验收标准：
+
+- 点击任意历史对话，消息列表显示该对话的真实历史（包括 user / assistant / system 角色气泡）。
+- 输入 3 行以上内容，输入框高度随之增长；超过 `max-h-36` 后出现内部滚动条。
+- 发送消息后，光标自动回到输入框。
+- 切换有 active_job_id 的对话时，task strip 恢复真实 job_type/status，SSE 订阅当前 thread 的 active session。
+- 切换 thread 后启动新任务，EventSource 订阅新 workflow，不消费旧 session 事件。
+- 点击停止按钮后，真实 job 进入 cancelled；刷新或切换回来后仍显示已取消。
+- 重命名后列表和 `GET /threads/{id}` 标题一致；删除后列表移除，`GET /threads/{id}` 返回 404。
+
+测试设计：
+
+- 手动验证：打开已有历史对话 → 消息正确显示。
+- 手动验证：输入多行 → 输入框撑高。
+- 手动验证：发送后 → 光标在输入框。
+- 手动验证：运行中点击停止 → job-control 生效，SSE 不再把旧任务写回当前 thread。
+- 单测：`ThreadStore.update_thread_title`、`ThreadStore.delete_thread`。
+- e2e：`PATCH /threads/{id}`、`DELETE /threads/{id}`。
+
+完成进展：
+
+- `Progress`: Done
+- `Owner`: Codex
+- `Last Updated`: 2026-05-17
+- `Checklist`:
+  - [x] `frontend/src/lib/api.ts` — 新增 `CreatorMessage`、`CreatorThreadDetail` interface，新增 `getThread()` 函数
+  - [x] `frontend/src/app/creator/page.tsx` — `selectThread` 调 `getThread` 加载历史消息，映射为 `ChatMessage[]`
+  - [x] `frontend/src/app/creator/page.tsx` — task strip 恢复逻辑：读取真实 job_type/status，恢复 strategy/generation 与 running/paused/cancelled
+  - [x] `frontend/src/app/creator/page.tsx` — `inputRef` + textarea `onChange` 自动撑高（reset to auto → expand to scrollHeight）
+  - [x] `frontend/src/app/creator/page.tsx` — `sendMessage` 所有退出路径末尾补 `inputRef.current?.focus()`
+  - [x] `frontend/src/app/creator/page.tsx` — placeholder 补充"Shift+Enter 换行"提示
+  - [x] UX-9-1 — 显眼停止按钮，调用真实 `POST /jobs/{job_id}/cancel`，失败时回退 `cancel_job` intent
+  - [x] UX-9-2 — 重命名/删除真实 API + 前端调用 + 单测/e2e
+  - [x] UX-9-3 — thread 切换后 EventSource 自动跟随新 workflow，旧 SSE 回调按 thread/session 丢弃
+  - [x] UX-9-4 — 切换对话 task 状态恢复，依赖 TD-ALIGN4-2 一起修
+  - [x] `pytest tests/unit/test_thread_store.py` — 9 passed
+  - [x] `pytest tests/e2e/test_creator_thread_api.py` — 9 passed
+  - [x] `npm run build` — 通过
+  - [x] `npm run dev` + `curl -I http://localhost:3000/creator` — 页面返回 200 OK
+- `Bugfix Log`:
+  - 2026-05-17 - [low] `enqueueGenerate` 在 ALIGN-7 移除轮询后成为死代码 import → 从 creator/page.tsx import 列表删除
+  - 2026-05-17 - [medium] `selectThread` 快速连点两个对话时存在竞态：后发起的 `getThread` 若先返回会被后来的覆盖 → 改用 `loadingThreadRef` 记录最后请求的 threadId，stale 响应直接 return 丢弃
+  - 2026-05-17 - [high] `CreatorMessage` interface 字段名写为 `id`，但后端 `GET /threads/{id}` 实际返回 `message_id`（与 `CreatorMessageRecord` schema 一致）→ interface 改为 `message_id`，`selectThread` 映射改为 `m.message_id`；若不修复，历史消息气泡 key 全为 `undefined`，React 会报 key 警告且列表渲染异常
+  - 2026-05-17 - [high] thread 切换后 EventSource 只按 React effect 生命周期关闭旧连接，但旧回调仍可能在关闭前落入当前 UI，导致新 thread 显示旧 session 进度/结果 -> SSE 订阅捕获 `subscribedThreadId` + `subscribedSessionId`，所有回调先校验当前 active thread 和 event session，不匹配直接丢弃 -> `npm run build` 通过，手动验收按切换 thread/启动新 workflow 场景执行
+  - 2026-05-17 - [medium] 重命名/删除菜单只有视觉入口没有真实行为 -> 缺少 thread update/delete API 与前端调用 -> 新增 `PATCH /threads/{id}`、`DELETE /threads/{id}`、`ThreadStore.delete_thread`、前端 `renameThread/deleteThread` 和菜单 handler；删除 active session 前先 cancel unfinished jobs -> `pytest tests/unit/test_thread_store.py`、`pytest tests/e2e/test_creator_thread_api.py` 通过
+  - 2026-05-17 - [medium] 切换 thread 后 task strip 只显示占位 stage，不能恢复 generation/paused/cancelled 状态 -> 前端 `selectThread` 读取 `GET /jobs/{active_job_id}`，按 job_type/status 恢复 stage/status，并对 accepted thread 回读 result -> `npm run build` 通过
+
 ## Completion Progress
 
-- `ALIGN-1 Runtime 连接层`: Pending
-- `ALIGN-2 Server Component API 读取迁移`: Pending
-- `ALIGN-3 SQLite Thread / Message Store`: Pending
-- `ALIGN-4 Creator Workflow API`: Pending
-- `ALIGN-5 Rule-based Intent Router`: Pending
-- `ALIGN-6 Job Control API`: Pending
-- `ALIGN-7 Thread-scoped Events`: Pending
-- `ALIGN-8 Manual Complete / Publish Candidate`: Pending
+- `ALIGN-1 Runtime 连接层`: Done
+- `ALIGN-2 Server Component API 读取迁移`: Done
+- `ALIGN-3 SQLite Thread / Message Store`: Done
+- `ALIGN-4 Creator Workflow API`: Done
+- `ALIGN-5 Rule-based Intent Router`: Done
+- `ALIGN-6 Job Control API`: Done
+- `ALIGN-7 Thread-scoped Events`: Done
+- `ALIGN-8 Manual Complete / Publish Candidate`: Done
+- `ALIGN-9 Creator Chat 基础交互完善`: Done
 
 ## Bugfix Log
 
-- None
+- 2026-05-17 [medium] **strategy→generate 结构性 RTT 延迟**：generate job 由前端 `onCompleted(strategy)` 触发 `POST /sessions/{id}/jobs/generate`，引入 1-3s SSE 往返延迟，且前端关闭时 generate 不会自动运行。改为 `job_worker._execute_job` 在 strategy job `mark_succeeded` 后直接 `job_store.enqueue(generate)` 并写入 `stage_changed` 事件；前端 `onCompleted(strategy)` 改为纯本地 `setTask({stage: "generation"})` 不再发 POST。
+
+- 2026-05-17 [medium] **spider 搜索黑盒等待**：`search_some_note(num=50)` 内部串行翻 3 页（每页 20 条），全部完成才返回，期间用户无任何进度反馈。改为在 `_sync_search` 中内联分页循环（调用 `search_note` per page），每页到达后触发 `on_page` 同步回调，通过 `asyncio.run_coroutine_threadsafe` 从线程池回调到 event loop，最终写入 `task_progress` 事件。用户每 20 条看到一次"搜索到 N 篇相关内容..."进度更新。HTTP 请求总数与原来相同，不增加风控风险。
+
+## Open Items Summary
+
+As of 2026-05-17, all ALIGN-1 through ALIGN-9 implementation tasks are `Done`.
+Remaining open items are deferred follow-up gaps, not blockers for the current
+local-first Creator Workbench MVP.
+
+Open checklist entries: 8.
+Unique open issues: 7 (`TD-ALIGN5-1` and `TD-ALIGN6-1` describe the same
+running-job soft pause gap from different task sections).
+
+- `TD-ALIGN4-1` — workflow still creates a new session on every start; session reuse is not implemented.
+- `TD-ALIGN5-1` / `TD-ALIGN6-1` — running job soft pause is not implemented; pause only applies to queued/retrying jobs, while running jobs should use cancel for the MVP.
+- `TD-ALIGN5-2` — `add_constraint` only persists the message; it does not trigger strategy replanning for an already running job.
+- `TD-ALIGN5-3` — rule-based intent classification has known keyword false positives; context-aware/model classification is deferred.
+- `TD-ALIGN5-4` — `redirect_job` intent is missing; changing task direction does not cancel and restart workflow automatically.
+- `TD-ALIGN7-2` — `GET /threads/{id}/events` has no auth gate; acceptable for local-first single-user MVP, but cloud deployment needs authorization.
+- `TD-ALIGN8-2` — `GET /publish-candidates` has no pagination; acceptable for MVP-sized candidate volume.
 
 ## Assumptions
 
-- This document update defines the execution plan; code implementation happens in follow-up tasks.
+- This document records the current execution plan and bugfix scope before code implementation.
 - Runtime URL remains fixed to `http://127.0.0.1:8000`.
 - Complete HTTPS cloud-to-localhost security hardening is deferred.
 - Thread/message/publish candidate storage uses SQLite.

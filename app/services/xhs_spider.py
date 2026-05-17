@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import os
 from pathlib import Path
 import threading
-from typing import List, Optional, Tuple, Dict, Any
+from typing import Callable, List, Optional, Tuple, Dict, Any
 from pydantic import BaseModel
 
 from app.config import settings
@@ -177,73 +177,90 @@ class XHSSpiderClient:
             return SpiderPermanentError(error_msg)
     
     async def search(
-        self, 
-        query: str, 
+        self,
+        query: str,
         num: int = 50,
         sort: int = 2,
-    ) -> Tuple[bool, str, List[XHSPost]]:
+        on_page: Optional[Callable[[List["XHSPost"]], None]] = None,
+    ) -> Tuple[bool, str, List["XHSPost"]]:
         """
         搜索小红书笔记
-        
+
         Args:
             query: 搜索关键词
             num: 需要获取的笔记数量
             sort: 排序方式 (2=最多点赞, 1=最新)
-        
+            on_page: 每页结果到达时调用的同步回调（在线程池里执行）
+
         Returns:
             (success, message, posts)
         """
-        # Run sync Spider API in thread pool
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(
-            None, self._sync_search, query, num, sort
+            None, self._sync_search, query, num, sort, on_page
         )
-    
+
     def _sync_search(
-        self, 
-        query: str, 
+        self,
+        query: str,
         num: int,
-        sort: int
-    ) -> Tuple[bool, str, List[XHSPost]]:
-        """同步搜索（在线程池中运行）"""
+        sort: int,
+        on_page: Optional[Callable[[List["XHSPost"]], None]] = None,
+    ) -> Tuple[bool, str, List["XHSPost"]]:
+        """同步分页搜索，每页完成后触发 on_page 回调（在线程池中运行）。"""
         api = self._get_api()
-        
+        all_posts: List[XHSPost] = []
+        page = 1
+
         try:
-            # Call search_some_note from XHS_Apis
-            # Signature: search_some_note(query, require_num, cookies_str, sort_type_choice=0, ...)
-            # sort_type_choice: 0=综合, 1=最新, 2=最多点赞, 3=最多收藏
-            success, msg, raw_notes = self._run_in_submodule_cwd(
-                api.search_some_note,
-                query,
-                num,
-                self.cookies,
-                sort,
-            )
-            
-            if not success:
-                return False, msg, []
-            
-            # Normalize raw notes to XHSPost
-            posts = []
-            for raw in raw_notes:
-                try:
-                    post = self._normalize_post(raw)
-                    posts.append(post)
-                except Exception as e:
-                    # Skip malformed posts
-                    continue
-            
-            return True, "", posts
-            
-        except Exception as e:
-            error_msg = str(e)
-            raise self._classify_error(error_msg)
+            while True:
+                success, msg, res_json = self._run_in_submodule_cwd(
+                    api.search_note,
+                    query,
+                    self.cookies,
+                    page,
+                    sort,
+                )
+                if not success:
+                    if not all_posts:
+                        return False, msg, []
+                    break
+
+                items = (res_json.get("data") or {}).get("items") or []
+                has_more = bool((res_json.get("data") or {}).get("has_more", False))
+
+                batch: List[XHSPost] = []
+                for raw in items:
+                    try:
+                        batch.append(self._normalize_post(raw))
+                    except Exception:
+                        continue
+
+                all_posts.extend(batch)
+
+                if batch and on_page is not None:
+                    try:
+                        on_page(batch)
+                    except Exception:
+                        pass
+
+                page += 1
+                if len(all_posts) >= num or not has_more:
+                    break
+
+            return True, "", all_posts[:num]
+
+        except Exception as exc:
+            if all_posts:
+                return True, "", all_posts[:num]
+            raise self._classify_error(str(exc))
     
     async def search_with_retry(
-        self, 
-        query: str, 
+        self,
+        query: str,
         num: int = 50,
         sort: int = 2,
+        on_page: Optional[Callable[[List["XHSPost"]], None]] = None,
     ) -> List[XHSPost]:
         """
         带重试的搜索
@@ -263,7 +280,7 @@ class XHSSpiderClient:
         # max_retries means number of retries after the initial attempt.
         for retry_count in range(self.max_retries + 1):
             try:
-                success, msg, posts = await self.search(query, num, sort)
+                success, msg, posts = await self.search(query, num, sort, on_page=on_page)
                 
                 if success:
                     return posts

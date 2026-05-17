@@ -545,6 +545,62 @@ class JobStore:
             )
         return ok
 
+    async def pause_job(self, job_id: str) -> Optional[JobRecord]:
+        """Pause a single job. Only queued/retrying → paused. Other statuses: no DB change.
+        Returns None if job not found; returns job as-is if transition is not applicable."""
+        assert self._conn is not None
+        async with self._conn.execute(
+            """
+            UPDATE jobs
+            SET status = 'paused', updated_at = CURRENT_TIMESTAMP
+            WHERE id = ? AND status IN ('queued', 'retrying')
+            """,
+            (job_id,),
+        ):
+            pass
+        await self._conn.commit()
+        return await self.get_job(job_id)
+
+    async def resume_job(self, job_id: str) -> Optional[JobRecord]:
+        """Resume a single paused job → queued. Other statuses: no DB change.
+        Returns None if job not found."""
+        assert self._conn is not None
+        async with self._conn.execute(
+            """
+            UPDATE jobs
+            SET status = 'queued',
+                not_before = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ? AND status = 'paused'
+            """,
+            (job_id,),
+        ):
+            pass
+        await self._conn.commit()
+        return await self.get_job(job_id)
+
+    async def cancel_job(
+        self, job_id: str, reason: str = "user_cancelled"
+    ) -> Optional[JobRecord]:
+        """Cancel a single job. queued/paused/retrying/running → cancelled.
+        Terminal statuses: no DB change. Returns None if job not found."""
+        assert self._conn is not None
+        async with self._conn.execute(
+            """
+            UPDATE jobs
+            SET status = 'cancelled',
+                cancel_reason = ?,
+                lease_expires_at = NULL,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+              AND status IN ('queued', 'paused', 'retrying', 'running')
+            """,
+            (reason, job_id),
+        ):
+            pass
+        await self._conn.commit()
+        return await self.get_job(job_id)
+
     async def pause_session_jobs(self, session_id: str) -> int:
         """Pause all queued/retrying jobs for a frozen session."""
         assert self._conn is not None

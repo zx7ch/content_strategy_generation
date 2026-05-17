@@ -28,6 +28,19 @@ class Settings(BaseSettings):
     # Runtime
     APP_ENV: str = "development"
     LOG_LEVEL: str = "INFO"
+    RUNTIME_SERVICE_NAME: str = Field(
+        default="xhs-agent-runtime",
+        validation_alias=_env_alias("RUNTIME_SERVICE_NAME"),
+    )
+    RUNTIME_VERSION: str = Field(default="0.1.0", validation_alias=_env_alias("RUNTIME_VERSION"))
+    RUNTIME_API_CONTRACT: str = Field(
+        default="local-runtime-v1",
+        validation_alias=_env_alias("RUNTIME_API_CONTRACT"),
+    )
+    CORS_ALLOWED_ORIGINS: str = Field(
+        default="http://localhost:3000,http://127.0.0.1:3000",
+        validation_alias=_env_alias("CORS_ALLOWED_ORIGINS"),
+    )
 
     # LLM providers
     LLM_PROVIDER: str = "anthropic"
@@ -163,6 +176,10 @@ class Settings(BaseSettings):
     V2_AUTH_HEADER: str = Field(default="Authorization", validation_alias=_env_alias("V2_AUTH_HEADER"))
     V2_WORKSPACE_HEADER: str = Field(default="X-Workspace-Id", validation_alias=_env_alias("V2_WORKSPACE_HEADER"))
     V2_USER_HEADER: str = Field(default="X-User-Id", validation_alias=_env_alias("V2_USER_HEADER"))
+
+    @property
+    def cors_allowed_origins(self) -> list[str]:
+        return [origin.strip() for origin in self.CORS_ALLOWED_ORIGINS.split(",") if origin.strip()]
 
     @model_validator(mode="after")
     def _validate_paths(self) -> "Settings":

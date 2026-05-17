@@ -10,7 +10,7 @@ import pytest
 async def test_run_generation_job_uses_session_backed_execute(monkeypatch):
     captured = {}
 
-    async def fake_execute(self, session_id):
+    async def fake_execute(self, session_id, **kwargs):
         captured["session_id"] = session_id
         return GenerationExecutionResult(
             success=True,
@@ -37,7 +37,7 @@ async def test_run_generation_job_uses_session_backed_execute(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_run_generation_job_raises_orchestration_error_on_failed_execute(monkeypatch):
-    async def fake_execute(self, session_id):
+    async def fake_execute(self, session_id, **kwargs):
         return GenerationExecutionResult(
             success=False,
             status="failed",

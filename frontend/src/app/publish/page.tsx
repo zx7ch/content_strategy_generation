@@ -1,13 +1,14 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 import { Card } from "@/components/ui/Card";
 import { DataTable } from "@/components/dashboard/DataTable";
 import { Button } from "@/components/ui/Button";
 import { useBrandContext } from "@/components/providers/BrandProvider";
 import { usePageData } from "@/hooks/usePageData";
-import { createPublishRecord, getPublishPageData, getRuntimeApiErrorMessage } from "@/lib/api";
+import { createPublishRecord, getPublishCandidates, getPublishPageData, getRuntimeApiErrorMessage } from "@/lib/api";
+import type { PublishCandidate } from "@/lib/api";
 import type { PublishRecord } from "@/lib/types";
 
 export default function PublishPage() {
@@ -18,6 +19,13 @@ export default function PublishPage() {
   );
   const [actionError, setActionError] = useState<string | null>(null);
   const [submittingMode, setSubmittingMode] = useState<"manual" | "decision" | null>(null);
+  const [candidates, setCandidates] = useState<PublishCandidate[]>([]);
+
+  useEffect(() => {
+    getPublishCandidates()
+      .then((data) => setCandidates(data.items))
+      .catch(() => {});
+  }, []);
   const records = data?.records ?? [];
   const source = data?.source ?? "live";
 
@@ -135,6 +143,39 @@ export default function PublishPage() {
         rows={records}
         emptyLabel={selectedBrandId ? "当前品牌还没有发布记录。" : "请先选择一个品牌。"}
       />
+
+      <section className="rounded-panel border border-white/70 bg-white/85 p-6 shadow-panel backdrop-blur">
+        <h2 className="mb-1 text-base font-semibold text-ink">Creator 发布候选</h2>
+        <p className="mb-4 text-sm text-quiet">
+          来自创作台「完成」操作的生成笔记候选，尚未正式登记为发布记录。
+        </p>
+        {candidates.length === 0 ? (
+          <p className="text-sm text-quiet">暂无 Creator 候选，在创作台完成任务后会出现在这里。</p>
+        ) : (
+          <div className="space-y-3">
+            {candidates.map((c) => (
+              <div key={c.candidate_id} className="rounded-lg border border-line bg-white px-4 py-3 text-sm">
+                <div className="flex items-start justify-between gap-4">
+                  <div className="min-w-0 flex-1">
+                    <p className="font-medium text-ink">{c.title}</p>
+                    <p className="mt-1 line-clamp-2 text-quiet">{c.content}</p>
+                    {c.tags.length > 0 && (
+                      <div className="mt-2 flex flex-wrap gap-1">
+                        {c.tags.filter(Boolean).map((tag) => (
+                          <span key={tag} className="rounded-full bg-slate-100 px-2 py-0.5 text-xs text-quiet">
+                            #{tag}
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                  <p className="shrink-0 text-xs text-quiet">{c.created_at.slice(0, 10)}</p>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
     </div>
   );
 }

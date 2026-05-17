@@ -48,6 +48,7 @@ class RAGService:
         self.embedding_model = embedding_model or settings.RAG_EMBEDDING_MODEL
         self._client: Optional[chromadb.Client] = None
         self._embedder = None
+        self._embedding_disabled = False
 
     def _get_client(self) -> chromadb.Client:
         if self._client is None:
@@ -87,6 +88,14 @@ class RAGService:
 
     def _get_embedder(self):
         if self._embedder is None:
+            # If the configured path is a local directory that doesn't exist, skip
+            # embedding rather than crashing. Quality score falls back to
+            # engagement-only computation (avg_similarity=0, score driven by engagement).
+            model_path = Path(self.embedding_model)
+            if model_path.is_absolute() and not model_path.exists():
+                self._embedder = None
+                self._embedding_disabled = True
+                return None
             try:
                 from sentence_transformers import SentenceTransformer
             except ImportError as exc:
@@ -121,6 +130,8 @@ class RAGService:
         """Generate embeddings with the configured production model."""
 
         embedder = self._get_embedder()
+        if embedder is None:
+            return [0.0] * self.EMBEDDING_DIM
         normalized_text = (text or "").strip() or " "
         vector = embedder.encode(
             [normalized_text],
@@ -140,6 +151,17 @@ class RAGService:
     def _sync_index_documents(self, session_id: str, posts: List[XHSPost], query: str) -> QualityScore:
         if not posts:
             return QualityScore(score=0.0, total_notes=0, filtered_count=0, avg_similarity=0.0)
+
+        # Embedding disabled (local model path not found): score by engagement only.
+        if getattr(self, "_embedding_disabled", False) or self._get_embedder() is None:
+            engagements = [
+                float(p.liked_count + 3 * p.collected_count + 5 * p.comment_count + 10 * p.share_count)
+                for p in posts
+            ]
+            max_e = max(engagements) if engagements else 1.0
+            norm = float(np.mean([e / max_e if max_e > 0 else 0.0 for e in engagements]))
+            score = max(0.35, min(1.0, 0.4 * norm + 0.6 * min(1.0, len(posts) / 20)))
+            return QualityScore(score=score, total_notes=len(posts), filtered_count=len(posts), avg_similarity=0.0)
 
         docs = self.chunk_posts(posts)
         collection = self._get_collection()

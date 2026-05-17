@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any, Awaitable, Callable, Optional
 
+ProgressCallback = Callable[[str], Awaitable[None]]
+
 from app.agents.content_generation_agent import ContentGenerationAgent
 from app.agents.content_generation_agent import GenerationExecutionResult
 from app.agents.content_strategy_agent import ContentStrategyAgent
@@ -46,7 +48,7 @@ class Orchestrator:
         self._strategy_runner = strategy_runner or self._run_strategy_job
         self._generation_runner = generation_runner or self._run_generation_job
 
-    async def run_job(self, job: JobRecord) -> dict[str, Any]:
+    async def run_job(self, job: JobRecord, *, progress_callback: Optional[ProgressCallback] = None) -> dict[str, Any]:
         """Validate session state then execute strategy/generation job."""
         async with SessionManager(self.db_path) as session_manager:
             session = await session_manager.get_session(job.session_id)
@@ -70,9 +72,9 @@ class Orchestrator:
                 )
 
         if job.job_type == "strategy":
-            return await self._strategy_runner(job.session_id, job.payload)
+            return await self._strategy_runner(job.session_id, job.payload, progress_callback=progress_callback)
         if job.job_type == "generate":
-            return await self._generation_runner(job.session_id, job.payload)
+            return await self._generation_runner(job.session_id, job.payload, progress_callback=progress_callback)
 
         raise JobOrchestrationError(
             f"Unsupported job_type: {job.job_type}",
@@ -80,10 +82,10 @@ class Orchestrator:
             retryable=False,
         )
 
-    async def _run_strategy_job(self, session_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    async def _run_strategy_job(self, session_id: str, payload: dict[str, Any], *, progress_callback: Optional[ProgressCallback] = None) -> dict[str, Any]:
         del payload  # reserved for future strategy options
         agent = ContentStrategyAgent(session_manager=SessionManager(self.db_path))
-        result = await agent.execute(session_id)
+        result = await agent.execute(session_id, progress_callback=progress_callback)
         if not result.success:
             retryable = result.error_code in self.RETRYABLE_CODES
             raise JobOrchestrationError(
@@ -97,10 +99,10 @@ class Orchestrator:
             "used_fallback": result.used_fallback,
         }
 
-    async def _run_generation_job(self, session_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    async def _run_generation_job(self, session_id: str, payload: dict[str, Any], *, progress_callback: Optional[ProgressCallback] = None) -> dict[str, Any]:
         del payload  # session-backed generation uses stored strategy/session data
         agent = ContentGenerationAgent(session_manager=SessionManager(self.db_path))
-        generated: GenerationExecutionResult = await agent.execute(session_id)
+        generated: GenerationExecutionResult = await agent.execute(session_id, progress_callback=progress_callback)
         if not generated.success:
             retryable = generated.error_code in self.RETRYABLE_CODES
             raise JobOrchestrationError(

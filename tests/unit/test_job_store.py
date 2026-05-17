@@ -191,3 +191,92 @@ async def test_cancel_session_jobs_marks_all_unfinished_jobs_cancelled(isolated_
         assert queued_ref.cancel_reason == "session_purged"
         assert retrying_ref is not None and retrying_ref.status == "cancelled"
         assert retrying_ref.cancel_reason == "session_purged"
+
+
+# ---------------------------------------------------------------------------
+# ALIGN-6: job-level pause / resume / cancel
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_pause_job_queued_transitions_to_paused(isolated_db):
+    session_id = str(uuid.uuid4())
+    await _create_session(isolated_db, session_id)
+
+    async with JobStore(isolated_db) as store:
+        job, _ = await store.enqueue(session_id=session_id, job_type="strategy")
+        assert job.status == "queued"
+
+        updated = await store.pause_job(job.id)
+        assert updated is not None
+        assert updated.status == "paused"
+
+
+@pytest.mark.asyncio
+async def test_pause_job_running_does_not_change_status(isolated_db):
+    session_id = str(uuid.uuid4())
+    await _create_session(isolated_db, session_id)
+
+    async with JobStore(isolated_db) as store:
+        job, _ = await store.enqueue(session_id=session_id, job_type="strategy")
+        # Simulate a running job by direct DB update
+        await store._conn.execute(
+            "UPDATE jobs SET status='running' WHERE id = ?", (job.id,)
+        )
+        await store._conn.commit()
+
+        updated = await store.pause_job(job.id)
+        assert updated is not None
+        assert updated.status == "running"  # no change; caller decides 409
+
+
+@pytest.mark.asyncio
+async def test_resume_job_paused_transitions_to_queued(isolated_db):
+    session_id = str(uuid.uuid4())
+    await _create_session(isolated_db, session_id)
+
+    async with JobStore(isolated_db) as store:
+        job, _ = await store.enqueue(session_id=session_id, job_type="strategy")
+        await store.pause_job(job.id)
+
+        updated = await store.resume_job(job.id)
+        assert updated is not None
+        assert updated.status == "queued"
+
+
+@pytest.mark.asyncio
+async def test_cancel_job_queued_transitions_to_cancelled(isolated_db):
+    session_id = str(uuid.uuid4())
+    await _create_session(isolated_db, session_id)
+
+    async with JobStore(isolated_db) as store:
+        job, _ = await store.enqueue(session_id=session_id, job_type="strategy")
+
+        updated = await store.cancel_job(job.id, reason="user_cancelled")
+        assert updated is not None
+        assert updated.status == "cancelled"
+        assert updated.cancel_reason == "user_cancelled"
+
+
+@pytest.mark.asyncio
+async def test_cancel_job_running_transitions_to_cancelled(isolated_db):
+    """cancel_job also cancels running jobs — worker checks before mark_succeeded."""
+    session_id = str(uuid.uuid4())
+    await _create_session(isolated_db, session_id)
+
+    async with JobStore(isolated_db) as store:
+        job, _ = await store.enqueue(session_id=session_id, job_type="strategy")
+        await store._conn.execute(
+            "UPDATE jobs SET status='running' WHERE id = ?", (job.id,)
+        )
+        await store._conn.commit()
+
+        updated = await store.cancel_job(job.id)
+        assert updated is not None
+        assert updated.status == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_pause_job_not_found_returns_none(isolated_db):
+    async with JobStore(isolated_db) as store:
+        result = await store.pause_job("does-not-exist")
+        assert result is None

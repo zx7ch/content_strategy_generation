@@ -79,6 +79,37 @@ def test_v2_routes_allow_local_frontend_cors() -> None:
     assert "X-User-Id" in preflight.headers["access-control-allow-headers"]
 
 
+def test_health_returns_minimum_local_runtime_contract() -> None:
+    with TestClient(app) as client:
+        response = client.get("/health")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["service"] == "xhs-agent-runtime"
+    assert payload["status"] == "healthy"
+    assert payload["version"] == "0.1.0"
+    assert payload["api_contract"] == "local-runtime-v1"
+    assert payload["queue"] == "active"
+
+
+def test_private_network_preflight_sets_allow_header() -> None:
+    origin = "http://127.0.0.1:3000"
+
+    with TestClient(app) as client:
+        response = client.options(
+            "/health",
+            headers={
+                "Origin": origin,
+                "Access-Control-Request-Method": "GET",
+                "Access-Control-Request-Private-Network": "true",
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == origin
+    assert response.headers["access-control-allow-private-network"] == "true"
+
+
 def test_strategy_and_generate_enforce_stage_contract(isolated_db):
     with TestClient(app) as client:
         session_id = _create_session_via_api(client)

@@ -47,7 +47,7 @@ export function WorkspaceProvider({ children }: PropsWithChildren) {
   if (!ready) {
     return (
       <div className="flex h-screen items-center justify-center text-sm text-gray-400">
-        正在连接...
+        正在连接 Agent Runtime...
       </div>
     );
   }

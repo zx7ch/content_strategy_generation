@@ -59,7 +59,7 @@ async def test_worker_retry_backoff_then_failed_after_max_attempts(isolated_db):
     await _create_session(isolated_db, session_id)
 
     class RetryAlwaysOrchestrator:
-        async def run_job(self, job):
+        async def run_job(self, job, **kwargs):
             raise JobOrchestrationError(
                 "temporary failure",
                 error_code="LLM_TIMEOUT",
@@ -118,7 +118,7 @@ async def test_worker_replay_keeps_business_write_idempotent_with_upsert(isolate
         await conn.commit()
 
     class IdempotentWriteOrchestrator:
-        async def run_job(self, job):
+        async def run_job(self, job, **kwargs):
             async with aiosqlite.connect(isolated_db) as conn:
                 await conn.execute(
                     """
@@ -148,7 +148,14 @@ async def test_worker_replay_keeps_business_write_idempotent_with_upsert(isolate
         assert await worker.run_once() is True
 
     async with aiosqlite.connect(isolated_db) as conn:
+        # With auto-enqueue, both strategy and generate each run exactly once
+        # across the two run_once() calls (idempotent upsert prevents duplicates).
         async with conn.execute("SELECT COUNT(*) FROM business_side_effects") as cursor:
+            row = await cursor.fetchone()
+            assert row[0] == 2
+        async with conn.execute(
+            "SELECT COUNT(*) FROM business_side_effects WHERE job_type = 'strategy'"
+        ) as cursor:
             row = await cursor.fetchone()
             assert row[0] == 1
 
@@ -184,7 +191,7 @@ async def test_purged_session_cancels_paused_jobs_and_worker_skips_execution(iso
     await _create_session(isolated_db, session_id)
 
     class NoopOrchestrator:
-        async def run_job(self, job):
+        async def run_job(self, job, **kwargs):
             return {"job_id": job.id}
 
     async with JobStore(isolated_db) as store:

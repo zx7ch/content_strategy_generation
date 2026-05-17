@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from time import monotonic
-from typing import Any, Optional
+from typing import Any, Callable, List, Optional
 
 from app.services.web_search.models import CapabilityRequest, CapabilityResult, Evidence, ProviderDescriptor, SearchTraceEntry, SearchIntent
 from app.services.xhs_spider import SpiderPermanentError, SpiderTransientError, XHSPost, XHSSpiderClient
@@ -27,7 +27,7 @@ class XhsSpiderDiscoverProvider:
     def supports(self, capability: str, intent: SearchIntent) -> bool:
         return capability == "discover" and intent.platform == "xiaohongshu"
 
-    async def execute(self, request: CapabilityRequest) -> CapabilityResult:
+    async def execute(self, request: CapabilityRequest, *, on_page: Optional[Callable] = None) -> CapabilityResult:
         started = monotonic()
         descriptor = self.describe()
         if not self.supports(request.capability, request.intent):
@@ -48,7 +48,7 @@ class XhsSpiderDiscoverProvider:
             )
 
         try:
-            posts = await self.spider_client.search_with_retry(request.intent.query, num=request.limit)
+            posts = await self.spider_client.search_with_retry(request.intent.query, num=request.limit, on_page=on_page)
             evidences = [self._post_to_evidence(post, request.intent.query, request.intent.session_id) for post in posts]
             status = "success" if evidences else "empty"
             reason = None if evidences else "empty_result"

@@ -17,6 +17,10 @@ def test_settings_default_values() -> None:
     assert settings.SESSION_ALIVE_HOURS == 24
     assert settings.ALERT_JOB_SUCCESS_RATE_MIN == pytest.approx(0.99)
     assert settings.RAG_EMBEDDING_MODEL == "BAAI/bge-base-zh-v1.5"
+    assert settings.RUNTIME_SERVICE_NAME == "xhs-agent-runtime"
+    assert settings.RUNTIME_VERSION == "0.1.0"
+    assert settings.RUNTIME_API_CONTRACT == "local-runtime-v1"
+    assert settings.cors_allowed_origins == ["http://localhost:3000", "http://127.0.0.1:3000"]
 
 
 def test_settings_env_override(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -30,12 +34,20 @@ def test_settings_env_override(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) 
     monkeypatch.setenv("XHS_SESSION_ALIVE_HOURS", "48")
     monkeypatch.setenv("XHS_CHROMA_PERSIST_DIR", str(chroma_dir))
     monkeypatch.setenv("XHS_SQLITE_DB_PATH", str(sqlite_parent / "xhs_agent.db"))
+    monkeypatch.setenv(
+        "XHS_CORS_ALLOWED_ORIGINS",
+        "http://localhost:3000, https://xhs-growth-agent.vercel.app ",
+    )
 
     settings = Settings(_env_file=None)
     assert settings.LLM_PROVIDER == "deepseek"
     assert settings.XHS_SPIDER_MAX_RETRIES == 7
     assert settings.SESSION_ALIVE_HOURS == 48
     assert settings.CHROMA_PERSIST_DIR == str(chroma_dir)
+    assert settings.cors_allowed_origins == [
+        "http://localhost:3000",
+        "https://xhs-growth-agent.vercel.app",
+    ]
 
 
 def test_settings_validation_error(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -112,22 +112,79 @@ class JobWorker:
             event_name="task_progress",
             stage=job.job_type,
             payload={
-                "message": f"{job.job_type} job running",
-                "progress": 50,
+                "message": "正在生成内容策略..." if job.job_type == "strategy" else "AI 正在生成笔记内容...",
+                "progress": 20,
                 "error_code": None,
                 "details": {"job_status": "running"},
             },
         )
+        async def _progress(message: str) -> None:
+            await self.job_store.append_session_event(
+                session_id=job.session_id,
+                job_id=job.id,
+                event_name="task_progress",
+                stage=job.job_type,
+                payload={
+                    "message": message,
+                    "progress": None,
+                    "error_code": None,
+                    "details": {"job_status": "running"},
+                },
+            )
+
         try:
-            result = await self.orchestrator.run_job(job)
+            result = await self.orchestrator.run_job(job, progress_callback=_progress)
+
+            # Stage boundary cancel guard: job may have been cancelled via API while
+            # the orchestrator was running. Do not write a success result in that case.
+            current = await self.job_store.get_job(job.id)
+            if current is not None and current.status == "cancelled":
+                await self.job_store.append_session_event(
+                    session_id=job.session_id,
+                    job_id=job.id,
+                    event_name="task_cancelled",
+                    stage=job.job_type,
+                    payload={
+                        "message": "任务已取消",
+                        "progress": None,
+                        "error_code": None,
+                        "details": {"cancel_reason": current.cancel_reason},
+                    },
+                )
+                return JobExecutionResult(success=False, failed=False)
+
             await self.job_store.mark_succeeded(job.id)
+
+            # Auto-enqueue generate job immediately when strategy succeeds,
+            # eliminating the frontend SSE round-trip that previously triggered it.
+            if job.job_type == "strategy":
+                gen_job, created = await self.job_store.enqueue(
+                    session_id=job.session_id,
+                    job_type="generate",
+                    payload=None,
+                    idempotency_key=f"auto-generate:{job.session_id}",
+                )
+                if created:
+                    await self.job_store.append_session_event(
+                        session_id=job.session_id,
+                        job_id=gen_job.id,
+                        event_name="stage_changed",
+                        stage="generate",
+                        payload={
+                            "message": "正在准备笔记生成任务...",
+                            "progress": 0,
+                            "error_code": None,
+                            "details": {"to_stage": "generate", "job_status": gen_job.status},
+                        },
+                    )
+
             await self.job_store.append_session_event(
                 session_id=job.session_id,
                 job_id=job.id,
                 event_name="task_completed",
                 stage=job.job_type,
                 payload={
-                    "message": f"{job.job_type} job completed",
+                    "message": "策略分析完毕" if job.job_type == "strategy" else "笔记生成完毕",
                     "progress": 100,
                     "error_code": None,
                     "details": result if isinstance(result, dict) else {},
@@ -150,7 +207,7 @@ class JobWorker:
                     event_name="task_failed",
                     stage=job.job_type,
                     payload={
-                        "message": str(exc),
+                        "message": "遇到临时问题，正在自动重试...",
                         "progress": None,
                         "error_code": error_code,
                         "details": {"retry_scheduled": True},

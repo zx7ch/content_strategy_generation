@@ -5,7 +5,17 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Optional
+import asyncio
+from typing import Any, Awaitable, Callable, Optional
+
+ProgressCallback = Callable[[str], Awaitable[None]]
+
+
+async def _safe_notify(callback: ProgressCallback, message: str) -> None:
+    try:
+        await callback(message)
+    except Exception:
+        pass
 
 from app.config import settings
 from app.llm.client import LLMClient
@@ -100,7 +110,14 @@ class ContentStrategyAgent:
         self.analyzer = engagement_analyzer or EngagementAnalyzer()
         self.llm = llm_client or LLMClient()
 
-    async def execute(self, session_id: str) -> StrategyResult:
+    async def execute(self, session_id: str, *, progress_callback: Optional[ProgressCallback] = None) -> StrategyResult:
+        async def _notify(message: str) -> None:
+            if progress_callback is not None:
+                try:
+                    await progress_callback(message)
+                except Exception:
+                    pass
+
         async with self.session_manager as manager:
             session = await manager.get_session(session_id)
             if session is None:
@@ -113,7 +130,8 @@ class ContentStrategyAgent:
             await manager.update_session(session_id, stage=SessionStage.STRATEGY)
 
             try:
-                posts = await self._retrieve_data(session_id=session_id, user_query=session.user_query)
+                posts = await self._retrieve_data(session_id=session_id, user_query=session.user_query, progress_callback=progress_callback)
+                await _notify("搜索完成，开始建立内容索引...")
                 quality = await self._chunk_and_index(
                     session_id=session_id,
                     posts=posts,
@@ -122,19 +140,23 @@ class ContentStrategyAgent:
 
                 expanded_queries: list[str] = []
                 if self._should_expand(quality.score, quality.total_notes):
+                    await _notify("内容数量不足，正在补充搜索...")
                     posts, quality, expanded_queries = await self._expand_and_retry(
                         session_id=session_id,
                         user_query=session.user_query,
                         seed_posts=posts,
                         seed_quality=quality,
                     )
+                    await _notify(f"补充搜索完成，共 {len(posts)} 篇内容")
 
                 platform_preference = self.analyzer.analyze_platform_preferences(posts)
                 used_fallback = quality.score < settings.QUALITY_SCORE_THRESHOLD
 
                 if used_fallback:
+                    await _notify("数据不足，使用通用策略...")
                     strategy = await self._generate_generic_strategy(session.user_query)
                 else:
+                    await _notify("正在基于真实数据生成内容策略...")
                     strategy = await self._generate_data_driven_strategy(
                         user_query=session.user_query,
                         posts=posts,
@@ -195,7 +217,20 @@ class ContentStrategyAgent:
                     error_code=exc.error_code,
                 )
 
-    async def _retrieve_data(self, *, session_id: str, user_query: str, limit: int = 50) -> list[XHSPost]:
+    async def _retrieve_data(self, *, session_id: str, user_query: str, limit: int = 50, progress_callback: Optional[ProgressCallback] = None) -> list[XHSPost]:
+        on_page = None
+        if progress_callback is not None:
+            loop = asyncio.get_event_loop()
+            collected: list[int] = [0]
+
+            def on_page(batch: list) -> None:
+                collected[0] += len(batch)
+                count = collected[0]
+                asyncio.run_coroutine_threadsafe(
+                    _safe_notify(progress_callback, f"搜索到 {count} 篇相关内容..."),
+                    loop,
+                )
+
         batch = await self.search_orchestrator.discover(
             SearchIntent(
                 query=user_query,
@@ -205,6 +240,7 @@ class ContentStrategyAgent:
                 workflow_stage=SessionStage.STRATEGY.value,
             ),
             limit=limit,
+            on_page=on_page,
         )
         if not batch.items and batch.failure_reason in {"auth_required", "rate_limited", "permanent_error", "transient_error"}:
             raise StrategyExecutionError(

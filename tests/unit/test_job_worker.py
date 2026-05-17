@@ -29,7 +29,7 @@ async def test_execute_job_marks_failed_after_retry_budget_exhausted(isolated_db
     await _create_session(isolated_db, session_id)
 
     class AlwaysRetryOrchestrator:
-        async def run_job(self, job):
+        async def run_job(self, job, **kwargs):
             raise RetryableJobError("temporary failure", error_code="LLM_TIMEOUT")
 
     async with JobStore(isolated_db) as store:

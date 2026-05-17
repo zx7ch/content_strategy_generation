@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import uuid
 from datetime import datetime
 from time import monotonic
@@ -17,6 +18,8 @@ from app.config import settings
 from app.logging_config import get_logger, log_event
 from app.memory.job_store import JobStore, SessionEventRecord
 from app.memory.session_state import SessionManager
+from app.memory.thread_store import ThreadStore
+from app.services.creator_intent_router import ACTIVE_JOB_STATUSES, IntentContext, classify_intent
 from app.models.schemas import (
     CreateSessionResponse,
     EnqueueResponse,
@@ -77,6 +80,25 @@ from app.models.schemas import (
     V2PublishRecordCreateRequest,
     V2PublishRecordListResponse,
     V2PublishRecordResponse,
+    CreatorThreadCreateRequest,
+    CreatorThreadUpdateRequest,
+    CreatorThreadSummary,
+    CreatorThreadDetail,
+    CreatorMessageRecord,
+    CreatorThreadResponse,
+    CreatorThreadListResponse,
+    CreatorThreadDetailResponse,
+    CreatorThreadDeleteResponse,
+    CreatorMessageCreateRequest,
+    CreatorMessageResponse,
+    CreatorWorkflowRequest,
+    CreatorWorkflowResponse,
+    JobControlResponse,
+    PublishCandidate,
+    CompleteThreadResponse,
+    PublishCandidatesResponse,
+    GeneratedNoteItem,
+    ThreadResultResponse,
 )
 from app.models.session import Session, SessionLifecycleState, SessionStage
 from app.v2.auth import WorkspaceAuthError, resolve_workspace_principal
@@ -143,12 +165,21 @@ app = FastAPI(
 )
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?",
+    allow_origins=settings.cors_allowed_origins,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
+    allow_private_network=True,
 )
 _logger = get_logger(__name__, component="api")
+
+
+@app.middleware("http")
+async def add_private_network_access_header(request: Request, call_next):
+    response = await call_next(request)
+    if request.headers.get("access-control-request-private-network") == "true":
+        response.headers["Access-Control-Allow-Private-Network"] = "true"
+    return response
 
 
 @app.exception_handler(APIError)
@@ -609,6 +640,57 @@ def _get_v2_feedback_service(request: Request) -> FeedbackService:
     return service
 
 
+def _get_thread_store(request: Request) -> ThreadStore:
+    store = getattr(request.app.state, "thread_store", None)
+    if store is None:
+        raise APIError(
+            status_code=500,
+            error_code="THREAD_STORE_UNAVAILABLE",
+            error_message="Thread store is not initialized",
+            suggested_action="请通过应用 lifespan 初始化 thread store 后重试",
+        )
+    return store
+
+
+def _get_job_store(request: Request) -> JobStore:
+    store = getattr(request.app.state, "job_store", None)
+    if store is None:
+        raise APIError(
+            status_code=500,
+            error_code="JOB_STORE_UNAVAILABLE",
+            error_message="Job store is not initialized",
+            suggested_action="请通过应用 lifespan 初始化 job store 后重试",
+        )
+    return store
+
+
+async def _generate_thread_title(user_message: str) -> str:
+    """Use Haiku to summarise the user's first message into a short thread title.
+    Falls back to a 10-char hard truncation on any error."""
+    import anthropic as _anthropic
+
+    def _sync_call() -> str:
+        client = _anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+        response = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=20,
+            temperature=0.3,
+            system=(
+                "你是一个对话标题生成器。"
+                "根据用户消息，用10个字以内的中文短语概括其核心需求，作为对话标题。"
+                "直接输出标题文字，不加引号、标点或任何解释。"
+            ),
+            messages=[{"role": "user", "content": user_message[:200]}],
+        )
+        return response.content[0].text.strip()
+
+    try:
+        return await asyncio.to_thread(_sync_call)
+    except Exception:
+        raw = user_message.strip().replace("\n", " ")
+        return raw[:10] + "…" if len(raw) > 10 else raw
+
+
 def _resolve_workspace_principal_or_error(request: Request):
     try:
         return resolve_workspace_principal(request.headers)
@@ -971,7 +1053,7 @@ async def _enqueue_with_stage(
                 event_name="stage_changed",
                 stage=next_stage.value,
                 payload={
-                    "message": f"{job_type} job 已入队",
+                    "message": "正在准备笔记生成任务..." if job_type == "generate" else "策略分析任务已就绪，等待执行...",
                     "progress": 0,
                     "error_code": None,
                     "details": {"to_stage": next_stage.value, "job_status": job.status},
@@ -2227,6 +2309,85 @@ async def get_job_status(job_id: str) -> JobStatusResponse:
     )
 
 
+_SESSION_TO_THREAD_EVENT: dict[str, str] = {
+    "task_progress":   "workflow_task_progress",
+    "task_completed":  "workflow_task_completed",
+    "task_failed":     "workflow_task_failed",
+    "task_cancelled":  "workflow_cancelled",
+    "stage_changed":   "workflow_stage_changed",
+    "session_resumed": "workflow_resumed",
+    "session_paused":  "workflow_paused",
+}
+
+
+def _format_sse_thread_event(
+    record: SessionEventRecord,
+    thread_event_name: str,
+    thread_id: str,
+    *,
+    include_id: bool = True,
+) -> str:
+    lines: list[str] = []
+    if include_id:
+        lines.append(f"id: {record.event_id}")
+    lines.append(f"event: {thread_event_name}")
+    data = {
+        "event_id": record.event_id,
+        "thread_id": thread_id,
+        "session_id": record.session_id,
+        "job_id": record.job_id,
+        "stage": record.stage,
+        "event_name": thread_event_name,
+        "payload": record.payload,
+    }
+    lines.append(f"data: {json.dumps(data, ensure_ascii=False, default=str)}")
+    return "\n".join(lines) + "\n\n"
+
+
+async def _thread_event_stream(
+    request: Request,
+    *,
+    thread_id: str,
+    session_id: str,
+    job_store: JobStore,
+    last_event_id: Optional[int],
+) -> AsyncIterator[str]:
+    replay_events = await job_store.list_session_events(
+        session_id,
+        after_event_id=last_event_id,
+        limit=settings.SSE_REPLAY_LIMIT,
+    )
+    last_sent_event_id = last_event_id or 0
+    for record in replay_events:
+        thread_event_name = _SESSION_TO_THREAD_EVENT.get(record.event_name, record.event_name)
+        last_sent_event_id = record.event_id
+        yield _format_sse_thread_event(record, thread_event_name, thread_id)
+
+    heartbeat_deadline = monotonic() + settings.SSE_HEARTBEAT_SECONDS
+    poll_interval = min(0.2, settings.SSE_HEARTBEAT_SECONDS)
+    while not await request.is_disconnected():
+        live_events = await job_store.list_session_events(
+            session_id,
+            after_event_id=last_sent_event_id,
+            limit=settings.SSE_REPLAY_LIMIT,
+        )
+        if live_events:
+            for record in live_events:
+                thread_event_name = _SESSION_TO_THREAD_EVENT.get(record.event_name, record.event_name)
+                last_sent_event_id = record.event_id
+                yield _format_sse_thread_event(record, thread_event_name, thread_id)
+            heartbeat_deadline = monotonic() + settings.SSE_HEARTBEAT_SECONDS
+            continue
+
+        now = monotonic()
+        if now >= heartbeat_deadline:
+            yield ": heartbeat\n\n"
+            heartbeat_deadline = monotonic() + settings.SSE_HEARTBEAT_SECONDS
+            continue
+
+        await asyncio.sleep(min(poll_interval, heartbeat_deadline - now))
+
+
 async def _event_stream(
     request: Request,
     *,
@@ -2318,11 +2479,590 @@ async def stream_session_events(
     )
 
 
+@app.post("/threads", status_code=201)
+async def create_thread(
+    body: CreatorThreadCreateRequest, request: Request
+) -> CreatorThreadResponse:
+    store = _get_thread_store(request)
+    row = await store.create_thread(title=body.title)
+    return CreatorThreadResponse(
+        thread_id=row["id"],
+        title=row["title"],
+        status=row["status"],
+        active_workflow_session_id=row["active_workflow_session_id"],
+        active_job_id=row["active_job_id"],
+    )
+
+
+@app.get("/threads")
+async def list_threads(request: Request) -> CreatorThreadListResponse:
+    store = _get_thread_store(request)
+    rows = await store.list_threads()
+    items = [
+        CreatorThreadSummary(
+            thread_id=r["id"],
+            title=r["title"],
+            status=r["status"],
+            active_job_id=r["active_job_id"],
+            created_at=r["created_at"],
+            updated_at=r["updated_at"],
+        )
+        for r in rows
+    ]
+    return CreatorThreadListResponse(items=items)
+
+
+@app.get("/threads/{thread_id}")
+async def get_thread(thread_id: str, request: Request) -> CreatorThreadDetailResponse:
+    store = _get_thread_store(request)
+    row = await store.get_thread(thread_id)
+    if row is None:
+        raise APIError(
+            status_code=404,
+            error_code="THREAD_NOT_FOUND",
+            error_message=f"Thread {thread_id} not found",
+            suggested_action="请检查 thread_id 是否正确",
+        )
+    messages = await store.get_thread_messages(thread_id)
+    thread_detail = CreatorThreadDetail(
+        thread_id=row["id"],
+        title=row["title"],
+        status=row["status"],
+        active_workflow_session_id=row["active_workflow_session_id"],
+        active_job_id=row["active_job_id"],
+        accepted_at=row["accepted_at"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+    message_records = [
+        CreatorMessageRecord(
+            message_id=m["id"],
+            thread_id=m["thread_id"],
+            role=m["role"],
+            text=m["text"],
+            intent=m["intent"],
+            linked_session_id=m["linked_session_id"],
+            linked_job_id=m["linked_job_id"],
+            created_at=m["created_at"],
+        )
+        for m in messages
+    ]
+    return CreatorThreadDetailResponse(thread=thread_detail, messages=message_records)
+
+
+@app.patch("/threads/{thread_id}")
+async def update_thread(
+    thread_id: str, body: CreatorThreadUpdateRequest, request: Request
+) -> CreatorThreadResponse:
+    store = _get_thread_store(request)
+    row = await store.get_thread(thread_id)
+    if row is None:
+        raise APIError(
+            status_code=404,
+            error_code="THREAD_NOT_FOUND",
+            error_message=f"Thread {thread_id} not found",
+            suggested_action="请检查 thread_id 是否正确",
+        )
+    title = body.title.strip()
+    if not title:
+        raise APIError(
+            status_code=422,
+            error_code="INVALID_THREAD_TITLE",
+            error_message="Thread title cannot be empty",
+            suggested_action="请输入有效的对话名称",
+        )
+    await store.update_thread_title(thread_id, title)
+    updated = await store.get_thread(thread_id)
+    assert updated is not None
+    return CreatorThreadResponse(
+        thread_id=updated["id"],
+        title=updated["title"],
+        status=updated["status"],
+        active_workflow_session_id=updated["active_workflow_session_id"],
+        active_job_id=updated["active_job_id"],
+    )
+
+
+@app.delete("/threads/{thread_id}")
+async def delete_thread(thread_id: str, request: Request) -> CreatorThreadDeleteResponse:
+    thread_store = _get_thread_store(request)
+    job_store = _get_job_store(request)
+    row = await thread_store.get_thread(thread_id)
+    if row is None:
+        raise APIError(
+            status_code=404,
+            error_code="THREAD_NOT_FOUND",
+            error_message=f"Thread {thread_id} not found",
+            suggested_action="请检查 thread_id 是否正确",
+        )
+    active_session_id: Optional[str] = row["active_workflow_session_id"]
+    if active_session_id:
+        await job_store.cancel_session_jobs(active_session_id, reason="thread_deleted")
+    deleted = await thread_store.delete_thread(thread_id)
+    return CreatorThreadDeleteResponse(thread_id=thread_id, deleted=deleted)
+
+
+@app.post("/threads/{thread_id}/messages", status_code=201)
+async def append_thread_message(
+    thread_id: str, body: CreatorMessageCreateRequest, request: Request
+) -> CreatorMessageResponse:
+    thread_store = _get_thread_store(request)
+    job_store = _get_job_store(request)
+
+    thread = await thread_store.get_thread(thread_id)
+    if thread is None:
+        raise APIError(
+            status_code=404,
+            error_code="THREAD_NOT_FOUND",
+            error_message=f"Thread {thread_id} not found",
+            suggested_action="请检查 thread_id 是否正确",
+        )
+
+    active_session_id: Optional[str] = thread["active_workflow_session_id"]
+    active_job_id: Optional[str] = thread["active_job_id"]
+    active_job = None
+    if active_job_id:
+        active_job = await job_store.get_job(active_job_id)
+
+    has_active_job = active_job is not None and active_job.status in ACTIVE_JOB_STATUSES
+
+    intent = await classify_intent(
+        body.text,
+        IntentContext(
+            has_active_job=has_active_job,
+            active_job_status=active_job.status if active_job else None,
+        ),
+    )
+
+    job_action_result: Optional[dict] = None
+    if intent == "pause_job" and active_session_id:
+        count = await job_store.pause_session_jobs(active_session_id)
+        job_action_result = {
+            "action": "pause", "affected_jobs": count,
+            "session_id": active_session_id, "job_id": active_job_id,
+        }
+    elif intent == "resume_job" and active_session_id:
+        count = await job_store.resume_paused_jobs(active_session_id)
+        job_action_result = {
+            "action": "resume", "affected_jobs": count,
+            "session_id": active_session_id, "job_id": active_job_id,
+        }
+    elif intent == "cancel_job" and active_session_id:
+        count = await job_store.cancel_session_jobs(active_session_id, reason="user_cancelled")
+        job_action_result = {
+            "action": "cancel", "affected_jobs": count,
+            "session_id": active_session_id, "job_id": active_job_id,
+        }
+    elif intent == "ask_status":
+        job_action_result = {
+            "job_id": active_job_id,
+            "job_status": active_job.status if active_job else None,
+            "job_type": active_job.job_type if active_job else None,
+            "session_id": active_session_id,
+        }
+
+    # Auto-rename thread on first user message (placeholder titles start with "对话 ")
+    updated_title: Optional[str] = None
+    current_title: str = thread["title"]
+    is_placeholder = current_title.startswith("对话 ")
+    if is_placeholder:
+        prior_count = await thread_store.count_user_messages(thread_id)
+        if prior_count == 0:
+            updated_title = await _generate_thread_title(body.text)
+            await thread_store.update_thread_title(thread_id, updated_title)
+
+    msg_row = await thread_store.append_message(
+        thread_id=thread_id,
+        role="user",
+        text=body.text,
+        intent=intent,
+        linked_session_id=active_session_id,
+        linked_job_id=active_job_id,
+    )
+    message_record = CreatorMessageRecord(
+        message_id=msg_row["id"],
+        thread_id=msg_row["thread_id"],
+        role=msg_row["role"],
+        text=msg_row["text"],
+        intent=msg_row["intent"],
+        linked_session_id=msg_row["linked_session_id"],
+        linked_job_id=msg_row["linked_job_id"],
+        created_at=msg_row["created_at"],
+    )
+
+    # Generate and persist the assistant reply so it survives thread switches
+    _JOB_TYPE_LABEL = {"strategy": "策略生成", "generate": "笔记生成"}
+    _JOB_STATUS_LABEL = {
+        "running": "进行中", "paused": "已暂停",
+        "cancelled": "已中断", "succeeded": "已完成",
+    }
+    assistant_reply: Optional[str] = None
+    if intent == "pause_job":
+        assistant_reply = "已暂停当前任务。"
+    elif intent == "resume_job":
+        assistant_reply = "已恢复任务，继续执行中。"
+    elif intent == "cancel_job":
+        assistant_reply = "已取消当前任务。"
+    elif intent == "ask_status":
+        if active_job:
+            type_label = _JOB_TYPE_LABEL.get(active_job.job_type, active_job.job_type)
+            status_label = _JOB_STATUS_LABEL.get(active_job.status, active_job.status)
+            assistant_reply = f"当前任务：{type_label} · {status_label}"
+        else:
+            assistant_reply = "当前没有运行中的任务。"
+    elif intent == "add_constraint":
+        assistant_reply = "已收到，后台任务继续执行。"
+    elif intent == "free_chat":
+        assistant_reply = "已收到。如需生成内容，请描述你的具体需求。"
+
+    if assistant_reply:
+        await thread_store.append_message(
+            thread_id=thread_id,
+            role="assistant",
+            text=assistant_reply,
+            linked_session_id=active_session_id,
+            linked_job_id=active_job_id,
+        )
+
+    return CreatorMessageResponse(message=message_record, intent=intent,
+                                  job_action_result=job_action_result,
+                                  updated_title=updated_title,
+                                  assistant_reply=assistant_reply)
+
+
+@app.post("/threads/{thread_id}/workflow", status_code=201)
+async def start_thread_workflow(
+    thread_id: str, body: CreatorWorkflowRequest, request: Request
+) -> CreatorWorkflowResponse:
+    thread_store = _get_thread_store(request)
+    job_store = _get_job_store(request)
+
+    thread = await thread_store.get_thread(thread_id)
+    if thread is None:
+        raise APIError(
+            status_code=404,
+            error_code="THREAD_NOT_FOUND",
+            error_message=f"Thread {thread_id} not found",
+            suggested_action="请检查 thread_id 是否正确",
+        )
+
+    # TD-ALIGN4-1: always creates a new session — session reuse is ALIGN-5's responsibility
+    session_id = str(uuid.uuid4())
+    user_id = body.user_id or DEFAULT_USER_ID
+
+    # Step 1: create session (stage = INIT), matching POST /sessions pattern
+    async with SessionManager(settings.SQLITE_DB_PATH) as session_manager:
+        session = await session_manager.create_session(
+            session_id=session_id,
+            user_id=user_id,
+            user_query=body.user_query,
+            platform=body.platform,
+            mode=body.mode,
+        )
+    await job_store.append_session_event(
+        session_id=session_id,
+        event_name="task_progress",
+        stage=session.stage.value,
+        payload={"message": "正在准备创作任务...", "progress": 0, "error_code": None,
+                 "details": {"stage": session.stage.value}},
+    )
+
+    # Step 2: advance stage to STRATEGY + enqueue job, matching _enqueue_with_stage pattern
+    async with SessionManager(settings.SQLITE_DB_PATH) as session_manager:
+        await session_manager.touch_user_activity(session_id)
+        await session_manager.update_session(session_id, stage=SessionStage.STRATEGY)
+    log_event(
+        _logger,
+        event_name="stage_changed",
+        level="info",
+        component="api",
+        session_id=session_id,
+        stage=SessionStage.STRATEGY.value,
+        from_stage=session.stage.value,
+        to_stage=SessionStage.STRATEGY.value,
+        job_type="strategy",
+    )
+
+    job, created = await job_store.enqueue(
+        session_id=session_id,
+        job_type="strategy",
+        payload=None,
+        idempotency_key=None,
+    )
+    if created:
+        await job_store.append_session_event(
+            session_id=session_id,
+            job_id=job.id,
+            event_name="stage_changed",
+            stage=SessionStage.STRATEGY.value,
+            payload={"message": "策略分析任务已就绪，等待执行...", "progress": 5, "error_code": None,
+                     "details": {"to_stage": SessionStage.STRATEGY.value, "job_status": job.status}},
+        )
+
+    await thread_store.update_thread_active_job(
+        thread_id=thread_id,
+        session_id=session_id,
+        job_id=job.id,
+    )
+
+    return CreatorWorkflowResponse(
+        thread_id=thread_id,
+        session_id=session_id,
+        job_id=job.id,
+        stage="strategy",
+    )
+
+
+@app.get("/threads/{thread_id}/events")
+async def stream_thread_events(
+    thread_id: str,
+    request: Request,
+    last_event_id: Optional[str] = Header(default=None, alias="Last-Event-ID"),
+) -> StreamingResponse:
+    thread_store = _get_thread_store(request)
+    job_store = _get_job_store(request)
+
+    thread = await thread_store.get_thread(thread_id)
+    if thread is None:
+        raise APIError(
+            status_code=404,
+            error_code="THREAD_NOT_FOUND",
+            error_message=f"Thread {thread_id} not found",
+            suggested_action="请检查 thread_id 是否正确",
+        )
+
+    parsed_last_event_id = _parse_last_event_id(last_event_id)
+    session_id: Optional[str] = thread["active_workflow_session_id"]
+
+    if session_id is None:
+        async def _empty_stream() -> AsyncIterator[str]:
+            yield ": no active session\n\n"
+        return StreamingResponse(
+            _empty_stream(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        )
+
+    return StreamingResponse(
+        _thread_event_stream(
+            request,
+            thread_id=thread_id,
+            session_id=session_id,
+            job_store=job_store,
+            last_event_id=parsed_last_event_id,
+        ),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+    )
+
+
+_TERMINAL_JOB_STATUSES = frozenset({"succeeded", "failed", "cancelled"})
+
+
+@app.post("/jobs/{job_id}/pause", response_model=JobControlResponse)
+async def pause_job_endpoint(job_id: str, request: Request) -> JobControlResponse:
+    job_store = _get_job_store(request)
+    existing = await job_store.get_job(job_id)
+    if existing is None:
+        raise APIError(
+            status_code=404,
+            error_code="JOB_NOT_FOUND",
+            error_message=f"Job {job_id} not found",
+            suggested_action="请检查 job_id 是否正确",
+        )
+    if existing.status == "running":
+        raise APIError(
+            status_code=409,
+            error_code="JOB_RUNNING",
+            error_message="Job is currently running; only queued/retrying jobs can be paused",
+            suggested_action="等待 job 完成后再操作，或调用 cancel",
+        )
+    if existing.status in _TERMINAL_JOB_STATUSES:
+        raise APIError(
+            status_code=409,
+            error_code="JOB_TERMINAL",
+            error_message=f"Job is already in terminal state: {existing.status}",
+            suggested_action="该 job 已结束，无法暂停",
+        )
+    job = await job_store.pause_job(job_id)
+    assert job is not None
+    return JobControlResponse(job_id=job.id, session_id=job.session_id, status=job.status)
+
+
+@app.post("/jobs/{job_id}/resume", response_model=JobControlResponse)
+async def resume_job_endpoint(job_id: str, request: Request) -> JobControlResponse:
+    job_store = _get_job_store(request)
+    existing = await job_store.get_job(job_id)
+    if existing is None:
+        raise APIError(
+            status_code=404,
+            error_code="JOB_NOT_FOUND",
+            error_message=f"Job {job_id} not found",
+            suggested_action="请检查 job_id 是否正确",
+        )
+    if existing.status != "paused":
+        raise APIError(
+            status_code=409,
+            error_code="JOB_NOT_PAUSED",
+            error_message=f"Job cannot be resumed from status: {existing.status}",
+            suggested_action="只有 paused 状态的 job 可以恢复",
+        )
+    job = await job_store.resume_job(job_id)
+    assert job is not None
+    return JobControlResponse(job_id=job.id, session_id=job.session_id, status=job.status)
+
+
+@app.post("/jobs/{job_id}/cancel", response_model=JobControlResponse)
+async def cancel_job_endpoint(job_id: str, request: Request) -> JobControlResponse:
+    job_store = _get_job_store(request)
+    existing = await job_store.get_job(job_id)
+    if existing is None:
+        raise APIError(
+            status_code=404,
+            error_code="JOB_NOT_FOUND",
+            error_message=f"Job {job_id} not found",
+            suggested_action="请检查 job_id 是否正确",
+        )
+    if existing.status in _TERMINAL_JOB_STATUSES:
+        raise APIError(
+            status_code=409,
+            error_code="JOB_TERMINAL",
+            error_message=f"Job is already in terminal state: {existing.status}",
+            suggested_action="该 job 已结束，无法取消",
+        )
+    job = await job_store.cancel_job(job_id, reason="user_cancelled")
+    assert job is not None
+    return JobControlResponse(job_id=job.id, session_id=job.session_id, status=job.status)
+
+
+@app.post("/threads/{thread_id}/complete", status_code=200)
+async def complete_thread_endpoint(thread_id: str, request: Request) -> CompleteThreadResponse:
+    thread_store = _get_thread_store(request)
+    thread = await thread_store.get_thread(thread_id)
+    if thread is None:
+        raise APIError(
+            status_code=404,
+            error_code="THREAD_NOT_FOUND",
+            error_message=f"Thread {thread_id} not found",
+            suggested_action="请检查 thread_id 是否正确",
+        )
+
+    if thread["status"] == "accepted":
+        count = await thread_store.count_publish_candidates(thread_id)
+        return CompleteThreadResponse(thread_id=thread_id, status="accepted", publish_candidate_count=count)
+
+    session_id: Optional[str] = thread.get("active_workflow_session_id")
+    candidates: list[dict] = []
+    if session_id:
+        try:
+            import aiosqlite as _aiosqlite
+            from app.memory.session_data_store import SessionDataStore as _SessionDataStore
+
+            async with _aiosqlite.connect(settings.SQLITE_DB_PATH) as _conn:
+                _conn.row_factory = _aiosqlite.Row
+                _ds = _SessionDataStore(_conn)
+                await _ds.init_tables()
+                notes = await _ds.get_generated_notes(session_id, note_ids=None)
+                candidates = [
+                    {
+                        "note_id": n.note_id,
+                        "title": n.title,
+                        "content": n.content,
+                        "tags": getattr(n, "tags", []) or [],
+                    }
+                    for n in notes
+                ]
+        except Exception:
+            pass
+
+    await thread_store.complete_thread(thread_id)
+    if candidates:
+        await thread_store.save_publish_candidates(thread_id, session_id, candidates)
+
+    count = await thread_store.count_publish_candidates(thread_id)
+    return CompleteThreadResponse(thread_id=thread_id, status="accepted", publish_candidate_count=count)
+
+
+@app.get("/publish-candidates")
+async def list_publish_candidates_endpoint(request: Request) -> PublishCandidatesResponse:
+    thread_store = _get_thread_store(request)
+    rows = await thread_store.list_publish_candidates()
+    items = [
+        PublishCandidate(
+            candidate_id=r["candidate_id"],
+            thread_id=r["thread_id"],
+            session_id=r["session_id"],
+            note_id=r["note_id"],
+            title=r["title"],
+            content=r["content"],
+            tags=r["tags"].split(",") if r["tags"] else [],
+            created_at=r["created_at"],
+        )
+        for r in rows
+    ]
+    return PublishCandidatesResponse(items=items)
+
+
+@app.get("/threads/{thread_id}/result")
+async def get_thread_result_endpoint(thread_id: str, request: Request) -> ThreadResultResponse:
+    thread_store = _get_thread_store(request)
+    thread = await thread_store.get_thread(thread_id)
+    if thread is None:
+        raise APIError(
+            status_code=404,
+            error_code="THREAD_NOT_FOUND",
+            error_message=f"Thread {thread_id} not found",
+            suggested_action="请检查 thread_id 是否正确",
+        )
+
+    session_id: Optional[str] = thread.get("active_workflow_session_id")
+    if not session_id:
+        return ThreadResultResponse(thread_id=thread_id, session_id=None, strategy=None, notes=[])
+
+    strategy_dict: Optional[dict] = None
+    notes_list: list[GeneratedNoteItem] = []
+    try:
+        import aiosqlite as _aiosqlite
+        from app.memory.session_data_store import SessionDataStore as _SessionDataStore
+
+        async with _aiosqlite.connect(settings.SQLITE_DB_PATH) as _conn:
+            _conn.row_factory = _aiosqlite.Row
+            _ds = _SessionDataStore(_conn)
+            await _ds.init_tables()
+            try:
+                strategy, _pref, _sid = await _ds.get_strategy(session_id, None)
+                strategy_dict = strategy.model_dump() if strategy else None
+            except Exception:
+                pass
+            notes = await _ds.get_generated_notes(session_id, note_ids=None)
+            notes_list = [
+                GeneratedNoteItem(
+                    note_id=n.note_id,
+                    title=n.title,
+                    content=n.content,
+                    tags=getattr(n, "tags", []) or [],
+                )
+                for n in notes
+            ]
+    except Exception:
+        pass
+
+    return ThreadResultResponse(
+        thread_id=thread_id,
+        session_id=session_id,
+        strategy=strategy_dict,
+        notes=notes_list,
+    )
+
+
 @app.get("/health")
 @app.head("/health")
 async def health_check() -> dict[str, Any]:
     return {
+        "service": settings.RUNTIME_SERVICE_NAME,
         "status": "healthy",
+        "version": settings.RUNTIME_VERSION,
+        "api_contract": settings.RUNTIME_API_CONTRACT,
         "timestamp": datetime.utcnow().isoformat(),
         "queue": "active",
     }

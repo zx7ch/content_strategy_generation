@@ -933,3 +933,135 @@ class RAGDocument(BaseModel):
     tags: List[str] = Field(default_factory=list)
     embedding_vector: Optional[List[float]] = None
     engagement_score: float = 0.0
+
+
+# ---------------------------------------------------------------------------
+# ALIGN-3: Creator thread / message schemas
+# ---------------------------------------------------------------------------
+
+class CreatorThreadCreateRequest(BaseModel):
+    title: Optional[str] = None
+
+
+class CreatorThreadUpdateRequest(BaseModel):
+    title: str = Field(..., min_length=1, max_length=80)
+
+
+class CreatorThreadSummary(BaseModel):
+    thread_id: str
+    title: str
+    status: str
+    active_job_id: Optional[str] = None
+    created_at: str
+    updated_at: str
+
+
+class CreatorThreadDetail(BaseModel):
+    thread_id: str
+    title: str
+    status: str
+    active_workflow_session_id: Optional[str] = None
+    active_job_id: Optional[str] = None
+    accepted_at: Optional[str] = None
+    created_at: str
+    updated_at: str
+
+
+class CreatorMessageRecord(BaseModel):
+    message_id: str
+    thread_id: str
+    role: str
+    text: str
+    intent: Optional[str] = None
+    linked_session_id: Optional[str] = None
+    linked_job_id: Optional[str] = None
+    created_at: str
+
+
+class CreatorThreadResponse(BaseModel):
+    thread_id: str
+    title: str
+    status: str
+    active_workflow_session_id: Optional[str] = None
+    active_job_id: Optional[str] = None
+
+
+class CreatorThreadListResponse(BaseModel):
+    items: List[CreatorThreadSummary]
+
+
+class CreatorThreadDetailResponse(BaseModel):
+    thread: CreatorThreadDetail
+    messages: List[CreatorMessageRecord]
+
+
+class CreatorThreadDeleteResponse(BaseModel):
+    thread_id: str
+    deleted: bool
+
+
+class CreatorMessageCreateRequest(BaseModel):
+    text: str
+
+
+class CreatorMessageResponse(BaseModel):
+    message: CreatorMessageRecord
+    intent: str
+    job_action_result: Optional[Dict[str, Any]] = None
+    updated_title: Optional[str] = None
+    assistant_reply: Optional[str] = None
+
+
+class CreatorWorkflowRequest(BaseModel):
+    user_query: str
+    platform: str = "xiaohongshu"
+    mode: str = "editing"
+    user_id: Optional[str] = None
+
+
+class CreatorWorkflowResponse(BaseModel):
+    thread_id: str
+    session_id: str
+    job_id: str
+    stage: str
+
+
+class JobControlResponse(BaseModel):
+    job_id: str
+    session_id: str
+    status: str
+
+
+class PublishCandidate(BaseModel):
+    candidate_id: str
+    thread_id: str
+    session_id: str
+    note_id: str
+    title: str
+    content: str
+    tags: List[str]
+    created_at: str
+
+
+class CompleteThreadResponse(BaseModel):
+    thread_id: str
+    status: str
+    publish_candidate_count: int
+
+
+class PublishCandidatesResponse(BaseModel):
+    items: List[PublishCandidate]
+
+
+class GeneratedNoteItem(BaseModel):
+    note_id: str
+    title: str
+    content: str
+    tags: List[str] = Field(default_factory=list)
+
+
+class ThreadResultResponse(BaseModel):
+    thread_id: str
+    session_id: Optional[str]
+    strategy: Optional[Dict[str, Any]]
+    notes: List[GeneratedNoteItem]

@@ -47,6 +47,33 @@ npm run dev
 
 默认首页会重定向到 `/brands`。
 
+## Vercel 部署
+
+前端正式部署时，Vercel 只托管 Next.js UI；Agent Runtime 仍运行在用户本机。
+
+Vercel 项目配置：
+
+- Root Directory: `frontend`
+- Framework Preset: `Next.js`
+- Install Command: `npm install`
+- Build Command: `npm run build`
+- Output Directory: 使用 Vercel 默认值
+
+生产环境变量：
+
+```bash
+NEXT_PUBLIC_XHS_API_BASE_URL=http://127.0.0.1:8000
+NEXT_PUBLIC_XHS_AUTH_TOKEN=
+```
+
+部署完成后，需要把 Vercel 生产域名加入本地后端 `.env`：
+
+```bash
+XHS_CORS_ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:3000,https://your-app.vercel.app
+```
+
+浏览器访问 Vercel 页面后，会从用户自己的机器访问 `http://127.0.0.1:8000`。因此 Vercel 服务端不能调用本地 runtime，依赖本地 runtime 的页面必须在浏览器端发起请求。
+
 ## 可选环境变量
 
 若要让前端读取真实 V2 API，可设置：
@@ -58,8 +85,7 @@ NEXT_PUBLIC_XHS_AUTH_TOKEN=<optional-when-v2-auth-enabled>
 
 说明：
 
-- `/brands` 与 `/brands/[id]` 为 SSR live 页面，会在服务端通过 `GET /workspaces/default` 解析默认 workspace。
-- 客户端页面仍通过 `WorkspaceProvider` 初始化 runtime workspace context。
+- `/brands` 与 `/brands/[id]` 等 live 页面应通过浏览器端请求本地 runtime。
+- 客户端页面通过 `WorkspaceProvider` 初始化 runtime workspace context。
 - 若后端启动正常，前端本地联调不需要手工配置 `workspace_id` / `user_id`。
-- 服务端路由和品牌详情页也兼容同名非 `NEXT_PUBLIC_` 变量。
 - 正式开发完成后的页面不应因为 API 失败而自动改用 mock 数据；应显示真实错误并提供可理解的重试路径。
