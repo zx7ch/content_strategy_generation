@@ -21,6 +21,8 @@ This isn't a cost optimization. It's an architectural boundary: orchestration be
 
 **Requirements**: Python 3.10+, macOS or Linux
 
+> **First-time install note**: `setup_env.sh` installs `sentence-transformers` and `torch` for local embedding. Expect 5–10 minutes on first install. On the first strategy run, the embedding model (~400 MB) downloads automatically — subsequent runs start in seconds.
+
 ```bash
 # 1. Setup
 ./setup_env.sh && source .venv/bin/activate
@@ -45,7 +47,7 @@ Open the frontend (`cd frontend && npm run dev`) — the browser auto-detects th
 
 **Creator Workbench** (`/creator`)
 
-Chat-first content creation. Send a message, a multi-stage workflow runs in the background — spider search, RAG indexing, strategy generation, note generation — while the chat window stays interactive. Task controls (pause, resume, cancel) are real backend operations backed by persistent job state, not UI-only changes.
+Chat-first content creation. Send a message, a multi-stage workflow-v2 run starts in the background — spider search, RAG indexing, strategy generation, note generation — while the chat window stays interactive. Task controls (pause, resume, cancel) are real backend operations backed by persistent workflow state, not UI-only changes.
 
 **Workspace Console** (`/brands`, `/topic-pool`, `/decisions`, `/publish`)
 
@@ -85,6 +87,24 @@ Brand growth operating loop. Manage data sources, topic pool decisions, publish 
 | Pause | Click the stop button in the task strip, or type "暂停" |
 | Resume | Click resume in the task strip, or type "继续" |
 | Cancel and restart | Type "取消" or click cancel, then start a new message with updated requirements |
+
+### Creator workflow-v2 API contract
+
+Natural-language intent goes through the message endpoint:
+
+```text
+POST /threads/{thread_id}/messages
+```
+
+The response includes `command_result` and `active_run_snapshot`. The frontend restores state from:
+
+```text
+GET /threads/{thread_id}/timeline
+GET /workflow-runs/{run_id}/snapshot
+GET /workflow-runs/{run_id}/events
+```
+
+`POST /threads/{thread_id}/workflow` remains as a legacy compatibility endpoint for old callers. It now forwards to the workflow-v2 message/orchestrator path and returns the created `run_id`; new tasks must not use old session/job fields as the source of truth.
 
 ---
 
@@ -180,6 +200,14 @@ pytest tests/integration -q  # integration tests
 pytest tests/e2e -q          # end-to-end tests
 pytest -q                    # all
 ```
+
+---
+
+## Discussion & Contributing
+
+If you're working on similar problems — local-first agent runtimes, resumable job queues, context assembly for long-running workflows, or the local orchestration + cloud inference boundary — feel free to open a [GitHub Discussion](../../discussions). Questions, alternative approaches, and critiques are all welcome.
+
+For bugs and feature requests, open an issue. For pull requests, please open an issue first to align on the change before writing code.
 
 ---
 
