@@ -9,6 +9,9 @@ import pytest
 from app.config import settings
 from app.memory.job_store import JobStore
 from app.memory.session_state import SessionManager
+from app.memory.workflow_store import WorkflowStore
+from app.models.workflow import WorkflowPhase, WorkflowStepStatus
+from app.services.workflow_run_manager import WorkflowRunManager
 
 
 async def _create_session(db_path: str, session_id: str) -> None:
@@ -280,3 +283,113 @@ async def test_pause_job_not_found_returns_none(isolated_db):
     async with JobStore(isolated_db) as store:
         result = await store.pause_job("does-not-exist")
         assert result is None
+
+
+@pytest.mark.asyncio
+async def test_enqueue_persists_workflow_refs(isolated_db):
+    session_id = str(uuid.uuid4())
+    await _create_session(isolated_db, session_id)
+
+    async with JobStore(isolated_db) as store:
+        job, created = await store.enqueue(
+            session_id=session_id,
+            job_type="strategy",
+            payload={"step_name": "strategy.llm_synthesize"},
+            run_id="run-1",
+            step_id="step-1",
+            child_task_id="child-1",
+        )
+
+    assert created is True
+    assert job.run_id == "run-1"
+    assert job.step_id == "step-1"
+    assert job.child_task_id == "child-1"
+    assert job.payload["step_name"] == "strategy.llm_synthesize"
+
+
+@pytest.mark.asyncio
+async def test_recover_expired_workflow_job_syncs_step_retrying(isolated_db):
+    session_id = str(uuid.uuid4())
+    await _create_session(isolated_db, session_id)
+    async with WorkflowRunManager(isolated_db) as manager:
+        run = await manager.start_run(thread_id="thread-1", user_id="u1")
+        steps = await manager.initialize_steps(
+            run.run_id,
+            [{"step_name": "strategy.llm_synthesize", "phase": WorkflowPhase.STRATEGY}],
+        )
+
+    async with JobStore(isolated_db) as store:
+        job, _ = await store.enqueue(
+            session_id=session_id,
+            job_type="strategy",
+            payload={"step_name": "strategy.llm_synthesize"},
+            run_id=run.run_id,
+            step_id=steps[0].step_id,
+            max_attempts=3,
+        )
+        leased = await store.lease_one(lease_seconds=1)
+        assert leased is not None
+        async with WorkflowRunManager(isolated_db) as manager:
+            await manager.start_step(run.run_id, "strategy.llm_synthesize", job_id=leased.id)
+        await store._conn.execute(
+            "UPDATE jobs SET lease_expires_at = DATETIME(CURRENT_TIMESTAMP, '-10 seconds') WHERE id = ?",
+            (job.id,),
+        )
+        await store._conn.commit()
+
+        recovered = await store.recover_expired_running_jobs()
+        refreshed_job = await store.get_job(job.id)
+
+    async with WorkflowStore(isolated_db) as workflow_store:
+        refreshed_step = await workflow_store.get_step(steps[0].step_id)
+
+    assert recovered == 1
+    assert refreshed_job is not None
+    assert refreshed_job.status == "retrying"
+    assert refreshed_step is not None
+    assert refreshed_step.status == WorkflowStepStatus.RETRYING
+    assert refreshed_step.error_code == "LEASE_EXPIRED"
+
+
+@pytest.mark.asyncio
+async def test_recover_expired_workflow_job_syncs_step_failed_when_budget_exhausted(isolated_db):
+    session_id = str(uuid.uuid4())
+    await _create_session(isolated_db, session_id)
+    async with WorkflowRunManager(isolated_db) as manager:
+        run = await manager.start_run(thread_id="thread-1", user_id="u1")
+        steps = await manager.initialize_steps(
+            run.run_id,
+            [{"step_name": "strategy.llm_synthesize", "phase": WorkflowPhase.STRATEGY}],
+        )
+
+    async with JobStore(isolated_db) as store:
+        job, _ = await store.enqueue(
+            session_id=session_id,
+            job_type="strategy",
+            payload={"step_name": "strategy.llm_synthesize"},
+            run_id=run.run_id,
+            step_id=steps[0].step_id,
+            max_attempts=1,
+        )
+        leased = await store.lease_one(lease_seconds=1)
+        assert leased is not None
+        async with WorkflowRunManager(isolated_db) as manager:
+            await manager.start_step(run.run_id, "strategy.llm_synthesize", job_id=leased.id)
+        await store._conn.execute(
+            "UPDATE jobs SET lease_expires_at = DATETIME(CURRENT_TIMESTAMP, '-10 seconds') WHERE id = ?",
+            (job.id,),
+        )
+        await store._conn.commit()
+
+        recovered = await store.recover_expired_running_jobs()
+        refreshed_job = await store.get_job(job.id)
+
+    async with WorkflowStore(isolated_db) as workflow_store:
+        refreshed_step = await workflow_store.get_step(steps[0].step_id)
+
+    assert recovered == 1
+    assert refreshed_job is not None
+    assert refreshed_job.status == "failed"
+    assert refreshed_step is not None
+    assert refreshed_step.status == WorkflowStepStatus.FAILED
+    assert refreshed_step.error_code == "LEASE_EXPIRED"
