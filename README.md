@@ -49,9 +49,36 @@ Open the frontend (`cd frontend && npm run dev`) — the browser auto-detects th
 
 Chat-first content creation. Send a message, a multi-stage workflow-v2 run starts in the background — spider search, RAG indexing, strategy generation, note generation — while the chat window stays interactive. Task controls (pause, resume, cancel) are real backend operations backed by persistent workflow state, not UI-only changes.
 
+![CreatorWorkbench](docs/images/creator_workbench.png)
+
 **Workspace Console** (`/brands`, `/topic-pool`, `/decisions`, `/publish`)
 
 Brand growth operating loop. Manage data sources, topic pool decisions, publish records, and performance feedback. All data reads happen from the browser directly to the local runtime — the Vercel server never proxies calls to your local machine.
+
+![WorkspaceTopicPool](docs/images/topic_pool.png)
+
+---
+
+### Brand Data Flywheel
+
+The Workspace Console is not just a place to store generated notes. It is where the brand slowly gets smarter.
+
+Each run leaves something behind: source materials, topic decisions, generated notes, publish records, performance signals, and small lessons about what worked. Instead of disappearing into chat history, these outputs become structured brand memory — reusable context for the next strategy run.
+
+In other words, the system does not start from a blank prompt every time.
+
+The loop looks like this:
+
+1. **Ingest** — collect competitor notes, search results, historical content, and user feedback.
+2. **Index** — clean, tag, embed, and organize the material into a searchable local knowledge base.
+3. **Strategize** — turn accumulated brand context into topic directions, positioning, and content angles.
+4. **Create** — generate note drafts and publish candidates from the selected strategy.
+5. **Publish** — record what was published, where it came from, and which topic or strategy it belongs to.
+6. **Learn** — feed engagement, conversion, and review insights back into the brand memory.
+
+This is the main difference between a one-off AI content generator and a brand growth system: every source, decision, draft, publish record, and performance signal makes the next run less generic. The brand does not just produce more content — it compounds context.
+
+![brand_data_flywheel](docs/images/brand_data_flywheel.png)
 
 ---
 
