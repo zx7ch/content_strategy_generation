@@ -13,6 +13,7 @@ from app.config import settings
 from app.memory.job_store import JobRecord
 from app.memory.session_state import SessionManager
 from app.models.session import SessionLifecycleState
+from app.services.step_executors import StepExecutorRegistry, UnsupportedWorkflowStepError
 
 
 class JobOrchestrationError(RuntimeError):
@@ -43,13 +44,20 @@ class Orchestrator:
         db_path: Optional[str] = None,
         strategy_runner: Optional[Runner] = None,
         generation_runner: Optional[Runner] = None,
+        step_executor_registry: Optional[StepExecutorRegistry] = None,
     ):
         self.db_path = db_path or settings.SQLITE_DB_PATH
         self._strategy_runner = strategy_runner or self._run_strategy_job
         self._generation_runner = generation_runner or self._run_generation_job
+        self._step_executor_registry = step_executor_registry or StepExecutorRegistry()
 
     async def run_job(self, job: JobRecord, *, progress_callback: Optional[ProgressCallback] = None) -> dict[str, Any]:
         """Validate session state then execute strategy/generation job."""
+        if job.run_id:
+            # WorkflowRun jobs are the new execution truth and intentionally do
+            # not require a legacy session row.
+            return await self.run_workflow_step(job)
+
         async with SessionManager(self.db_path) as session_manager:
             session = await session_manager.get_session(job.session_id)
             if session is None:
@@ -81,6 +89,41 @@ class Orchestrator:
             error_code="JOB_TYPE_UNSUPPORTED",
             retryable=False,
         )
+
+    async def run_workflow_step(self, job: JobRecord) -> dict[str, Any]:
+        """Execute a workflow-bound job through the step executor registry."""
+        if not job.run_id:
+            raise JobOrchestrationError(
+                "Workflow job missing run_id",
+                error_code="WORKFLOW_RUN_ID_MISSING",
+                retryable=False,
+            )
+        step_name = job.payload.get("step_name")
+        if not step_name:
+            raise JobOrchestrationError(
+                "Workflow job missing step_name",
+                error_code="WORKFLOW_STEP_NAME_MISSING",
+                retryable=False,
+            )
+        try:
+            result = await self._step_executor_registry.execute(
+                run_id=job.run_id,
+                step_name=str(step_name),
+            )
+        except UnsupportedWorkflowStepError as exc:
+            raise JobOrchestrationError(
+                str(exc),
+                error_code=exc.error_code,
+                retryable=exc.retryable,
+            ) from exc
+
+        return {
+            "success": True,
+            "step_name": result.step_name,
+            "artifact_refs": result.artifact_refs,
+            "child_task_refs": result.child_task_refs,
+            "skipped_child_tasks": result.skipped_child_tasks,
+        }
 
     async def _run_strategy_job(self, session_id: str, payload: dict[str, Any], *, progress_callback: Optional[ProgressCallback] = None) -> dict[str, Any]:
         del payload  # reserved for future strategy options

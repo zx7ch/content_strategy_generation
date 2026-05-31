@@ -110,6 +110,100 @@ class ContentStrategyAgent:
         self.analyzer = engagement_analyzer or EngagementAnalyzer()
         self.llm = llm_client or LLMClient()
 
+    async def plan_queries_step(self, context) -> dict[str, Any]:
+        """Canonical runner for discovery.plan_queries."""
+        query = context.user_request or ""
+        return {"primary_query": query, "queries": [query] if query else []}
+
+    async def spider_search_step(self, context) -> list[dict[str, Any]]:
+        """Canonical runner for discovery.spider_search."""
+        posts = await self._retrieve_data(
+            session_id=context.run["run_id"],
+            user_query=context.user_request or "",
+        )
+        return [post.model_dump(mode="json") for post in posts]
+
+    async def assess_source_quality_step(self, context) -> dict[str, Any]:
+        """Canonical runner for discovery.assess_source_quality."""
+        posts = self._posts_from_context(context)
+        return {
+            "total_notes": len(posts),
+            "quality_hint": "sufficient" if len(posts) >= settings.EXPANSION_DOC_COUNT_MAX else "limited",
+        }
+
+    async def expand_queries_step(self, context) -> dict[str, Any]:
+        """Canonical runner for discovery.expand_queries."""
+        posts = self._posts_from_context(context)
+        queries = await self._generate_expanded_queries(
+            original_query=context.user_request or "",
+            doc_count=len(posts),
+            quality_score=0.0,
+            expansion_count=0,
+            existing_queries=[context.user_request or ""],
+        )
+        return {"queries": queries}
+
+    async def persist_sources_step(self, context) -> dict[str, Any]:
+        """Canonical runner for discovery.persist_sources."""
+        return {"items": [post.model_dump(mode="json") for post in self._posts_from_context(context)]}
+
+    async def rag_index_step(self, context) -> dict[str, Any]:
+        """Canonical runner for retrieval.rag_index."""
+        posts = self._posts_from_context(context)
+        quality = await self._chunk_and_index(
+            session_id=context.run["run_id"],
+            posts=posts,
+            query=context.user_request or "",
+        )
+        return quality.model_dump(mode="json") if hasattr(quality, "model_dump") else dict(quality.__dict__)
+
+    async def rag_retrieve_step(self, context) -> dict[str, Any]:
+        """Canonical runner for retrieval.rag_retrieve."""
+        return {
+            "query": context.user_request,
+            "source_artifact_ids": [
+                artifact.get("artifact_id")
+                for artifact in context.source_context.get("artifacts", [])
+            ],
+            "rag_artifact_ids": [
+                artifact.get("artifact_id")
+                for artifact in context.rag_context.get("artifacts", [])
+            ],
+        }
+
+    async def prepare_prompt_step(self, context) -> dict[str, Any]:
+        """Canonical runner for strategy.prepare_prompt."""
+        return {
+            "user_query": context.user_request,
+            "constraint_count": len(context.constraints),
+            "source_count": len(self._posts_from_context(context)),
+        }
+
+    async def llm_synthesize_step(self, context) -> dict[str, Any]:
+        """Canonical runner for strategy.llm_synthesize."""
+        posts = self._posts_from_context(context)
+        if posts:
+            platform_preference = self.analyzer.analyze_platform_preferences(posts)
+            strategy = await self._generate_data_driven_strategy(
+                user_query=context.user_request or "",
+                posts=posts,
+                platform_pref=platform_preference,
+            )
+        else:
+            strategy = await self._generate_generic_strategy(context.user_request or "通用内容")
+        return strategy.model_dump(mode="json")
+
+    async def validate_strategy_step(self, context) -> dict[str, Any]:
+        """Canonical runner for strategy.validate_strategy."""
+        strategy_artifact = self._latest_artifact_payload(context, "strategy")
+        required = {"positioning", "target_audience", "content_pillars"}
+        missing = sorted(required - set(strategy_artifact))
+        return {"valid": not missing, "missing": missing, "strategy": strategy_artifact}
+
+    async def persist_strategy_step(self, context) -> dict[str, Any]:
+        """Canonical runner for strategy.persist_strategy."""
+        return self._latest_artifact_payload(context, "strategy")
+
     async def execute(self, session_id: str, *, progress_callback: Optional[ProgressCallback] = None) -> StrategyResult:
         async def _notify(message: str) -> None:
             if progress_callback is not None:
@@ -446,6 +540,51 @@ class ContentStrategyAgent:
                 return parsed
 
         raise ValueError("LLM response is not valid JSON object")
+
+    @staticmethod
+    def _latest_artifact_payload(context, artifact_type: str) -> dict[str, Any]:
+        for artifact in reversed(context.input_artifacts or context.prior_artifacts):
+            if artifact.get("artifact_type") == artifact_type and isinstance(artifact.get("payload_json"), dict):
+                return dict(artifact["payload_json"])
+        return {}
+
+    @staticmethod
+    def _posts_from_context(context) -> list[XHSPost]:
+        posts: list[XHSPost] = []
+        source_artifacts = context.source_context.get("artifacts", []) or []
+        if not source_artifacts:
+            source_artifacts = [
+                artifact
+                for artifact in context.input_artifacts or context.prior_artifacts
+                if artifact.get("artifact_type") == "source_snapshot"
+            ]
+        for artifact in source_artifacts:
+            payload = artifact.get("payload_json") or {}
+            items = payload.get("items", payload if isinstance(payload, list) else [])
+            if isinstance(items, dict):
+                items = [items]
+            for item in items or []:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    posts.append(XHSPost.model_validate(item))
+                except Exception:
+                    posts.append(
+                        XHSPost(
+                            note_id=str(item.get("note_id") or item.get("id") or item.get("title") or "source"),
+                            title=str(item.get("title") or "无标题"),
+                            content=str(item.get("content") or item.get("content_text") or ""),
+                            author=str(item.get("author") or ""),
+                            tags=[str(tag) for tag in item.get("tags", [])],
+                            liked_count=int(item.get("liked_count") or 0),
+                            collected_count=int(item.get("collected_count") or 0),
+                            comment_count=int(item.get("comment_count") or 0),
+                            share_count=int(item.get("share_count") or 0),
+                            note_url=str(item.get("note_url") or item.get("source_url") or ""),
+                            images=[str(image) for image in item.get("images", [])],
+                        )
+                    )
+        return posts
 
     @staticmethod
     def _evidence_to_post(evidence: Any) -> Optional[XHSPost]:

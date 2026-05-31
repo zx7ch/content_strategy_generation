@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import uuid
+import json
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 
 import aiosqlite
 
 from app.logging_config import get_logger
+from app.memory.workflow_store import ensure_column
 
 
 def _now_iso() -> str:
@@ -56,18 +58,37 @@ class ThreadStore:
             """
             CREATE TABLE IF NOT EXISTS creator_threads (
                 id TEXT PRIMARY KEY,
+                workspace_id TEXT,
+                brand_id TEXT,
                 title TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'active',
                 active_workflow_session_id TEXT,
                 active_job_id TEXT,
+                active_run_id TEXT,
                 accepted_at TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
             """
         )
+        await ensure_column(
+            self._conn,
+            table_name="creator_threads",
+            column_name="active_run_id",
+            column_sql="active_run_id TEXT",
+        )
+        for column_name in ("workspace_id", "brand_id"):
+            await ensure_column(
+                self._conn,
+                table_name="creator_threads",
+                column_name=column_name,
+                column_sql=f"{column_name} TEXT",
+            )
         await self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_threads_created ON creator_threads(created_at DESC)"
+        )
+        await self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_threads_scope ON creator_threads(workspace_id, brand_id, created_at DESC)"
         )
         await self._conn.execute(
             """
@@ -76,13 +97,27 @@ class ThreadStore:
                 thread_id TEXT NOT NULL REFERENCES creator_threads(id),
                 role TEXT NOT NULL,
                 text TEXT NOT NULL,
+                message_type TEXT NOT NULL DEFAULT 'text',
                 intent TEXT,
                 linked_session_id TEXT,
                 linked_job_id TEXT,
+                run_id TEXT,
+                artifact_refs_json TEXT,
                 created_at TEXT NOT NULL
             )
             """
         )
+        for column_name, column_sql in (
+            ("message_type", "message_type TEXT NOT NULL DEFAULT 'text'"),
+            ("run_id", "run_id TEXT"),
+            ("artifact_refs_json", "artifact_refs_json TEXT"),
+        ):
+            await ensure_column(
+                self._conn,
+                table_name="creator_messages",
+                column_name=column_name,
+                column_sql=column_sql,
+            )
         await self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_messages_thread ON creator_messages(thread_id, created_at ASC)"
         )
@@ -105,27 +140,48 @@ class ThreadStore:
         )
         await self._conn.commit()
 
-    async def create_thread(self, title: Optional[str] = None) -> dict:
+    async def create_thread(
+        self,
+        title: Optional[str] = None,
+        *,
+        workspace_id: Optional[str] = None,
+        brand_id: Optional[str] = None,
+    ) -> dict:
         assert self._conn is not None
         now = _now_iso()
         thread_id = _new_id()
         effective_title = title or f"对话 {now[:16].replace('T', ' ')}"
         await self._conn.execute(
             """
-            INSERT INTO creator_threads (id, title, status, created_at, updated_at)
-            VALUES (?, ?, 'active', ?, ?)
+            INSERT INTO creator_threads (id, workspace_id, brand_id, title, status, created_at, updated_at)
+            VALUES (?, ?, ?, ?, 'active', ?, ?)
             """,
-            (thread_id, effective_title, now, now),
+            (thread_id, workspace_id, brand_id, effective_title, now, now),
         )
         await self._conn.commit()
         row = await self._get_thread_row(thread_id)
         assert row is not None
         return dict(row)
 
-    async def list_threads(self) -> list[dict]:
+    async def list_threads(
+        self,
+        *,
+        workspace_id: Optional[str] = None,
+        brand_id: Optional[str] = None,
+    ) -> list[dict]:
         assert self._conn is not None
+        clauses: list[str] = []
+        params: list[Any] = []
+        if workspace_id is not None:
+            clauses.append("workspace_id = ?")
+            params.append(workspace_id)
+        if brand_id is not None:
+            clauses.append("brand_id = ?")
+            params.append(brand_id)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         async with self._conn.execute(
-            "SELECT * FROM creator_threads ORDER BY created_at DESC"
+            f"SELECT * FROM creator_threads {where} ORDER BY created_at DESC",
+            params,
         ) as cursor:
             rows = await cursor.fetchall()
         return [dict(r) for r in rows]
@@ -158,6 +214,9 @@ class ThreadStore:
         intent: Optional[str] = None,
         linked_session_id: Optional[str] = None,
         linked_job_id: Optional[str] = None,
+        message_type: str = "text",
+        run_id: Optional[str] = None,
+        artifact_refs: Optional[list[dict[str, Any]]] = None,
     ) -> dict:
         assert self._conn is not None
         now = _now_iso()
@@ -165,10 +224,26 @@ class ThreadStore:
         await self._conn.execute(
             """
             INSERT INTO creator_messages
-                (id, thread_id, role, text, intent, linked_session_id, linked_job_id, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                (
+                    id, thread_id, role, text, message_type, intent,
+                    linked_session_id, linked_job_id, run_id, artifact_refs_json,
+                    created_at
+                )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (message_id, thread_id, role, text, intent, linked_session_id, linked_job_id, now),
+            (
+                message_id,
+                thread_id,
+                role,
+                text,
+                message_type,
+                intent,
+                linked_session_id,
+                linked_job_id,
+                run_id,
+                json.dumps(artifact_refs, ensure_ascii=False) if artifact_refs is not None else None,
+                now,
+            ),
         )
         # update thread updated_at
         await self._conn.execute(
@@ -182,6 +257,50 @@ class ThreadStore:
             row = await cursor.fetchone()
         assert row is not None
         return dict(row)
+
+    async def append_artifact_result_message(
+        self,
+        *,
+        thread_id: str,
+        run_id: str,
+        artifact_refs: list[dict[str, Any]],
+        text: str = "创作结果已生成。",
+        idempotent: bool = True,
+    ) -> dict:
+        """Persist the workflow result as an artifact reference message, idempotently."""
+
+        assert self._conn is not None
+        normalized_refs = [
+            {
+                "artifact_id": ref["artifact_id"],
+                "artifact_type": ref.get("artifact_type"),
+                "artifact_version": ref.get("artifact_version"),
+                "parent_artifact_id": ref.get("parent_artifact_id"),
+            }
+            for ref in artifact_refs
+            if ref.get("artifact_id")
+        ]
+        if idempotent:
+            async with self._conn.execute(
+                """
+                SELECT * FROM creator_messages
+                WHERE thread_id = ? AND run_id = ? AND message_type = 'artifact_result'
+                ORDER BY created_at ASC
+                LIMIT 1
+                """,
+                (thread_id, run_id),
+            ) as cursor:
+                row = await cursor.fetchone()
+            if row is not None:
+                return dict(row)
+        return await self.append_message(
+            thread_id=thread_id,
+            role="assistant",
+            text=text,
+            message_type="artifact_result",
+            run_id=run_id,
+            artifact_refs=normalized_refs,
+        )
 
     async def complete_thread(self, thread_id: str) -> Optional[dict]:
         """Mark thread as accepted. Returns updated thread dict or None if not found."""
@@ -300,5 +419,23 @@ class ThreadStore:
             WHERE id = ?
             """,
             (session_id, job_id, now, thread_id),
+        )
+        await self._conn.commit()
+
+    async def update_thread_active_run(
+        self,
+        thread_id: str,
+        run_id: Optional[str],
+    ) -> None:
+        assert self._conn is not None
+        now = _now_iso()
+        await self._conn.execute(
+            """
+            UPDATE creator_threads
+            SET active_run_id = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (run_id, now, thread_id),
         )
         await self._conn.commit()

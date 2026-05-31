@@ -10,7 +10,12 @@ from app.config import settings
 from app.logging_config import get_logger, log_event
 from app.memory.job_store import JobRecord, JobStore
 from app.memory.session_state import SessionManager
+from app.memory.workflow_store import WorkflowStore
 from app.models.session import SessionError, SessionStage
+from app.models.workflow import WorkflowRunStatus, WorkflowStepStatus
+from app.services.workflow_dispatcher import WorkflowStepDispatcher
+from app.services.step_executors import WorkflowStepCommitBlocked
+from app.services.workflow_run_manager import WorkflowRunManager, WorkflowTransitionError
 
 
 class JobExecutionError(RuntimeError):
@@ -105,7 +110,113 @@ class JobWorker:
         await self._execute_job(job)
         return True
 
+    @staticmethod
+    def _workflow_step_name(job: JobRecord) -> Optional[str]:
+        if not job.run_id:
+            return None
+        step_name = job.payload.get("step_name")
+        return str(step_name) if step_name else None
+
+    async def _start_workflow_step(self, job: JobRecord) -> Optional[str]:
+        step_name = self._workflow_step_name(job)
+        if not step_name or not job.run_id:
+            return None
+        async with WorkflowRunManager(self.job_store.db_path) as manager:
+            await manager.start_step(job.run_id, step_name, job_id=job.id)
+        return step_name
+
+    async def _complete_workflow_step(
+        self,
+        job: JobRecord,
+        step_name: Optional[str],
+        result: dict,
+    ) -> bool:
+        if not step_name or not job.run_id:
+            return True
+        artifact_refs = result.get("artifact_refs") if isinstance(result, dict) else None
+        async with WorkflowRunManager(self.job_store.db_path) as manager:
+            step = await manager.complete_step(
+                job.run_id,
+                step_name,
+                artifact_refs=artifact_refs if isinstance(artifact_refs, list) else [],
+            )
+        return step.status == WorkflowStepStatus.SUCCEEDED
+
+    async def _retry_workflow_step(
+        self,
+        job: JobRecord,
+        step_name: Optional[str],
+        *,
+        error_code: str,
+        error_message: str,
+    ) -> None:
+        if not step_name or not job.run_id:
+            return
+        async with WorkflowRunManager(self.job_store.db_path) as manager:
+            await manager.retry_step(
+                job.run_id,
+                step_name,
+                {"code": error_code, "message": error_message},
+            )
+
+    async def _fail_workflow_step(
+        self,
+        job: JobRecord,
+        step_name: Optional[str],
+        *,
+        error_code: str,
+        error_message: str,
+    ) -> None:
+        if not step_name or not job.run_id:
+            return
+        async with WorkflowRunManager(self.job_store.db_path) as manager:
+            await manager.fail_step(
+                job.run_id,
+                step_name,
+                {"code": error_code, "message": error_message},
+            )
+
+    async def _ack_workflow_pause_if_requested(
+        self,
+        job: JobRecord,
+        step_name: Optional[str],
+    ) -> bool:
+        if not step_name or not job.run_id:
+            return False
+        async with WorkflowStore(self.job_store.db_path) as store:
+            run = await store.get_run(job.run_id)
+        if run is None or run.status != WorkflowRunStatus.PAUSING:
+            return False
+        async with WorkflowRunManager(self.job_store.db_path) as manager:
+            await manager.ack_pause_at_boundary(job.run_id, step_name, job_id=job.id)
+        return True
+
+    async def _ack_workflow_cancel_if_requested(
+        self,
+        job: JobRecord,
+        step_name: Optional[str],
+    ) -> None:
+        if not step_name or not job.run_id:
+            return
+        async with WorkflowStore(self.job_store.db_path) as store:
+            run = await store.get_run(job.run_id)
+        if run is None or run.status != WorkflowRunStatus.CANCELLING:
+            return
+        async with WorkflowRunManager(self.job_store.db_path) as manager:
+            await manager.ack_cancel_at_boundary(job.run_id, step_name, job_id=job.id)
+
     async def _execute_job(self, job: JobRecord) -> JobExecutionResult:
+        step_name: Optional[str] = None
+        try:
+            step_name = await self._start_workflow_step(job)
+        except WorkflowTransitionError as exc:
+            await self.job_store.mark_failed(
+                job.id,
+                error_code="WORKFLOW_STEP_START_REJECTED",
+                error_message=str(exc),
+            )
+            return JobExecutionResult(success=False, failed=True)
+
         await self.job_store.append_session_event(
             session_id=job.session_id,
             job_id=job.id,
@@ -139,6 +250,7 @@ class JobWorker:
             # the orchestrator was running. Do not write a success result in that case.
             current = await self.job_store.get_job(job.id)
             if current is not None and current.status == "cancelled":
+                await self._ack_workflow_cancel_if_requested(job, step_name)
                 await self.job_store.append_session_event(
                     session_id=job.session_id,
                     job_id=job.id,
@@ -153,11 +265,45 @@ class JobWorker:
                 )
                 return JobExecutionResult(success=False, failed=False)
 
+            if await self._ack_workflow_pause_if_requested(job, step_name):
+                await self.job_store.append_session_event(
+                    session_id=job.session_id,
+                    job_id=job.id,
+                    event_name="task_paused",
+                    stage=job.job_type,
+                    payload={
+                        "message": "任务已在安全边界暂停",
+                        "progress": None,
+                        "error_code": None,
+                        "details": {"pause_reason": "safe_boundary"},
+                    },
+                )
+                return JobExecutionResult(success=False, failed=False)
+
+            workflow_committed = await self._complete_workflow_step(job, step_name, result)
+            if not workflow_committed:
+                await self.job_store.cancel_job(job.id, reason="run_cancelled")
+                await self.job_store.append_session_event(
+                    session_id=job.session_id,
+                    job_id=job.id,
+                    event_name="task_cancelled",
+                    stage=job.job_type,
+                    payload={
+                        "message": "任务已取消",
+                        "progress": None,
+                        "error_code": None,
+                        "details": {"cancel_reason": "run_cancelled"},
+                    },
+                )
+                return JobExecutionResult(success=False, failed=False)
+
             await self.job_store.mark_succeeded(job.id)
+            if job.run_id:
+                await WorkflowStepDispatcher(self.job_store.db_path).enqueue_next_step_or_complete(job.run_id)
 
             # Auto-enqueue generate job immediately when strategy succeeds,
             # eliminating the frontend SSE round-trip that previously triggered it.
-            if job.job_type == "strategy":
+            if job.job_type == "strategy" and not job.run_id:
                 gen_job, created = await self.job_store.enqueue(
                     session_id=job.session_id,
                     job_type="generate",
@@ -191,11 +337,55 @@ class JobWorker:
                 },
             )
             return JobExecutionResult(success=True)
+        except WorkflowStepCommitBlocked as exc:
+            if exc.run_status in {
+                WorkflowRunStatus.PAUSING.value,
+                WorkflowRunStatus.PAUSED.value,
+            }:
+                await self._ack_workflow_pause_if_requested(job, step_name)
+                await self.job_store.append_session_event(
+                    session_id=job.session_id,
+                    job_id=job.id,
+                    event_name="task_paused",
+                    stage=job.job_type,
+                    payload={
+                        "message": "任务已在安全边界暂停",
+                        "progress": None,
+                        "error_code": None,
+                        "details": {"pause_reason": "safe_boundary_commit_guard"},
+                    },
+                )
+                return JobExecutionResult(success=False, failed=False)
+            if exc.run_status in {
+                WorkflowRunStatus.CANCELLING.value,
+                WorkflowRunStatus.CANCELLED.value,
+            }:
+                await self._ack_workflow_cancel_if_requested(job, step_name)
+                await self.job_store.append_session_event(
+                    session_id=job.session_id,
+                    job_id=job.id,
+                    event_name="task_cancelled",
+                    stage=job.job_type,
+                    payload={
+                        "message": "任务已取消",
+                        "progress": None,
+                        "error_code": exc.error_code,
+                        "details": {"cancel_reason": "commit_guard"},
+                    },
+                )
+                return JobExecutionResult(success=False, failed=False)
+            raise
         except Exception as exc:  # noqa: BLE001
             error_code = getattr(exc, "error_code", "JOB_EXECUTION_ERROR")
             retryable = bool(getattr(exc, "retryable", False))
 
             if retryable and job.attempts < job.max_attempts:
+                await self._retry_workflow_step(
+                    job,
+                    step_name,
+                    error_code=error_code,
+                    error_message=str(exc),
+                )
                 await self.job_store.schedule_retry(
                     job.id,
                     error_code=error_code,
@@ -219,6 +409,12 @@ class JobWorker:
             if retryable:
                 final_error_code = "JOB_MAX_RETRIES_EXCEEDED"
 
+            await self._fail_workflow_step(
+                job,
+                step_name,
+                error_code=final_error_code,
+                error_message=str(exc),
+            )
             await self._mark_session_failed(
                 session_id=job.session_id,
                 job_type=job.job_type,

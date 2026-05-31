@@ -10,7 +10,7 @@ from datetime import datetime
 from time import monotonic
 from typing import Any, AsyncIterator, Optional
 
-from fastapi import FastAPI, Header, Request, status
+from fastapi import FastAPI, Header, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
@@ -19,7 +19,11 @@ from app.logging_config import get_logger, log_event
 from app.memory.job_store import JobStore, SessionEventRecord
 from app.memory.session_state import SessionManager
 from app.memory.thread_store import ThreadStore
+from app.memory.workflow_store import WorkflowStore
+from app.models.workflow import WorkflowArtifactType
 from app.services.creator_intent_router import ACTIVE_JOB_STATUSES, IntentContext, classify_intent
+from app.services.conversation_orchestrator import ConversationOrchestrator
+from app.services.workflow_artifact_policy import WorkflowArtifactVersionPolicy
 from app.models.schemas import (
     CreateSessionResponse,
     EnqueueResponse,
@@ -88,6 +92,7 @@ from app.models.schemas import (
     CreatorThreadResponse,
     CreatorThreadListResponse,
     CreatorThreadDetailResponse,
+    CreatorThreadTimelineResponse,
     CreatorThreadDeleteResponse,
     CreatorMessageCreateRequest,
     CreatorMessageResponse,
@@ -167,11 +172,48 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_allowed_origins,
     allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "HEAD", "OPTIONS"],
+    allow_headers=[
+        "Authorization",
+        "Content-Type",
+        "X-Workspace-Id",
+        "X-User-Id",
+        "Access-Control-Request-Private-Network",
+    ],
     allow_private_network=True,
 )
 _logger = get_logger(__name__, component="api")
+_embedding_prewarm_task: Optional[asyncio.Task] = None
+_embedding_prewarm_status: dict[str, Any] = {
+    "status": "idle",
+    "message": "Embedding model has not been prewarmed.",
+}
+
+
+async def _run_embedding_prewarm() -> None:
+    global _embedding_prewarm_status
+    _embedding_prewarm_status = {
+        "status": "warming",
+        "message": "正在初始化本地向量模型（首次较慢）",
+        "started_at": datetime.utcnow().isoformat(),
+    }
+    try:
+        from app.services.rag_service import RAGService
+
+        rag = RAGService()
+        embedder = await asyncio.to_thread(rag._get_embedder)
+        _embedding_prewarm_status = {
+            "status": "ready" if embedder is not None else "disabled",
+            "message": "本地向量模型已准备就绪" if embedder is not None else "本地向量模型已禁用",
+            "completed_at": datetime.utcnow().isoformat(),
+        }
+    except Exception as exc:  # noqa: BLE001
+        _embedding_prewarm_status = {
+            "status": "failed",
+            "message": "本地向量模型初始化失败",
+            "error": str(exc),
+            "completed_at": datetime.utcnow().isoformat(),
+        }
 
 
 @app.middleware("http")
@@ -932,6 +974,344 @@ def _format_sse_event(event: SessionEvent, *, include_id: bool = True) -> str:
     lines.append(f"event: {event.event_name}")
     lines.append(f"data: {event.model_dump_json()}")
     return "\n".join(lines) + "\n\n"
+
+
+def _serialize_model(model) -> dict[str, Any]:
+    return model.model_dump(mode="json")
+
+
+def _format_workflow_sse_event(event) -> str:
+    data = {
+        "event_id": event.event_id,
+        "run_id": event.run_id,
+        "thread_id": event.thread_id,
+        "step_id": event.step_id,
+        "child_task_id": event.child_task_id,
+        "job_id": event.job_id,
+        "event_type": event.event_type,
+        "event_level": event.event_level,
+        "payload": event.payload_json,
+        "created_at": event.created_at.isoformat(),
+    }
+    return "\n".join(
+        [
+            f"id: {event.event_id}",
+            f"event: {event.event_type}",
+            f"data: {json.dumps(data, ensure_ascii=False, default=str)}",
+        ]
+    ) + "\n\n"
+
+
+async def _get_active_workflow_job(store: WorkflowStore, active_job_id: Optional[str]) -> Optional[dict[str, Any]]:
+    if not active_job_id:
+        return None
+    assert store._conn is not None
+    async with store._conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'jobs'"
+    ) as cursor:
+        if await cursor.fetchone() is None:
+            return None
+    async with store._conn.execute("SELECT * FROM jobs WHERE id = ?", (active_job_id,)) as cursor:
+        row = await cursor.fetchone()
+    return dict(row) if row is not None else None
+
+
+async def _load_workflow_snapshot(
+    run_id: str,
+    *,
+    expected_thread_id: Optional[str] = None,
+) -> dict[str, Any]:
+    async with WorkflowStore(settings.SQLITE_DB_PATH) as store:
+        run = await store.get_run(run_id)
+        if run is None:
+            raise APIError(
+                status_code=404,
+                error_code="WORKFLOW_RUN_NOT_FOUND",
+                error_message=f"Workflow run {run_id} not found",
+                suggested_action="请检查 run_id 是否正确",
+            )
+        if expected_thread_id is not None and run.thread_id != expected_thread_id:
+            raise APIError(
+                status_code=409,
+                error_code="THREAD_RUN_MISMATCH",
+                error_message=f"Workflow run {run_id} does not belong to thread {expected_thread_id}",
+                error_details={"run_thread_id": run.thread_id, "requested_thread_id": expected_thread_id},
+                suggested_action="请确认 thread_id 与 run_id 是否匹配",
+            )
+        steps = await store.list_steps(run_id)
+        child_tasks = await store.list_child_tasks(run_id)
+        constraints = await store.list_constraints(run_id)
+        active_job = await _get_active_workflow_job(store, run.active_job_id)
+    artifacts = await WorkflowArtifactVersionPolicy(settings.SQLITE_DB_PATH).safe_materialize_run_artifacts(run_id)
+    return {
+        "run": _serialize_model(run),
+        "steps": [_serialize_model(step) for step in steps],
+        "child_tasks": [_serialize_model(task) for task in child_tasks],
+        "artifacts": artifacts,
+        "constraints": [_serialize_model(constraint) for constraint in constraints],
+        "active_job": active_job,
+    }
+
+
+def _message_record_from_row(row: dict[str, Any], artifact_refs: Optional[list[dict[str, Any]]] = None) -> CreatorMessageRecord:
+    refs = artifact_refs
+    if refs is None:
+        try:
+            refs = json.loads(row.get("artifact_refs_json") or "[]")
+        except json.JSONDecodeError:
+            refs = []
+    return CreatorMessageRecord(
+        message_id=row["id"],
+        thread_id=row["thread_id"],
+        role=row["role"],
+        text=row["text"],
+        message_type=row.get("message_type") or "text",
+        intent=row.get("intent"),
+        linked_session_id=row.get("linked_session_id"),
+        linked_job_id=row.get("linked_job_id"),
+        run_id=row.get("run_id"),
+        artifact_refs=refs,
+        created_at=row["created_at"],
+    )
+
+
+def _thread_detail_from_row(row: dict[str, Any]) -> CreatorThreadDetail:
+    return CreatorThreadDetail(
+        thread_id=row["id"],
+        workspace_id=row.get("workspace_id"),
+        brand_id=row.get("brand_id"),
+        title=row["title"],
+        status=row["status"],
+        active_workflow_session_id=row["active_workflow_session_id"],
+        active_job_id=row["active_job_id"],
+        active_run_id=row.get("active_run_id"),
+        accepted_at=row["accepted_at"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+async def _hydrate_timeline_artifact_refs(messages: list[dict[str, Any]]) -> list[CreatorMessageRecord]:
+    run_ids = sorted({m.get("run_id") for m in messages if m.get("run_id")})
+    artifact_by_id: dict[str, dict[str, Any]] = {}
+    if run_ids:
+        policy = WorkflowArtifactVersionPolicy(settings.SQLITE_DB_PATH)
+        for run_id in run_ids:
+            for payload in await policy.safe_materialize_run_artifacts(run_id):
+                artifact_by_id[payload["artifact_id"]] = payload
+
+    records: list[CreatorMessageRecord] = []
+    for message in messages:
+        try:
+            raw_refs = json.loads(message.get("artifact_refs_json") or "[]")
+        except json.JSONDecodeError:
+            raw_refs = []
+        hydrated_refs: list[dict[str, Any]] = []
+        for ref in raw_refs:
+            artifact = artifact_by_id.get(ref.get("artifact_id"))
+            hydrated_refs.append({**ref, "artifact": artifact} if artifact is not None else ref)
+        records.append(_message_record_from_row(message, hydrated_refs))
+    return records
+
+
+def _note_from_payload(payload: dict[str, Any], *, fallback_id: str) -> Optional[dict[str, Any]]:
+    return WorkflowArtifactVersionPolicy.note_from_payload(payload, fallback_id=fallback_id)
+
+
+def _notes_from_final_result(payload: Optional[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return []
+    candidates = payload.get("notes") or payload.get("generated_notes") or []
+    notes: list[dict[str, Any]] = []
+    for index, item in enumerate(candidates):
+        if not isinstance(item, dict):
+            continue
+        nested_payload = item.get("payload_json") if isinstance(item.get("payload_json"), dict) else item
+        note = _note_from_payload(nested_payload, fallback_id=str(item.get("artifact_id") or f"note-{index}"))
+        if note is not None:
+            notes.append(note)
+    return notes
+
+
+async def _ensure_publish_candidate_artifacts(
+    *,
+    thread_id: str,
+    run_id: str,
+    workspace_id: Optional[str],
+    brand_id: Optional[str],
+    notes: list[dict[str, Any]],
+) -> int:
+    async with WorkflowStore(settings.SQLITE_DB_PATH) as store:
+        existing = await store.list_artifacts(run_id)
+        existing_note_ids = {
+            str((artifact.payload_json or {}).get("note_id"))
+            for artifact in existing
+            if artifact.artifact_type == WorkflowArtifactType.PUBLISH_CANDIDATE
+        }
+        next_version = max((artifact.artifact_version for artifact in existing), default=0) + 1
+        created_count = 0
+        for note in notes:
+            note_id = str(note.get("note_id") or "")
+            if not note_id or note_id in existing_note_ids:
+                continue
+            await store.create_artifact(
+                run_id=run_id,
+                thread_id=thread_id,
+                artifact_type=WorkflowArtifactType.PUBLISH_CANDIDATE,
+                artifact_version=next_version,
+                payload={
+                    "note_id": note_id,
+                    "workspace_id": workspace_id,
+                    "brand_id": brand_id,
+                    "title": note.get("title") or "未命名笔记",
+                    "content": note.get("content") or "",
+                    "tags": note.get("tags") or [],
+                    "topic_type": note.get("topic_type") or "方法",
+                    "core_hypothesis": note.get("core_hypothesis") or "认可笔记可沉淀为后续创作选题",
+                    "score": float(note.get("score") or 0.0),
+                    "score_type": "predicted",
+                    "source": "publish_candidate",
+                },
+                summary_text=str(note.get("title") or note_id),
+            )
+            existing_note_ids.add(note_id)
+            next_version += 1
+            created_count += 1
+        return len(existing_note_ids) if existing_note_ids else created_count
+
+
+async def _list_publish_candidate_artifacts(
+    *,
+    workspace_id: Optional[str] = None,
+    brand_id: Optional[str] = None,
+    thread_id: Optional[str] = None,
+    run_id: Optional[str] = None,
+) -> list[dict[str, Any]]:
+    async with WorkflowStore(settings.SQLITE_DB_PATH) as store:
+        artifacts = await store.list_artifacts_by_type(WorkflowArtifactType.PUBLISH_CANDIDATE)
+    rows: list[dict[str, Any]] = []
+    for artifact in artifacts:
+        payload = artifact.payload_json or {}
+        if workspace_id is not None and payload.get("workspace_id") != workspace_id:
+            continue
+        if brand_id is not None and payload.get("brand_id") != brand_id:
+            continue
+        if thread_id is not None and artifact.thread_id != thread_id:
+            continue
+        if run_id is not None and artifact.run_id != run_id:
+            continue
+        rows.append(
+            {
+                "candidate_id": artifact.artifact_id,
+                "workspace_id": payload.get("workspace_id"),
+                "brand_id": payload.get("brand_id"),
+                "thread_id": artifact.thread_id,
+                "session_id": artifact.run_id,
+                "note_id": str(payload.get("note_id") or artifact.artifact_id),
+                "title": str(payload.get("title") or "未命名笔记"),
+                "content": str(payload.get("content") or ""),
+                "tags": payload.get("tags") if isinstance(payload.get("tags"), list) else [],
+                "topic_type": str(payload.get("topic_type") or "方法"),
+                "core_hypothesis": str(payload.get("core_hypothesis") or "认可笔记可沉淀为后续创作选题"),
+                "score": float(payload.get("score") or 0.0),
+                "score_type": str(payload.get("score_type") or "predicted"),
+                "source": str(payload.get("source") or "publish_candidate"),
+                "created_at": artifact.created_at.isoformat(),
+            }
+        )
+    return rows
+
+
+async def _load_workflow_result(
+    thread: dict[str, Any],
+    *,
+    publishable_only: bool = False,
+) -> tuple[Optional[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    run_id = thread.get("active_run_id")
+    if not run_id:
+        return None, [], []
+    policy = WorkflowArtifactVersionPolicy(settings.SQLITE_DB_PATH)
+    artifacts = await policy.safe_materialize_run_artifacts(run_id)
+    strategy_artifacts = [a for a in artifacts if a["artifact_type"] == "strategy"]
+    final_artifacts = [a for a in artifacts if a["artifact_type"] == "final_result"]
+    note_artifacts = [a for a in artifacts if a["artifact_type"] == "generated_note"]
+    strategy = (
+        strategy_artifacts[-1].get("materialized_payload_json") or strategy_artifacts[-1].get("payload_json")
+        if strategy_artifacts
+        else None
+    )
+    notes = policy.select_publishable_notes(artifacts)
+    if not notes and not publishable_only:
+        for artifact in note_artifacts:
+            if artifact.get("status") in WorkflowArtifactVersionPolicy.NON_PUBLISHABLE_STATUSES:
+                continue
+            note = _note_from_payload(
+                artifact.get("materialized_payload_json") or artifact.get("payload_json") or {},
+                fallback_id=artifact["artifact_id"],
+            )
+            if note is not None:
+                notes.append(note)
+    result_refs = final_artifacts[-1:] or note_artifacts or strategy_artifacts
+    artifact_refs = [
+        {
+            "artifact_id": artifact["artifact_id"],
+            "artifact_type": artifact["artifact_type"],
+            "artifact_version": artifact["artifact_version"],
+        }
+        for artifact in result_refs
+    ]
+    return strategy, notes, artifact_refs
+
+
+def _resolve_workflow_event_cursor(
+    *,
+    after_event_id: Optional[int],
+    last_event_id: Optional[str],
+) -> Optional[int]:
+    if after_event_id is not None:
+        if after_event_id < 0:
+            raise APIError(
+                status_code=400,
+                error_code="INVALID_AFTER_EVENT_ID",
+                error_message="after_event_id 必须是非负整数",
+                error_details={"after_event_id": after_event_id},
+                suggested_action="请使用最近一次持久化事件的 event_id 重新连接",
+            )
+        return after_event_id
+    return _parse_last_event_id(last_event_id)
+
+
+async def _workflow_event_stream(
+    request: Request,
+    *,
+    run_id: str,
+    after_event_id: Optional[int],
+) -> AsyncIterator[str]:
+    async with WorkflowStore(settings.SQLITE_DB_PATH) as store:
+        last_sent_event_id = after_event_id or 0
+        replay_events = await store.list_events(run_id, after_event_id=after_event_id)
+        for event in replay_events:
+            last_sent_event_id = event.event_id
+            yield _format_workflow_sse_event(event)
+
+        heartbeat_deadline = monotonic() + settings.SSE_HEARTBEAT_SECONDS
+        poll_interval = min(0.2, settings.SSE_HEARTBEAT_SECONDS)
+        while not await request.is_disconnected():
+            live_events = await store.list_events(run_id, after_event_id=last_sent_event_id)
+            if live_events:
+                for event in live_events:
+                    last_sent_event_id = event.event_id
+                    yield _format_workflow_sse_event(event)
+                heartbeat_deadline = monotonic() + settings.SSE_HEARTBEAT_SECONDS
+                continue
+
+            now = monotonic()
+            if now >= heartbeat_deadline:
+                yield ": heartbeat\n\n"
+                heartbeat_deadline = monotonic() + settings.SSE_HEARTBEAT_SECONDS
+                continue
+
+            await asyncio.sleep(min(poll_interval, heartbeat_deadline - now))
 
 
 async def _load_session_or_error(
@@ -2479,14 +2859,63 @@ async def stream_session_events(
     )
 
 
+@app.get("/workflow-runs/{run_id}/snapshot")
+async def get_workflow_run_snapshot(
+    run_id: str,
+    thread_id: Optional[str] = None,
+) -> dict[str, Any]:
+    return await _load_workflow_snapshot(run_id, expected_thread_id=thread_id)
+
+
+@app.get("/workflow-runs/{run_id}/events")
+async def stream_workflow_events(
+    run_id: str,
+    request: Request,
+    after_event_id: Optional[int] = Query(default=None),
+    last_event_id: Optional[str] = Header(default=None, alias="Last-Event-ID"),
+) -> StreamingResponse:
+    async with WorkflowStore(settings.SQLITE_DB_PATH) as store:
+        if await store.get_run(run_id) is None:
+            raise APIError(
+                status_code=404,
+                error_code="WORKFLOW_RUN_NOT_FOUND",
+                error_message=f"Workflow run {run_id} not found",
+                suggested_action="请检查 run_id 是否正确",
+            )
+
+    cursor = _resolve_workflow_event_cursor(
+        after_event_id=after_event_id,
+        last_event_id=last_event_id,
+    )
+    return StreamingResponse(
+        _workflow_event_stream(request, run_id=run_id, after_event_id=cursor),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+        },
+    )
+
+
 @app.post("/threads", status_code=201)
 async def create_thread(
     body: CreatorThreadCreateRequest, request: Request
 ) -> CreatorThreadResponse:
     store = _get_thread_store(request)
-    row = await store.create_thread(title=body.title)
+    principal = None
+    try:
+        principal = _resolve_workspace_principal_or_error(request)
+    except APIError:
+        principal = None
+    row = await store.create_thread(
+        title=body.title,
+        workspace_id=principal.workspace_id if principal is not None else None,
+        brand_id=body.brand_id,
+    )
     return CreatorThreadResponse(
         thread_id=row["id"],
+        workspace_id=row.get("workspace_id"),
+        brand_id=row.get("brand_id"),
         title=row["title"],
         status=row["status"],
         active_workflow_session_id=row["active_workflow_session_id"],
@@ -2497,10 +2926,21 @@ async def create_thread(
 @app.get("/threads")
 async def list_threads(request: Request) -> CreatorThreadListResponse:
     store = _get_thread_store(request)
-    rows = await store.list_threads()
+    principal = None
+    try:
+        principal = _resolve_workspace_principal_or_error(request)
+    except APIError:
+        principal = None
+    brand_id = request.query_params.get("brand_id") or None
+    rows = await store.list_threads(
+        workspace_id=principal.workspace_id if principal is not None else None,
+        brand_id=brand_id,
+    )
     items = [
         CreatorThreadSummary(
             thread_id=r["id"],
+            workspace_id=r.get("workspace_id"),
+            brand_id=r.get("brand_id"),
             title=r["title"],
             status=r["status"],
             active_job_id=r["active_job_id"],
@@ -2524,30 +2964,27 @@ async def get_thread(thread_id: str, request: Request) -> CreatorThreadDetailRes
             suggested_action="请检查 thread_id 是否正确",
         )
     messages = await store.get_thread_messages(thread_id)
-    thread_detail = CreatorThreadDetail(
-        thread_id=row["id"],
-        title=row["title"],
-        status=row["status"],
-        active_workflow_session_id=row["active_workflow_session_id"],
-        active_job_id=row["active_job_id"],
-        accepted_at=row["accepted_at"],
-        created_at=row["created_at"],
-        updated_at=row["updated_at"],
-    )
-    message_records = [
-        CreatorMessageRecord(
-            message_id=m["id"],
-            thread_id=m["thread_id"],
-            role=m["role"],
-            text=m["text"],
-            intent=m["intent"],
-            linked_session_id=m["linked_session_id"],
-            linked_job_id=m["linked_job_id"],
-            created_at=m["created_at"],
-        )
-        for m in messages
-    ]
+    thread_detail = _thread_detail_from_row(row)
+    message_records = [_message_record_from_row(m) for m in messages]
     return CreatorThreadDetailResponse(thread=thread_detail, messages=message_records)
+
+
+@app.get("/threads/{thread_id}/timeline")
+async def get_thread_timeline(thread_id: str, request: Request) -> CreatorThreadTimelineResponse:
+    store = _get_thread_store(request)
+    row = await store.get_thread(thread_id)
+    if row is None:
+        raise APIError(
+            status_code=404,
+            error_code="THREAD_NOT_FOUND",
+            error_message=f"Thread {thread_id} not found",
+            suggested_action="请检查 thread_id 是否正确",
+        )
+    messages = await store.get_thread_messages(thread_id)
+    return CreatorThreadTimelineResponse(
+        thread=_thread_detail_from_row(row),
+        messages=await _hydrate_timeline_artifact_refs(messages),
+    )
 
 
 @app.patch("/threads/{thread_id}")
@@ -2607,7 +3044,6 @@ async def append_thread_message(
     thread_id: str, body: CreatorMessageCreateRequest, request: Request
 ) -> CreatorMessageResponse:
     thread_store = _get_thread_store(request)
-    job_store = _get_job_store(request)
 
     thread = await thread_store.get_thread(thread_id)
     if thread is None:
@@ -2618,8 +3054,31 @@ async def append_thread_message(
             suggested_action="请检查 thread_id 是否正确",
         )
 
+    if thread.get("active_run_id") or not thread.get("active_workflow_session_id"):
+        orchestrator = ConversationOrchestrator(
+            db_path=settings.SQLITE_DB_PATH,
+            thread_store=thread_store,
+        )
+        result = await orchestrator.handle_message(
+            thread=thread,
+            text=body.text,
+            user_id=DEFAULT_USER_ID,
+        )
+        msg_row = result["message_row"]
+        message_record = _message_record_from_row(msg_row)
+        return CreatorMessageResponse(
+            message=message_record,
+            intent=result["intent"],
+            job_action_result=None,
+            command_result=result["command_result"],
+            active_run_snapshot=result["active_run_snapshot"],
+            updated_title=None,
+            assistant_reply=result["assistant_reply"],
+        )
+
     active_session_id: Optional[str] = thread["active_workflow_session_id"]
     active_job_id: Optional[str] = thread["active_job_id"]
+    job_store = _get_job_store(request)
     active_job = None
     if active_job_id:
         active_job = await job_store.get_job(active_job_id)
@@ -2679,16 +3138,7 @@ async def append_thread_message(
         linked_session_id=active_session_id,
         linked_job_id=active_job_id,
     )
-    message_record = CreatorMessageRecord(
-        message_id=msg_row["id"],
-        thread_id=msg_row["thread_id"],
-        role=msg_row["role"],
-        text=msg_row["text"],
-        intent=msg_row["intent"],
-        linked_session_id=msg_row["linked_session_id"],
-        linked_job_id=msg_row["linked_job_id"],
-        created_at=msg_row["created_at"],
-    )
+    message_record = _message_record_from_row(msg_row)
 
     # Generate and persist the assistant reply so it survives thread switches
     _JOB_TYPE_LABEL = {"strategy": "策略生成", "generate": "笔记生成"}
@@ -2735,7 +3185,6 @@ async def start_thread_workflow(
     thread_id: str, body: CreatorWorkflowRequest, request: Request
 ) -> CreatorWorkflowResponse:
     thread_store = _get_thread_store(request)
-    job_store = _get_job_store(request)
 
     thread = await thread_store.get_thread(thread_id)
     if thread is None:
@@ -2746,70 +3195,40 @@ async def start_thread_workflow(
             suggested_action="请检查 thread_id 是否正确",
         )
 
-    # TD-ALIGN4-1: always creates a new session — session reuse is ALIGN-5's responsibility
-    session_id = str(uuid.uuid4())
     user_id = body.user_id or DEFAULT_USER_ID
-
-    # Step 1: create session (stage = INIT), matching POST /sessions pattern
-    async with SessionManager(settings.SQLITE_DB_PATH) as session_manager:
-        session = await session_manager.create_session(
-            session_id=session_id,
-            user_id=user_id,
-            user_query=body.user_query,
-            platform=body.platform,
-            mode=body.mode,
+    orchestrator = ConversationOrchestrator(
+        db_path=settings.SQLITE_DB_PATH,
+        thread_store=thread_store,
+    )
+    # T10: keep this legacy route as a compatibility wrapper only. New creator
+    # workflow truth must come from workflow-v2 run/snapshot state, not sessions.
+    result = await orchestrator.handle_message(
+        thread=thread,
+        text=body.user_query,
+        user_id=user_id,
+    )
+    active_run_snapshot = result.get("active_run_snapshot") or {}
+    command_result = result.get("command_result") or {}
+    run = active_run_snapshot.get("run") or {}
+    run_id = command_result.get("run_id") or run.get("run_id")
+    if not run_id:
+        raise APIError(
+            status_code=400,
+            error_code="WORKFLOW_V2_START_FAILED",
+            error_message="Legacy workflow endpoint could not start a workflow-v2 run",
+            suggested_action="请改用 POST /threads/{thread_id}/messages 发送自然语言需求",
         )
-    await job_store.append_session_event(
-        session_id=session_id,
-        event_name="task_progress",
-        stage=session.stage.value,
-        payload={"message": "正在准备创作任务...", "progress": 0, "error_code": None,
-                 "details": {"stage": session.stage.value}},
-    )
-
-    # Step 2: advance stage to STRATEGY + enqueue job, matching _enqueue_with_stage pattern
-    async with SessionManager(settings.SQLITE_DB_PATH) as session_manager:
-        await session_manager.touch_user_activity(session_id)
-        await session_manager.update_session(session_id, stage=SessionStage.STRATEGY)
-    log_event(
-        _logger,
-        event_name="stage_changed",
-        level="info",
-        component="api",
-        session_id=session_id,
-        stage=SessionStage.STRATEGY.value,
-        from_stage=session.stage.value,
-        to_stage=SessionStage.STRATEGY.value,
-        job_type="strategy",
-    )
-
-    job, created = await job_store.enqueue(
-        session_id=session_id,
-        job_type="strategy",
-        payload=None,
-        idempotency_key=None,
-    )
-    if created:
-        await job_store.append_session_event(
-            session_id=session_id,
-            job_id=job.id,
-            event_name="stage_changed",
-            stage=SessionStage.STRATEGY.value,
-            payload={"message": "策略分析任务已就绪，等待执行...", "progress": 5, "error_code": None,
-                     "details": {"to_stage": SessionStage.STRATEGY.value, "job_status": job.status}},
-        )
-
-    await thread_store.update_thread_active_job(
-        thread_id=thread_id,
-        session_id=session_id,
-        job_id=job.id,
-    )
+    stage = run.get("current_step") or run.get("phase") or "workflow-v2"
 
     return CreatorWorkflowResponse(
         thread_id=thread_id,
-        session_id=session_id,
-        job_id=job.id,
-        stage="strategy",
+        session_id=run_id,
+        job_id="",
+        stage=stage,
+        run_id=run_id,
+        command_result=command_result,
+        active_run_snapshot=active_run_snapshot,
+        compatibility_mode="workflow-v2",
     )
 
 
@@ -2948,7 +3367,38 @@ async def complete_thread_endpoint(thread_id: str, request: Request) -> Complete
         )
 
     if thread["status"] == "accepted":
-        count = await thread_store.count_publish_candidates(thread_id)
+        if thread.get("active_run_id"):
+            candidates = [
+                item for item in await _list_publish_candidate_artifacts(
+                    workspace_id=thread.get("workspace_id"),
+                    brand_id=thread.get("brand_id"),
+                )
+                if item["thread_id"] == thread_id and item["session_id"] == thread["active_run_id"]
+            ]
+            count = len(candidates)
+        else:
+            count = await thread_store.count_publish_candidates(thread_id)
+        return CompleteThreadResponse(thread_id=thread_id, status="accepted", publish_candidate_count=count)
+
+    if thread.get("active_run_id"):
+        _strategy, notes, artifact_refs = await _load_workflow_result(thread, publishable_only=True)
+        await thread_store.complete_thread(thread_id)
+        if artifact_refs:
+            await thread_store.append_artifact_result_message(
+                thread_id=thread_id,
+                run_id=thread["active_run_id"],
+                artifact_refs=artifact_refs,
+            )
+        if notes:
+            count = await _ensure_publish_candidate_artifacts(
+                thread_id=thread_id,
+                run_id=thread["active_run_id"],
+                workspace_id=thread.get("workspace_id"),
+                brand_id=thread.get("brand_id"),
+                notes=notes,
+            )
+        else:
+            count = 0
         return CompleteThreadResponse(thread_id=thread_id, status="accepted", publish_candidate_count=count)
 
     session_id: Optional[str] = thread.get("active_workflow_session_id")
@@ -2984,18 +3434,42 @@ async def complete_thread_endpoint(thread_id: str, request: Request) -> Complete
 
 
 @app.get("/publish-candidates")
-async def list_publish_candidates_endpoint(request: Request) -> PublishCandidatesResponse:
+async def list_publish_candidates_endpoint(
+    request: Request,
+    brand_id: Optional[str] = Query(default=None),
+    thread_id: Optional[str] = Query(default=None),
+    run_id: Optional[str] = Query(default=None),
+) -> PublishCandidatesResponse:
     thread_store = _get_thread_store(request)
-    rows = await thread_store.list_publish_candidates()
+    principal = None
+    try:
+        principal = _resolve_workspace_principal_or_error(request)
+    except APIError:
+        principal = None
+    rows = await _list_publish_candidate_artifacts(
+        workspace_id=principal.workspace_id if principal is not None else None,
+        brand_id=brand_id,
+        thread_id=thread_id,
+        run_id=run_id,
+    )
+    if not rows and principal is None and brand_id is None and thread_id is None and run_id is None:
+        rows = await thread_store.list_publish_candidates()
     items = [
         PublishCandidate(
             candidate_id=r["candidate_id"],
+            workspace_id=r.get("workspace_id"),
+            brand_id=r.get("brand_id"),
             thread_id=r["thread_id"],
             session_id=r["session_id"],
             note_id=r["note_id"],
             title=r["title"],
             content=r["content"],
-            tags=r["tags"].split(",") if r["tags"] else [],
+            tags=r["tags"] if isinstance(r.get("tags"), list) else (r["tags"].split(",") if r.get("tags") else []),
+            topic_type=r.get("topic_type") or "方法",
+            core_hypothesis=r.get("core_hypothesis") or "认可笔记可沉淀为后续创作选题",
+            score=float(r.get("score") or 0.0),
+            score_type=r.get("score_type") or "predicted",
+            source=r.get("source") or "publish_candidate",
             created_at=r["created_at"],
         )
         for r in rows
@@ -3013,6 +3487,21 @@ async def get_thread_result_endpoint(thread_id: str, request: Request) -> Thread
             error_code="THREAD_NOT_FOUND",
             error_message=f"Thread {thread_id} not found",
             suggested_action="请检查 thread_id 是否正确",
+        )
+
+    if thread.get("active_run_id"):
+        strategy, notes, artifact_refs = await _load_workflow_result(thread)
+        if artifact_refs:
+            await thread_store.append_artifact_result_message(
+                thread_id=thread_id,
+                run_id=thread["active_run_id"],
+                artifact_refs=artifact_refs,
+            )
+        return ThreadResultResponse(
+            thread_id=thread_id,
+            session_id=thread["active_run_id"],
+            strategy=strategy,
+            notes=[GeneratedNoteItem(**note) for note in notes],
         )
 
     session_id: Optional[str] = thread.get("active_workflow_session_id")
@@ -3063,6 +3552,31 @@ async def health_check() -> dict[str, Any]:
         "status": "healthy",
         "version": settings.RUNTIME_VERSION,
         "api_contract": settings.RUNTIME_API_CONTRACT,
+        "features": {
+            "workflow_v2": True,
+            "publish_candidate_artifacts": True,
+            "sse_progress": True,
+            "runtime_commands": True,
+            "embedding_prewarm": True,
+        },
         "timestamp": datetime.utcnow().isoformat(),
         "queue": "active",
+    }
+
+
+@app.post("/runtime/prewarm")
+async def prewarm_runtime() -> dict[str, Any]:
+    global _embedding_prewarm_task
+    if _embedding_prewarm_task is None or _embedding_prewarm_task.done():
+        if _embedding_prewarm_status.get("status") != "ready":
+            _embedding_prewarm_task = asyncio.create_task(_run_embedding_prewarm())
+    return {
+        "embedding": _embedding_prewarm_status,
+    }
+
+
+@app.get("/runtime/prewarm")
+async def get_runtime_prewarm_status() -> dict[str, Any]:
+    return {
+        "embedding": _embedding_prewarm_status,
     }

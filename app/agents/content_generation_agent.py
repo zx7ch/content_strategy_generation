@@ -137,6 +137,105 @@ class ContentGenerationAgent:
     def resolve_language_instruction(request: ContentGeneratorRequest) -> str:
         return build_language_instruction(request.output_language)
 
+    async def plan_proposals_step(self, context) -> list[dict[str, Any]]:
+        """Canonical runner for generation.plan_proposals."""
+        strategy = self._strategy_from_context(context)
+        proposals = await self.generate_proposals(
+            content_strategy=strategy,
+            target_audience=strategy.target_audience,
+            output_language="zh-CN",
+        )
+        return [proposal.model_dump(mode="json") for proposal in proposals]
+
+    async def select_proposals_step(self, context) -> list[dict[str, Any]]:
+        """Canonical runner for generation.select_proposals."""
+        proposals = self._proposals_from_context(context)
+        strategy = self._strategy_from_context(context)
+        preference = self._preference_from_context(context)
+        if not proposals:
+            proposals = await self.generate_proposals(
+                content_strategy=strategy,
+                target_audience=strategy.target_audience,
+                output_language="zh-CN",
+            )
+        selected = self.select_top_k(self.score_proposals(proposals, preference))
+        return [proposal.model_dump(mode="json") for proposal in selected]
+
+    async def generate_note_child_step(self, context, target: dict[str, Any], index: int) -> dict[str, Any]:
+        """Canonical child runner for generation.generate_notes_parallel."""
+        strategy = self._strategy_from_context(context)
+        proposal = self._proposal_from_artifact(target, fallback_index=index)
+        temperature = settings.PARALLEL_TEMPERATURES[
+            min(index, len(settings.PARALLEL_TEMPERATURES) - 1)
+        ]
+        note = await self._generate_single(
+            slot_id=index,
+            proposal=proposal,
+            content_strategy=strategy,
+            target_audience=strategy.target_audience,
+            temperature=temperature,
+            output_language="zh-CN",
+        )
+        return note.model_dump(mode="json")
+
+    async def similarity_check_step(self, context) -> dict[str, Any]:
+        """Canonical runner for generation.similarity_check."""
+        notes = self._notes_from_context(context)
+        checks: list[dict[str, Any]] = []
+        for note in notes:
+            similarity = await self._check_similarity(
+                note,
+                session_id=context.run["run_id"],
+            )
+            checks.append(
+                {
+                    "note_id": note.note_id,
+                    "embedding_similarity": similarity.embedding_similarity,
+                    "lexical_overlap": similarity.lexical_overlap,
+                    "should_retry": similarity.should_retry,
+                    "status": similarity.status,
+                }
+            )
+        return {
+            "notes_checked": len(checks),
+            "checks": checks,
+            "should_rewrite": any(check["should_retry"] for check in checks),
+            "target_artifact_id": self._first_generated_note_artifact_id(context),
+        }
+
+    async def rewrite_or_reselect_step(self, context) -> dict[str, Any]:
+        """Canonical runner for generation.rewrite_or_reselect."""
+        target = self._revision_note_from_context(context)
+        if target is None:
+            raise ContentGenerationError("No generated note available for rewrite.")
+        rewritten = target.model_copy(
+            update={
+                "note_id": f"note_{uuid.uuid4().hex[:12]}",
+                "title": f"{target.title}（优化版）",
+                "similarity_check": {
+                    **target.similarity_check,
+                    "status": "rewritten",
+                },
+            }
+        )
+        return rewritten.model_dump(mode="json")
+
+    async def aggregate_notes_step(self, context) -> dict[str, Any]:
+        """Canonical runner for generation.aggregate_notes."""
+        notes = self._notes_from_context(context)
+        budget = SessionTokenBudget(settings.SESSION_TOKEN_BUDGET)
+        report = self._collect_results(
+            total_proposals=len(context.generation_targets or []),
+            selected_count=len(notes),
+            notes=notes,
+            failed_count=0,
+            budget=budget,
+        )
+        return {
+            "notes": [note.model_dump(mode="json") for note in notes],
+            "similarity_report": report,
+        }
+
     async def generate_proposals(
         self,
         *,
@@ -276,6 +375,8 @@ class ContentGenerationAgent:
             generation_params={
                 "temperature": temperature,
                 "proposal_id": proposal.proposal_id,
+                "proposal_score": proposal.score,
+                "proposal_angle": proposal.angle,
                 "slot_id": slot_id,
             },
         )
@@ -736,6 +837,121 @@ class ContentGenerationAgent:
             if isinstance(pillars, list):
                 return [str(item) for item in pillars]
         return []
+
+    @staticmethod
+    def _strategy_from_context(context) -> ContentStrategy:
+        for artifact in reversed(context.input_artifacts or context.prior_artifacts):
+            if artifact.get("artifact_type") != "strategy":
+                continue
+            payload = artifact.get("payload_json") or {}
+            if isinstance(payload, dict) and "strategy" in payload and isinstance(payload["strategy"], dict):
+                payload = payload["strategy"]
+            if isinstance(payload, dict) and payload.get("valid") is True and isinstance(payload.get("strategy"), dict):
+                payload = payload["strategy"]
+            if isinstance(payload, dict):
+                return ContentGenerationAgent._strategy_from_payload(payload)
+        return ContentGenerationAgent._strategy_from_payload({})
+
+    @staticmethod
+    def _strategy_from_payload(payload: dict[str, Any]) -> ContentStrategy:
+        return ContentStrategy(
+            positioning=str(payload.get("positioning") or "通用内容"),
+            target_audience=str(payload.get("target_audience") or "大众用户"),
+            content_pillars=[str(item) for item in payload.get("content_pillars", ["实用经验"])],
+            key_messaging=str(payload.get("key_messaging") or "真实可执行"),
+            content_types=[str(item) for item in payload.get("content_types", ["图文笔记"])],
+            posting_strategy=str(payload.get("posting_strategy") or "晚间发布"),
+            data_source_quality=float(payload.get("data_source_quality") or 0.0),
+        )
+
+    @staticmethod
+    def _preference_from_context(_context) -> PlatformPreference:
+        return PlatformPreference(
+            avg_title_length=16,
+            popular_tags=[],
+            optimal_posting_times=["20:00"],
+            content_patterns=["中等长度文案"],
+        )
+
+    @staticmethod
+    def _proposals_from_context(context) -> list[Proposal]:
+        proposals: list[Proposal] = []
+        for artifact in context.input_artifacts or context.prior_artifacts:
+            if artifact.get("artifact_type") != "proposal":
+                continue
+            payload = artifact.get("payload_json") or {}
+            if isinstance(payload, dict):
+                proposals.append(ContentGenerationAgent._proposal_from_payload(payload))
+        return proposals
+
+    @staticmethod
+    def _proposal_from_artifact(artifact: dict[str, Any], *, fallback_index: int) -> Proposal:
+        payload = artifact.get("payload_json") if isinstance(artifact, dict) else None
+        if isinstance(payload, dict):
+            return ContentGenerationAgent._proposal_from_payload(payload)
+        return Proposal(
+            proposal_id=str(artifact.get("artifact_id") or f"proposal-{fallback_index}"),
+            angle=str(artifact.get("title") or "内容角度"),
+            hook=str(artifact.get("title") or "标题概念"),
+            outline=str(artifact.get("summary_text") or "内容大纲"),
+            target_emotion="practical_value",
+            content_pillars=[],
+            suggested_tags=[],
+        )
+
+    @staticmethod
+    def _proposal_from_payload(payload: dict[str, Any]) -> Proposal:
+        return Proposal(
+            proposal_id=str(payload.get("proposal_id") or uuid.uuid4().hex[:8]),
+            angle=str(payload.get("angle") or payload.get("title") or "内容角度"),
+            hook=str(payload.get("hook") or payload.get("title_concept") or payload.get("title") or "标题概念"),
+            outline=ContentGenerationAgent._stringify_outline(payload.get("outline") or payload.get("content_outline") or "内容大纲"),
+            target_emotion=str(payload.get("target_emotion") or "practical_value"),
+            content_pillars=[str(item) for item in payload.get("content_pillars", [])],
+            suggested_tags=[str(item) for item in payload.get("suggested_tags", [])],
+            score=float(payload.get("score") or 0.0),
+            is_used=bool(payload.get("is_used") or False),
+            is_high_risk=bool(payload.get("is_high_risk") or False),
+        )
+
+    @staticmethod
+    def _notes_from_context(context) -> list[GeneratedNote]:
+        notes: list[GeneratedNote] = []
+        for artifact in context.input_artifacts or context.prior_artifacts:
+            if artifact.get("artifact_type") != "generated_note":
+                continue
+            payload = artifact.get("payload_json") or {}
+            if isinstance(payload, dict):
+                notes.append(ContentGenerationAgent._note_from_payload(payload))
+        return notes
+
+    @staticmethod
+    def _revision_note_from_context(context) -> Optional[GeneratedNote]:
+        for artifact in context.revision_targets or context.input_artifacts:
+            payload = artifact.get("payload_json") or {}
+            if artifact.get("artifact_type") == "generated_note" and isinstance(payload, dict):
+                return ContentGenerationAgent._note_from_payload(payload)
+        return None
+
+    @staticmethod
+    def _note_from_payload(payload: dict[str, Any]) -> GeneratedNote:
+        return GeneratedNote(
+            note_id=str(payload.get("note_id") or uuid.uuid4().hex[:12]),
+            title=str(payload.get("title") or "未命名笔记"),
+            content=str(payload.get("content") or ""),
+            tags=[str(tag) for tag in payload.get("tags", [])],
+            cover_design_prompt=str(payload.get("cover_design_prompt") or "封面设计"),
+            suggested_update_time=str(payload.get("suggested_update_time") or payload.get("designed_update_time") or "20:00"),
+            similarity_check=dict(payload.get("similarity_check") or {"max_similarity": 0.0, "status": "safe"}),
+            generation_params=dict(payload.get("generation_params") or {}),
+        )
+
+    @staticmethod
+    def _first_generated_note_artifact_id(context) -> Optional[str]:
+        for artifact in context.input_artifacts or context.prior_artifacts:
+            if artifact.get("artifact_type") == "generated_note":
+                return artifact.get("artifact_id")
+        return None
 
     @staticmethod
     def _normalize_proposal_item(

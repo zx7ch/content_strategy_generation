@@ -11,6 +11,7 @@ import aiosqlite
 
 from app.config import settings
 from app.logging_config import get_logger, log_event
+from app.memory.workflow_store import ensure_column
 
 
 @dataclass(slots=True)
@@ -31,6 +32,9 @@ class JobRecord:
     last_error_code: Optional[str]
     last_error_message: Optional[str]
     cancel_reason: Optional[str]
+    run_id: Optional[str]
+    step_id: Optional[str]
+    child_task_id: Optional[str]
     created_at: Optional[str]
     updated_at: Optional[str]
 
@@ -160,13 +164,26 @@ class JobStore:
                 last_error_code TEXT,
                 last_error_message TEXT,
                 cancel_reason TEXT,
+                run_id TEXT,
+                step_id TEXT,
+                child_task_id TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
             """
         )
+        for column_name in ("run_id", "step_id", "child_task_id"):
+            await ensure_column(
+                self._conn,
+                table_name="jobs",
+                column_name=column_name,
+                column_sql=f"{column_name} TEXT",
+            )
         await self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_jobs_runnable ON jobs(status, not_before, priority, created_at)"
+        )
+        await self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_jobs_workflow_refs ON jobs(run_id, step_id, child_task_id)"
         )
         await self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_jobs_lease ON jobs(lease_expires_at)"
@@ -214,6 +231,9 @@ class JobStore:
             last_error_code=row["last_error_code"],
             last_error_message=row["last_error_message"],
             cancel_reason=row["cancel_reason"],
+            run_id=row["run_id"],
+            step_id=row["step_id"],
+            child_task_id=row["child_task_id"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )
@@ -306,6 +326,9 @@ class JobStore:
         idempotency_key: Optional[str] = None,
         priority: int = 100,
         max_attempts: Optional[int] = None,
+        run_id: Optional[str] = None,
+        step_id: Optional[str] = None,
+        child_task_id: Optional[str] = None,
     ) -> tuple[JobRecord, bool]:
         """Enqueue a job. Returns (job, created)."""
         assert self._conn is not None
@@ -336,11 +359,23 @@ class JobStore:
             INSERT INTO jobs (
                 id, session_id, job_type, payload_json, status,
                 priority, attempts, max_attempts,
-                not_before, idempotency_key, created_at, updated_at
+                not_before, idempotency_key, run_id, step_id, child_task_id,
+                created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, 'queued', ?, 0, ?, CURRENT_TIMESTAMP, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            VALUES (?, ?, ?, ?, 'queued', ?, 0, ?, CURRENT_TIMESTAMP, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
             """,
-            (job_id, session_id, job_type, payload_json, priority, effective_max_attempts, idempotency_key),
+            (
+                job_id,
+                session_id,
+                job_type,
+                payload_json,
+                priority,
+                effective_max_attempts,
+                idempotency_key,
+                run_id,
+                step_id,
+                child_task_id,
+            ),
         )
         await self._conn.commit()
 
@@ -370,10 +405,10 @@ class JobStore:
             WITH candidate AS (
                 SELECT j.id
                 FROM jobs j
-                JOIN sessions s ON s.session_id = j.session_id
+                LEFT JOIN sessions s ON s.session_id = j.session_id
                 WHERE j.status IN ('queued', 'retrying')
                   AND j.not_before <= CURRENT_TIMESTAMP
-                  AND s.lifecycle_state = 'alive'
+                  AND (j.run_id IS NOT NULL OR s.lifecycle_state = 'alive')
                   AND NOT EXISTS (
                       SELECT 1 FROM jobs r
                       WHERE r.session_id = j.session_id
@@ -418,6 +453,16 @@ class JobStore:
 
         async with self._conn.execute(
             """
+            SELECT *
+            FROM jobs
+            WHERE status = 'running'
+              AND lease_expires_at < CURRENT_TIMESTAMP
+            """
+        ) as cursor:
+            expired_rows = await cursor.fetchall()
+
+        async with self._conn.execute(
+            """
             UPDATE jobs
             SET status = CASE
                     WHEN attempts >= max_attempts THEN 'failed'
@@ -437,7 +482,37 @@ class JobStore:
         ) as cursor:
             recovered = cursor.rowcount
         await self._conn.commit()
+
+        if recovered:
+            await self._sync_expired_workflow_steps(expired_rows)
         return recovered
+
+    async def _sync_expired_workflow_steps(self, rows: list[aiosqlite.Row]) -> None:
+        from app.services.workflow_run_manager import WorkflowRunManager, WorkflowTransitionError
+
+        for row in rows:
+            job = self._row_to_job(row)
+            if not job.run_id:
+                continue
+            step_name = str(job.payload.get("step_name") or "")
+            if not step_name:
+                continue
+            async with WorkflowRunManager(self.db_path) as manager:
+                try:
+                    if job.attempts >= job.max_attempts:
+                        await manager.fail_step(
+                            job.run_id,
+                            step_name,
+                            {"code": "LEASE_EXPIRED", "message": "worker lease expired before ack"},
+                        )
+                    else:
+                        await manager.retry_step(
+                            job.run_id,
+                            step_name,
+                            {"code": "LEASE_EXPIRED", "message": "worker lease expired before ack"},
+                        )
+                except WorkflowTransitionError:
+                    continue
 
     async def mark_succeeded(self, job_id: str) -> bool:
         assert self._conn is not None
@@ -652,6 +727,62 @@ class JobStore:
               AND status IN ('queued', 'paused', 'retrying', 'running')
             """,
             (reason, session_id),
+        ) as cursor:
+            count = cursor.rowcount
+        await self._conn.commit()
+        return count
+
+    async def pause_workflow_run_jobs(self, run_id: str) -> int:
+        """Pause queued/retrying jobs bound to a workflow run."""
+        assert self._conn is not None
+        async with self._conn.execute(
+            """
+            UPDATE jobs
+            SET status = 'paused',
+                updated_at = CURRENT_TIMESTAMP
+            WHERE run_id = ?
+              AND status IN ('queued', 'retrying')
+            """,
+            (run_id,),
+        ) as cursor:
+            count = cursor.rowcount
+        await self._conn.commit()
+        return count
+
+    async def resume_workflow_run_jobs(self, run_id: str) -> int:
+        """Resume paused jobs bound to a workflow run."""
+        assert self._conn is not None
+        async with self._conn.execute(
+            """
+            UPDATE jobs
+            SET status = 'queued',
+                not_before = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE run_id = ?
+              AND status = 'paused'
+            """,
+            (run_id,),
+        ) as cursor:
+            count = cursor.rowcount
+        await self._conn.commit()
+        return count
+
+    async def cancel_workflow_run_jobs(
+        self, run_id: str, reason: str = "run_cancelled"
+    ) -> int:
+        """Cancel unfinished jobs bound to a workflow run."""
+        assert self._conn is not None
+        async with self._conn.execute(
+            """
+            UPDATE jobs
+            SET status = 'cancelled',
+                cancel_reason = ?,
+                lease_expires_at = NULL,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE run_id = ?
+              AND status IN ('queued', 'paused', 'retrying', 'running')
+            """,
+            (reason, run_id),
         ) as cursor:
             count = cursor.rowcount
         await self._conn.commit()

@@ -941,6 +941,7 @@ class RAGDocument(BaseModel):
 
 class CreatorThreadCreateRequest(BaseModel):
     title: Optional[str] = None
+    brand_id: Optional[str] = None
 
 
 class CreatorThreadUpdateRequest(BaseModel):
@@ -949,6 +950,8 @@ class CreatorThreadUpdateRequest(BaseModel):
 
 class CreatorThreadSummary(BaseModel):
     thread_id: str
+    workspace_id: Optional[str] = None
+    brand_id: Optional[str] = None
     title: str
     status: str
     active_job_id: Optional[str] = None
@@ -958,10 +961,13 @@ class CreatorThreadSummary(BaseModel):
 
 class CreatorThreadDetail(BaseModel):
     thread_id: str
+    workspace_id: Optional[str] = None
+    brand_id: Optional[str] = None
     title: str
     status: str
     active_workflow_session_id: Optional[str] = None
     active_job_id: Optional[str] = None
+    active_run_id: Optional[str] = None
     accepted_at: Optional[str] = None
     created_at: str
     updated_at: str
@@ -972,14 +978,19 @@ class CreatorMessageRecord(BaseModel):
     thread_id: str
     role: str
     text: str
+    message_type: str = "text"
     intent: Optional[str] = None
     linked_session_id: Optional[str] = None
     linked_job_id: Optional[str] = None
+    run_id: Optional[str] = None
+    artifact_refs: List[Dict[str, Any]] = Field(default_factory=list)
     created_at: str
 
 
 class CreatorThreadResponse(BaseModel):
     thread_id: str
+    workspace_id: Optional[str] = None
+    brand_id: Optional[str] = None
     title: str
     status: str
     active_workflow_session_id: Optional[str] = None
@@ -991,6 +1002,11 @@ class CreatorThreadListResponse(BaseModel):
 
 
 class CreatorThreadDetailResponse(BaseModel):
+    thread: CreatorThreadDetail
+    messages: List[CreatorMessageRecord]
+
+
+class CreatorThreadTimelineResponse(BaseModel):
     thread: CreatorThreadDetail
     messages: List[CreatorMessageRecord]
 
@@ -1008,6 +1024,8 @@ class CreatorMessageResponse(BaseModel):
     message: CreatorMessageRecord
     intent: str
     job_action_result: Optional[Dict[str, Any]] = None
+    command_result: Optional[Dict[str, Any]] = None
+    active_run_snapshot: Optional[Dict[str, Any]] = None
     updated_title: Optional[str] = None
     assistant_reply: Optional[str] = None
 
@@ -1024,6 +1042,10 @@ class CreatorWorkflowResponse(BaseModel):
     session_id: str
     job_id: str
     stage: str
+    run_id: Optional[str] = None
+    command_result: Optional[Dict[str, Any]] = None
+    active_run_snapshot: Optional[Dict[str, Any]] = None
+    compatibility_mode: Optional[str] = None
 
 
 class JobControlResponse(BaseModel):
@@ -1034,12 +1056,19 @@ class JobControlResponse(BaseModel):
 
 class PublishCandidate(BaseModel):
     candidate_id: str
+    workspace_id: Optional[str] = None
+    brand_id: Optional[str] = None
     thread_id: str
     session_id: str
     note_id: str
     title: str
     content: str
     tags: List[str]
+    topic_type: str = "方法"
+    core_hypothesis: str = "认可笔记可沉淀为后续创作选题"
+    score: float = 0.0
+    score_type: str = "predicted"
+    source: str = "publish_candidate"
     created_at: str
 
 
