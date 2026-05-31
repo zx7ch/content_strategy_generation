@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import uuid
 import json
 from datetime import datetime
@@ -24,7 +25,7 @@ def _new_id() -> str:
 class ThreadStore:
     """Persistent store for Creator conversation threads and messages."""
 
-    def __init__(self, db_path: str = "./data/creator_threads.db"):
+    def __init__(self, db_path: str = os.environ.get("CREATOR_THREADS_DB_PATH", "./data/creator_threads.db")):
         self.db_path = db_path
         self._conn: Optional[aiosqlite.Connection] = None
         self._logger = get_logger(__name__, component="thread_store")

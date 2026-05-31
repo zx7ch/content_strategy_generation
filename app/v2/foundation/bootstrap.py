@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import sqlite3
 from typing import Any
 
 from app.config import Settings
 from app.v2.db.runner import run_p1_1_migrations
-from app.v2.foundation.models import WorkspaceRecord, utcnow
+from app.v2.foundation.models import BrandRecord, WorkspaceRecord, utcnow
 from app.v2.foundation.postgres_store import PostgresMasterDataStore
+from app.v2.foundation.sqlite_store import SQLiteMasterDataStore
 from app.v2.runtime import resolve_v2_backend
 from app.v2.foundation.service import MasterDataService
 from app.v2.foundation.store import InMemoryMasterDataStore
@@ -109,6 +111,53 @@ def _ensure_default_demo_data(service: MasterDataService) -> None:
         )
 
 
+def _reconcile_orphaned_brands(service: MasterDataService, db_path: str) -> None:
+    """Re-create brand records for any brand_id referenced in PUBLISH_CANDIDATE artifacts
+    that are missing from the store (e.g. brands created under the old InMemoryMasterDataStore)."""
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """SELECT DISTINCT
+                   json_extract(payload_json, '$.brand_id') AS brand_id,
+                   json_extract(payload_json, '$.workspace_id') AS workspace_id
+               FROM workflow_artifacts
+               WHERE artifact_type = 'publish_candidate'
+                 AND json_extract(payload_json, '$.brand_id') IS NOT NULL"""
+        ).fetchall()
+        conn.close()
+    except Exception:
+        return
+
+    now = utcnow()
+    for row in rows:
+        brand_id = row["brand_id"]
+        workspace_id = row["workspace_id"] or DEFAULT_WORKSPACE_ID
+        if not brand_id or service._store.get_brand(brand_id) is not None:
+            continue
+        # Ensure workspace exists before adding brand
+        if service._store.get_workspace(workspace_id) is None:
+            service._store.save_workspace(WorkspaceRecord(
+                id=workspace_id,
+                name="default",
+                slug=f"ws-{workspace_id[:8]}",
+                created_at=now,
+                updated_at=now,
+            ))
+        service._store.save_brand(BrandRecord(
+            id=brand_id,
+            workspace_id=workspace_id,
+            name="已完成创作品牌",
+            category=None,
+            stage="growth",
+            target_audience={},
+            brand_voice={},
+            goals={},
+            created_at=now,
+            updated_at=now,
+        ))
+
+
 def build_master_data_runtime(config: Settings):
     backend = resolve_v2_backend(config, component="foundation")
     if backend == "postgres":
@@ -116,6 +165,13 @@ def build_master_data_runtime(config: Settings):
         store = PostgresMasterDataStore(config.POSTGRES_DSN)
         service = MasterDataService(store)
         _ensure_default_demo_data(service)
+        return store, service
+
+    if config.SQLITE_DB_PATH.strip() and config.SQLITE_DB_PATH.strip() != ":memory:":
+        store = SQLiteMasterDataStore(config.SQLITE_DB_PATH)
+        service = MasterDataService(store)
+        _ensure_default_demo_data(service)
+        _reconcile_orphaned_brands(service, config.SQLITE_DB_PATH)
         return store, service
 
     store = InMemoryMasterDataStore()

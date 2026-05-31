@@ -376,6 +376,7 @@ class JobWorker:
                 return JobExecutionResult(success=False, failed=False)
             raise
         except Exception as exc:  # noqa: BLE001
+            self._logger.exception("job execution raised unhandled exception", job_id=job.id)
             error_code = getattr(exc, "error_code", "JOB_EXECUTION_ERROR")
             retryable = bool(getattr(exc, "retryable", False))
 

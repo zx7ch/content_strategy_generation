@@ -38,7 +38,7 @@ class Settings(BaseSettings):
         validation_alias=_env_alias("RUNTIME_API_CONTRACT"),
     )
     CORS_ALLOWED_ORIGINS: str = Field(
-        default="http://localhost:3000,http://127.0.0.1:3000,https://xhs-creator.vercel.app",
+        default="http://localhost:3000,http://127.0.0.1:3000,https://content-strategy-generation.vercel.app",
         validation_alias=_env_alias("CORS_ALLOWED_ORIGINS"),
     )
 

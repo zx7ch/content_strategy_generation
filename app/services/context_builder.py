@@ -8,6 +8,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Optional
 
 from app.config import settings
+from app.memory.thread_store import ThreadStore
 from app.memory.workflow_store import WorkflowStore
 from app.models.workflow import (
     WorkflowArtifact,
@@ -270,7 +271,7 @@ class ContextBuilder:
             if run is None:
                 raise ValueError(f"Workflow run not found: {run_id}")
             step = await self._resolve_step(store, run_id, step_name)
-            messages = await self._load_messages(store, run.thread_id)
+            messages = await self._load_messages(run.thread_id)
             constraints = await store.list_constraints(run_id)
             artifacts = await store.list_artifacts(run_id)
 
@@ -305,14 +306,9 @@ class ContextBuilder:
         raise ValueError(f"Workflow step not found: {step_name}")
 
     @staticmethod
-    async def _load_messages(store: WorkflowStore, thread_id: str) -> list[dict[str, Any]]:
-        assert store._conn is not None
-        async with store._conn.execute(
-            "SELECT * FROM creator_messages WHERE thread_id = ? ORDER BY created_at ASC",
-            (thread_id,),
-        ) as cursor:
-            rows = await cursor.fetchall()
-        return [dict(row) for row in rows]
+    async def _load_messages(thread_id: str) -> list[dict[str, Any]]:
+        async with ThreadStore() as ts:
+            return await ts.get_thread_messages(thread_id)
 
     @staticmethod
     def _filter_constraints(

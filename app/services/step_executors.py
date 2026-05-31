@@ -11,6 +11,9 @@ from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Optional, Protocol
 
 from app.config import settings
+from app.logging_config import get_logger
+
+_logger = get_logger(__name__, component="step_executor")
 from app.memory.workflow_store import WorkflowStore
 from app.models.workflow import WorkflowArtifactType, WorkflowRunStatus, WorkflowStepStatus
 from app.services.context_builder import ContextBuilder, StepContext
@@ -347,6 +350,7 @@ class GenerationStepExecutor(BaseStepExecutor):
             try:
                 note_payload = await _maybe_await(self.note_runner(context, target, index))
             except Exception as exc:  # noqa: BLE001
+                _logger.exception("note generation raised unhandled exception", child_task_id=task.child_task_id, error=str(exc))
                 async with WorkflowRunManager(self.db_path) as manager:
                     await manager.retry_child_task(
                         task.child_task_id,

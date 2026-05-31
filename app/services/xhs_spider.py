@@ -11,6 +11,9 @@ from typing import Callable, List, Optional, Tuple, Dict, Any
 from pydantic import BaseModel
 
 from app.config import settings
+from app.logging_config import get_logger
+
+_logger = get_logger(__name__, component="spider")
 
 
 class XHSPost(BaseModel):
@@ -152,6 +155,7 @@ class XHSSpiderClient:
                     os.chdir(original_dir)
                     
             except ImportError as e:
+                _logger.error("spider submodule import failed", error=str(e), submodule_path=str(self._submodule_path))
                 raise SpiderPermanentError(
                     f"XHS Spider submodule not available. "
                     f"Please run: git submodule update --init\n"
@@ -251,6 +255,7 @@ class XHSSpiderClient:
             return True, "", all_posts[:num]
 
         except Exception as exc:
+            _logger.exception("spider sync_search raised", query=query, error=str(exc))
             if all_posts:
                 return True, "", all_posts[:num]
             raise self._classify_error(str(exc))
@@ -289,11 +294,12 @@ class XHSSpiderClient:
                     last_error = SpiderTransientError(msg)
                     
             except SpiderTransientError as e:
+                _logger.warning("spider transient error, will retry", attempt=retry_count, error=str(e))
                 last_error = e
                 # Will retry
                 
-            except SpiderPermanentError:
-                # Don't retry permanent errors
+            except SpiderPermanentError as e:
+                _logger.error("spider permanent error, aborting retries", attempt=retry_count, error=str(e))
                 raise
             
             # Calculate backoff: 2^attempt seconds (2, 4, 8, 16, 32)

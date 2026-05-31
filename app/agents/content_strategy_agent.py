@@ -18,6 +18,9 @@ async def _safe_notify(callback: ProgressCallback, message: str) -> None:
         pass
 
 from app.config import settings
+from app.logging_config import get_logger
+
+_logger = get_logger(__name__, component="strategy_agent")
 from app.llm.client import LLMClient
 from app.memory.session_state import SessionManager
 from app.models.session import (
@@ -459,7 +462,8 @@ class ContentStrategyAgent:
                     seen.add(query)
                     deduped.append(query)
             return deduped[:5]
-        except Exception:
+        except Exception as exc:
+            _logger.warning("query expansion failed, falling back to empty", error=str(exc))
             return []
 
     async def _generate_data_driven_strategy(
@@ -510,7 +514,8 @@ class ContentStrategyAgent:
                 posting_strategy=str(payload.get("posting_strategy", "每周2-3更")),
                 data_source_quality=default_quality,
             )
-        except Exception:
+        except Exception as exc:
+            _logger.warning("strategy generation parse failed, returning default strategy", error=str(exc))
             return ContentStrategy(
                 positioning="生活方式分享者",
                 target_audience="25-35岁对该主题感兴趣的用户",

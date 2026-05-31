@@ -170,6 +170,7 @@ class WorkflowArtifactVersionPolicy:
 
     def select_publishable_notes(self, artifacts: list[dict[str, Any]]) -> list[dict[str, Any]]:
         proposal_by_id = self._proposal_by_id(artifacts)
+        artifacts_by_id = {a["artifact_id"]: a for a in artifacts}
         final_results = [
             artifact
             for artifact in artifacts
@@ -182,6 +183,7 @@ class WorkflowArtifactVersionPolicy:
             return self._notes_from_final_result(
                 final_results[-1].get("materialized_payload_json") or final_results[-1].get("payload_json"),
                 proposal_by_id=proposal_by_id,
+                artifacts_by_id=artifacts_by_id,
             )
 
         notes: list[dict[str, Any]] = []
@@ -270,18 +272,28 @@ class WorkflowArtifactVersionPolicy:
         payload: Optional[dict[str, Any]],
         *,
         proposal_by_id: Optional[dict[str, dict[str, Any]]] = None,
+        artifacts_by_id: Optional[dict[str, dict[str, Any]]] = None,
     ) -> list[dict[str, Any]]:
         if not isinstance(payload, dict):
             return []
-        candidates = payload.get("notes") or payload.get("generated_notes") or []
+        candidates = payload.get("notes") or payload.get("generated_notes") or payload.get("artifact_refs") or []
         notes: list[dict[str, Any]] = []
         for index, item in enumerate(candidates):
             if not isinstance(item, dict):
                 continue
-            nested_payload = item.get("payload_json") if isinstance(item.get("payload_json"), dict) else item
+            # If this item is an artifact reference (has artifact_id but no inline payload),
+            # resolve it from the materialized artifacts dict.
+            artifact_id = item.get("artifact_id")
+            if artifact_id and artifacts_by_id and artifact_id in artifacts_by_id:
+                resolved = artifacts_by_id[artifact_id]
+                nested_payload = resolved.get("materialized_payload_json") or resolved.get("payload_json") or item
+            elif isinstance(item.get("payload_json"), dict):
+                nested_payload = item["payload_json"]
+            else:
+                nested_payload = item
             note = self.note_from_payload(
                 nested_payload,
-                fallback_id=str(item.get("artifact_id") or f"note-{index}"),
+                fallback_id=str(artifact_id or f"note-{index}"),
                 proposal_by_id=proposal_by_id,
             )
             if note is not None:

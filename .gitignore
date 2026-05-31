@@ -89,3 +89,10 @@ local/
 notes/
 tmp/
 instructions/
+
+# Claude Code session data
+.claude/
+.tmp/
+
+# ML models (large binaries)
+models/

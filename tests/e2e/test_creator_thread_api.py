@@ -105,7 +105,9 @@ async def test_post_message_to_thread(client):
     body = resp.json()
     assert body["message"]["text"] == "帮我生成笔记"
     assert body["message"]["role"] == "user"
-    assert body["intent"] == "free_chat"
+    assert body["intent"] == "start_workflow"
+    assert body["command_result"]["action"] == "start_workflow"
+    assert body["active_run_snapshot"]["run"]["thread_id"] == thread_id
 
 
 async def test_get_nonexistent_thread_404(client):
