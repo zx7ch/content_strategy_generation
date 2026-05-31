@@ -12,6 +12,7 @@ eggs/
 .eggs/
 lib/
 lib64/
+!frontend/src/lib/
 parts/
 sdist/
 var/
@@ -87,3 +88,4 @@ dmypy.json
 local/
 notes/
 tmp/
+instructions/

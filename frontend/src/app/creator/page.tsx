@@ -3,37 +3,46 @@
 import { useEffect, useRef, useState } from "react";
 import {
   appendThreadMessage,
-  cancelJob,
   completeThread,
   createThread,
   deleteThread,
-  getJobStatus,
-  getThread,
+  getThreadTimeline,
   getThreadResult,
+  getWorkflowRunSnapshot,
   listThreads,
   renameThread,
-  resumeJob,
-  startThreadWorkflow,
-  subscribeThreadEvents,
+  subscribeWorkflowRunEvents,
+  type CreatorMessage,
   type CreatorThreadSummary,
   type GeneratedNoteItem,
+  type WorkflowArtifactRef,
+  type WorkflowRunEventData,
+  type WorkflowRunSnapshot,
 } from "@/lib/api";
+import { useBrandContext } from "@/components/providers/BrandProvider";
 
-type TaskStatus = "running" | "paused" | "cancelled" | "completed";
+type TaskStatus = "running" | "paused" | "failed" | "cancelled" | "completed";
 type MessageRole = "assistant" | "user" | "system";
 
 interface ChatMessage {
   id: string;
   role: MessageRole;
   text: string;
+  messageType?: string;
+  artifactRefs?: WorkflowArtifactRef[];
+  runId?: string | null;
+  actionUrl?: string;
+  actionLabel?: string;
 }
 
 interface WorkflowTask {
-  stage: "strategy" | "generation" | "completed";
+  stage: string;
   status: TaskStatus;
   progress: number;
-  sessionId: string;
-  jobId: string;
+  runId: string;
+  completedSteps: number;
+  totalSteps: number;
+  currentStepLabel: string;
 }
 
 const WELCOME_MESSAGE: ChatMessage = {
@@ -44,10 +53,6 @@ const WELCOME_MESSAGE: ChatMessage = {
 
 function createId(prefix: string) {
   return `${prefix}-${Math.random().toString(16).slice(2, 10)}`;
-}
-
-function inferTaskIntent(text: string) {
-  return /生成|选题|策略|文案|笔记|脚本|内容/.test(text);
 }
 
 // Map raw backend event messages → user-readable Chinese.
@@ -65,19 +70,343 @@ function translateStatusMsg(msg: string): string | null {
 }
 
 function stageLabel(stage: WorkflowTask["stage"]) {
+  if (stage === "intake") return "需求理解";
+  if (stage === "context") return "上下文构建";
+  if (stage === "discovery") return "素材发现";
+  if (stage === "retrieval") return "资料召回";
   if (stage === "strategy") return "策略生成";
   if (stage === "generation") return "笔记生成";
+  if (stage === "finalization") return "结果整理";
+  if (stage === "review") return "等待确认";
   return "已完成";
+}
+
+function stepLabel(stepName: string | null | undefined, phase?: string | null) {
+  if (!stepName && phase) return stageLabel(phase);
+  if (!stepName) return "准备任务";
+  const labels: Record<string, string> = {
+    "intake.capture_request": "理解创作需求",
+    "context.build_context": "构建创作上下文",
+    "context.load_constraints": "读取补充要求",
+    "context.load_previous_artifacts": "读取历史结果",
+    "discovery.plan_queries": "规划真实搜索关键词",
+    "discovery.spider_search": "正在搜索小红书真实内容",
+    "discovery.assess_source_quality": "评估真实素材质量",
+    "discovery.expand_queries": "扩展搜索方向",
+    "discovery.persist_sources": "保存真实素材快照",
+    "retrieval.rag_index": "建立资料索引",
+    "retrieval.rag_retrieve": "召回相关资料",
+    "strategy.prepare_prompt": "准备策略提示词",
+    "strategy.llm_synthesize": "生成内容策略",
+    "strategy.validate_strategy": "校验内容策略",
+    "strategy.persist_strategy": "保存内容策略",
+    "generation.plan_proposals": "规划笔记选题",
+    "generation.select_proposals": "筛选笔记方案",
+    "generation.generate_notes_parallel": "生成小红书笔记",
+    "generation.similarity_check": "检查内容相似度",
+    "generation.rewrite_or_reselect": "优化笔记内容",
+    "generation.aggregate_notes": "整理生成笔记",
+    "finalization.persist_artifacts": "整理创作结果",
+    "finalization.emit_result_ready": "准备结果展示",
+    "review.await_user_acceptance": "等待确认",
+    "review.publish_candidates": "整理发布候选",
+  };
+  return labels[stepName] ?? stageLabel(phase ?? stepName.split(".")[0]);
 }
 
 function statusLabel(status: TaskStatus) {
   if (status === "running") return "进行中";
   if (status === "paused") return "已暂停";
+  if (status === "failed") return "执行失败";
   if (status === "cancelled") return "已中断";
   return "完成";
 }
 
+function taskFromSnapshot(snapshot: WorkflowRunSnapshot): WorkflowTask | null {
+  const status = snapshot.run.status;
+  const totalSteps = snapshot.steps.length;
+  const completedSteps = snapshot.steps.filter((step) =>
+    ["succeeded", "skipped", "cancelled", "failed"].includes(step.status)
+  ).length;
+  const progress = totalSteps > 0 ? Math.round((completedSteps / totalSteps) * 100) : 0;
+  const currentStep = snapshot.steps.find((step) => step.status === "running") ??
+    snapshot.steps.find((step) => step.step_name === snapshot.run.current_step) ??
+    snapshot.steps.find((step) => ["pending", "retrying"].includes(step.status));
+  const currentStepLabel = stepLabel(currentStep?.step_name ?? snapshot.run.current_step, snapshot.run.phase);
+  if (status === "succeeded") {
+    return {
+      stage: "completed",
+      status: "completed",
+      progress: 100,
+      runId: snapshot.run.run_id,
+      completedSteps: totalSteps,
+      totalSteps,
+      currentStepLabel: "任务已完成",
+    };
+  }
+  if (status === "failed") {
+    return {
+      stage: snapshot.run.phase,
+      status: "failed",
+      progress,
+      runId: snapshot.run.run_id,
+      completedSteps,
+      totalSteps,
+      currentStepLabel,
+    };
+  }
+  if (status === "cancelled" || status === "cancelling") {
+    return {
+      stage: snapshot.run.phase,
+      status: "cancelled",
+      progress,
+      runId: snapshot.run.run_id,
+      completedSteps,
+      totalSteps,
+      currentStepLabel,
+    };
+  }
+  if (status === "paused" || status === "pausing") {
+    return {
+      stage: snapshot.run.phase,
+      status: "paused",
+      progress,
+      runId: snapshot.run.run_id,
+      completedSteps,
+      totalSteps,
+      currentStepLabel,
+    };
+  }
+  if (status === "created" || status === "running" || status === "waiting_user") {
+    return {
+      stage: snapshot.run.phase,
+      status: "running",
+      progress,
+      runId: snapshot.run.run_id,
+      completedSteps,
+      totalSteps,
+      currentStepLabel,
+    };
+  }
+  return null;
+}
+
+function workflowEventLine(data: WorkflowRunEventData): string | null {
+  const raw = data.payload?.message;
+  if (raw && typeof raw === "string") return translateStatusMsg(raw);
+  const stepName = typeof data.payload?.step_name === "string" ? data.payload.step_name : undefined;
+  if (data.event_type === "run_started") return "任务已创建";
+  if (data.event_type === "steps_initialized") return "已拆解创作步骤";
+  if (data.event_type === "embedding_initializing") return "正在初始化本地向量模型（首次较慢）";
+  if (data.event_type === "run_advanced") return `准备执行：${stepLabel(stepName)}`;
+  if (data.event_type === "step_started") return `正在执行：${stepLabel(stepName)}`;
+  if (data.event_type === "step_completed") return `已完成：${stepLabel(stepName)}`;
+  if (data.event_type === "artifact_attached") return "已保存阶段结果";
+  if (data.event_type === "constraint_added") return "已记录补充要求";
+  if (data.event_type === "run_pause_requested") return "已请求暂停";
+  if (data.event_type === "run_resumed") return "已恢复任务";
+  if (data.event_type === "run_cancel_requested") return "已请求取消";
+  if (data.event_type === "run_succeeded" || data.event_type === "run_completed") return "任务已完成";
+  if (data.event_type === "run_failed" || data.event_type === "step_failed") return "任务执行失败";
+  return null;
+}
+
+function chatMessageFromRecord(message: CreatorMessage): ChatMessage {
+  return {
+    id: message.message_id,
+    role: message.role,
+    text: message.text,
+    messageType: message.message_type,
+    artifactRefs: message.artifact_refs,
+    runId: message.run_id,
+  };
+}
+
+function payloadFromArtifactRef(ref: WorkflowArtifactRef): Record<string, unknown> | null {
+  return ref.artifact?.materialized_payload_json ?? ref.artifact?.payload_json ?? null;
+}
+
+function noteFromArtifactRef(ref: WorkflowArtifactRef): GeneratedNoteItem | null {
+  const payload = payloadFromArtifactRef(ref);
+  if (!payload) return null;
+  const nested = typeof payload.note === "object" && payload.note !== null
+    ? payload.note as Record<string, unknown>
+    : payload;
+  const title = nested.title ?? nested.hook ?? nested.summary;
+  const content = nested.content ?? nested.body ?? nested.outline;
+  if (!title && !content) return null;
+  const tags = Array.isArray(nested.tags)
+    ? nested.tags
+    : Array.isArray(nested.suggested_tags)
+      ? nested.suggested_tags
+      : [];
+  return {
+    note_id: String(nested.note_id ?? nested.id ?? ref.artifact_id),
+    title: String(title ?? "未命名笔记"),
+    content: String(content ?? ""),
+    tags: tags.map(String),
+  };
+}
+
+function collectArtifactRefs(messages: ChatMessage[]): WorkflowArtifactRef[] {
+  const byId = new Map<string, WorkflowArtifactRef>();
+  for (const message of messages) {
+    for (const ref of message.artifactRefs ?? []) {
+      if (!ref.artifact_id) continue;
+      byId.set(ref.artifact_id, { ...byId.get(ref.artifact_id), ...ref });
+    }
+  }
+  return [...byId.values()];
+}
+
+function shortArtifactId(id: string | null | undefined): string {
+  if (!id) return "";
+  return id.length > 14 ? `${id.slice(0, 10)}...` : id;
+}
+
+function artifactStatusLabel(ref: WorkflowArtifactRef): string {
+  const status = ref.artifact?.status ?? "created";
+  if (ref.artifact_type === "final_result" || ref.artifact?.artifact_type === "final_result") return "final";
+  if (status === "accepted") return "accepted";
+  if (status === "active") return "active";
+  if (status === "superseded") return "superseded";
+  return status;
+}
+
+function versionLabel(ref: WorkflowArtifactRef): string {
+  const version = ref.artifact_version ?? ref.artifact?.artifact_version ?? 1;
+  return `v${version}`;
+}
+
+function findArtifactRef(refs: WorkflowArtifactRef[], artifactId: string | null | undefined): WorkflowArtifactRef | null {
+  if (!artifactId) return null;
+  return refs.find((ref) => ref.artifact_id === artifactId) ?? null;
+}
+
+function versionChainFor(ref: WorkflowArtifactRef, allRefs: WorkflowArtifactRef[]): WorkflowArtifactRef[] {
+  const chain: WorkflowArtifactRef[] = [];
+  const seen = new Set<string>();
+  let cursor: WorkflowArtifactRef | null = ref;
+  while (cursor && !seen.has(cursor.artifact_id)) {
+    seen.add(cursor.artifact_id);
+    chain.unshift(cursor);
+    cursor = findArtifactRef(allRefs, cursor.parent_artifact_id ?? cursor.artifact?.parent_artifact_id);
+  }
+  return chain;
+}
+
+function ArtifactVersionBadges({ ref, current = false }: { ref: WorkflowArtifactRef; current?: boolean }) {
+  const mode = ref.artifact?.payload_mode ?? "snapshot";
+  const parentId = ref.parent_artifact_id ?? ref.artifact?.parent_artifact_id;
+  return (
+    <div className="mt-2 flex flex-wrap items-center gap-1.5 text-[10px] font-medium uppercase tracking-wide">
+      {current && <span className="rounded-full bg-ink px-2 py-0.5 text-white">current</span>}
+      <span className="rounded-full bg-slate-100 px-2 py-0.5 text-slate-600">{versionLabel(ref)}</span>
+      <span className="rounded-full bg-slate-100 px-2 py-0.5 text-slate-600">{artifactStatusLabel(ref)}</span>
+      <span className="rounded-full bg-slate-100 px-2 py-0.5 text-slate-600">{mode}</span>
+      {parentId && (
+        <span className="rounded-full bg-slate-100 px-2 py-0.5 text-slate-600">
+          parent {shortArtifactId(parentId)}
+        </span>
+      )}
+    </div>
+  );
+}
+
+function VersionChainView({ current, allRefs }: { current: WorkflowArtifactRef; allRefs: WorkflowArtifactRef[] }) {
+  const chain = versionChainFor(current, allRefs);
+  const parentId = current.parent_artifact_id ?? current.artifact?.parent_artifact_id;
+  if (!parentId && chain.length <= 1) return null;
+
+  return (
+    <details className="mt-3 rounded-lg border border-line/60 bg-slate-50 px-3 py-2">
+      <summary className="cursor-pointer text-xs font-medium text-slate-600">
+        版本链（{chain.length} 个版本）
+      </summary>
+      <div className="mt-2 space-y-2">
+        {chain.map((item) => {
+          const note = noteFromArtifactRef(item);
+          const isCurrent = item.artifact_id === current.artifact_id;
+          return (
+            <div key={item.artifact_id} className="rounded-lg bg-white px-3 py-2">
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <p className="truncate text-xs font-medium text-ink">
+                    {note?.title ?? item.artifact?.summary_text ?? shortArtifactId(item.artifact_id)}
+                  </p>
+                  {note?.content && (
+                    <p className="mt-1 line-clamp-2 text-[11px] leading-4 text-quiet">{note.content}</p>
+                  )}
+                </div>
+                <span className="shrink-0 rounded-full bg-slate-100 px-2 py-0.5 text-[10px] text-slate-600">
+                  {isCurrent ? "当前" : "旧版"}
+                </span>
+              </div>
+              <ArtifactVersionBadges ref={item} current={isCurrent} />
+            </div>
+          );
+        })}
+        {parentId && chain.length === 1 && (
+          <p className="text-[11px] text-quiet">父版本 {shortArtifactId(parentId)} 尚未出现在当前时间线引用中。</p>
+        )}
+      </div>
+    </details>
+  );
+}
+
+function ArtifactRefsView({ refs, allRefs }: { refs: WorkflowArtifactRef[]; allRefs: WorkflowArtifactRef[] }) {
+  const notes = refs
+    .filter((ref) => ref.artifact_type === "generated_note" || ref.artifact?.artifact_type === "generated_note")
+    .map((ref) => ({ ref, note: noteFromArtifactRef(ref) }))
+    .filter((item): item is { ref: WorkflowArtifactRef; note: GeneratedNoteItem } => item.note !== null);
+  const strategies = refs
+    .filter((ref) => ref.artifact_type === "strategy" || ref.artifact?.artifact_type === "strategy")
+    .map((ref) => ({ ref, payload: payloadFromArtifactRef(ref) }))
+    .filter((item): item is { ref: WorkflowArtifactRef; payload: Record<string, unknown> } => item.payload !== null);
+
+  if (notes.length === 0 && strategies.length === 0) return null;
+
+  return (
+    <div className="mt-3 space-y-2.5">
+      {strategies.map(({ ref, payload }, index) => (
+        <div key={`strategy-${index}`} className="rounded-xl border border-line/60 bg-white px-4 py-3">
+          <p className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-quiet">
+            内容策略定位
+          </p>
+          <p className="leading-6 text-ink">{String(payload.positioning ?? payload.summary ?? "策略已生成")}</p>
+          <ArtifactVersionBadges ref={ref} current />
+        </div>
+      ))}
+      {notes.length > 0 && (
+        <div className="space-y-2.5">
+          <p className="text-[10px] font-semibold uppercase tracking-wider text-quiet">
+            生成笔记（{notes.length} 篇）
+          </p>
+          {notes.map(({ ref, note }) => (
+            <div key={ref.artifact_id} className="rounded-xl border border-line/60 bg-white px-4 py-3">
+              <p className="font-medium text-ink">{note.title}</p>
+              <p className="mt-1 line-clamp-4 text-xs leading-5 text-quiet">{note.content}</p>
+              {note.tags.filter(Boolean).length > 0 && (
+                <div className="mt-2 flex flex-wrap gap-1">
+                  {note.tags.filter(Boolean).map((tag) => (
+                    <span key={tag} className="rounded-full bg-slate-100 px-2 py-0.5 text-[11px] text-quiet">
+                      #{tag}
+                    </span>
+                  ))}
+                </div>
+              )}
+              <ArtifactVersionBadges ref={ref} current />
+              <VersionChainView current={ref} allRefs={allRefs} />
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function CreatorPage() {
+  const { selectedBrandId } = useBrandContext();
   const [threads, setThreads] = useState<CreatorThreadSummary[]>([]);
   const [activeThreadId, setActiveThreadId] = useState<string | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([WELCOME_MESSAGE]);
@@ -95,123 +424,145 @@ export default function CreatorPage() {
     notes: GeneratedNoteItem[];
   } | null>(null);
   const [isAccepted, setIsAccepted] = useState(false);
-  // Set when switching to a thread that has a paused job — prompts user to resume/cancel
-  const [pendingResume, setPendingResume] = useState<{ jobId: string; sessionId: string } | null>(null);
-
   const taskRef = useRef<WorkflowTask | null>(null);
   const activeThreadIdRef = useRef<string | null>(null);
   const chatEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const snapshotRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const snapshotRefreshInFlightRef = useRef(false);
   // Tracks the most recently *requested* thread load to discard stale responses
   const loadingThreadRef = useRef<string | null>(null);
 
   const activeThread = threads.find((t) => t.thread_id === activeThreadId) ?? null;
+  const activeTopicPoolUrl = activeThread
+    ? `/topic-pool?thread_id=${encodeURIComponent(activeThread.thread_id)}${task?.runId ? `&run_id=${encodeURIComponent(task.runId)}` : ""}`
+    : null;
   const isTaskRunning = task?.status === "running" || task?.status === "paused";
+  const showTaskCard = task?.status === "running" || task?.status === "paused" || task?.status === "failed";
+  const allArtifactRefs = collectArtifactRefs(messages);
 
   useEffect(() => { taskRef.current = task; }, [task]);
   useEffect(() => { activeThreadIdRef.current = activeThreadId; }, [activeThreadId]);
 
-  // Auto-scroll to bottom whenever messages or live feed updates
+  // Auto-scroll only for chat/result changes. Task progress stays inside the
+  // progress card and must not push the conversation downward on every event.
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, statusLog, generatedResult]);
+  }, [messages, generatedResult]);
 
   // Load thread list on mount; auto-select most recent
   useEffect(() => {
-    listThreads()
+    listThreads(selectedBrandId)
       .then((items) => {
         setThreads(items);
         if (items.length > 0) void selectThread(items[0].thread_id);
       })
       .catch(() => {});
-  }, []);
+  }, [selectedBrandId]);
 
   // SSE subscription — active only while task is running
   useEffect(() => {
     if (!activeThreadId || !task || task.status !== "running") return;
     const subscribedThreadId = activeThreadId;
-    const subscribedSessionId = task.sessionId;
-    const isStaleEvent = (data: { thread_id: string; session_id: string }) =>
-      data.thread_id !== subscribedThreadId ||
-      data.session_id !== subscribedSessionId ||
-      activeThreadIdRef.current !== subscribedThreadId;
+    const subscribedRunId = task.runId;
+    const isStale = () => activeThreadIdRef.current !== subscribedThreadId;
 
-    const es = subscribeThreadEvents(activeThreadId, {
-      onProgress: (data) => {
-        if (isStaleEvent(data)) return;
-        // Update real progress from SSE payload
+    const refreshSnapshot = async () => {
+      if (snapshotRefreshInFlightRef.current) return;
+      snapshotRefreshInFlightRef.current = true;
+      try {
+        const snapshot = await getWorkflowRunSnapshot(subscribedRunId, subscribedThreadId);
+        if (isStale()) return;
+        applySnapshot(snapshot, subscribedThreadId);
+      } catch {
+        // Snapshot refresh is best-effort; SSE keeps the visible log moving.
+      } finally {
+        snapshotRefreshInFlightRef.current = false;
+      }
+    };
+
+    const scheduleRefreshSnapshot = () => {
+      if (snapshotRefreshTimerRef.current) return;
+      snapshotRefreshTimerRef.current = setTimeout(() => {
+        snapshotRefreshTimerRef.current = null;
+        void refreshSnapshot();
+      }, 500);
+    };
+
+    const es = subscribeWorkflowRunEvents(subscribedRunId, {
+      onEvent: (data) => {
+        if (isStale()) return;
         const progress = typeof data.payload?.progress === "number" ? data.payload.progress : undefined;
         if (progress !== undefined) {
           setTask((t) => t ? { ...t, progress } : t);
         }
-        // Append live status message (translated to user-friendly text)
-        const raw = data.payload?.message;
-        if (raw && typeof raw === "string") {
-          const translated = translateStatusMsg(raw);
-          if (translated) setStatusLog((log) => [...log, translated]);
+        if (data.payload?.phase && typeof data.payload.phase === "string") {
+          setTask((t) => t ? { ...t, stage: data.payload.phase as string } : t);
         }
+        const line = workflowEventLine(data);
+        if (line) setStatusLog((log) => [...log, line].slice(-6));
+        scheduleRefreshSnapshot();
       },
-      onStageChanged: (data) => {
-        if (isStaleEvent(data)) return;
-        if (data.stage === "generate" && data.job_id) {
-          setTask((t) =>
-            t ? { ...t, stage: "generation", jobId: data.job_id!, progress: 0 } : t
-          );
-        }
-        const raw = data.payload?.message;
-        if (raw && typeof raw === "string") {
-          const translated = translateStatusMsg(raw);
-          if (translated) setStatusLog((log) => [...log, translated]);
-        }
-      },
-      onCompleted: (data) => {
-        if (isStaleEvent(data)) return;
-        const current = taskRef.current;
-        if (!current) return;
-        if (data.stage === "strategy") {
-          // generate job is auto-enqueued by the backend worker; just update local stage
-          setTask((t) => t ? { ...t, stage: "generation", progress: 0 } : t);
-        } else if (data.stage === "generate") {
-          es.close();
-          setTask((t) => t ? { ...t, status: "completed", stage: "completed", progress: 100 } : t);
-          setIsAccepted(false);
-          setStatusLog([]);
-          if (subscribedThreadId) {
-            getThreadResult(subscribedThreadId)
-              .then((result) => {
-                if (activeThreadIdRef.current !== subscribedThreadId) return;
-                setGeneratedResult({
-                  strategy: result.strategy as { positioning: string } | null,
-                  notes: result.notes,
-                });
-              })
-              .catch(() => {
-                appendMessage({ role: "assistant", text: "笔记生成完毕，但读取结果失败，请刷新页面重试。" });
-              });
-          }
-        }
+      onCompleted: () => {
+        if (isStale()) return;
+        es.close();
+        setTask((t) => t ? { ...t, status: "completed", stage: "completed", progress: 100 } : t);
+        setIsAccepted(false);
+        setStatusLog((log) => [...log, "任务已完成"].slice(-6));
+        void refreshSnapshot();
+        getThreadResult(subscribedThreadId)
+          .then((result) => {
+            if (isStale()) return;
+            setGeneratedResult({
+              strategy: result.strategy as { positioning: string } | null,
+              notes: result.notes,
+            });
+          })
+          .catch(() => {
+            appendMessage({ role: "assistant", text: "任务完成，但读取结果失败，请刷新页面重试。" });
+          });
       },
       onFailed: () => {
-        if (activeThreadIdRef.current !== subscribedThreadId) return;
+        if (isStale()) return;
         es.close();
-        setTask((t) => t ? { ...t, status: "cancelled" } : t);
-        setStatusLog([]);
-        appendMessage({ role: "system", text: "任务执行失败，请重试。" });
+        setTask((t) => t ? { ...t, status: "failed" } : t);
+        setStatusLog((log) => [...log, "任务执行失败，请重试。"].slice(-6));
       },
       onCancelled: () => {
-        if (activeThreadIdRef.current !== subscribedThreadId) return;
+        if (isStale()) return;
         es.close();
         setTask((t) => t ? { ...t, status: "cancelled" } : t);
-        setStatusLog([]);
-        appendMessage({ role: "system", text: "任务已取消。" });
+        setStatusLog((log) => [...log, "任务已取消。"].slice(-6));
       },
     });
 
-    return () => es.close();
-  }, [activeThreadId, task?.status, task?.sessionId]);
+    return () => {
+      if (snapshotRefreshTimerRef.current) {
+        clearTimeout(snapshotRefreshTimerRef.current);
+        snapshotRefreshTimerRef.current = null;
+      }
+      es.close();
+    };
+  }, [activeThreadId, task?.status, task?.runId]);
 
   function appendMessage(message: Omit<ChatMessage, "id">) {
     setMessages((current) => [...current, { ...message, id: createId("msg") }]);
+  }
+
+  function applySnapshot(snapshot: WorkflowRunSnapshot | null | undefined, threadId: string) {
+    if (!snapshot) return;
+    const nextTask = taskFromSnapshot(snapshot);
+    setTask(nextTask);
+    setThreads((current) =>
+      current.map((t) =>
+        t.thread_id === threadId
+          ? { ...t, active_run_id: snapshot.run.run_id, updated_at: new Date().toISOString() }
+          : t
+      )
+    );
+    if (snapshot.artifacts.length === 0) {
+      setGeneratedResult(null);
+    }
   }
 
   function resetConversation() {
@@ -220,7 +571,6 @@ export default function CreatorPage() {
     setStatusLog([]);
     setGeneratedResult(null);
     setIsAccepted(false);
-    setPendingResume(null);
   }
 
   async function selectThread(threadId: string) {
@@ -229,11 +579,11 @@ export default function CreatorPage() {
     resetConversation();
     loadingThreadRef.current = threadId;
     try {
-      const { thread, messages: history } = await getThread(threadId);
+      const { thread, messages: history } = await getThreadTimeline(threadId);
       // Discard stale response if user already switched to another thread
       if (loadingThreadRef.current !== threadId) return;
       if (history.length > 0) {
-        setMessages(history.map((m) => ({ id: m.message_id, role: m.role, text: m.text })));
+        setMessages(history.map(chatMessageFromRecord));
       }
       if (thread.status === "accepted") {
         setIsAccepted(true);
@@ -248,33 +598,10 @@ export default function CreatorPage() {
           .catch(() => {});
       }
 
-      // Restore task strip from the active workflow. SSE replay then catches up
-      // stage/progress/result for the specific thread + session.
-      if (thread.active_job_id && thread.active_workflow_session_id && thread.status !== "accepted") {
-        let restoredStage: WorkflowTask["stage"] = "strategy";
-        let restoredStatus: TaskStatus = "running";
-        try {
-          const job = await getJobStatus(thread.active_job_id);
-          if (loadingThreadRef.current !== threadId) return;
-          restoredStage = job.job_type === "generate" ? "generation" : "strategy";
-          if (job.status === "paused") restoredStatus = "paused";
-          if (job.status === "cancelled" || job.status === "failed") restoredStatus = "cancelled";
-        } catch {
-          // Keep a running placeholder; SSE replay can still restore the task.
-        }
-        setTask({
-          stage: restoredStage,
-          status: restoredStatus,
-          progress: 0,
-          sessionId: thread.active_workflow_session_id,
-          jobId: thread.active_job_id,
-        });
-        if (restoredStatus === "paused") {
-          setPendingResume({
-            jobId: thread.active_job_id,
-            sessionId: thread.active_workflow_session_id,
-          });
-        }
+      if (thread.active_run_id && thread.status !== "accepted") {
+        const snapshot = await getWorkflowRunSnapshot(thread.active_run_id, threadId);
+        if (loadingThreadRef.current !== threadId) return;
+        applySnapshot(snapshot, threadId);
       }
     } catch {
       // silently keep welcome message on load failure
@@ -283,7 +610,7 @@ export default function CreatorPage() {
 
   async function handleNewThread() {
     try {
-      const created = await createThread();
+      const created = await createThread(undefined, selectedBrandId);
       addThreadToState(created.thread_id, created.title);
       setActiveThreadId(created.thread_id);
       resetConversation();
@@ -295,9 +622,11 @@ export default function CreatorPage() {
   function addThreadToState(thread_id: string, title: string) {
     const summary: CreatorThreadSummary = {
       thread_id,
+      brand_id: selectedBrandId,
       title,
       status: "active",
       active_job_id: null,
+      active_run_id: null,
       created_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
     };
@@ -311,7 +640,7 @@ export default function CreatorPage() {
       const title = firstMessage.length > 20
         ? firstMessage.slice(0, 20) + "…"
         : firstMessage;
-      const created = await createThread(title);
+      const created = await createThread(title, selectedBrandId);
       addThreadToState(created.thread_id, created.title);
       setActiveThreadId(created.thread_id);
       return created.thread_id;
@@ -324,6 +653,7 @@ export default function CreatorPage() {
   async function sendMessage(textOverride?: string) {
     const text = (textOverride ?? input).trim();
     if (!text || isLoading) return;
+    setIsLoading(true);
     setInput("");
     // Reset textarea height after clearing
     if (inputRef.current) {
@@ -333,12 +663,13 @@ export default function CreatorPage() {
 
     // Ensure we have an active thread (auto-create if none)
     const threadId = await ensureThread(text);
-    if (!threadId) return;
+    if (!threadId) {
+      setIsLoading(false);
+      return;
+    }
 
-    let intent = "free_chat";
     try {
       const result = await appendThreadMessage(threadId, text);
-      intent = result.intent;
       if (result.updated_title) {
         setThreads((current) =>
           current.map((t) =>
@@ -349,101 +680,80 @@ export default function CreatorPage() {
       if (result.assistant_reply) {
         appendMessage({ role: "assistant", text: result.assistant_reply });
       }
-      if (intent === "pause_job") {
-        setTask((t) => t ? { ...t, status: "paused" } : t);
-        inputRef.current?.focus();
-        return;
-      } else if (intent === "resume_job") {
-        setTask((t) => t ? { ...t, status: "running" } : t);
-        setPendingResume(null);
-        inputRef.current?.focus();
-        return;
-      } else if (intent === "cancel_job") {
-        setTask((t) => t ? { ...t, status: "cancelled" } : t);
-        setPendingResume(null);
-        inputRef.current?.focus();
-        return;
-      } else if (intent === "ask_status") {
-        inputRef.current?.focus();
-        return;
+      if (result.active_run_snapshot) {
+        applySnapshot(result.active_run_snapshot, threadId);
+      }
+      if (
+        result.intent === "complete_run" ||
+        result.intent === "revise_artifact" ||
+        result.intent === "rerun_workflow"
+      ) {
+        try {
+          const timeline = await getThreadTimeline(threadId);
+          setMessages(timeline.messages.map(chatMessageFromRecord));
+        } catch {
+          // The optimistic user/assistant messages above remain valid.
+        }
       }
     } catch {
-      // fall through to local intent inference
-    }
-
-    if (intent === "add_constraint") {
-      inputRef.current?.focus();
-      return;
-    }
-
-    if (inferTaskIntent(text) && (!task || task.status !== "running")) {
-      await startWorkflow(text, threadId);
-      inputRef.current?.focus();
-      return;
-    }
-
-    appendMessage({ role: "assistant", text: "已收到。如需生成内容，请描述你的具体需求。" });
-    inputRef.current?.focus();
-  }
-
-  async function startWorkflow(text: string, threadId: string) {
-    setIsLoading(true);
-    setStatusLog([]);
-    setGeneratedResult(null);
-    try {
-      const result = await startThreadWorkflow(threadId, text);
-      setTask({
-        stage: "strategy",
-        status: "running",
-        progress: 0,
-        sessionId: result.session_id,
-        jobId: result.job_id,
-      });
-      setThreads((current) =>
-        current.map((t) =>
-          t.thread_id === threadId ? { ...t, active_job_id: result.job_id } : t
-        )
-      );
-      // status log is driven by real SSE events, no hardcoded initial message
-    } catch {
-      appendMessage({ role: "system", text: "启动工作流失败，请检查 runtime 是否在线。" });
+      appendMessage({ role: "system", text: "发送失败，请检查 runtime 是否在线。" });
     } finally {
       setIsLoading(false);
+      inputRef.current?.focus();
     }
   }
 
   async function handleComplete() {
     if (!activeThread || isAccepted) return;
     try {
-      await completeThread(activeThread.thread_id);
+      const result = await completeThread(activeThread.thread_id);
       setIsAccepted(true);
+      appendMessage({
+        role: "assistant",
+        text: `已加入选题库（${result.publish_candidate_count} 篇）。`,
+        actionLabel: "查看选题库",
+        actionUrl: activeTopicPoolUrl ?? "/topic-pool",
+      });
     } catch {
       appendMessage({ role: "system", text: "提交失败，请检查 runtime 是否在线。" });
     }
   }
 
   async function handleStopTask() {
-    if (!task || task.status !== "running") return;
+    if (!task || !["running", "paused"].includes(task.status)) return;
     try {
-      await cancelJob(task.jobId);
-      setTask((t) => t ? { ...t, status: "cancelled" } : t);
-      setPendingResume(null);
-      setStatusLog([]);
-      appendMessage({ role: "assistant", text: "已停止当前任务。" });
-    } catch {
-      if (activeThreadId) {
-        try {
-          await appendThreadMessage(activeThreadId, "取消当前任务");
-          setTask((t) => t ? { ...t, status: "cancelled" } : t);
-          setPendingResume(null);
-          setStatusLog([]);
-          appendMessage({ role: "assistant", text: "已停止当前任务。" });
-          return;
-        } catch {
-          // fall through to error message
-        }
+      if (!activeThreadId) return;
+      const result = await appendThreadMessage(activeThreadId, "取消当前任务");
+      if (result.active_run_snapshot) {
+        applySnapshot(result.active_run_snapshot, activeThreadId);
+      } else {
+        setTask((t) => t ? { ...t, status: "cancelled" } : t);
       }
+      setTask((t) => t ? { ...t, status: "cancelled" } : t);
+      setStatusLog([]);
+      if (result.assistant_reply) {
+        appendMessage({ role: "assistant", text: result.assistant_reply });
+      }
+    } catch {
       appendMessage({ role: "system", text: "停止任务失败，请稍后重试。" });
+    }
+  }
+
+  async function handlePauseOrResumeTask() {
+    if (!task || !activeThreadId) return;
+    try {
+      const result = await appendThreadMessage(
+        activeThreadId,
+        task.status === "paused" ? "继续" : "暂停一下"
+      );
+      if (result.active_run_snapshot) {
+        applySnapshot(result.active_run_snapshot, activeThreadId);
+      }
+      if (result.assistant_reply) {
+        appendMessage({ role: "assistant", text: result.assistant_reply });
+      }
+    } catch {
+      appendMessage({ role: "system", text: "任务控制失败，请稍后重试。" });
     }
   }
 
@@ -636,6 +946,17 @@ export default function CreatorPage() {
                     ) : (
                       <>
                         <div className="whitespace-pre-wrap">{message.text}</div>
+                        {message.actionUrl && message.actionLabel ? (
+                          <a
+                            className="mt-2 inline-flex rounded-lg border border-line bg-white px-3 py-1.5 text-xs font-medium text-ink transition hover:bg-slate-50"
+                            href={message.actionUrl}
+                          >
+                            {message.actionLabel}
+                          </a>
+                        ) : null}
+                        {message.messageType === "artifact_result" && message.artifactRefs && (
+                          <ArtifactRefsView refs={message.artifactRefs} allRefs={allArtifactRefs} />
+                        )}
                         {isUser && (
                           <button
                             type="button"
@@ -652,74 +973,79 @@ export default function CreatorPage() {
               );
             })}
 
-            {/* ── Live status feed — shows real-time SSE messages while task runs ── */}
-            {isTaskRunning && statusLog.length > 0 && (
+            {/* Live WorkflowRun progress card */}
+            {showTaskCard && task && (
               <div className="flex justify-start">
-                <div className="max-w-[80%] rounded-2xl bg-[#f0f2f5] px-4 py-3 text-sm text-ink">
-                  {/* Stage label with pulsing indicator */}
-                  <div className="mb-2.5 flex items-center gap-2">
-                    <span className="h-2 w-2 animate-pulse rounded-full bg-emerald-500" />
-                    <span className="text-xs font-medium uppercase tracking-wide text-quiet">
-                      {stageLabel(task?.stage ?? "strategy")}
+                <div className="w-full max-w-[80%] rounded-2xl bg-[#f0f2f5] px-4 py-3 text-sm text-ink">
+                  <div className="flex items-start justify-between gap-4">
+                    <div>
+                      <div className="mb-2 flex items-center gap-2">
+                        <span
+                          className={[
+                            "h-2 w-2 rounded-full",
+                            task.status === "failed" ? "bg-danger" : "animate-pulse bg-emerald-500",
+                          ].join(" ")}
+                        />
+                        <span className="font-medium">
+                          {task.status === "failed" ? "创作任务执行失败" : "创作任务进行中"}
+                        </span>
+                      </div>
+                      <div className="space-y-1 text-xs leading-5 text-quiet">
+                        <p>阶段：{stageLabel(task.stage)}</p>
+                        <p>当前：{task.currentStepLabel}</p>
+                        <p>
+                          进度：{task.completedSteps} / {task.totalSteps || "?"} · {task.progress}%
+                        </p>
+                      </div>
+                    </div>
+                    <span className="shrink-0 rounded-full bg-white px-2.5 py-1 text-xs text-quiet">
+                      {statusLabel(task.status)}
                     </span>
                   </div>
-                  {/* Log lines */}
-                  <div className="space-y-1.5">
-                    {statusLog.map((line, i) => {
-                      const isLatest = i === statusLog.length - 1;
-                      return (
-                        <div
-                          key={i}
-                          className={["flex items-start gap-2 text-xs", isLatest ? "text-ink" : "text-slate-400"].join(" ")}
-                        >
-                          <span className="mt-px shrink-0 text-[10px]">
-                            {isLatest ? "⋯" : "✓"}
-                          </span>
-                          <span>{line}</span>
-                        </div>
-                      );
-                    })}
+                  <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-white">
+                    <div
+                      className="h-full rounded-full bg-emerald-500 transition-all"
+                      style={{ width: `${Math.max(0, Math.min(100, task.progress))}%` }}
+                    />
                   </div>
-                </div>
-              </div>
-            )}
-
-            {/* ── Paused job resume prompt ── */}
-            {pendingResume && (
-              <div className="flex justify-start">
-                <div className="max-w-[80%] rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-ink">
-                  <p className="mb-3 leading-6">上次有一个任务被暂停了，是否继续执行？</p>
-                  <div className="flex gap-2">
-                    <button
-                      type="button"
-                      onClick={async () => {
-                        try {
-                          await resumeJob(pendingResume.jobId);
-                        } catch {
-                          // The next status refresh/SSE replay will correct local state.
-                        }
-                        setTask((t) => t ? { ...t, status: "running" } : t);
-                        setPendingResume(null);
-                      }}
-                      className="rounded-lg bg-ink px-3 py-1.5 text-xs font-medium text-white hover:bg-slate-800"
-                    >
-                      继续
-                    </button>
-                    <button
-                      type="button"
-                      onClick={async () => {
-                        try {
-                          await cancelJob(pendingResume.jobId);
-                        } catch {
-                          // The next status refresh/SSE replay will correct local state.
-                        }
-                        setTask((t) => t ? { ...t, status: "cancelled" } : t);
-                        setPendingResume(null);
-                      }}
-                      className="rounded-lg border border-line px-3 py-1.5 text-xs text-slate-500 hover:bg-slate-100"
-                    >
-                      放弃
-                    </button>
+                  <div className="mt-3">
+                    <p className="mb-1.5 text-xs font-medium text-quiet">最近进展：</p>
+                    <div className="space-y-1.5">
+                      {(statusLog.length ? statusLog : ["任务已创建"]).map((line, i, lines) => {
+                        const isLatest = i === lines.length - 1;
+                        return (
+                          <div
+                            key={`${line}-${i}`}
+                            className={["flex items-start gap-2 text-xs", isLatest ? "text-ink" : "text-slate-400"].join(" ")}
+                          >
+                            <span className="mt-px shrink-0 text-[10px]">
+                              {isLatest ? "⋯" : "✓"}
+                            </span>
+                            <span>{line}</span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                  <div className="mt-3 flex gap-2">
+                    {task.status !== "failed" && (
+                      <>
+                        <button
+                          type="button"
+                          onClick={() => void handlePauseOrResumeTask()}
+                          className="rounded-lg border border-line bg-white px-3 py-1.5 text-xs font-medium text-ink transition hover:bg-slate-50"
+                        >
+                          {task.status === "paused" ? "继续" : "暂停"}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => void handleStopTask()}
+                          className="rounded-lg border border-danger/30 bg-dangerBg px-3 py-1.5 text-xs font-medium text-danger transition hover:bg-red-100"
+                        >
+                          取消
+                        </button>
+                      </>
+                    )}
                   </div>
                 </div>
               </div>
@@ -776,8 +1102,16 @@ export default function CreatorPage() {
                   <div className="mt-4 flex items-center justify-between gap-3">
                     <p className="text-xs text-quiet">
                       {isAccepted
-                        ? "笔记已加入发布候选列表，可在「发布记录」页查看。"
-                        : "确认结果后点击完成，笔记将进入发布候选。"}
+                        ? "笔记已加入选题库，可直接查看。"
+                        : "确认结果后点击完成，笔记将进入选题库。"}
+                      {isAccepted && activeTopicPoolUrl ? (
+                        <a
+                          className="ml-2 font-medium text-slate-700 underline decoration-dotted underline-offset-4"
+                          href={activeTopicPoolUrl}
+                        >
+                          查看选题库
+                        </a>
+                      ) : null}
                     </p>
                     <button
                       type="button"
