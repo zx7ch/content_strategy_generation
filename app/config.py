@@ -5,11 +5,20 @@ Production settings must stay aligned with `.env.example`.
 
 from __future__ import annotations
 
+from importlib.metadata import PackageNotFoundError, version as _pkg_version
 from pathlib import Path
 from typing import List
 
 from pydantic import AliasChoices, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Single source of truth: pyproject.toml [project] version.
+# importlib.metadata works both in dev (after `pip install -e .`)
+# and inside the PyInstaller bundle (dist-info is included via spec).
+try:
+    _RUNTIME_VERSION = _pkg_version("xhs-note-generator")
+except PackageNotFoundError:
+    _RUNTIME_VERSION = "dev"
 
 
 def _env_alias(name: str) -> AliasChoices:
@@ -32,7 +41,7 @@ class Settings(BaseSettings):
         default="xhs-agent-runtime",
         validation_alias=_env_alias("RUNTIME_SERVICE_NAME"),
     )
-    RUNTIME_VERSION: str = Field(default="0.1.0", validation_alias=_env_alias("RUNTIME_VERSION"))
+    RUNTIME_VERSION: str = Field(default=_RUNTIME_VERSION, validation_alias=_env_alias("RUNTIME_VERSION"))
     RUNTIME_API_CONTRACT: str = Field(
         default="local-runtime-v1",
         validation_alias=_env_alias("RUNTIME_API_CONTRACT"),

@@ -4,7 +4,7 @@ import asyncio
 from contextlib import asynccontextmanager
 
 from app.agents.orchestrator import Orchestrator
-from app.api.routes.router import app
+from app.api.routes.router import app, schedule_embedding_prewarm
 from app.config import settings
 from app.memory.job_store import JobStore
 from app.memory.thread_store import ThreadStore
@@ -58,6 +58,11 @@ async def _worker_lifespan(application):
     v2_decision_service.attach_scorer_service(v2_scorer_service)
     stop_event = asyncio.Event()
     worker_task = asyncio.create_task(worker.run_loop(stop_event=stop_event))
+
+    # Start embedding model preload immediately in background.
+    # Model downloads (~780 MB) or loads from cache without blocking startup.
+    # By the time the user runs their first task, the model is likely ready.
+    schedule_embedding_prewarm()
 
     application.state.job_store = job_store
     application.state.orchestrator = orchestrator

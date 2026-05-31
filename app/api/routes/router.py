@@ -3564,12 +3564,21 @@ async def health_check() -> dict[str, Any]:
     }
 
 
-@app.post("/runtime/prewarm")
-async def prewarm_runtime() -> dict[str, Any]:
+def schedule_embedding_prewarm() -> None:
+    """Start embedding model preload as a background task.
+
+    Safe to call multiple times — no-ops if already running or ready.
+    Must be called from inside a running event loop (e.g. app lifespan).
+    """
     global _embedding_prewarm_task
     if _embedding_prewarm_task is None or _embedding_prewarm_task.done():
         if _embedding_prewarm_status.get("status") != "ready":
             _embedding_prewarm_task = asyncio.create_task(_run_embedding_prewarm())
+
+
+@app.post("/runtime/prewarm")
+async def prewarm_runtime() -> dict[str, Any]:
+    schedule_embedding_prewarm()
     return {
         "embedding": _embedding_prewarm_status,
     }
