@@ -5,17 +5,58 @@
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.104+-009688.svg)](https://fastapi.tiangolo.com)
 [![LangGraph](https://img.shields.io/badge/LangGraph-1.1+-orange.svg)](https://langchain-ai.github.io/langgraph/)
 
+[![Substack](https://img.shields.io/badge/Substack-Product%20Notes-FF6719?logo=substack&logoColor=white)](https://substack.com/@doris183601)
+
 > Cloud UI · Local Agent Runtime · Cloud LLM Inference
 
 A content strategy and note generation system for Xiaohongshu (Little Red Book) creators. The agent workflow runs on your machine — not in the cloud.
-
-![Deployment Architecture](docs/images/deployment_structure.png)
 
 Most AI content tools host the entire agent service in the cloud. This project takes a different approach: **the frontend is on Vercel, LLM inference calls the cloud, but the agent runtime runs locally**. Workflow orchestration, job queue, RAG index, vector search, and task recovery all live on your machine.
 
 This isn't a cost optimization. It's an architectural boundary: orchestration belongs where your data and context live.
 
 ---
+<div style="display:none">
+## Download & Install (No Python Required)
+
+The easiest way to run XHS Growth Agent is to download the pre-built Runtime from the Releases page — no Python, no dependencies, just unzip and run.
+
+**→ [Download Latest Release](https://github.com/zx7ch/content_strategy_generation/releases/latest)**
+
+| Platform | File |
+|---|---|
+| macOS Apple Silicon (M1/M2/M3) | `xhs-runtime-macos-arm64.zip` |
+| macOS Intel | `xhs-runtime-macos-x86_64.zip` |
+
+### Setup (3 steps)
+
+**1. Unzip and open config**
+
+After unzipping, the Runtime creates a config file at:
+`~/Library/Application Support/xhs-growth-agent/config.env`
+
+Open that file with any text editor and fill in:
+- `LLM_PROVIDER` — choose your AI provider (`anthropic`, `openai`, `deepseek`, etc.)
+- The corresponding API Key
+- `XHS_SPIDER_COOKIES` — your Xiaohongshu login cookie
+
+**2. Launch the Runtime**
+
+Double-click `start.command`.
+
+> **macOS security note**: On first launch macOS may show "unverified developer". Right-click → Open to proceed, or run `xattr -cr ./xhs-runtime` in Terminal.
+
+**3. Open the frontend**
+
+Visit **https://content-strategy-generation.vercel.app** — the UI connects to your local Runtime automatically.
+
+### Updating
+
+Download the new zip, unzip it next to the old folder (or replace it). Your data and config are stored separately and are **never overwritten by updates**:
+- Config & databases & model cache: `~/Library/Application Support/xhs-growth-agent/`
+
+---
+</div>
 
 ## Quick Start
 
@@ -136,6 +177,8 @@ GET /workflow-runs/{run_id}/events
 ---
 
 ## Architecture
+
+![Deployment Architecture](docs/images/deployment_structure.png)
 
 ### Deployment Model
 
