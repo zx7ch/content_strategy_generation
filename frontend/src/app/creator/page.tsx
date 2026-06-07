@@ -8,6 +8,9 @@ import {
   createThread,
   deleteThread,
   getJobStatus,
+  getSessionUsage,
+  getSessionUsageEvents,
+  getSessionUsageSteps,
   getThread,
   getThreadResult,
   listThreads,
@@ -17,6 +20,9 @@ import {
   subscribeThreadEvents,
   type CreatorThreadSummary,
   type GeneratedNoteItem,
+  type SessionUsageEvent,
+  type SessionUsageStepSummary,
+  type SessionUsageSummary,
 } from "@/lib/api";
 
 type TaskStatus = "running" | "paused" | "cancelled" | "completed";
@@ -77,6 +83,36 @@ function statusLabel(status: TaskStatus) {
   return "完成";
 }
 
+function formatTokens(value: number) {
+  if (value >= 1000) return `${(value / 1000).toFixed(value >= 10000 ? 1 : 2)}K`;
+  return String(value);
+}
+
+function formatCost(value: number, currency: string) {
+  const symbol = currency === "USD" ? "$" : `${currency} `;
+  if (value <= 0) return `${symbol}0.000`;
+  return `${symbol}${value.toFixed(value < 0.01 ? 4 : 3)}`;
+}
+
+function formatLatency(value: number | null) {
+  if (value === null) return "-";
+  if (value >= 1000) return `${(value / 1000).toFixed(1)}s`;
+  return `${value}ms`;
+}
+
+function formatTimestamp(value: string) {
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return value;
+  return parsed.toLocaleString("zh-CN", {
+    hour12: false,
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+
 export default function CreatorPage() {
   const [threads, setThreads] = useState<CreatorThreadSummary[]>([]);
   const [activeThreadId, setActiveThreadId] = useState<string | null>(null);
@@ -86,6 +122,10 @@ export default function CreatorPage() {
   const [editingText, setEditingText] = useState("");
   const [activeMenuId, setActiveMenuId] = useState<string | null>(null);
   const [task, setTask] = useState<WorkflowTask | null>(null);
+  const [usageSummary, setUsageSummary] = useState<SessionUsageSummary | null>(null);
+  const [usageSteps, setUsageSteps] = useState<SessionUsageStepSummary[]>([]);
+  const [usageEvents, setUsageEvents] = useState<SessionUsageEvent[]>([]);
+  const [showUsageDetails, setShowUsageDetails] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   // Live status feed driven by SSE payload.message
   const [statusLog, setStatusLog] = useState<string[]>([]);
@@ -110,6 +150,52 @@ export default function CreatorPage() {
 
   useEffect(() => { taskRef.current = task; }, [task]);
   useEffect(() => { activeThreadIdRef.current = activeThreadId; }, [activeThreadId]);
+
+  useEffect(() => {
+    if (!task?.sessionId) {
+      setUsageSummary(null);
+      setUsageSteps([]);
+      setUsageEvents([]);
+      setShowUsageDetails(false);
+      return;
+    }
+
+    const sessionId = task.sessionId;
+    let cancelled = false;
+    async function refreshUsage() {
+      try {
+        const [usage, steps, events] = await Promise.all([
+          getSessionUsage(sessionId),
+          getSessionUsageSteps(sessionId),
+          getSessionUsageEvents(sessionId),
+        ]);
+        if (!cancelled) {
+          setUsageSummary(usage);
+          setUsageSteps(steps);
+          setUsageEvents(events);
+        }
+      } catch {
+        if (!cancelled) {
+          setUsageSummary(null);
+          setUsageSteps([]);
+          setUsageEvents([]);
+        }
+      }
+    }
+
+    void refreshUsage();
+    if (task.status !== "running") {
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    const timer = window.setInterval(refreshUsage, 5000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [task?.sessionId, task?.status]);
 
   // Auto-scroll to bottom whenever messages or live feed updates
   useEffect(() => {
@@ -217,6 +303,10 @@ export default function CreatorPage() {
   function resetConversation() {
     setMessages([WELCOME_MESSAGE]);
     setTask(null);
+    setUsageSummary(null);
+    setUsageSteps([]);
+    setUsageEvents([]);
+    setShowUsageDetails(false);
     setStatusLog([]);
     setGeneratedResult(null);
     setIsAccepted(false);
@@ -594,6 +684,104 @@ export default function CreatorPage() {
         {/* Chat message feed */}
         <div className="flex-1 overflow-y-auto px-4 py-6 md:px-6">
           <div className="mx-auto flex max-w-3xl flex-col gap-5">
+
+            {task?.sessionId && (
+              <section className="space-y-3 rounded-lg border border-white/60 bg-white/70 px-4 py-3 text-sm shadow-sm backdrop-blur">
+                <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                  <div>
+                    <p className="text-xs font-medium text-quiet">本次任务消耗</p>
+                    <p className="mt-1 text-sm font-medium text-ink">
+                      {formatTokens(usageSummary?.total_tokens ?? 0)} tokens
+                    </p>
+                  </div>
+                  <div className="grid grid-cols-2 gap-3 text-sm sm:min-w-64">
+                    <div className="rounded-md border border-white/60 bg-white/50 px-3 py-2">
+                      <p className="text-xs text-quiet">模型调用</p>
+                      <p className="mt-1 font-medium text-ink">{usageSummary?.total_calls ?? 0} 次</p>
+                    </div>
+                    <div className="rounded-md border border-white/60 bg-white/50 px-3 py-2">
+                      <p className="text-xs text-quiet">预估费用</p>
+                      <p className="mt-1 font-medium text-ink">
+                        {formatCost(usageSummary?.total_cost ?? 0, usageSummary?.currency ?? "USD")}
+                      </p>
+                    </div>
+                  </div>
+                </div>
+                {usageSteps.length > 0 && (
+                  <div className="flex flex-wrap gap-2 border-t border-white/60 pt-3">
+                    {usageSteps.map((step) => (
+                      <span
+                        key={`${step.step_id ?? "unknown"}-${step.agent_name ?? "agent"}`}
+                        className="inline-flex items-center gap-1 rounded-md border border-white/60 bg-white/50 px-2.5 py-1 text-xs text-slate-700"
+                      >
+                        <span className="font-medium text-ink">{step.step_name ?? "未归属步骤"}</span>
+                        <span>{formatTokens(step.total_tokens)} tokens</span>
+                        <span>{formatCost(step.total_cost, step.currency)}</span>
+                        {step.failed_calls > 0 && (
+                          <span className="text-rose-600">{step.failed_calls} failed</span>
+                        )}
+                      </span>
+                    ))}
+                  </div>
+                )}
+                <div className="border-t border-white/60 pt-3">
+                  <button
+                    type="button"
+                    onClick={() => setShowUsageDetails((current) => !current)}
+                    className="flex w-full items-center justify-between rounded-md px-1 py-1 text-left text-xs font-medium text-ink hover:bg-white/40"
+                  >
+                    <span>LLM 调用明细</span>
+                    <span className="text-quiet">
+                      {usageEvents.length} calls · {showUsageDetails ? "收起" : "展开"}
+                    </span>
+                  </button>
+                  {showUsageDetails && (
+                    <div className="mt-2 space-y-2">
+                      {usageEvents.length === 0 ? (
+                        <p className="rounded-md border border-dashed border-white/60 bg-white/40 px-3 py-2 text-xs text-quiet">
+                          暂无模型调用记录
+                        </p>
+                      ) : (
+                        usageEvents.map((event) => {
+                          const failed = event.status !== "success";
+                          return (
+                            <div
+                              key={event.id}
+                              className={[
+                                "rounded-md border bg-white/50 px-3 py-2 text-xs",
+                                failed ? "border-rose-200" : "border-white/60",
+                              ].join(" ")}
+                            >
+                              <div className="flex flex-wrap items-center justify-between gap-2">
+                                <div className="min-w-0">
+                                  <span className="font-medium text-ink">{event.agent_name ?? "LLM Call"}</span>
+                                  <span className="ml-2 text-quiet">
+                                    {event.provider} / {event.model}
+                                  </span>
+                                </div>
+                                <span className={failed ? "font-medium text-rose-600" : "text-quiet"}>
+                                  {event.status}
+                                </span>
+                              </div>
+                              <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-quiet">
+                                <span>{event.model_policy ?? "default"}</span>
+                                <span>{formatTokens(event.total_tokens)} tokens</span>
+                                <span>{formatCost(event.total_cost, event.currency)}</span>
+                                <span>{formatLatency(event.latency_ms)}</span>
+                                <span>{formatTimestamp(event.created_at)}</span>
+                              </div>
+                              {failed && event.error_message && (
+                                <p className="mt-1 text-rose-600">{event.error_message}</p>
+                              )}
+                            </div>
+                          );
+                        })
+                      )}
+                    </div>
+                  )}
+                </div>
+              </section>
+            )}
 
             {messages.map((message) => {
               const isUser = message.role === "user";

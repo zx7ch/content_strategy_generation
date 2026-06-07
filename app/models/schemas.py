@@ -292,6 +292,65 @@ class SessionStatusResponse(BaseModel):
     error: Optional[str] = None
 
 
+class LLMUsageSummaryResponse(BaseModel):
+    session_id: Optional[str] = None
+    job_id: Optional[str] = None
+    total_calls: int
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+    total_cost: float
+    currency: str
+    latency_ms: int
+
+
+class LLMUsageStepSummaryResponse(BaseModel):
+    step_id: Optional[str] = None
+    step_name: Optional[str] = None
+    agent_name: Optional[str] = None
+    total_calls: int
+    failed_calls: int
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+    total_cost: float
+    currency: str
+    latency_ms: int
+
+
+class LLMUsageStepsResponse(BaseModel):
+    session_id: Optional[str] = None
+    job_id: Optional[str] = None
+    steps: List[LLMUsageStepSummaryResponse]
+
+
+class LLMUsageEventResponse(BaseModel):
+    id: str
+    session_id: Optional[str] = None
+    job_id: Optional[str] = None
+    step_id: Optional[str] = None
+    step_name: Optional[str] = None
+    agent_name: Optional[str] = None
+    provider: str
+    model: str
+    model_policy: Optional[str] = None
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+    total_cost: float
+    currency: str
+    latency_ms: Optional[int] = None
+    status: str
+    error_message: Optional[str] = None
+    created_at: str
+
+
+class LLMUsageEventsResponse(BaseModel):
+    session_id: Optional[str] = None
+    job_id: Optional[str] = None
+    events: List[LLMUsageEventResponse]
+
+
 class ErrorResponse(BaseModel):
     error_code: str
     error_message: str

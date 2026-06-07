@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 from typing import Any, Awaitable, Callable, Optional
 
 ProgressCallback = Callable[[str], Awaitable[None]]
@@ -13,6 +14,7 @@ from app.config import settings
 from app.memory.job_store import JobRecord
 from app.memory.session_state import SessionManager
 from app.models.session import SessionLifecycleState
+from app.services.llm.tracked_client import build_default_tracked_chat_client
 
 
 class JobOrchestrationError(RuntimeError):
@@ -24,7 +26,7 @@ class JobOrchestrationError(RuntimeError):
         self.retryable = retryable
 
 
-Runner = Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]]
+Runner = Callable[..., Awaitable[dict[str, Any]]]
 
 
 class Orchestrator:
@@ -72,9 +74,21 @@ class Orchestrator:
                 )
 
         if job.job_type == "strategy":
-            return await self._strategy_runner(job.session_id, job.payload, progress_callback=progress_callback)
+            return await self._invoke_runner(
+                self._strategy_runner,
+                job.session_id,
+                job.payload,
+                job_id=job.id,
+                progress_callback=progress_callback,
+            )
         if job.job_type == "generate":
-            return await self._generation_runner(job.session_id, job.payload, progress_callback=progress_callback)
+            return await self._invoke_runner(
+                self._generation_runner,
+                job.session_id,
+                job.payload,
+                job_id=job.id,
+                progress_callback=progress_callback,
+            )
 
         raise JobOrchestrationError(
             f"Unsupported job_type: {job.job_type}",
@@ -82,9 +96,45 @@ class Orchestrator:
             retryable=False,
         )
 
-    async def _run_strategy_job(self, session_id: str, payload: dict[str, Any], *, progress_callback: Optional[ProgressCallback] = None) -> dict[str, Any]:
+    async def _invoke_runner(
+        self,
+        runner: Runner,
+        session_id: str,
+        payload: dict[str, Any],
+        *,
+        job_id: str,
+        progress_callback: Optional[ProgressCallback],
+    ) -> dict[str, Any]:
+        signature = inspect.signature(runner)
+        keyword_args: dict[str, Any] = {}
+        if "job_id" in signature.parameters:
+            keyword_args["job_id"] = job_id
+        if "progress_callback" in signature.parameters:
+            keyword_args["progress_callback"] = progress_callback
+        return await runner(session_id, payload, **keyword_args)
+
+    async def _run_strategy_job(
+        self,
+        session_id: str,
+        payload: dict[str, Any],
+        *,
+        job_id: str,
+        progress_callback: Optional[ProgressCallback] = None,
+    ) -> dict[str, Any]:
         del payload  # reserved for future strategy options
-        agent = ContentStrategyAgent(session_manager=SessionManager(self.db_path))
+        llm_client = build_default_tracked_chat_client(
+            db_path=self.db_path,
+            session_id=session_id,
+            job_id=job_id,
+            model_policy="balanced",
+            step_id="strategy",
+            step_name="策略生成",
+            agent_name="ContentStrategyAgent",
+        )
+        agent = ContentStrategyAgent(
+            session_manager=SessionManager(self.db_path),
+            llm_client=llm_client,
+        )
         result = await agent.execute(session_id, progress_callback=progress_callback)
         if not result.success:
             retryable = result.error_code in self.RETRYABLE_CODES
@@ -99,9 +149,28 @@ class Orchestrator:
             "used_fallback": result.used_fallback,
         }
 
-    async def _run_generation_job(self, session_id: str, payload: dict[str, Any], *, progress_callback: Optional[ProgressCallback] = None) -> dict[str, Any]:
+    async def _run_generation_job(
+        self,
+        session_id: str,
+        payload: dict[str, Any],
+        *,
+        job_id: str,
+        progress_callback: Optional[ProgressCallback] = None,
+    ) -> dict[str, Any]:
         del payload  # session-backed generation uses stored strategy/session data
-        agent = ContentGenerationAgent(session_manager=SessionManager(self.db_path))
+        llm_client = build_default_tracked_chat_client(
+            db_path=self.db_path,
+            session_id=session_id,
+            job_id=job_id,
+            model_policy="quality",
+            step_id="generation",
+            step_name="笔记生成",
+            agent_name="ContentGenerationAgent",
+        )
+        agent = ContentGenerationAgent(
+            session_manager=SessionManager(self.db_path),
+            llm_client=llm_client,
+        )
         generated: GenerationExecutionResult = await agent.execute(session_id, progress_callback=progress_callback)
         if not generated.success:
             retryable = generated.error_code in self.RETRYABLE_CODES

@@ -20,12 +20,18 @@ from app.memory.job_store import JobStore, SessionEventRecord
 from app.memory.session_state import SessionManager
 from app.memory.thread_store import ThreadStore
 from app.services.creator_intent_router import ACTIVE_JOB_STATUSES, IntentContext, classify_intent
+from app.services.llm.usage_tracker import LLMUsageTracker
 from app.models.schemas import (
     CreateSessionResponse,
     EnqueueResponse,
     ErrorResponse,
     InitSessionRequest,
     JobStatusResponse,
+    LLMUsageEventResponse,
+    LLMUsageEventsResponse,
+    LLMUsageSummaryResponse,
+    LLMUsageStepSummaryResponse,
+    LLMUsageStepsResponse,
     ResumeSessionResponse,
     SessionEvent,
     SessionEventPayload,
@@ -2285,6 +2291,81 @@ async def get_session_status(session_id: str) -> SessionStatusResponse:
     return await _build_session_status(session)
 
 
+@app.get("/sessions/{session_id}/usage", response_model=LLMUsageSummaryResponse)
+async def get_session_usage(session_id: str) -> LLMUsageSummaryResponse:
+    async with LLMUsageTracker(settings.SQLITE_DB_PATH) as tracker:
+        summary = await tracker.summarize_session(session_id)
+    return LLMUsageSummaryResponse(
+        session_id=session_id,
+        total_calls=summary.total_calls,
+        prompt_tokens=summary.prompt_tokens,
+        completion_tokens=summary.completion_tokens,
+        total_tokens=summary.total_tokens,
+        total_cost=summary.total_cost,
+        currency=summary.currency,
+        latency_ms=summary.latency_ms,
+    )
+
+
+def _usage_step_to_response(step) -> LLMUsageStepSummaryResponse:
+    return LLMUsageStepSummaryResponse(
+        step_id=step.step_id,
+        step_name=step.step_name,
+        agent_name=step.agent_name,
+        total_calls=step.total_calls,
+        failed_calls=step.failed_calls,
+        prompt_tokens=step.prompt_tokens,
+        completion_tokens=step.completion_tokens,
+        total_tokens=step.total_tokens,
+        total_cost=step.total_cost,
+        currency=step.currency,
+        latency_ms=step.latency_ms,
+    )
+
+
+def _usage_event_to_response(event) -> LLMUsageEventResponse:
+    return LLMUsageEventResponse(
+        id=event.id,
+        session_id=event.session_id,
+        job_id=event.job_id,
+        step_id=event.step_id,
+        step_name=event.step_name,
+        agent_name=event.agent_name,
+        provider=event.provider,
+        model=event.model,
+        model_policy=event.model_policy,
+        prompt_tokens=event.prompt_tokens,
+        completion_tokens=event.completion_tokens,
+        total_tokens=event.total_tokens,
+        total_cost=event.total_cost,
+        currency=event.currency,
+        latency_ms=event.latency_ms,
+        status=event.status,
+        error_message=event.error_message,
+        created_at=event.created_at,
+    )
+
+
+@app.get("/sessions/{session_id}/usage/steps", response_model=LLMUsageStepsResponse)
+async def get_session_usage_steps(session_id: str) -> LLMUsageStepsResponse:
+    async with LLMUsageTracker(settings.SQLITE_DB_PATH) as tracker:
+        steps = await tracker.summarize_session_steps(session_id)
+    return LLMUsageStepsResponse(
+        session_id=session_id,
+        steps=[_usage_step_to_response(step) for step in steps],
+    )
+
+
+@app.get("/sessions/{session_id}/usage/events", response_model=LLMUsageEventsResponse)
+async def get_session_usage_events(session_id: str) -> LLMUsageEventsResponse:
+    async with LLMUsageTracker(settings.SQLITE_DB_PATH) as tracker:
+        events = await tracker.list_session_events(session_id)
+    return LLMUsageEventsResponse(
+        session_id=session_id,
+        events=[_usage_event_to_response(event) for event in events],
+    )
+
+
 @app.get("/jobs/{job_id}", response_model=JobStatusResponse)
 async def get_job_status(job_id: str) -> JobStatusResponse:
     async with JobStore(settings.SQLITE_DB_PATH) as store:
@@ -2306,6 +2387,42 @@ async def get_job_status(job_id: str) -> JobStatusResponse:
         last_error_code=job.last_error_code,
         last_error_message=job.last_error_message,
         cancel_reason=job.cancel_reason,
+    )
+
+
+@app.get("/jobs/{job_id}/usage", response_model=LLMUsageSummaryResponse)
+async def get_job_usage(job_id: str) -> LLMUsageSummaryResponse:
+    async with LLMUsageTracker(settings.SQLITE_DB_PATH) as tracker:
+        summary = await tracker.summarize_job(job_id)
+    return LLMUsageSummaryResponse(
+        job_id=job_id,
+        total_calls=summary.total_calls,
+        prompt_tokens=summary.prompt_tokens,
+        completion_tokens=summary.completion_tokens,
+        total_tokens=summary.total_tokens,
+        total_cost=summary.total_cost,
+        currency=summary.currency,
+        latency_ms=summary.latency_ms,
+    )
+
+
+@app.get("/jobs/{job_id}/usage/steps", response_model=LLMUsageStepsResponse)
+async def get_job_usage_steps(job_id: str) -> LLMUsageStepsResponse:
+    async with LLMUsageTracker(settings.SQLITE_DB_PATH) as tracker:
+        steps = await tracker.summarize_job_steps(job_id)
+    return LLMUsageStepsResponse(
+        job_id=job_id,
+        steps=[_usage_step_to_response(step) for step in steps],
+    )
+
+
+@app.get("/jobs/{job_id}/usage/events", response_model=LLMUsageEventsResponse)
+async def get_job_usage_events(job_id: str) -> LLMUsageEventsResponse:
+    async with LLMUsageTracker(settings.SQLITE_DB_PATH) as tracker:
+        events = await tracker.list_job_events(job_id)
+    return LLMUsageEventsResponse(
+        job_id=job_id,
+        events=[_usage_event_to_response(event) for event in events],
     )
 
 
