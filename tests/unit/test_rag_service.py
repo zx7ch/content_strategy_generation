@@ -20,9 +20,10 @@ class _QueryResult:
 
 
 class FakeCollection:
-    def __init__(self):
+    def __init__(self, metadata=None):
         self.rows: Dict[str, Dict[str, Any]] = {}
         self.last_query_where = None
+        self.metadata = metadata or {}
 
     def upsert(self, ids, documents, embeddings, metadatas):
         for i, doc_id in enumerate(ids):
@@ -54,12 +55,28 @@ class FakeCollection:
         for i in ids:
             self.rows.pop(i, None)
 
+    def modify(self, metadata=None):
+        self.metadata = metadata or {}
+
 
 class FakeClient:
     def __init__(self):
-        self.collection = FakeCollection()
+        self.collection = None
+        self.created_metadata = None
 
     def get_or_create_collection(self, name, metadata=None):
+        if self.collection is None:
+            self.collection = FakeCollection(metadata=metadata)
+        return self.collection
+
+    def get_collection(self, name):
+        if self.collection is None:
+            raise ValueError("missing collection")
+        return self.collection
+
+    def create_collection(self, name, metadata=None):
+        self.created_metadata = metadata
+        self.collection = FakeCollection(metadata=metadata)
         return self.collection
 
 
@@ -110,6 +127,39 @@ def test_generate_embedding_uses_model_output_and_dimension(rag_service):
     assert len(embedding) == 768
     assert embedding[0] > 0
     assert rag_service.embedding_model == settings.RAG_EMBEDDING_MODEL
+
+
+def test_get_collection_creates_with_embedding_model_metadata():
+    rag = RAGService(persist_dir="/tmp/chroma-test", embedding_model="model-a")
+    rag._client = FakeClient()
+
+    collection = rag._get_collection()
+
+    assert collection.metadata == {"hnsw:space": "cosine", "embedding_model": "model-a"}
+    assert rag._client.created_metadata == {"hnsw:space": "cosine", "embedding_model": "model-a"}
+
+
+def test_get_collection_backfills_missing_embedding_model_metadata():
+    rag = RAGService(persist_dir="/tmp/chroma-test", embedding_model="model-a")
+    rag._client = FakeClient()
+    rag._client.collection = FakeCollection(metadata={"hnsw:space": "cosine"})
+
+    collection = rag._get_collection()
+
+    assert collection.metadata == {"hnsw:space": "cosine", "embedding_model": "model-a"}
+
+
+def test_get_collection_warns_on_embedding_model_mismatch(caplog):
+    rag = RAGService(persist_dir="/tmp/chroma-test", embedding_model="model-b")
+    rag._client = FakeClient()
+    rag._client.collection = FakeCollection(
+        metadata={"hnsw:space": "cosine", "embedding_model": "model-a"}
+    )
+
+    collection = rag._get_collection()
+
+    assert collection.metadata["embedding_model"] == "model-a"
+    assert "Embedding model mismatch" in caplog.text
 
 
 @pytest.mark.asyncio
