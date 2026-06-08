@@ -81,6 +81,7 @@ coverage.xml
 .mypy_cache/
 .dmypy.json
 dmypy.json
+*.tsbuildinfo
 
 # Ruff
 .ruff_cache/
@@ -89,3 +90,7 @@ dmypy.json
 local/
 notes/
 tmp/
+.tmp/
+.claude/
+config.env
+models/
