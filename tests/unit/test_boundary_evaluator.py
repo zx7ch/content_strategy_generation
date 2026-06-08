@@ -39,6 +39,14 @@ async def _context_for(
             run.run_id,
             [{"step_name": step_name, "phase": WorkflowPhase(run_phase)}],
         )
+        await manager.add_constraint(
+            run_id=run.run_id,
+            message_id="constraint-msg",
+            raw_text="constraint",
+            constraint_type=constraint_type,
+            scope="run",
+            normalized_constraint={"value": "x"},
+        )
     async with WorkflowStore(db_path) as store:
         assert store._conn is not None
         await store._conn.execute(
@@ -46,15 +54,6 @@ async def _context_for(
             (run_status, run_phase, run.run_id),
         )
         await store._conn.commit()
-        await store.create_constraint(
-            run_id=run.run_id,
-            thread_id=run.thread_id,
-            message_id="constraint-msg",
-            raw_text="constraint",
-            constraint_type=constraint_type,
-            scope="run",
-            normalized={"value": "x"},
-        )
     return await ContextBuilder(db_path).build_context(run.run_id, step_name)
 
 

@@ -196,6 +196,56 @@ async def test_cancel_session_jobs_marks_all_unfinished_jobs_cancelled(isolated_
         assert retrying_ref.cancel_reason == "session_purged"
 
 
+@pytest.mark.asyncio
+async def test_pause_resume_and_cancel_workflow_run_jobs(isolated_db):
+    session_id = str(uuid.uuid4())
+    await _create_session(isolated_db, session_id)
+
+    async with JobStore(isolated_db) as store:
+        queued_job, _ = await store.enqueue(
+            session_id=session_id,
+            job_type="strategy",
+            run_id="run-1",
+            step_id="step-1",
+        )
+        retrying_job, _ = await store.enqueue(
+            session_id=session_id,
+            job_type="generate",
+            run_id="run-1",
+            step_id="step-1",
+        )
+        other_job, _ = await store.enqueue(
+            session_id=session_id,
+            job_type="strategy",
+            run_id="run-2",
+            step_id="step-2",
+        )
+        assert store._conn is not None
+        await store._conn.execute(
+            "UPDATE jobs SET status='retrying' WHERE id=?",
+            (retrying_job.id,),
+        )
+        await store._conn.commit()
+
+        paused = await store.pause_workflow_run_jobs("run-1")
+        assert paused == 2
+        assert (await store.get_job(queued_job.id)).status == "paused"
+        assert (await store.get_job(retrying_job.id)).status == "paused"
+        assert (await store.get_job(other_job.id)).status == "queued"
+
+        resumed = await store.resume_workflow_run_jobs("run-1")
+        assert resumed == 2
+        assert (await store.get_job(queued_job.id)).status == "queued"
+        assert (await store.get_job(retrying_job.id)).status == "queued"
+
+        cancelled = await store.cancel_workflow_run_jobs("run-1", reason="user_cancelled")
+        assert cancelled == 2
+        assert (await store.get_job(queued_job.id)).status == "cancelled"
+        assert (await store.get_job(queued_job.id)).cancel_reason == "user_cancelled"
+        assert (await store.get_job(retrying_job.id)).status == "cancelled"
+        assert (await store.get_job(other_job.id)).status == "queued"
+
+
 # ---------------------------------------------------------------------------
 # ALIGN-6: job-level pause / resume / cancel
 # ---------------------------------------------------------------------------

@@ -124,7 +124,7 @@ async def test_state_update_and_event_append_succeed_together(manager):
     assert refreshed is not None
     assert refreshed.status == WorkflowRunStatus.PAUSING
     assert events[-1].event_type == "run_pause_requested"
-    assert events[-1].payload_json == {"reason": "user_pause"}
+    assert events[-1].payload_json == {"reason": "user_pause", "paused_job_count": 0}
 
 
 @pytest.mark.asyncio

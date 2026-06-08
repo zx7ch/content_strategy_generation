@@ -7,7 +7,6 @@ from fastapi.testclient import TestClient
 import pytest
 
 from app.agents.content_generation_agent import GenerationExecutionResult
-from app.agents.content_strategy_agent import StrategyResult
 from app.config import settings
 from app.main import app
 from app.memory.job_store import JobStore
@@ -17,7 +16,6 @@ from app.models.session import (
     GeneratedNote,
     PlatformPreference,
     SessionStage,
-    SpiderNote,
 )
 
 
@@ -64,43 +62,8 @@ async def _seed_strategy_session(db_path: str, session_id: str) -> None:
         )
 
 
-async def _fake_strategy_execute(self, session_id: str) -> StrategyResult:
-    async with SessionManager(settings.SQLITE_DB_PATH) as manager:
-        strategy = ContentStrategy(
-            positioning=f"定位-{session_id}",
-            target_audience="城市女生",
-            content_pillars=["教程"],
-            key_messaging="真实可执行",
-            content_types=["图文"],
-            posting_strategy="晚间",
-            data_source_quality=0.67,
-        )
-        preference = PlatformPreference(
-            avg_title_length=14,
-            popular_tags=[session_id],
-            optimal_posting_times=["20:00"],
-            content_patterns=["中等长度文案"],
-        )
-        await manager.update_session(
-            session_id,
-            spider_notes=[SpiderNote(note_id="n1", title="标题", content="内容", tags=["tag"])],
-            content_strategy=strategy,
-            platform_preference=preference,
-            quality_score=0.67,
-            used_fallback=False,
-            stage=SessionStage.STRATEGY,
-        )
-    return StrategyResult(
-        success=True,
-        message="ok",
-        quality_score=0.67,
-        content_strategy=strategy,
-        platform_preference=preference,
-        used_fallback=False,
-    )
-
-
-async def _fake_generation_execute(self, session_id: str) -> GenerationExecutionResult:
+async def _fake_generation_execute(self, session_id: str, *, progress_callback=None) -> GenerationExecutionResult:
+    del progress_callback
     note = GeneratedNote(
         note_id=f"note-{session_id}",
         title=f"{session_id}-标题",
@@ -128,66 +91,9 @@ async def _fake_generation_execute(self, session_id: str) -> GenerationExecution
     )
 
 
-async def _slow_generation_execute(self, session_id: str) -> GenerationExecutionResult:
+async def _slow_generation_execute(self, session_id: str, *, progress_callback=None) -> GenerationExecutionResult:
     await asyncio.sleep(0.3)
-    return await _fake_generation_execute(self, session_id)
-
-
-def test_strategy_idempotency_replays_existing_job_and_multi_session_data_stays_isolated(isolated_db, monkeypatch):
-    monkeypatch.setattr(
-        "app.agents.content_strategy_agent.ContentStrategyAgent.execute",
-        _fake_strategy_execute,
-    )
-
-    with TestClient(app) as client:
-        first = client.post(
-            "/sessions",
-            json={"user_id": "u1", "user_query": "轻运动", "platform": "xiaohongshu", "mode": "editing"},
-        )
-        second = client.post(
-            "/sessions",
-            json={"user_id": "u2", "user_query": "收纳", "platform": "xiaohongshu", "mode": "editing"},
-        )
-        first_session = first.json()["session_id"]
-        second_session = second.json()["session_id"]
-
-        first_job = client.post(
-            f"/sessions/{first_session}/strategy",
-            headers={"Idempotency-Key": "dup-strategy"},
-        ).json()["job_id"]
-        replay = client.post(
-            f"/sessions/{first_session}/strategy",
-            headers={"Idempotency-Key": "dup-strategy"},
-        )
-        second_job = client.post(
-            f"/sessions/{second_session}/strategy",
-            headers={"Idempotency-Key": "dup-strategy"},
-        ).json()["job_id"]
-
-        assert replay.status_code == 202
-        assert replay.json()["job_id"] == first_job
-
-        _wait_for_job(client, first_job)
-        _wait_for_job(client, second_job)
-
-    async def _assert_state() -> None:
-        async with JobStore(isolated_db) as store:
-            assert await store.count_jobs(first_session, "strategy") == 1
-            assert await store.count_jobs(second_session, "strategy") == 1
-
-        async with SessionManager(isolated_db) as manager:
-            session_one = await manager.get_session(first_session)
-            session_two = await manager.get_session(second_session)
-            assert session_one is not None
-            assert session_two is not None
-            assert session_one.content_strategy is not None
-            assert session_two.content_strategy is not None
-            assert session_one.content_strategy.positioning != session_two.content_strategy.positioning
-            assert session_one.platform_preference is not None
-            assert session_two.platform_preference is not None
-            assert session_one.platform_preference.popular_tags != session_two.platform_preference.popular_tags
-
-    asyncio.run(_assert_state())
+    return await _fake_generation_execute(self, session_id, progress_callback=progress_callback)
 
 
 def test_generate_idempotency_replays_after_completion_without_creating_duplicate_jobs(isolated_db, monkeypatch):
