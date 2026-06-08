@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import uuid
+
 import httpx
 import pytest
 
 from app.api.routes.router import app
 from app.memory.job_store import JobStore
+from app.memory.session_state import SessionManager
 from app.memory.thread_store import ThreadStore
 
 
@@ -47,15 +50,22 @@ async def client(tmp_path):
 
 
 async def _create_thread_with_job(client: httpx.AsyncClient) -> tuple[str, str, str]:
-    """Helper: create a thread, start a workflow, return (thread_id, session_id, job_id)."""
+    """Helper: create a thread with a legacy session/job link."""
     create = await client.post("/threads", json={"title": "Intent Test"})
     thread_id = create.json()["thread_id"]
-    wf = await client.post(
-        f"/threads/{thread_id}/workflow",
-        json={"user_query": "帮我生成内容策略"},
+    session_id = f"sess-{uuid.uuid4().hex}"
+    async with SessionManager(app.state.job_store.db_path) as session_manager:
+        await session_manager.create_session(
+            session_id=session_id,
+            user_id="user-1",
+            user_query="帮我生成内容策略",
+        )
+    job, _created = await app.state.job_store.enqueue(
+        session_id=session_id,
+        job_type="strategy",
     )
-    body = wf.json()
-    return thread_id, body["session_id"], body["job_id"]
+    await app.state.thread_store.update_thread_active_job(thread_id, session_id, job.id)
+    return thread_id, session_id, job.id
 
 
 async def test_message_free_chat_no_active_job(client):

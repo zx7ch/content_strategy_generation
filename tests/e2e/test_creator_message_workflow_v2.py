@@ -7,6 +7,7 @@ import pytest
 
 from app.api.routes.router import app
 from app.config import settings
+from app.memory.job_store import JobStore
 from app.memory.thread_store import ThreadStore
 from app.memory.workflow_store import WorkflowStore
 
@@ -52,6 +53,40 @@ async def test_generation_message_creates_active_run(client):
     assert body["active_run_snapshot"]["run"]["thread_id"] == thread_id
     assert body["active_run_snapshot"]["run"]["current_step"] == "intake.capture_request"
     assert body["active_run_snapshot"]["steps"][0]["step_name"] == "intake.capture_request"
+    async with JobStore(settings.SQLITE_DB_PATH) as store:
+        job = await store.get_latest_job_for_session(body["command_result"]["run_id"])
+    assert job is not None
+    assert job.run_id == body["command_result"]["run_id"]
+    assert job.payload["step_name"] == "intake.capture_request"
+
+
+@pytest.mark.asyncio
+async def test_message_active_run_snapshot_matches_workflow_snapshot_api(client):
+    thread_id = await _create_thread(client)
+
+    response = await client.post(
+        f"/threads/{thread_id}/messages",
+        json={"text": "帮我生成一组小红书防晒衣笔记"},
+    )
+
+    assert response.status_code == 201
+    body = response.json()
+    message_snapshot = body["active_run_snapshot"]
+    run_id = body["command_result"]["run_id"]
+
+    snapshot_response = await client.get(
+        f"/workflow-runs/{run_id}/snapshot",
+        params={"thread_id": thread_id},
+    )
+
+    assert snapshot_response.status_code == 200
+    api_snapshot = snapshot_response.json()
+    assert message_snapshot["run"] == api_snapshot["run"]
+    assert message_snapshot["steps"] == api_snapshot["steps"]
+    assert message_snapshot["child_tasks"] == api_snapshot["child_tasks"]
+    assert message_snapshot["artifacts"] == api_snapshot["artifacts"]
+    assert message_snapshot["constraints"] == api_snapshot["constraints"]
+    assert message_snapshot["active_job"] == api_snapshot["active_job"]
 
 
 @pytest.mark.asyncio
@@ -106,6 +141,26 @@ async def test_pause_resume_cancel_commands_use_run_commands(client):
     cancel = await client.post(f"/threads/{thread_id}/messages", json={"text": "取消任务"})
     assert cancel.json()["command_result"]["action"] == "cancel_run"
     assert cancel.json()["active_run_snapshot"]["run"]["status"] == "cancelling"
+
+
+@pytest.mark.asyncio
+async def test_generation_message_after_cancelling_run_starts_new_run(client):
+    thread_id = await _create_thread(client)
+    start = await client.post(f"/threads/{thread_id}/messages", json={"text": "帮我生成内容策略"})
+    old_run_id = start.json()["command_result"]["run_id"]
+    cancel = await client.post(f"/threads/{thread_id}/messages", json={"text": "取消任务"})
+    assert cancel.json()["active_run_snapshot"]["run"]["status"] == "cancelling"
+
+    response = await client.post(
+        f"/threads/{thread_id}/messages",
+        json={"text": "帮我生成两篇小红书敏感肌修护笔记"},
+    )
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["intent"] == "start_workflow"
+    assert body["command_result"]["run_id"] != old_run_id
+    assert body["active_run_snapshot"]["run"]["status"] == "running"
 
 
 @pytest.mark.asyncio

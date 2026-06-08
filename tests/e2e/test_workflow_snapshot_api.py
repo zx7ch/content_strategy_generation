@@ -9,7 +9,6 @@ import pytest
 from app.api.routes.router import app
 from app.config import settings
 from app.memory.job_store import JobStore
-from app.memory.workflow_store import WorkflowStore
 from app.models.workflow import WorkflowArtifactType, WorkflowConstraintType, WorkflowPhase
 from app.services.workflow_run_manager import WorkflowRunManager
 
@@ -34,30 +33,31 @@ async def _seed_snapshot(db_path: str):
             ],
         )
         await manager.start_step(run.run_id, "intake.capture_request", job_id="job-active")
-
-    async with WorkflowStore(db_path) as store:
-        await store.create_child_task(
+        await manager.create_child_tasks(
             run_id=run.run_id,
             step_id=steps[0].step_id,
-            task_type="note_generation",
-            slot_index=0,
+            tasks=[
+                {
+                    "task_type": "note_generation",
+                    "slot_index": 0,
+                }
+            ],
         )
-        await store.create_artifact(
+        await manager.attach_artifact(
             run_id=run.run_id,
-            thread_id=run.thread_id,
             artifact_type=WorkflowArtifactType.STRATEGY,
             payload={"positioning": "轻运动"},
             storage_table="strategy_data",
             storage_key="strategy-1",
+            created_by_step_id=steps[0].step_id,
         )
-        await store.create_constraint(
+        await manager.add_constraint(
             run_id=run.run_id,
-            thread_id=run.thread_id,
             message_id="msg-constraint",
             raw_text="风格更生活化",
             constraint_type=WorkflowConstraintType.STYLE,
             scope="run",
-            normalized={"tone": "lifestyle"},
+            normalized_constraint={"tone": "lifestyle"},
         )
 
     async with JobStore(db_path) as job_store:

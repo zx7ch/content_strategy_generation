@@ -1,9 +1,0 @@
-{
-  "recorded_at": "2026-03-22 16:07:30 CST",
-  "node": "environment_check",
-  "llm_provider": "kimi",
-  "kimi_key_present": true,
-  "spider_cookie_present": true,
-  "embedding_model": "/Users/czx/Documents/agentic/xhs_note_generator/models/bge-base-zh-v1.5",
-  "embedding_model_exists": true
-}

@@ -90,7 +90,12 @@ dmypy.json
 local/
 notes/
 tmp/
-.tmp/
-.claude/
 config.env
+instructions/
+
+# Claude Code session data
+.claude/
+.tmp/
+
+# ML models (large binaries)
 models/

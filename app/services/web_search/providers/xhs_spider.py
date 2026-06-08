@@ -5,8 +5,11 @@ from __future__ import annotations
 from time import monotonic
 from typing import Any, Callable, List, Optional
 
+from app.logging_config import get_logger
 from app.services.web_search.models import CapabilityRequest, CapabilityResult, Evidence, ProviderDescriptor, SearchTraceEntry, SearchIntent
 from app.services.xhs_spider import SpiderPermanentError, SpiderTransientError, XHSPost, XHSSpiderClient
+
+_logger = get_logger(__name__)
 
 
 class XhsSpiderDiscoverProvider:
@@ -48,7 +51,19 @@ class XhsSpiderDiscoverProvider:
             )
 
         try:
-            posts = await self.spider_client.search_with_retry(request.intent.query, num=request.limit, on_page=on_page)
+            try:
+                posts = await self.spider_client.search_with_retry(
+                    request.intent.query,
+                    num=request.limit,
+                    on_page=on_page,
+                )
+            except TypeError as exc:
+                if "on_page" not in str(exc):
+                    raise
+                posts = await self.spider_client.search_with_retry(
+                    request.intent.query,
+                    num=request.limit,
+                )
             evidences = [self._post_to_evidence(post, request.intent.query, request.intent.session_id) for post in posts]
             status = "success" if evidences else "empty"
             reason = None if evidences else "empty_result"
@@ -57,6 +72,7 @@ class XhsSpiderDiscoverProvider:
             status = "transient_error"
             reason = "transient_error"
         except SpiderPermanentError as exc:
+            _logger.exception("spider permanent error", error=str(exc))
             evidences = []
             status = "permanent_error"
             reason = self._classify_failure_reason(exc)

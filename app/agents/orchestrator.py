@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import inspect
 from typing import Any, Awaitable, Callable, Optional
 
 ProgressCallback = Callable[[str], Awaitable[None]]
@@ -14,7 +13,7 @@ from app.config import settings
 from app.memory.job_store import JobRecord
 from app.memory.session_state import SessionManager
 from app.models.session import SessionLifecycleState
-from app.services.llm.tracked_client import build_default_tracked_chat_client
+from app.services.step_executors import StepExecutorRegistry, UnsupportedWorkflowStepError
 
 
 class JobOrchestrationError(RuntimeError):
@@ -26,7 +25,7 @@ class JobOrchestrationError(RuntimeError):
         self.retryable = retryable
 
 
-Runner = Callable[..., Awaitable[dict[str, Any]]]
+Runner = Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]]
 
 
 class Orchestrator:
@@ -45,13 +44,20 @@ class Orchestrator:
         db_path: Optional[str] = None,
         strategy_runner: Optional[Runner] = None,
         generation_runner: Optional[Runner] = None,
+        step_executor_registry: Optional[StepExecutorRegistry] = None,
     ):
         self.db_path = db_path or settings.SQLITE_DB_PATH
         self._strategy_runner = strategy_runner or self._run_strategy_job
         self._generation_runner = generation_runner or self._run_generation_job
+        self._step_executor_registry = step_executor_registry or StepExecutorRegistry()
 
     async def run_job(self, job: JobRecord, *, progress_callback: Optional[ProgressCallback] = None) -> dict[str, Any]:
         """Validate session state then execute strategy/generation job."""
+        if job.run_id:
+            # WorkflowRun jobs are the new execution truth and intentionally do
+            # not require a legacy session row.
+            return await self.run_workflow_step(job)
+
         async with SessionManager(self.db_path) as session_manager:
             session = await session_manager.get_session(job.session_id)
             if session is None:
@@ -74,21 +80,9 @@ class Orchestrator:
                 )
 
         if job.job_type == "strategy":
-            return await self._invoke_runner(
-                self._strategy_runner,
-                job.session_id,
-                job.payload,
-                job_id=job.id,
-                progress_callback=progress_callback,
-            )
+            return await self._strategy_runner(job.session_id, job.payload, progress_callback=progress_callback)
         if job.job_type == "generate":
-            return await self._invoke_runner(
-                self._generation_runner,
-                job.session_id,
-                job.payload,
-                job_id=job.id,
-                progress_callback=progress_callback,
-            )
+            return await self._generation_runner(job.session_id, job.payload, progress_callback=progress_callback)
 
         raise JobOrchestrationError(
             f"Unsupported job_type: {job.job_type}",
@@ -96,45 +90,44 @@ class Orchestrator:
             retryable=False,
         )
 
-    async def _invoke_runner(
-        self,
-        runner: Runner,
-        session_id: str,
-        payload: dict[str, Any],
-        *,
-        job_id: str,
-        progress_callback: Optional[ProgressCallback],
-    ) -> dict[str, Any]:
-        signature = inspect.signature(runner)
-        keyword_args: dict[str, Any] = {}
-        if "job_id" in signature.parameters:
-            keyword_args["job_id"] = job_id
-        if "progress_callback" in signature.parameters:
-            keyword_args["progress_callback"] = progress_callback
-        return await runner(session_id, payload, **keyword_args)
+    async def run_workflow_step(self, job: JobRecord) -> dict[str, Any]:
+        """Execute a workflow-bound job through the step executor registry."""
+        if not job.run_id:
+            raise JobOrchestrationError(
+                "Workflow job missing run_id",
+                error_code="WORKFLOW_RUN_ID_MISSING",
+                retryable=False,
+            )
+        step_name = job.payload.get("step_name")
+        if not step_name:
+            raise JobOrchestrationError(
+                "Workflow job missing step_name",
+                error_code="WORKFLOW_STEP_NAME_MISSING",
+                retryable=False,
+            )
+        try:
+            result = await self._step_executor_registry.execute(
+                run_id=job.run_id,
+                step_name=str(step_name),
+            )
+        except UnsupportedWorkflowStepError as exc:
+            raise JobOrchestrationError(
+                str(exc),
+                error_code=exc.error_code,
+                retryable=exc.retryable,
+            ) from exc
 
-    async def _run_strategy_job(
-        self,
-        session_id: str,
-        payload: dict[str, Any],
-        *,
-        job_id: str,
-        progress_callback: Optional[ProgressCallback] = None,
-    ) -> dict[str, Any]:
+        return {
+            "success": True,
+            "step_name": result.step_name,
+            "artifact_refs": result.artifact_refs,
+            "child_task_refs": result.child_task_refs,
+            "skipped_child_tasks": result.skipped_child_tasks,
+        }
+
+    async def _run_strategy_job(self, session_id: str, payload: dict[str, Any], *, progress_callback: Optional[ProgressCallback] = None) -> dict[str, Any]:
         del payload  # reserved for future strategy options
-        llm_client = build_default_tracked_chat_client(
-            db_path=self.db_path,
-            session_id=session_id,
-            job_id=job_id,
-            model_policy="balanced",
-            step_id="strategy",
-            step_name="策略生成",
-            agent_name="ContentStrategyAgent",
-        )
-        agent = ContentStrategyAgent(
-            session_manager=SessionManager(self.db_path),
-            llm_client=llm_client,
-        )
+        agent = ContentStrategyAgent(session_manager=SessionManager(self.db_path))
         result = await agent.execute(session_id, progress_callback=progress_callback)
         if not result.success:
             retryable = result.error_code in self.RETRYABLE_CODES
@@ -149,28 +142,9 @@ class Orchestrator:
             "used_fallback": result.used_fallback,
         }
 
-    async def _run_generation_job(
-        self,
-        session_id: str,
-        payload: dict[str, Any],
-        *,
-        job_id: str,
-        progress_callback: Optional[ProgressCallback] = None,
-    ) -> dict[str, Any]:
+    async def _run_generation_job(self, session_id: str, payload: dict[str, Any], *, progress_callback: Optional[ProgressCallback] = None) -> dict[str, Any]:
         del payload  # session-backed generation uses stored strategy/session data
-        llm_client = build_default_tracked_chat_client(
-            db_path=self.db_path,
-            session_id=session_id,
-            job_id=job_id,
-            model_policy="quality",
-            step_id="generation",
-            step_name="笔记生成",
-            agent_name="ContentGenerationAgent",
-        )
-        agent = ContentGenerationAgent(
-            session_manager=SessionManager(self.db_path),
-            llm_client=llm_client,
-        )
+        agent = ContentGenerationAgent(session_manager=SessionManager(self.db_path))
         generated: GenerationExecutionResult = await agent.execute(session_id, progress_callback=progress_callback)
         if not generated.success:
             retryable = generated.error_code in self.RETRYABLE_CODES

@@ -4,10 +4,11 @@ import asyncio
 from contextlib import asynccontextmanager
 
 from app.agents.orchestrator import Orchestrator
-from app.api.routes.router import app
+from app.api.routes.router import app, schedule_embedding_prewarm
 from app.config import settings
 from app.memory.job_store import JobStore
 from app.memory.thread_store import ThreadStore
+from app.services.step_executors import build_agent_step_executor_registry
 from app.v2.discovery.bootstrap import build_discovery_runtime
 from app.v2.decision.bootstrap import build_decision_runtime
 from app.v2.feedback.bootstrap import build_feedback_runtime
@@ -24,7 +25,10 @@ async def _worker_lifespan(application):
     await job_store.connect()
     thread_store = ThreadStore()
     await thread_store.connect()
-    orchestrator = Orchestrator(db_path=settings.SQLITE_DB_PATH)
+    orchestrator = Orchestrator(
+        db_path=settings.SQLITE_DB_PATH,
+        step_executor_registry=build_agent_step_executor_registry(db_path=settings.SQLITE_DB_PATH),
+    )
     worker = JobWorker(job_store=job_store, orchestrator=orchestrator)
     v2_master_data_store, v2_master_data_service = build_master_data_runtime(settings)
     v2_ingestion_store, v2_ingestion_service = build_ingestion_runtime(settings)
@@ -54,6 +58,11 @@ async def _worker_lifespan(application):
     v2_decision_service.attach_scorer_service(v2_scorer_service)
     stop_event = asyncio.Event()
     worker_task = asyncio.create_task(worker.run_loop(stop_event=stop_event))
+
+    # Start embedding model preload immediately in background.
+    # Model downloads (~780 MB) or loads from cache without blocking startup.
+    # By the time the user runs their first task, the model is likely ready.
+    schedule_embedding_prewarm()
 
     application.state.job_store = job_store
     application.state.orchestrator = orchestrator

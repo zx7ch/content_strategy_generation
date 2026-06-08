@@ -1,20 +1,18 @@
 "use client";
 
 import { useState } from "react";
-import { useRouter } from "next/navigation";
+import { useSearchParams } from "next/navigation";
 
 import { Card } from "@/components/ui/Card";
 import { DataTable } from "@/components/dashboard/DataTable";
 import { StatCard } from "@/components/dashboard/StatCard";
-import { Button } from "@/components/ui/Button";
 import { InfoTooltip } from "@/components/ui/InfoTooltip";
-import { useBrandContext } from "@/components/providers/BrandProvider";
 import { usePageData } from "@/hooks/usePageData";
+import { useBrandContext } from "@/components/providers/BrandProvider";
 import {
+  getRuntimeApiErrorKind,
+  getPublishCandidates,
   getRuntimeApiErrorMessage,
-  getTopicPoolPageData,
-  runDecisionBatch,
-  triggerTopicPoolRefresh
 } from "@/lib/api";
 import type { Topic } from "@/lib/types";
 
@@ -55,6 +53,7 @@ function getSignalLabel(signalType: string) {
     case "trend":
       return "趋势信号";
     case "owned_performance":
+    case "accepted_publish_candidate":
       return "自有内容反馈";
     default:
       return "互动信号";
@@ -62,58 +61,43 @@ function getSignalLabel(signalType: string) {
 }
 
 export default function TopicPoolPage() {
-  const router = useRouter();
-  const { selectedBrandId, selectedBrandName, loadError, retryBrands } = useBrandContext();
+  const { selectedBrandId } = useBrandContext();
+  const searchParams = useSearchParams();
+  const threadId = searchParams.get("thread_id");
+  const runId = searchParams.get("run_id");
   const { data, error, isLoading, mutate } = usePageData(
-    selectedBrandId ? `topic-pool:${selectedBrandId}` : null,
-    () => getTopicPoolPageData(selectedBrandId ?? "")
+    selectedBrandId ? `publish-candidates:${selectedBrandId}:${threadId ?? ""}:${runId ?? ""}` : null,
+    () => getPublishCandidates({ brandId: selectedBrandId, threadId, runId })
   );
-  const [refreshing, setRefreshing] = useState(false);
-  const [runningDecision, setRunningDecision] = useState(false);
-  const [actionError, setActionError] = useState<string | null>(null);
   const [expandedTopicIds, setExpandedTopicIds] = useState<Record<string, boolean>>({});
 
-  const topics = data?.topics ?? [];
-  const stats = data?.stats ?? { totalCandidates: 0, bestScore: 0, lastRefreshAt: null };
-  const source = data?.source ?? "live";
-  const brand = data?.brand ?? {
-    id: selectedBrandId ?? "unselected",
-    name: selectedBrandName ?? "未选择",
-    stage: "Seed" as const,
-    targetAudience: "待补充"
-  };
-
-  async function handleRefresh() {
-    if (!selectedBrandId) {
-      return;
-    }
-    setActionError(null);
-    setRefreshing(true);
-    try {
-      await triggerTopicPoolRefresh(selectedBrandId);
-      await mutate();
-    } catch (refreshError) {
-      setActionError(refreshError instanceof Error ? refreshError.message : "刷新选题失败");
-    } finally {
-      setRefreshing(false);
-    }
-  }
-
-  async function handleRunDecision() {
-    if (!selectedBrandId) {
-      return;
-    }
-    setActionError(null);
-    setRunningDecision(true);
-    try {
-      const batch = await runDecisionBatch(selectedBrandId);
-      router.push(`/decisions?batch_id=${batch.batch_id}`);
-    } catch (decisionError) {
-      setActionError(decisionError instanceof Error ? decisionError.message : "执行决策失败");
-    } finally {
-      setRunningDecision(false);
-    }
-  }
+  const candidates = data?.items ?? [];
+  const errorKind = error ? getRuntimeApiErrorKind(error) : null;
+  const topics: Topic[] = candidates.map((item) => ({
+    id: item.candidate_id,
+    title: item.title,
+    type: item.topic_type === "问题" ? "Problem" : item.topic_type === "清单" ? "Scenario" : "Core",
+    hypothesis: item.core_hypothesis,
+    score: item.score,
+    source: "OwnedPerformance",
+    angle: item.content,
+    evidenceCount: 1,
+    updatedAt: item.created_at,
+    status: item.score_type === "predicted" ? "预测潜力分" : item.score_type,
+    evidenceProvenance: [{
+      itemId: item.note_id,
+      originalTitle: item.title,
+      signalType: "accepted_publish_candidate",
+      contributionWeight: 1,
+      signalScore: item.score,
+      likes: 0,
+      comments: 0,
+      collects: 0,
+      shares: 0
+    }]
+  }));
+  const bestScore = topics.reduce((best, topic) => Math.max(best, topic.score), 0);
+  const latestCreatedAt = candidates[0]?.created_at ?? null;
 
   function toggleExplainability(topicId: string) {
     setExpandedTopicIds((current) => ({
@@ -127,82 +111,50 @@ export default function TopicPoolPage() {
       <section className="flex flex-col gap-4 rounded-panel border border-white/70 bg-white/85 p-6 shadow-panel backdrop-blur sm:flex-row sm:items-center sm:justify-between">
         <div>
           <p className="text-sm text-quiet">Topic Pool</p>
-          <h1 className="mt-1 text-3xl font-semibold tracking-tight text-ink">选题候选库</h1>
+          <h1 className="mt-1 text-3xl font-semibold tracking-tight text-ink">选题库</h1>
           <p className="mt-2 text-sm text-quiet">
-            当前品牌: {brand.name} · 数据源: {source === "live" ? "Live API" : "Live API"}
+            数据源: 已认可创作产物 · 得分: 预测潜力分{threadId || runId ? " · 已过滤到本次完成结果" : ""}
           </p>
-          <p className="mt-1 text-sm text-quiet">
-            品牌阶段: {brand.stage} · 目标受众: {brand.targetAudience}
-          </p>
-        </div>
-        <div className="flex flex-wrap gap-3">
-          <Button
-            variant="outline"
-            disabled={!selectedBrandId || runningDecision || topics.length === 0}
-            onClick={handleRunDecision}
-          >
-            {runningDecision ? "执行中..." : "执行决策"}
-          </Button>
-          <Button
-            variant="primary"
-            disabled={!selectedBrandId || refreshing}
-            onClick={handleRefresh}
-          >
-            {refreshing ? "刷新中..." : "刷新选题"}
-          </Button>
         </div>
       </section>
 
       <section className="grid gap-4 md:grid-cols-3">
-        <StatCard value={String(stats.totalCandidates)} label="总候选数" />
-        <StatCard value={stats.bestScore.toFixed(2)} label="最高得分" />
-        <StatCard value={stats.lastRefreshAt ? stats.lastRefreshAt.slice(11, 16) : "--:--"} label="最近刷新" />
+        <StatCard value={String(topics.length)} label="已认可笔记" />
+        <StatCard value={bestScore.toFixed(2)} label="最高预测潜力分" />
+        <StatCard value={latestCreatedAt ? latestCreatedAt.slice(11, 16) : "--:--"} label="最近加入" />
       </section>
-
-      {loadError ? (
-        <Card>
-          <p className="text-sm text-rose-600">
-            读取品牌列表失败：{getRuntimeApiErrorMessage(loadError)}
-          </p>
-          <div className="mt-3">
-            <Button variant="outline" onClick={retryBrands}>
-              重试品牌加载
-            </Button>
-          </div>
-        </Card>
-      ) : null}
 
       {isLoading ? (
         <Card>
-          <p className="text-sm text-quiet">正在加载当前品牌的 Topic Pool...</p>
+          <p className="text-sm text-quiet">正在加载选题库...</p>
         </Card>
       ) : null}
 
       {error ? (
         <Card>
-          <p className="text-sm text-rose-600">
-            读取 Topic Pool 失败：{getRuntimeApiErrorMessage(error)}
+          <p className="text-sm font-medium text-rose-600">
+            {errorKind === "offline"
+              ? "请启动本地 Agent Runtime"
+              : errorKind === "version"
+                ? "请升级本地 Agent Runtime"
+                : errorKind === "contract"
+                  ? "本地 Agent Runtime API 契约不匹配"
+                  : "读取选题库失败"}
+          </p>
+          <p className="mt-1 text-sm text-quiet">
+            {getRuntimeApiErrorMessage(error)}
           </p>
           <div className="mt-3">
-            <Button variant="outline" onClick={() => void mutate()}>
+            <button
+              type="button"
+              className="rounded-md border border-slate-200 px-3 py-1.5 text-sm font-medium text-slate-700 transition hover:bg-slate-50"
+              onClick={() => void mutate()}
+            >
               重试读取
-            </Button>
+            </button>
           </div>
         </Card>
       ) : null}
-
-      {actionError ? (
-        <Card>
-          <p className="text-sm text-rose-600">{actionError}</p>
-        </Card>
-      ) : null}
-
-      <Card className="space-y-2">
-        <h2 className="text-base font-semibold text-ink">这页是做什么的</h2>
-        <p className="text-sm text-quiet">
-          这里是候选选题池。先点击“刷新选题”生成候选，再展开“查看依据”核对来源笔记，确认没问题后再去执行决策。
-        </p>
-      </Card>
 
       <DataTable<Topic>
         columns={[
@@ -361,9 +313,7 @@ export default function TopicPoolPage() {
         ]}
         rows={topics}
         emptyLabel={
-          selectedBrandId
-            ? "当前品牌还没有候选选题，先触发 source sync / data import，再点击刷新选题。"
-            : "请先选择一个品牌。"
+          "还没有已认可的创作结果。请先在创作台完成一轮任务并点击完成。"
         }
       />
     </div>
