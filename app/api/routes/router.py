@@ -20,92 +20,103 @@ from app.memory.job_store import JobStore, SessionEventRecord
 from app.memory.session_state import SessionManager
 from app.memory.thread_store import ThreadStore
 from app.memory.workflow_store import WorkflowStore
-from app.models.workflow import WorkflowArtifactType
-from app.services.creator_intent_router import ACTIVE_JOB_STATUSES, IntentContext, classify_intent
-from app.services.conversation_orchestrator import ConversationOrchestrator
-from app.services.workflow_artifact_policy import WorkflowArtifactVersionPolicy
 from app.models.schemas import (
+    CompleteThreadResponse,
     CreateSessionResponse,
+    CreatorMessageCreateRequest,
+    CreatorMessageRecord,
+    CreatorMessageResponse,
+    CreatorThreadCreateRequest,
+    CreatorThreadDeleteResponse,
+    CreatorThreadDetail,
+    CreatorThreadDetailResponse,
+    CreatorThreadListResponse,
+    CreatorThreadResponse,
+    CreatorThreadSummary,
+    CreatorThreadTimelineResponse,
+    CreatorThreadUpdateRequest,
+    CreatorWorkflowRequest,
+    CreatorWorkflowResponse,
     EnqueueResponse,
     ErrorResponse,
+    GeneratedNoteItem,
     InitSessionRequest,
+    JobControlResponse,
     JobStatusResponse,
+    LLMUsageEventResponse,
+    LLMUsageEventsResponse,
+    LLMUsageStepsResponse,
+    LLMUsageStepSummaryResponse,
+    LLMUsageSummaryResponse,
+    PublishCandidate,
+    PublishCandidatesResponse,
     ResumeSessionResponse,
     SessionEvent,
     SessionEventPayload,
     SessionStatusResponse,
+    ThreadResultResponse,
     V2BrandChannelCreateRequest,
     V2BrandChannelListResponse,
     V2BrandChannelResponse,
     V2BrandChannelUpdateRequest,
     V2BrandCreateRequest,
-    V2DataImportPreviewRequest,
-    V2DataImportPreviewResponse,
+    V2BrandDataImportRequest,
     V2BrandListResponse,
     V2BrandPolicyConfigResponse,
     V2BrandPolicyConfigUpsertRequest,
     V2BrandResponse,
-    V2BrandUpdateRequest,
-    V2BrandDataImportRequest,
     V2BrandSourceSyncRequest,
-    V2BrandWorkspaceResponse,
-    V2ExtensionCaptureSessionCreateRequest,
-    V2ExtensionCaptureSessionResponse,
-    V2ExtensionCaptureSubmitRequest,
     V2BrandStateSnapshotCreateRequest,
     V2BrandStateSnapshotListResponse,
     V2BrandStateSnapshotResponse,
-    V2DiscoveryCustomQueryRequest,
-    V2DiscoveryTaskCreateRequest,
-    V2DiscoveryTaskResponse,
-    V2IngestionAcceptedResponse,
-    V2IngestionRunResponse,
-    V2TopicPoolBrandSummary,
-    V2TopicPoolItemResponse,
-    V2TopicPoolListResponse,
-    V2TopicPoolRefreshRequest,
-    V2TopicPoolRefreshResponse,
-    V2TopicPoolStatsResponse,
-    V2DefaultWorkspaceResponse,
-    V2DecisionBatchItemResponse,
+    V2BrandUpdateRequest,
+    V2BrandWorkspaceResponse,
+    V2DataImportPreviewRequest,
+    V2DataImportPreviewResponse,
     V2DecisionBatchDetailResponse,
+    V2DecisionBatchItemResponse,
     V2DecisionBatchItemReviewRequest,
     V2DecisionBatchItemReviewResponse,
     V2DecisionRunRequest,
     V2DecisionRunResponse,
+    V2DefaultWorkspaceResponse,
+    V2DiscoveryCustomQueryRequest,
+    V2DiscoveryTaskCreateRequest,
+    V2DiscoveryTaskResponse,
     V2EvaluationRunRequest,
     V2EvaluationRunResponse,
     V2EvaluationRunSliceResponse,
-    V2WorkspaceCreateRequest,
-    V2WorkspaceResponse,
+    V2ExtensionCaptureSessionCreateRequest,
+    V2ExtensionCaptureSessionResponse,
+    V2ExtensionCaptureSubmitRequest,
+    V2IngestionAcceptedResponse,
+    V2IngestionRunResponse,
     V2PerformanceImportRequest,
     V2PerformanceSnapshotListResponse,
     V2PerformanceSnapshotResponse,
     V2PublishRecordCreateRequest,
     V2PublishRecordListResponse,
     V2PublishRecordResponse,
-    CreatorThreadCreateRequest,
-    CreatorThreadUpdateRequest,
-    CreatorThreadSummary,
-    CreatorThreadDetail,
-    CreatorMessageRecord,
-    CreatorThreadResponse,
-    CreatorThreadListResponse,
-    CreatorThreadDetailResponse,
-    CreatorThreadTimelineResponse,
-    CreatorThreadDeleteResponse,
-    CreatorMessageCreateRequest,
-    CreatorMessageResponse,
-    CreatorWorkflowRequest,
-    CreatorWorkflowResponse,
-    JobControlResponse,
-    PublishCandidate,
-    CompleteThreadResponse,
-    PublishCandidatesResponse,
-    GeneratedNoteItem,
-    ThreadResultResponse,
+    V2TopicPoolBrandSummary,
+    V2TopicPoolItemResponse,
+    V2TopicPoolListResponse,
+    V2TopicPoolRefreshRequest,
+    V2TopicPoolRefreshResponse,
+    V2TopicPoolStatsResponse,
+    V2WorkspaceCreateRequest,
+    V2WorkspaceResponse,
 )
 from app.models.session import Session, SessionLifecycleState, SessionStage
+from app.models.workflow import WorkflowArtifactType
+from app.services.conversation_orchestrator import ConversationOrchestrator
+from app.services.creator_intent_router import ACTIVE_JOB_STATUSES, IntentContext, classify_intent
+from app.services.llm.usage_tracker import (
+    LLMUsageEvent,
+    LLMUsageStepSummary,
+    LLMUsageSummary,
+    LLMUsageTracker,
+)
+from app.services.workflow_artifact_policy import WorkflowArtifactVersionPolicy
 from app.v2.auth import WorkspaceAuthError, resolve_workspace_principal
 from app.v2.decision import (
     DecisionError,
@@ -121,7 +132,6 @@ from app.v2.discovery import (
     DiscoveryService,
     DiscoveryValidationError,
 )
-from app.v2.foundation.bootstrap import DEFAULT_USER_ID, DEFAULT_WORKSPACE_ID
 from app.v2.feedback import (
     FeedbackError,
     FeedbackNotFoundError,
@@ -129,9 +139,10 @@ from app.v2.feedback import (
     FeedbackValidationError,
 )
 from app.v2.foundation import MasterDataService
+from app.v2.foundation.bootstrap import DEFAULT_USER_ID, DEFAULT_WORKSPACE_ID
 from app.v2.foundation.service import (
-    MasterDataError,
     MasterDataConflictError,
+    MasterDataError,
     MasterDataInvariantError,
     MasterDataNotFoundError,
     MasterDataScopeError,
@@ -246,6 +257,64 @@ def _session_to_create_response(session: Session) -> CreateSessionResponse:
         purge_after=_iso(session.purge_after),
         created_at=session.created_at.isoformat(),
         updated_at=session.updated_at.isoformat(),
+    )
+
+
+def _usage_summary_to_response(
+    usage: LLMUsageSummary,
+    *,
+    session_id: str | None = None,
+    job_id: str | None = None,
+) -> LLMUsageSummaryResponse:
+    return LLMUsageSummaryResponse(
+        session_id=session_id,
+        job_id=job_id,
+        total_calls=usage.total_calls,
+        prompt_tokens=usage.prompt_tokens,
+        completion_tokens=usage.completion_tokens,
+        total_tokens=usage.total_tokens,
+        total_cost=usage.total_cost,
+        currency=usage.currency,
+        latency_ms=usage.latency_ms,
+    )
+
+
+def _usage_step_to_response(step: LLMUsageStepSummary) -> LLMUsageStepSummaryResponse:
+    return LLMUsageStepSummaryResponse(
+        step_id=step.step_id,
+        step_name=step.step_name,
+        agent_name=step.agent_name,
+        total_calls=step.total_calls,
+        failed_calls=step.failed_calls,
+        prompt_tokens=step.prompt_tokens,
+        completion_tokens=step.completion_tokens,
+        total_tokens=step.total_tokens,
+        total_cost=step.total_cost,
+        currency=step.currency,
+        latency_ms=step.latency_ms,
+    )
+
+
+def _usage_event_to_response(event: LLMUsageEvent) -> LLMUsageEventResponse:
+    return LLMUsageEventResponse(
+        id=event.id,
+        session_id=event.session_id,
+        job_id=event.job_id,
+        step_id=event.step_id,
+        step_name=event.step_name,
+        agent_name=event.agent_name,
+        provider=event.provider,
+        model=event.model,
+        model_policy=event.model_policy,
+        prompt_tokens=event.prompt_tokens,
+        completion_tokens=event.completion_tokens,
+        total_tokens=event.total_tokens,
+        total_cost=event.total_cost,
+        currency=event.currency,
+        latency_ms=event.latency_ms,
+        status=event.status,
+        error_message=event.error_message,
+        created_at=event.created_at,
     )
 
 
@@ -2689,6 +2758,60 @@ async def get_job_status(job_id: str) -> JobStatusResponse:
     )
 
 
+@app.get("/sessions/{session_id}/usage", response_model=LLMUsageSummaryResponse)
+async def get_session_usage(session_id: str) -> LLMUsageSummaryResponse:
+    async with LLMUsageTracker() as tracker:
+        usage = await tracker.summarize_session(session_id)
+    return _usage_summary_to_response(usage, session_id=session_id)
+
+
+@app.get("/jobs/{job_id}/usage", response_model=LLMUsageSummaryResponse)
+async def get_job_usage(job_id: str) -> LLMUsageSummaryResponse:
+    async with LLMUsageTracker() as tracker:
+        usage = await tracker.summarize_job(job_id)
+    return _usage_summary_to_response(usage, job_id=job_id)
+
+
+@app.get("/sessions/{session_id}/usage/steps", response_model=LLMUsageStepsResponse)
+async def get_session_usage_steps(session_id: str) -> LLMUsageStepsResponse:
+    async with LLMUsageTracker() as tracker:
+        steps = await tracker.summarize_session_steps(session_id)
+    return LLMUsageStepsResponse(
+        session_id=session_id,
+        steps=[_usage_step_to_response(step) for step in steps],
+    )
+
+
+@app.get("/jobs/{job_id}/usage/steps", response_model=LLMUsageStepsResponse)
+async def get_job_usage_steps(job_id: str) -> LLMUsageStepsResponse:
+    async with LLMUsageTracker() as tracker:
+        steps = await tracker.summarize_job_steps(job_id)
+    return LLMUsageStepsResponse(
+        job_id=job_id,
+        steps=[_usage_step_to_response(step) for step in steps],
+    )
+
+
+@app.get("/sessions/{session_id}/usage/events", response_model=LLMUsageEventsResponse)
+async def get_session_usage_events(session_id: str) -> LLMUsageEventsResponse:
+    async with LLMUsageTracker() as tracker:
+        events = await tracker.list_session_events(session_id)
+    return LLMUsageEventsResponse(
+        session_id=session_id,
+        events=[_usage_event_to_response(event) for event in events],
+    )
+
+
+@app.get("/jobs/{job_id}/usage/events", response_model=LLMUsageEventsResponse)
+async def get_job_usage_events(job_id: str) -> LLMUsageEventsResponse:
+    async with LLMUsageTracker() as tracker:
+        events = await tracker.list_job_events(job_id)
+    return LLMUsageEventsResponse(
+        job_id=job_id,
+        events=[_usage_event_to_response(event) for event in events],
+    )
+
+
 _SESSION_TO_THREAD_EVENT: dict[str, str] = {
     "task_progress":   "workflow_task_progress",
     "task_completed":  "workflow_task_completed",
@@ -3406,6 +3529,7 @@ async def complete_thread_endpoint(thread_id: str, request: Request) -> Complete
     if session_id:
         try:
             import aiosqlite as _aiosqlite
+
             from app.memory.session_data_store import SessionDataStore as _SessionDataStore
 
             async with _aiosqlite.connect(settings.SQLITE_DB_PATH) as _conn:
@@ -3512,6 +3636,7 @@ async def get_thread_result_endpoint(thread_id: str, request: Request) -> Thread
     notes_list: list[GeneratedNoteItem] = []
     try:
         import aiosqlite as _aiosqlite
+
         from app.memory.session_data_store import SessionDataStore as _SessionDataStore
 
         async with _aiosqlite.connect(settings.SQLITE_DB_PATH) as _conn:
