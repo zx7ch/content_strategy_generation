@@ -679,7 +679,11 @@ async function requestJson<T>(
         throw error;
       }
     } catch (error) {
-      if (error instanceof Error && error.message !== `request failed: ${response.status}`) {
+      if (
+        error instanceof Error &&
+        error.message !== `request failed: ${response.status}` &&
+        error.name !== "SyntaxError"
+      ) {
         throw error;
       }
     }
