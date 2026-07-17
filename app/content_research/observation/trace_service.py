@@ -1,0 +1,244 @@
+"""Read-only trace aggregation for Content Research workflows."""
+
+from __future__ import annotations
+
+from dataclasses import asdict, is_dataclass
+from datetime import datetime, timezone
+from typing import Any
+
+from pydantic import BaseModel
+
+from app.content_research.api_schemas import ContentResearchTraceResponse
+from app.content_research.models import ObservationEventRecord, ResearchBriefRecord, TraceRecord
+from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
+from app.memory.workflow_store import WorkflowStore
+from app.services.llm.usage_tracker import LLMUsageSummary, LLMUsageTracker
+
+
+class ContentResearchTraceService:
+    """Build a frontend-friendly trace view from persisted runtime sources."""
+
+    def __init__(self, *, store: SQLiteContentResearchStore, db_path: str) -> None:
+        self._store = store
+        self._db_path = db_path
+
+    async def build_trace(
+        self,
+        *,
+        workflow_run_id: str,
+        brief: ResearchBriefRecord,
+    ) -> ContentResearchTraceResponse:
+        traces = self._store.list_traces_for_workflow(workflow_run_id)
+        observation_events = [
+            event
+            for trace in traces
+            for event in self._store.list_observation_events(trace.id)
+        ]
+
+        async with WorkflowStore(self._db_path) as workflow_store:
+            run = await workflow_store.get_run(workflow_run_id)
+            runtime_steps = await workflow_store.list_steps(workflow_run_id)
+            runtime_child_tasks = await workflow_store.list_child_tasks(workflow_run_id)
+            workflow_events = await workflow_store.list_events(workflow_run_id)
+
+        async with LLMUsageTracker(self._db_path) as usage_tracker:
+            usage_summary = await usage_tracker.summarize_job(workflow_run_id)
+            usage_steps = await usage_tracker.summarize_job_steps(workflow_run_id)
+            usage_events = await usage_tracker.list_job_events(workflow_run_id)
+
+        current_stage = _derive_current_stage(
+            run=_json_dict(run),
+            steps=[_json_dict(step) for step in runtime_steps],
+            traces=traces,
+        )
+        run_status = str(run.status.value if run and hasattr(run.status, "value") else run.status) if run else brief.status
+        duration_ms = _duration_ms(
+            traces=traces,
+            observation_events=observation_events,
+            workflow_events=[_json_dict(event) for event in workflow_events],
+            run=_json_dict(run),
+        )
+        usage_steps_dicts = [_json_dict(step) for step in usage_steps]
+        usage_events_dicts = [_json_dict(event) for event in usage_events]
+        workflow_event_dicts = [_json_dict(event) for event in workflow_events]
+        observation_event_dicts = [_observation_event_dict(event) for event in observation_events]
+
+        return ContentResearchTraceResponse(
+            workflow_run_id=workflow_run_id,
+            thread_id=brief.thread_id,
+            current_stage=current_stage,
+            run_status=run_status,
+            recoverable=_is_recoverable(run_status, brief.status),
+            duration_ms=duration_ms,
+            error_count=_error_count(
+                observation_events=observation_event_dicts,
+                workflow_events=workflow_event_dicts,
+                usage_events=usage_events_dicts,
+            ),
+            retry_count=_retry_count(workflow_events=workflow_event_dicts, usage_steps=usage_steps_dicts),
+            traces=[_trace_dict(trace) for trace in traces],
+            observation_events=observation_event_dicts,
+            workflow_events=workflow_event_dicts,
+            runtime_steps=[_json_dict(step) for step in runtime_steps],
+            runtime_child_tasks=[_json_dict(task) for task in runtime_child_tasks],
+            usage_summary=_usage_summary_dict(usage_summary),
+            usage_steps=usage_steps_dicts,
+            usage_events=usage_events_dicts,
+        )
+
+
+def _json_dict(value: Any) -> dict:
+    if value is None:
+        return {}
+    if isinstance(value, BaseModel):
+        return value.model_dump(mode="json")
+    if is_dataclass(value):
+        return _json_safe(asdict(value))
+    if isinstance(value, dict):
+        return _json_safe(value)
+    return {}
+
+
+def _trace_dict(trace: TraceRecord) -> dict:
+    return _json_safe(
+        {
+            "id": trace.id,
+            "workflow_run_id": trace.workflow_run_id,
+            "thread_id": trace.thread_id,
+            "schema_version": trace.schema_version,
+            "status": trace.status,
+            "started_at": trace.started_at,
+            "created_at": trace.created_at,
+            "updated_at": trace.updated_at,
+            "payload": trace.payload,
+            "metadata": trace.metadata,
+        }
+    )
+
+
+def _observation_event_dict(event: ObservationEventRecord) -> dict:
+    return _json_safe(
+        {
+            "id": event.id,
+            "trace_id": event.trace_id,
+            "workflow_run_id": event.workflow_run_id,
+            "thread_id": event.thread_id,
+            "schema_version": event.schema_version,
+            "status": event.status,
+            "sequence_no": event.sequence_no,
+            "event_type": event.event_type,
+            "event_name": event.event_name,
+            "timestamp": event.timestamp,
+            "created_at": event.created_at,
+            "updated_at": event.updated_at,
+            "payload": event.payload,
+            "metadata": event.metadata,
+        }
+    )
+
+
+def _usage_summary_dict(summary: LLMUsageSummary) -> dict:
+    return _json_safe(asdict(summary))
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(item) for item in value]
+    if hasattr(value, "value"):
+        return value.value
+    return value
+
+
+def _derive_current_stage(*, run: dict, steps: list[dict], traces: list[TraceRecord]) -> str | None:
+    if run.get("current_step"):
+        return str(run["current_step"])
+    for step in steps:
+        if step.get("status") == "running":
+            return str(step.get("step_name") or "")
+    for trace in reversed(traces):
+        stage = trace.payload.get("stage") or trace.payload.get("current_stage")
+        if stage:
+            return str(stage)
+    return None
+
+
+def _duration_ms(
+    *,
+    traces: list[TraceRecord],
+    observation_events: list[ObservationEventRecord],
+    workflow_events: list[dict],
+    run: dict,
+) -> int:
+    times: list[datetime] = []
+    for key in ("started_at", "created_at", "updated_at", "completed_at", "failed_at", "cancelled_at"):
+        parsed = _parse_dt(run.get(key))
+        if parsed:
+            times.append(parsed)
+    for trace in traces:
+        times.extend([trace.started_at, trace.created_at, trace.updated_at])
+    for event in observation_events:
+        times.extend([event.timestamp, event.created_at, event.updated_at])
+    for event in workflow_events:
+        parsed = _parse_dt(event.get("created_at"))
+        if parsed:
+            times.append(parsed)
+    if len(times) < 2:
+        return 0
+    start = min(times)
+    end = max(times)
+    return max(0, int((end - start).total_seconds() * 1000))
+
+
+def _parse_dt(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _error_count(*, observation_events: list[dict], workflow_events: list[dict], usage_events: list[dict]) -> int:
+    count = 0
+    for event in observation_events:
+        if _event_has_error(event):
+            count += 1
+    for event in workflow_events:
+        if _event_has_error(event):
+            count += 1
+    for event in usage_events:
+        if str(event.get("status") or "").lower() != "success" or event.get("error_message"):
+            count += 1
+    return count
+
+
+def _retry_count(*, workflow_events: list[dict], usage_steps: list[dict]) -> int:
+    workflow_retry_count = sum(1 for event in workflow_events if "retry" in str(event.get("event_type") or ""))
+    failed_usage_calls = sum(int(step.get("failed_calls") or 0) for step in usage_steps)
+    return workflow_retry_count + failed_usage_calls
+
+
+def _event_has_error(event: dict) -> bool:
+    event_type = str(event.get("event_type") or "").lower()
+    event_level = str(event.get("event_level") or "").lower()
+    status = str(event.get("status") or "").lower()
+    payload = event.get("payload") or event.get("payload_json") or {}
+    return (
+        "failed" in event_type
+        or event_level == "error"
+        or status in {"failed", "error"}
+        or bool(payload.get("error_code"))
+        or bool(payload.get("error_message"))
+    )
+
+
+def _is_recoverable(run_status: str | None, brief_status: str) -> bool:
+    status_values = {str(run_status or "").lower(), brief_status.lower()}
+    return not bool(status_values & {"final_timeout", "failed", "cancelled"})

@@ -1,0 +1,163 @@
+"""Lightweight presearch execution for Content Research."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from dataclasses import dataclass
+from typing import Any, Protocol
+
+from app.services.llm.types import LLMCallContext, LLMRequest, LLMResponse
+
+from app.content_research.presearch.prompts import build_presearch_messages
+
+
+class PresearchLLM(Protocol):
+    async def generate(self, request: LLMRequest) -> LLMResponse: ...
+
+
+@dataclass(frozen=True)
+class PresearchInput:
+    seed_text: str
+    user_note: str | None
+    thread_id: str
+    workflow_run_id: str
+    user_id: str
+
+
+@dataclass(frozen=True)
+class PresearchChecklist:
+    subject_confirmation: str
+    competitor_tags: list[str]
+    research_directions: list[str]
+    custom_research_question: str = ""
+    custom_competitor_input: str = ""
+
+
+@dataclass(frozen=True)
+class PresearchOutcome:
+    status: str
+    checklist: PresearchChecklist
+    timeout_status: str = "none"
+    fallback_used: bool = False
+    error_code: str | None = None
+    error_message: str | None = None
+
+
+class PresearchService:
+    def __init__(
+        self,
+        llm: PresearchLLM | None = None,
+        *,
+        first_feedback_timeout_seconds: float = 10.0,
+        hard_cutoff_seconds: float = 20.0,
+    ) -> None:
+        self._llm = llm
+        self.first_feedback_timeout_seconds = first_feedback_timeout_seconds
+        self.hard_cutoff_seconds = hard_cutoff_seconds
+
+    async def create_llm_task(self, request: PresearchInput) -> asyncio.Task[PresearchOutcome] | None:
+        if self._llm is None:
+            return None
+        return asyncio.create_task(self._run_llm(request))
+
+    async def wait_for_first_feedback(
+        self,
+        *,
+        request: PresearchInput,
+        task: asyncio.Task[PresearchOutcome] | None,
+    ) -> PresearchOutcome:
+        if task is None:
+            return self.fallback(request, error_code="LLM_UNAVAILABLE")
+        try:
+            return await asyncio.wait_for(
+                asyncio.shield(task),
+                timeout=self.first_feedback_timeout_seconds,
+            )
+        except asyncio.TimeoutError:
+            return self.fallback(request, timeout_status="first_timeout", error_code="PRESEARCH_FIRST_TIMEOUT")
+
+    async def wait_for_hard_cutoff(
+        self,
+        *,
+        request: PresearchInput,
+        task: asyncio.Task[PresearchOutcome],
+    ) -> PresearchOutcome | None:
+        remaining = max(0.0, self.hard_cutoff_seconds - self.first_feedback_timeout_seconds)
+        try:
+            return await asyncio.wait_for(asyncio.shield(task), timeout=remaining)
+        except asyncio.TimeoutError:
+            task.cancel()
+            return self.fallback(request, timeout_status="final_timeout", error_code="PRESEARCH_FINAL_TIMEOUT")
+        except asyncio.CancelledError:
+            return self.fallback(request, timeout_status="final_timeout", error_code="PRESEARCH_CANCELLED")
+
+    def fallback(
+        self,
+        request: PresearchInput,
+        *,
+        timeout_status: str = "none",
+        error_code: str | None = None,
+        error_message: str | None = None,
+    ) -> PresearchOutcome:
+        from app.content_research.presearch.fallback_templates import build_fallback_checklist
+
+        return PresearchOutcome(
+            status="fallback" if timeout_status != "final_timeout" else "final_timeout",
+            checklist=build_fallback_checklist(request.seed_text, request.user_note),
+            timeout_status=timeout_status,
+            fallback_used=True,
+            error_code=error_code,
+            error_message=error_message,
+        )
+
+    async def _run_llm(self, request: PresearchInput) -> PresearchOutcome:
+        assert self._llm is not None
+        try:
+            response = await self._llm.generate(
+                LLMRequest(
+                    messages=build_presearch_messages(request.seed_text, request.user_note),
+                    task_type="content_research.presearch",
+                    model_policy="cheap_fast",
+                    temperature=1.0,
+                    max_tokens=700,
+                    context=LLMCallContext(
+                        session_id=request.thread_id,
+                        step_name="presearch",
+                        agent_name="content_research_presearch",
+                        user_id=request.user_id,
+                    ),
+                )
+            )
+            return PresearchOutcome(
+                status="completed",
+                checklist=self._parse_checklist(response.content),
+                fallback_used=False,
+            )
+        except Exception as exc:  # noqa: BLE001 - presearch must fall back instead of blocking UX.
+            return self.fallback(
+                request,
+                error_code="PRESEARCH_LLM_FAILED",
+                error_message=str(exc),
+            )
+
+    def _parse_checklist(self, content: str) -> PresearchChecklist:
+        data = json.loads(content)
+        if not isinstance(data, dict):
+            raise ValueError("presearch response must be a JSON object")
+        subject = str(data.get("subject_confirmation") or "").strip()
+        if not subject:
+            raise ValueError("presearch response missing subject_confirmation")
+        return PresearchChecklist(
+            subject_confirmation=subject,
+            competitor_tags=self._string_list(data.get("competitor_tags")),
+            research_directions=self._string_list(data.get("research_directions")),
+            custom_research_question=str(data.get("custom_research_question") or ""),
+            custom_competitor_input=str(data.get("custom_competitor_input") or ""),
+        )
+
+    @staticmethod
+    def _string_list(value: Any) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        return [str(item).strip() for item in value if str(item).strip()]
