@@ -11,6 +11,8 @@ P0_WORKFLOW_ACTIONS = (
     "confirm_brief",
     "start_formal_research",
     "retry_formal_research",
+    "pause_formal_research",
+    "resume_formal_research",
     "end_content_research",
 )
 
@@ -128,6 +130,7 @@ class ContentResearchTraceResponse(BaseModel):
     runtime_steps: list[dict] = Field(default_factory=list)
     runtime_child_tasks: list[dict] = Field(default_factory=list)
     usage_summary: dict = Field(default_factory=dict)
+    external_api_summary: dict = Field(default_factory=dict)
     usage_steps: list[dict] = Field(default_factory=list)
     usage_events: list[dict] = Field(default_factory=list)
 

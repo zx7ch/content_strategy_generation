@@ -82,6 +82,7 @@ class ContentResearchTraceService:
             runtime_steps=[_json_dict(step) for step in runtime_steps],
             runtime_child_tasks=[_json_dict(task) for task in runtime_child_tasks],
             usage_summary=_usage_summary_dict(usage_summary),
+            external_api_summary=_external_api_summary(observation_event_dicts),
             usage_steps=usage_steps_dicts,
             usage_events=usage_events_dicts,
         )
@@ -139,6 +140,28 @@ def _observation_event_dict(event: ObservationEventRecord) -> dict:
 
 def _usage_summary_dict(summary: LLMUsageSummary) -> dict:
     return _json_safe(asdict(summary))
+
+
+def _external_api_summary(observation_events: list[dict]) -> dict:
+    """Summarize source-adapter calls for UI observability, never for recovery."""
+    started = [event for event in observation_events if event.get("event_name") == "source_collection_started"]
+    completed = [event for event in observation_events if event.get("event_name") == "source_collection_completed"]
+    failed = [event for event in observation_events if event.get("event_name") == "source_collection_failed"]
+    by_provider: dict[str, int] = {}
+    by_operation: dict[str, int] = {}
+    for event in started:
+        payload = dict(event.get("payload") or {})
+        provider = str(payload.get("provider") or "unknown")
+        operation = str(payload.get("operation") or "collect")
+        by_provider[provider] = by_provider.get(provider, 0) + 1
+        by_operation[operation] = by_operation.get(operation, 0) + 1
+    return {
+        "call_count": len(started),
+        "completed_count": len(completed),
+        "failed_count": len(failed),
+        "by_provider": by_provider,
+        "by_operation": by_operation,
+    }
 
 
 def _json_safe(value: Any) -> Any:

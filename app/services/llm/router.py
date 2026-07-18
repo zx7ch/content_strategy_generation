@@ -20,6 +20,11 @@ def build_default_policy_map(settings_obj: object = settings) -> dict[str, Resol
             model=_setting_value(settings_obj, "DEEPSEEK_MODEL", "deepseek-chat"),
             model_policy="cheap",
         ),
+        "cheap_fast": ResolvedModel(
+            provider="kimi",
+            model=_setting_value(settings_obj, "KIMI_MODEL", "moonshot-v1-8k"),
+            model_policy="cheap_fast",
+        ),
         "balanced": ResolvedModel(
             provider="openai",
             model=_setting_value(settings_obj, "OPENAI_MODEL", "gpt-4o-mini"),

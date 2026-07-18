@@ -22,9 +22,14 @@ class UsageCost:
 
 
 DEFAULT_PRICING: dict[str, ModelPricing] = {
+    "openai:gpt-4.1-mini": ModelPricing(input_per_1m_tokens=0.40, output_per_1m_tokens=1.60),
     "openai:gpt-4o-mini": ModelPricing(input_per_1m_tokens=0.15, output_per_1m_tokens=0.60),
     "openai:gpt-4o": ModelPricing(input_per_1m_tokens=2.50, output_per_1m_tokens=10.00),
     "deepseek:deepseek-chat": ModelPricing(input_per_1m_tokens=0.14, output_per_1m_tokens=0.28),
+    "anthropic:claude-haiku-4-5": ModelPricing(input_per_1m_tokens=1.00, output_per_1m_tokens=5.00),
+    "anthropic:claude-sonnet-4-6": ModelPricing(input_per_1m_tokens=3.00, output_per_1m_tokens=15.00),
+    "kimi:moonshot-v1-8k": ModelPricing(input_per_1m_tokens=0.20, output_per_1m_tokens=2.00),
+    "kimi:kimi-k2.6": ModelPricing(input_per_1m_tokens=0.95, output_per_1m_tokens=4.00),
 }
 
 

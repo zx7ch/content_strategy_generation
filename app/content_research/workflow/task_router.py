@@ -6,10 +6,20 @@ from dataclasses import replace
 from typing import Any
 
 from app.content_research.agents import build_default_subagent_registry
-from app.content_research.agents.base import ContentResearchSubagent, SubagentExecutionContext, SubagentExecutionResult
-from app.content_research.evidence import EvidenceBundleService, EvidenceService
+from app.content_research.agents.base import (
+    ContentResearchSubagent,
+    SubagentExecutionContext,
+    SubagentExecutionResult,
+)
 from app.content_research.analysis import DirectionalAnalysisService
-from app.content_research.models import ObservationEventRecord, SubagentTaskRecord, TraceRecord, utcnow
+from app.content_research.evidence import EvidenceBundleService, EvidenceService
+from app.content_research.models import (
+    ObservationEventRecord,
+    SubagentTaskRecord,
+    TraceRecord,
+    utcnow,
+)
+from app.content_research.runtime import CheckpointRuntime, canonical_fingerprint
 from app.content_research.sources import SourceAdapterRegistry
 from app.content_research.sources.base import SourceCollectionResult
 from app.content_research.stores.base import ContentResearchStore
@@ -105,11 +115,24 @@ class SubagentTaskRouter:
         agent = self._agents.get(agent_name)
         if agent is None:
             raise ValueError(f"Unsupported content research subagent: {agent_name}")
+        db_path = getattr(self._store, "_db_path", None)
+        checkpoint_runtime = CheckpointRuntime(db_path) if db_path else None
+        collect_fingerprint = canonical_fingerprint({
+            "task_id": task.id, "stage": "collect", "input": task.payload.get("input_payload", {}),
+        })
+        if checkpoint_runtime is not None and checkpoint_runtime.is_completed(
+            subagent_task_id=task.id, stage_name="collect", input_fingerprint=collect_fingerprint,
+        ):
+            return self._store.get_subagent_task(task.id) or task
 
         trace = self._ensure_trace(task, trace_id)
         sequence_no = self._next_observation_sequence(trace.id)
         started = replace(task, status="running", updated_at=utcnow())
         self._store.save_subagent_task(started)
+        if checkpoint_runtime is not None:
+            checkpoint_runtime.checkpoint(
+                subagent_task_id=task.id, stage_name="collect", input_fingerprint=collect_fingerprint, status="running",
+            )
         self._append_event(trace, sequence_no, "task_started", "subagent_task_started", started, {"agent_name": agent_name})
         sequence_no += 1
         self._append_event(
@@ -136,6 +159,12 @@ class SubagentTaskRouter:
             )
         except Exception as exc:
             failed = self._terminal_task(started, status="failed", result=None, error=str(exc))
+            if checkpoint_runtime is not None:
+                checkpoint_runtime.checkpoint(
+                    subagent_task_id=task.id, stage_name="collect", input_fingerprint=collect_fingerprint,
+                    status="failed_recoverable", failure={"code": "agent_execution_failed", "message": str(exc), "recoverable": True},
+                    retry_count=1,
+                )
             self._append_event(
                 trace,
                 sequence_no,
@@ -148,6 +177,12 @@ class SubagentTaskRouter:
 
         sequence_no = self._append_result_events(trace, sequence_no, started, result)
         terminal = self._terminal_task(started, status=result.status, result=result)
+        if checkpoint_runtime is not None and result.status in {"completed", "partial_completed"}:
+            refs = (result.evidence_bundle.id,) if result.evidence_bundle else ()
+            checkpoint_runtime.checkpoint(
+                subagent_task_id=task.id, stage_name="collect", input_fingerprint=collect_fingerprint,
+                status="completed", output_refs=refs,
+            )
         terminal_event = "subagent_task_completed" if result.status in {"completed", "partial_completed"} else "subagent_task_failed"
         self._append_event(
             trace,

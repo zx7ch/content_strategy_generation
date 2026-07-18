@@ -998,7 +998,11 @@ class WorkflowRunManager:
             assert self._conn is not None
             child = await self._fetch_child_task_row(child_task_id)
             run = await self._fetch_run_row(child["run_id"])
-            if child["status"] != WorkflowStepStatus.RUNNING.value:
+            # A content-research specialist may have reached a durable failed
+            # terminal state while its parent research step remains open for a
+            # user-triggered retry.  Requeueing it preserves the same child ID
+            # and its event history instead of creating a duplicate task.
+            if child["status"] not in {WorkflowStepStatus.RUNNING.value, WorkflowStepStatus.FAILED.value}:
                 raise WorkflowTransitionError(f"retry_child_task not allowed from {child['status']}")
             code, message = self._normalize_error(error)
             await self._conn.execute(

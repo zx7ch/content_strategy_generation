@@ -126,6 +126,12 @@ class WorkflowStore:
         await self._create_workflow_tables()
         await self._conn.commit()
 
+    async def delete_run(self, run_id: str) -> None:
+        assert self._conn is not None
+        for table in ("workflow_constraints", "workflow_artifacts", "workflow_events", "workflow_child_tasks", "workflow_steps", "workflow_runs"):
+            await self._conn.execute(f"DELETE FROM {table} WHERE run_id = ?", (run_id,))
+        await self._conn.commit()
+
     async def _create_workflow_tables(self) -> None:
         assert self._conn is not None
         await self._conn.execute(

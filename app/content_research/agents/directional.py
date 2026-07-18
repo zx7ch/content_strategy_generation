@@ -10,9 +10,14 @@ from app.content_research.agents.base import (
     SubagentExecutionResult,
     SubagentFinding,
 )
-from app.content_research.compression import EvidenceFactExtractor, FindingSummarizer
 from app.content_research.analysis import DirectionalAnalysisService
-from app.content_research.evidence import EvidenceBundleItemRecord, EvidenceBundleRecord, EvidenceBundleService, EvidenceService
+from app.content_research.compression import EvidenceFactExtractor, FindingSummarizer
+from app.content_research.evidence import (
+    EvidenceBundleItemRecord,
+    EvidenceBundleRecord,
+    EvidenceBundleService,
+    EvidenceService,
+)
 from app.content_research.sources import SourceCollectionRequest
 
 
@@ -148,6 +153,7 @@ class DirectionalResearchAgent:
             direction_label,
             finding,
             evidence_records,
+            facts,
             list(fact_records_by_source_id.values()),
             cited_fact_records,
             finding_record,
@@ -175,6 +181,7 @@ class DirectionalResearchAgent:
         direction_label: str,
         finding: SubagentFinding,
         evidence_records: list,
+        facts: list[dict[str, Any]],
         fact_records: list,
         cited_fact_records: list,
         finding_record,
@@ -192,7 +199,9 @@ class DirectionalResearchAgent:
         }
         supported_claim_count = 1 if cited_fact_ids else 0
         citation_coverage_score = float(supported_claim_count)
-        contradiction_summary = _contradiction_summary(cited_fact_records)
+        # Contradiction detection evaluates the accepted directional fact set,
+        # not merely the subset used by the single synthesized finding.
+        contradiction_summary = _contradiction_summary(fact_records)
         accepted_evidence_count = len(facts)
         bundle = EvidenceBundleRecord(
             id=bundle_id,

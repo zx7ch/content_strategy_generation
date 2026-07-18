@@ -23,6 +23,21 @@ DEFAULT_OPENAI_COMPATIBLE_PROVIDERS: Final[tuple[str, ...]] = (
 )
 
 
+def build_default_llm_service() -> LLMService:
+    providers = {
+        provider: OpenAICompatibleAdapter(
+            provider=provider,
+            base_url=getattr(settings, f"{provider.upper()}_BASE_URL", "") or None,
+        )
+        for provider in DEFAULT_OPENAI_COMPATIBLE_PROVIDERS
+    }
+    return LLMService(
+        router=ModelRouter(settings_obj=settings),
+        credential_resolver=CredentialResolver(settings),
+        providers=providers,
+    )
+
+
 class TrackedLLMChatClient:
     """Old `LLMClient.chat()` shape backed by the new LLM abstraction layer."""
 
@@ -129,16 +144,8 @@ def build_default_tracked_chat_client(
     step_name: str | None = None,
     agent_name: str | None = None,
 ) -> TrackedLLMChatClient:
-    providers = {
-        provider: OpenAICompatibleAdapter(provider=provider)
-        for provider in DEFAULT_OPENAI_COMPATIBLE_PROVIDERS
-    }
     return TrackedLLMChatClient(
-        llm_service=LLMService(
-            router=ModelRouter(settings_obj=settings),
-            credential_resolver=CredentialResolver(settings),
-            providers=providers,
-        ),
+        llm_service=build_default_llm_service(),
         usage_tracker=LLMUsageTracker(db_path),
         pricing_calculator=PricingCalculator(),
         context=LLMCallContext(

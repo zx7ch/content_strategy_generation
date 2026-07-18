@@ -7,37 +7,37 @@ import uuid
 from dataclasses import asdict, replace
 from typing import Any, Protocol
 
+from app.content_research.advancement import DecisionAdvancementService
+from app.content_research.analysis import DirectionalAnalysisLLM, DirectionalAnalysisService
 from app.content_research.api_schemas import (
     CONTENT_RESEARCH_API_SCHEMA_VERSION,
+    P0_WORKFLOW_ACTIONS,
     ContentResearchBriefConfirmRequest,
     ContentResearchBriefResponse,
     ContentResearchDirectionResponse,
     ContentResearchFormalResearchResponse,
-    EvidenceBundleView,
-    HumanDecisionRequest,
-    HumanDecisionResponse,
-    HumanDecisionsResponse,
     ContentResearchPlanResponse,
-    ContentResearchWorkflowActionRequest,
-    ContentResearchWorkflowActionResponse,
-    P0_WORKFLOW_ACTIONS,
     ContentResearchPresearchResponse,
     ContentResearchSourceCollectionRequest,
     ContentResearchSourceCollectionResponse,
     ContentResearchSubagentTaskResponse,
     ContentResearchTraceResponse,
+    ContentResearchWorkflowActionRequest,
+    ContentResearchWorkflowActionResponse,
     ContentResearchWorkflowEventsResponse,
     ContentResearchWorkflowSummaryResponse,
+    EvidenceBundleView,
+    HumanDecisionRequest,
+    HumanDecisionResponse,
+    HumanDecisionsResponse,
     ResultItem,
     SnapshotResponse,
 )
-from app.content_research.decisions import ResearchDecisionService
-from app.content_research.advancement import DecisionAdvancementService
-from app.content_research.analysis import DirectionalAnalysisLLM, DirectionalAnalysisService
+from app.content_research.contracts import build_default_snapshot
 from app.content_research.decision_policy import DecisionPolicyService
+from app.content_research.decisions import ResearchDecisionService
 from app.content_research.evidence import EvidenceBundleService, EvidenceService
 from app.content_research.evidence.models import EvidenceBundleRecord, EvidenceRecord
-from app.content_research.synthesis import synthesize_snapshot
 from app.content_research.models import (
     ObservationEventRecord,
     ResearchBriefRecord,
@@ -49,21 +49,26 @@ from app.content_research.models import (
     utcnow,
 )
 from app.content_research.observation import ContentResearchTraceService
-from app.content_research.presearch.service import PresearchInput, PresearchOutcome, PresearchService
+from app.content_research.presearch.service import (
+    PresearchInput,
+    PresearchOutcome,
+    PresearchService,
+)
 from app.content_research.sources import (
     SourceAdapterRegistry,
     SourceCollectionRequest,
 )
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
+from app.content_research.synthesis import synthesize_snapshot
 from app.content_research.workflow import (
     BriefConfirmation,
     ResearchDirectionRegistry,
     ResearchPlanBuilder,
     SubagentTaskRouter,
 )
-from app.models.workflow import WorkflowPhase
 from app.memory.thread_store import ThreadStore
 from app.memory.workflow_store import WorkflowStore
+from app.models.workflow import WorkflowPhase
 from app.services.workflow_run_manager import WorkflowRunManager
 
 
@@ -100,6 +105,12 @@ class WorkflowRuntime(Protocol):
     ) -> None: ...
 
     async def end_content_research_run(self, *, workflow_run_id: str, thread_id: str) -> dict: ...
+
+    async def pause_content_research_run(self, *, workflow_run_id: str) -> dict: ...
+
+    async def resume_content_research_run(self, *, workflow_run_id: str) -> dict: ...
+
+    async def acknowledge_pause_at_safe_boundary(self, *, workflow_run_id: str) -> dict: ...
 
     async def complete_formal_research(self, *, workflow_run_id: str, task_outcomes: list[dict], artifact_refs: list[dict]) -> bool: ...
 
@@ -285,6 +296,21 @@ class WorkflowRunManagerRuntime:
             "cancel_status": cancel_status,
         }
 
+    async def pause_content_research_run(self, *, workflow_run_id: str) -> dict:
+        async with WorkflowRunManager(self._db_path) as manager:
+            run = await manager.pause_run(workflow_run_id, reason="content_research_user_pause")
+        return {"workflow_run_id": workflow_run_id, "status": run.status.value, "recoverable": True}
+
+    async def resume_content_research_run(self, *, workflow_run_id: str) -> dict:
+        async with WorkflowRunManager(self._db_path) as manager:
+            run = await manager.resume_run(workflow_run_id)
+        return {"workflow_run_id": workflow_run_id, "status": run.status.value, "recoverable": True}
+
+    async def acknowledge_pause_at_safe_boundary(self, *, workflow_run_id: str) -> dict:
+        async with WorkflowRunManager(self._db_path) as manager:
+            run = await manager.ack_pause_at_boundary(workflow_run_id, "formal_research")
+        return {"workflow_run_id": workflow_run_id, "status": run.status.value, "recoverable": True}
+
 
 class ContentResearchService:
     def __init__(
@@ -459,6 +485,15 @@ class ContentResearchService:
             payload=plan_payload,
         )
         self._store.save_plan(plan)
+        snapshot, sample_policies, direction_contracts = build_default_snapshot(
+            snapshot_id=_new_id("rps"), workflow_run_id=brief.workflow_run_id,
+            brief_id=brief.id, plan_id=plan.id,
+        )
+        self._store.save_run_policy_snapshot(snapshot)
+        for sample_policy in sample_policies:
+            self._store.save_sample_policy(sample_policy)
+        for direction_contract in direction_contracts:
+            self._store.save_direction_contract(direction_contract)
 
         saved_tasks: list[SubagentTaskRecord] = []
         for index, direction in enumerate(directions):
@@ -512,6 +547,23 @@ class ContentResearchService:
             )
 
         return await self.get_workflow_summary(brief.workflow_run_id)
+
+    def get_policy_snapshot(self, workflow_run_id: str) -> dict[str, Any]:
+        snapshot = self._store.get_run_policy_snapshot_for_workflow(workflow_run_id)
+        if snapshot is None:
+            raise ContentResearchNotFoundError(f"Policy snapshot not found for workflow: {workflow_run_id}")
+        contracts = self._store.list_direction_contracts(snapshot.id)
+        policies = [self._store.get_sample_policy(item.sample_policy_id) for item in contracts]
+        return {
+            "schema_version": "content_research_policy_snapshot_response_v1",
+            "id": snapshot.id,
+            "workflow_run_id": snapshot.workflow_run_id,
+            "effective_policy": snapshot.effective_policy,
+            "effective_policy_hash": snapshot.effective_policy_hash,
+            "run_as_of_at": snapshot.run_as_of_at.isoformat(),
+            "sample_policies": [asdict(item) for item in policies if item is not None],
+            "direction_contracts": [asdict(item) for item in contracts],
+        }
 
     async def get_workflow_summary(self, workflow_run_id: str) -> ContentResearchWorkflowSummaryResponse:
         brief = self._store.get_brief_by_workflow(workflow_run_id)
@@ -833,6 +885,14 @@ class ContentResearchService:
                 local_cache_id=brief.id,
             )
 
+        if action == "pause_formal_research":
+            result = await self._workflow_runtime.pause_content_research_run(workflow_run_id=workflow_run_id)
+            return self._action_response(workflow_run_id=workflow_run_id, action=action, status=result["status"], result=result, local_cache_id=brief.id)
+
+        if action == "resume_formal_research":
+            result = await self._workflow_runtime.resume_content_research_run(workflow_run_id=workflow_run_id)
+            return self._action_response(workflow_run_id=workflow_run_id, action=action, status=result["status"], result=result, local_cache_id=brief.id)
+
         if action not in {"start_formal_research", "retry_formal_research"}:
             raise ContentResearchValidationError(f"Unsupported Content Research workflow action: {action}")
         source_request = ContentResearchSourceCollectionRequest(**request.payload)
@@ -983,6 +1043,12 @@ class ContentResearchService:
             )
         )
         terminal_by_id = {task.id: task for task in terminals}
+        runtime_state = await self._workflow_runtime.get_runtime_snapshot(brief.workflow_run_id)
+        if runtime_state.get("run_status") == "pausing":
+            await self._workflow_runtime.acknowledge_pause_at_safe_boundary(
+                workflow_run_id=brief.workflow_run_id,
+            )
+            return
         outcomes: list[dict] = []
         for task in tasks:
             terminal = terminal_by_id.get(task.id) or task

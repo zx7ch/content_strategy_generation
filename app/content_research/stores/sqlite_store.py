@@ -5,9 +5,10 @@ from __future__ import annotations
 import json
 import sqlite3
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, TypeVar
 
 from app.content_research.bootstrap import bootstrap_content_research_schema
+from app.content_research.contracts import DirectionContract, RunPolicySnapshot, SamplePolicy
 from app.content_research.evidence.models import (
     EvidenceBundleItemRecord,
     EvidenceBundleRecord,
@@ -23,6 +24,21 @@ from app.content_research.models import (
     ResearchResultSnapshotRecord,
     SubagentTaskRecord,
     TraceRecord,
+)
+from app.content_research.persistence_models import (
+    AggregateClaimRecord,
+    BudgetLedgerEntryRecord,
+    CanonicalSourceRecord,
+    ClaimAdmissionDecisionRecord,
+    ClaimCandidateRecord,
+    CrossDirectionRecord,
+    DirectionalEvidencePacketRecord,
+    DirectionResultDecisionRecord,
+    DirectionSourceProjectionRecord,
+    ReportFaithfulnessDecisionRecord,
+    StageCheckpointRecord,
+    TypedPersistenceRecord,
+    WeakSignalRecord,
 )
 
 
@@ -84,6 +100,24 @@ def _dumps_any_list(value: list[Any]) -> str:
 def _validate_payload(record_type: str, payload: dict[str, Any]) -> None:
     if not payload.get("schema_version"):
         raise ValueError(f"{record_type} payload must include schema_version")
+
+
+_TypedRecordT = TypeVar("_TypedRecordT", bound=TypedPersistenceRecord)
+
+_TYPED_RECORD_TABLES: dict[type[TypedPersistenceRecord], tuple[str, tuple[str, ...]]] = {
+    CanonicalSourceRecord: ("content_research_canonical_sources", ("platform", "platform_source_kind", "platform_source_id", "canonical_url")),
+    DirectionSourceProjectionRecord: ("content_research_direction_source_projections", ("research_direction_id", "canonical_source_id", "evidence_packet_id")),
+    DirectionalEvidencePacketRecord: ("content_research_directional_evidence_packets", ("research_direction_id", "canonical_source_id", "field_projection_hash")),
+    ClaimCandidateRecord: ("content_research_claim_candidates", ("research_direction_id", "evidence_packet_id", "statement")),
+    ClaimAdmissionDecisionRecord: ("content_research_claim_admission_decisions", ("research_direction_id", "claim_candidate_id", "decision", "policy_snapshot_id")),
+    DirectionResultDecisionRecord: ("content_research_direction_result_decisions", ("research_direction_id", "policy_snapshot_id")),
+    WeakSignalRecord: ("content_research_weak_signals", ("admission_decision_id",)),
+    CrossDirectionRecord: ("content_research_cross_direction_records", ("research_plan_id", "record_type")),
+    AggregateClaimRecord: ("content_research_aggregate_claims", ("research_plan_id", "aggregate_type")),
+    StageCheckpointRecord: ("content_research_stage_checkpoints", ("subagent_task_id", "stage_name", "input_fingerprint", "status", "retry_count")),
+    BudgetLedgerEntryRecord: ("content_research_budget_ledger_entries", ("research_plan_id", "research_direction_id", "idempotency_key", "reservation_status", "reserved_amount", "consumed_amount", "stage_checkpoint_id")),
+    ReportFaithfulnessDecisionRecord: ("content_research_report_faithfulness_decisions", ("research_plan_id", "result_snapshot_id")),
+}
 
 
 class SQLiteContentResearchStore:
@@ -825,6 +859,193 @@ class SQLiteContentResearchStore:
         for decision in self.list_human_decisions_for_workflow(workflow_run_id):
             current[(decision.target_type, decision.target_id)] = decision
         return list(current.values())
+
+    def save_run_policy_snapshot(self, snapshot: RunPolicySnapshot) -> RunPolicySnapshot:
+        with self._connect() as conn:
+            existing = conn.execute("SELECT effective_policy_hash FROM content_research_run_policy_snapshots WHERE id = ?", (snapshot.id,)).fetchone()
+            if existing is not None:
+                if existing[0] != snapshot.effective_policy_hash:
+                    raise ValueError(f"RunPolicySnapshot is append-only: {snapshot.id}")
+                return snapshot
+            conn.execute("INSERT INTO content_research_run_policy_snapshots VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (snapshot.id, snapshot.workflow_run_id, snapshot.research_brief_id, snapshot.research_plan_id, snapshot.schema_version, _dumps(snapshot.effective_policy), snapshot.effective_policy_hash, _fmt_dt(snapshot.run_as_of_at), _dumps(snapshot.base_policy_ids_and_versions), _dumps(snapshot.requested_overrides), _dumps(snapshot.validation_result), _fmt_dt(snapshot.created_at), _dumps(snapshot.metadata)))
+        return snapshot
+
+    def get_run_policy_snapshot(self, snapshot_id: str) -> RunPolicySnapshot | None:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM content_research_run_policy_snapshots WHERE id = ?", (snapshot_id,)).fetchone()
+        return self._row_to_snapshot(row) if row else None
+
+    def get_run_policy_snapshot_for_workflow(self, workflow_run_id: str) -> RunPolicySnapshot | None:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM content_research_run_policy_snapshots WHERE workflow_run_id = ?", (workflow_run_id,)).fetchone()
+        return self._row_to_snapshot(row) if row else None
+
+    def save_sample_policy(self, policy: SamplePolicy) -> SamplePolicy:
+        with self._connect() as conn:
+            conn.execute("INSERT INTO content_research_sample_policies VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING", (policy.id, policy.schema_version, policy.direction_id, policy.minimum_samples, policy.minimum_independent_authors, policy.author_cap, _dumps(policy.metadata)))
+        return policy
+
+    def get_sample_policy(self, sample_policy_id: str) -> SamplePolicy | None:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM content_research_sample_policies WHERE id = ?", (sample_policy_id,)).fetchone()
+        return SamplePolicy(id=row["id"], schema_version=row["schema_version"], direction_id=row["direction_id"], minimum_samples=row["minimum_samples"], minimum_independent_authors=row["minimum_independent_authors"], author_cap=row["author_cap"], metadata=_loads(row["metadata_json"])) if row else None
+
+    def save_direction_contract(self, contract: DirectionContract) -> DirectionContract:
+        with self._connect() as conn:
+            conn.execute("INSERT INTO content_research_direction_contracts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING", (contract.id, contract.snapshot_id, contract.direction_id, contract.schema_version, contract.sample_policy_id, _dumps_any_list(list(contract.required_note_fields)), _dumps_any_list(list(contract.optional_note_fields)), _dumps_any_list(list(contract.required_comment_fields)), _dumps_any_list(list(contract.claim_rules)), contract.analysis_schema_version, contract.resume_contract_version, _dumps(contract.metadata)))
+        return contract
+
+    def list_direction_contracts(self, snapshot_id: str) -> list[DirectionContract]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT * FROM content_research_direction_contracts WHERE snapshot_id = ? ORDER BY direction_id", (snapshot_id,)).fetchall()
+        return [DirectionContract(id=row["id"], snapshot_id=row["snapshot_id"], direction_id=row["direction_id"], schema_version=row["schema_version"], sample_policy_id=row["sample_policy_id"], required_note_fields=tuple(_loads_any_list(row["required_note_fields_json"])), optional_note_fields=tuple(_loads_any_list(row["optional_note_fields_json"])), required_comment_fields=tuple(_loads_any_list(row["required_comment_fields_json"])), claim_rules=tuple(_loads_any_list(row["claim_rules_json"])), analysis_schema_version=row["analysis_schema_version"], resume_contract_version=row["resume_contract_version"], metadata=_loads(row["metadata_json"])) for row in rows]
+
+    def _save_typed_record(
+        self,
+        table: str,
+        record: TypedPersistenceRecord,
+        values: dict[str, Any],
+    ) -> TypedPersistenceRecord:
+        if not isinstance(record, TypedPersistenceRecord):
+            raise TypeError("new persistence APIs require typed records")
+        columns = ("id", "schema_version", *values, "payload_json", "metadata_json", "created_at")
+        placeholders = ", ".join("?" for _ in columns)
+        with self._connect() as conn:
+            conn.execute(
+                f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({placeholders})",
+                (
+                    record.id,
+                    record.schema_version,
+                    *values.values(),
+                    _dumps(record.payload),
+                    _dumps(record.metadata),
+                    _fmt_dt(record.created_at),
+                ),
+            )
+        return record
+
+    def _require_typed_parent(self, table: str, record_id: str, relation: str) -> None:
+        with self._connect() as conn:
+            row = conn.execute(f"SELECT 1 FROM {table} WHERE id = ?", (record_id,)).fetchone()
+        if row is None:
+            raise ValueError(f"missing {relation}: {record_id}")
+
+    def _get_typed_record(
+        self,
+        table: str,
+        record_id: str,
+        record_type: type[TypedPersistenceRecord],
+        fields: tuple[str, ...],
+    ) -> TypedPersistenceRecord | None:
+        with self._connect() as conn:
+            row = conn.execute(f"SELECT * FROM {table} WHERE id = ?", (record_id,)).fetchone()
+        return self._row_to_typed_record(row, record_type, fields) if row else None
+
+    def _list_typed_records(
+        self,
+        table: str,
+        record_type: type[TypedPersistenceRecord],
+        fields: tuple[str, ...],
+    ) -> list[TypedPersistenceRecord]:
+        with self._connect() as conn:
+            rows = conn.execute(f"SELECT * FROM {table} ORDER BY created_at ASC, id ASC").fetchall()
+        return [self._row_to_typed_record(row, record_type, fields) for row in rows]
+
+    def get_typed_record(
+        self,
+        record_type: type[_TypedRecordT],
+        record_id: str,
+    ) -> _TypedRecordT | None:
+        try:
+            table, fields = _TYPED_RECORD_TABLES[record_type]
+        except KeyError as exc:
+            raise TypeError("unsupported typed persistence record") from exc
+        return self._get_typed_record(table, record_id, record_type, fields)  # type: ignore[return-value]
+
+    def list_typed_records(self, record_type: type[_TypedRecordT]) -> list[_TypedRecordT]:
+        try:
+            table, fields = _TYPED_RECORD_TABLES[record_type]
+        except KeyError as exc:
+            raise TypeError("unsupported typed persistence record") from exc
+        return self._list_typed_records(table, record_type, fields)  # type: ignore[return-value]
+
+    @staticmethod
+    def _row_to_typed_record(
+        row: sqlite3.Row,
+        record_type: type[TypedPersistenceRecord],
+        fields: tuple[str, ...],
+    ) -> TypedPersistenceRecord:
+        return record_type(
+            id=row["id"], schema_version=row["schema_version"], payload=_loads(row["payload_json"]),
+            metadata=_loads(row["metadata_json"]), created_at=_parse_dt(row["created_at"]),
+            **{field: row[field] for field in fields},
+        )
+
+    def save_canonical_source(self, source: CanonicalSourceRecord) -> CanonicalSourceRecord:
+        return self._save_typed_record("content_research_canonical_sources", source, {"platform": source.platform, "platform_source_kind": source.platform_source_kind, "platform_source_id": source.platform_source_id, "canonical_url": source.canonical_url})  # type: ignore[return-value]
+
+    def resolve_canonical_source(self, source: CanonicalSourceRecord) -> CanonicalSourceRecord:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO content_research_canonical_sources (id, schema_version, platform, platform_source_kind, platform_source_id, canonical_url, payload_json, metadata_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(platform, platform_source_kind, platform_source_id) DO NOTHING",
+                (source.id, source.schema_version, source.platform, source.platform_source_kind, source.platform_source_id, source.canonical_url, _dumps(source.payload), _dumps(source.metadata), _fmt_dt(source.created_at)),
+            )
+            row = conn.execute("SELECT * FROM content_research_canonical_sources WHERE platform = ? AND platform_source_kind = ? AND platform_source_id = ?", (source.platform, source.platform_source_kind, source.platform_source_id)).fetchone()
+        return self._row_to_typed_record(row, CanonicalSourceRecord, ("platform", "platform_source_kind", "platform_source_id", "canonical_url"))  # type: ignore[return-value]
+
+    def get_canonical_source(self, source_id: str) -> CanonicalSourceRecord | None:
+        return self._get_typed_record("content_research_canonical_sources", source_id, CanonicalSourceRecord, ("platform", "platform_source_kind", "platform_source_id", "canonical_url"))  # type: ignore[return-value]
+
+    def save_direction_source_projection(self, record: DirectionSourceProjectionRecord) -> DirectionSourceProjectionRecord:
+        self._require_typed_parent("content_research_canonical_sources", record.canonical_source_id, "canonical source")
+        self._require_typed_parent("content_research_directional_evidence_packets", record.evidence_packet_id, "evidence packet")
+        return self._save_typed_record("content_research_direction_source_projections", record, {"research_direction_id": record.research_direction_id, "canonical_source_id": record.canonical_source_id, "evidence_packet_id": record.evidence_packet_id})  # type: ignore[return-value]
+
+    def save_directional_evidence_packet(self, record: DirectionalEvidencePacketRecord) -> DirectionalEvidencePacketRecord:
+        self._require_typed_parent("content_research_canonical_sources", record.canonical_source_id, "canonical source")
+        return self._save_typed_record("content_research_directional_evidence_packets", record, {"research_direction_id": record.research_direction_id, "canonical_source_id": record.canonical_source_id, "field_projection_hash": record.field_projection_hash})  # type: ignore[return-value]
+
+    def save_claim_candidate(self, record: ClaimCandidateRecord) -> ClaimCandidateRecord:
+        self._require_typed_parent("content_research_directional_evidence_packets", record.evidence_packet_id, "evidence packet")
+        return self._save_typed_record("content_research_claim_candidates", record, {"research_direction_id": record.research_direction_id, "evidence_packet_id": record.evidence_packet_id, "statement": record.statement})  # type: ignore[return-value]
+
+    def save_claim_admission_decision(self, record: ClaimAdmissionDecisionRecord) -> ClaimAdmissionDecisionRecord:
+        self._require_typed_parent("content_research_claim_candidates", record.claim_candidate_id, "claim candidate")
+        self._require_typed_parent("content_research_run_policy_snapshots", record.policy_snapshot_id, "policy snapshot")
+        return self._save_typed_record("content_research_claim_admission_decisions", record, {"research_direction_id": record.research_direction_id, "claim_candidate_id": record.claim_candidate_id, "decision": record.decision, "policy_snapshot_id": record.policy_snapshot_id})  # type: ignore[return-value]
+
+    def save_direction_result_decision(self, record: DirectionResultDecisionRecord) -> DirectionResultDecisionRecord:
+        self._require_typed_parent("content_research_run_policy_snapshots", record.policy_snapshot_id, "policy snapshot")
+        return self._save_typed_record("content_research_direction_result_decisions", record, {"research_direction_id": record.research_direction_id, "policy_snapshot_id": record.policy_snapshot_id})  # type: ignore[return-value]
+
+    def save_weak_signal(self, record: WeakSignalRecord) -> WeakSignalRecord:
+        self._require_typed_parent("content_research_claim_admission_decisions", record.admission_decision_id, "admission decision")
+        return self._save_typed_record("content_research_weak_signals", record, {"admission_decision_id": record.admission_decision_id})  # type: ignore[return-value]
+
+    def save_cross_direction_record(self, record: CrossDirectionRecord) -> CrossDirectionRecord:
+        return self._save_typed_record("content_research_cross_direction_records", record, {"research_plan_id": record.research_plan_id, "record_type": record.record_type})  # type: ignore[return-value]
+
+    def save_aggregate_claim(self, record: AggregateClaimRecord) -> AggregateClaimRecord:
+        return self._save_typed_record("content_research_aggregate_claims", record, {"research_plan_id": record.research_plan_id, "aggregate_type": record.aggregate_type})  # type: ignore[return-value]
+
+    def save_stage_checkpoint(self, record: StageCheckpointRecord) -> StageCheckpointRecord:
+        return self._save_typed_record("content_research_stage_checkpoints", record, {"subagent_task_id": record.subagent_task_id, "stage_name": record.stage_name, "input_fingerprint": record.input_fingerprint, "status": record.status, "retry_count": record.retry_count})  # type: ignore[return-value]
+
+    def save_budget_ledger_entry(self, record: BudgetLedgerEntryRecord) -> BudgetLedgerEntryRecord:
+        if record.stage_checkpoint_id:
+            self._require_typed_parent("content_research_stage_checkpoints", record.stage_checkpoint_id, "stage checkpoint")
+        return self._save_typed_record("content_research_budget_ledger_entries", record, {"research_plan_id": record.research_plan_id, "research_direction_id": record.research_direction_id, "idempotency_key": record.idempotency_key, "reservation_status": record.reservation_status, "reserved_amount": record.reserved_amount, "consumed_amount": record.consumed_amount, "stage_checkpoint_id": record.stage_checkpoint_id})  # type: ignore[return-value]
+
+    def save_report_faithfulness_decision(self, record: ReportFaithfulnessDecisionRecord) -> ReportFaithfulnessDecisionRecord:
+        return self._save_typed_record(
+            "content_research_report_faithfulness_decisions",
+            record,
+            {"research_plan_id": record.research_plan_id, "result_snapshot_id": record.result_snapshot_id},
+        )  # type: ignore[return-value]
+
+    @staticmethod
+    def _row_to_snapshot(row: sqlite3.Row) -> RunPolicySnapshot:
+        return RunPolicySnapshot(id=row["id"], workflow_run_id=row["workflow_run_id"], research_brief_id=row["research_brief_id"], research_plan_id=row["research_plan_id"], schema_version=row["schema_version"], effective_policy=_loads(row["effective_policy_json"]), effective_policy_hash=row["effective_policy_hash"], run_as_of_at=_parse_dt(row["run_as_of_at"]), base_policy_ids_and_versions=_loads(row["base_policy_json"]), requested_overrides=_loads(row["requested_overrides_json"]), validation_result=_loads(row["validation_result_json"]), created_at=_parse_dt(row["created_at"]), metadata=_loads(row["metadata_json"]))
 
     @staticmethod
     def _row_to_brief(row: sqlite3.Row) -> ResearchBriefRecord:

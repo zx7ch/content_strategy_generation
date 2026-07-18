@@ -14,7 +14,7 @@ from app.services.llm.types import LLMRequest, LLMResponse, TokenUsage
 DEFAULT_BASE_URLS: dict[str, str] = {
     "openai": "https://api.openai.com/v1",
     "deepseek": "https://api.deepseek.com/v1",
-    "kimi": "https://api.moonshot.cn/v1",
+    "kimi": "https://api.kimi.com/coding/v1",
     "moonshot": "https://api.moonshot.cn/v1",
     "qwen": "https://dashscope.aliyuncs.com/compatible-mode/v1",
 }

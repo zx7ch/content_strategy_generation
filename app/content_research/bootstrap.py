@@ -5,7 +5,7 @@ from __future__ import annotations
 import sqlite3
 
 
-def bootstrap_content_research_schema(db_path: str) -> None:
+def _bootstrap_legacy_content_research_schema(db_path: str) -> None:
     """Create Content Research tables and indexes if they do not exist."""
     with sqlite3.connect(db_path) as conn:
         conn.execute("PRAGMA journal_mode=WAL")
@@ -286,3 +286,10 @@ def bootstrap_content_research_schema(db_path: str) -> None:
                 ON content_research_human_decisions(workflow_run_id, target_type, target_id, created_at);
             """
         )
+
+
+def bootstrap_content_research_schema(db_path: str) -> None:
+    """Apply ordered Content Research schema migrations."""
+    from app.content_research.migrations import apply_content_research_migrations
+
+    apply_content_research_migrations(db_path, _bootstrap_legacy_content_research_schema)
