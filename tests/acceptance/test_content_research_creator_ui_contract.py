@@ -379,38 +379,30 @@ def test_content_research_complete_report_keeps_cards_and_recovery_structured(pa
     expect(published.get_by_text("待验证行动假设，非已验证事实。")).to_be_visible()
 
 
-def test_content_research_citation_metadata_and_paging_preserve_frozen_indices(page_with_runtime):
+def test_content_research_citation_metadata_preserves_frozen_indices(page_with_runtime):
     page, frontend_url, backend_url = page_with_runtime
     report = published_report_payload()
-    report["citation_total"] = 2
-    report["citation_limit"] = 1
-    next_page = json.loads(json.dumps(report))
-    next_page["citation_offset"] = 1
-    next_page["citation_groups"] = [{
+    report["citations"].append({
         "citation_group_id": "cg-ui-2", "display_index": 8,
-        "preview_ref": {"quote": "第二组冻结依据", "jump_state": "unavailable"},
         "evidence_refs": [{"quote": "第二条完整依据", "title": "第二篇笔记", "source_type": "note", "captured_at": "2026-07-21T00:00:00Z", "field_path": "note.desc", "jump_state": "unavailable"}],
-    }]
-    runtime = MockRuntime(report=report, report_pages={1: next_page}, timeline=True)
+    })
+    runtime = MockRuntime(report=report, timeline=True)
     runtime.install(page, backend_url)
 
     page.goto(f"{frontend_url}/creator?contentResearchRunId=run-ui", wait_until="networkidle")
     published = page.locator('article[aria-label="Content Research published report"]')
     published.get_by_role("button", name="打开引用 7").click()
     evidence = page.locator('aside[aria-label="Content Research citation evidence"]')
-    expect(evidence.get_by_text("尺码反馈集中，链接不可用")).to_be_visible()
+    expect(evidence.get_by_text("完整冻结依据")).to_be_visible()
     expect(evidence.get_by_text("北面冲锋衣尺码笔记 · note · 2026-07-21T00:00:00Z · note.desc")).to_be_visible()
-    published.get_by_role("button", name="加载其余 1 组引用").click()
     next_citation = published.get_by_role("button", name="打开引用 8")
     expect(next_citation).to_have_count(1)
     next_citation.click()
-    expect(evidence.get_by_text("第二组冻结依据")).to_be_visible()
     expect(evidence.get_by_text("第二条完整依据")).to_be_visible()
     evidence.get_by_role("button", name="关闭引用依据").click()
     expect(next_citation).to_have_count(1)
     next_citation.click()
-    expect(evidence.get_by_text("第二组冻结依据")).to_be_visible()
-    assert runtime.report_offsets == [0, 1]
+    expect(evidence.get_by_text("第二条完整依据")).to_be_visible()
 
 
 def open_content_research(page: Page, frontend_url: str, seed: str, *, wait_for_checklist: bool = True) -> None:
@@ -448,7 +440,6 @@ class MockRuntime:
         formal_action_status: int = 200,
         report: dict[str, Any] | None = None,
         report_status: int = 200,
-        report_pages: dict[int, dict[str, Any]] | None = None,
         timeline: bool = False,
     ) -> None:
         self.presearch_status = presearch_status
@@ -464,8 +455,6 @@ class MockRuntime:
         self.report_calls = 0
         self.report = report or published_report_payload()
         self.report_status = report_status
-        self.report_pages = report_pages or {}
-        self.report_offsets: list[int] = []
         self.timeline = timeline
 
     def install(self, page: Page, backend_url: str) -> None:
@@ -654,32 +643,25 @@ def published_report_payload() -> dict[str, Any]:
     return {
         "schema_version": "content_research_api_v1",
         "workflow_run_id": "run-ui",
-        "workflow_terminal_state": "succeeded",
-        "publication_state": "partial_verified_report",
-        "artifact": {"artifact_id": "artifact-ui", "version": 1},
-        "publication": {"report_publication_id": "pub-ui"},
-        "sections": [
-            {"section_id": "core", "section_kind": "core_conclusions", "text": "尺寸说明应先于促销表达。", "citation_group_ids": ["cg-ui"], "citation_anchors": [{"anchor_id": "anchor-ui", "citation_group_id": "cg-ui"}]},
-            {"section_id": "findings", "section_kind": "main_findings", "text": "已验证的发现应直接服务内容决策。"},
-            {"section_id": "next", "section_kind": "next_steps", "text": "下一轮先补采评论样本。"},
-        ],
-        "citation_groups": [{
+        "workflow_execution_state": "succeeded",
+        "subject": "北面",
+        "frozen_scope": {"direction_ids": ["product_marketing"]},
+        "publication": {"state": "partial_verified_report", "report_publication_id": "pub-ui"},
+        "sections": {
+            "main_findings": [{"claim_candidate_id": "claim-ui", "statement": "尺寸说明是当前可验证的内容重点。"}],
+            "weak_signals": [{"reason": "评论样本尚不足，需继续补采。"}],
+            "limitations_scope": [{"message": "当前结论仅覆盖已冻结的公开样本。"}],
+        },
+        "status_strip": {"admitted_finding_count": 1},
+        "citations": [{
             "citation_group_id": "cg-ui", "display_index": 7,
-            "preview_ref": {"quote": "尺码反馈集中，链接不可用", "jump_state": "unavailable"},
             "evidence_refs": [
                 {"quote": "完整冻结依据", "title": "北面冲锋衣尺码笔记", "source_type": "note", "captured_at": "2026-07-21T00:00:00Z", "field_path": "note.desc", "source_url": "https://example.test/note-ui", "jump_state": "available"},
                 {"quote": "备用证据链接不可用", "jump_state": "unavailable"},
             ],
         }],
-        "citation_total": 1,
-        "citation_offset": 0,
-        "citation_limit": 50,
-        "claim_cards": [{"claim_candidate_id": "claim-ui", "statement": "尺寸说明是当前可验证的内容重点。"}],
-        "weak_signals": [{"reason": "评论样本尚不足，需继续补采。"}],
-        "cross_direction_records": [{"summary": "产品营销与评论方向存在待补采的证据张力。"}],
-        "aggregate_claims": [],
-        "limitations_recovery": [{"message": "当前结论仅覆盖已冻结的公开样本。"}],
-        "trace": {"checkpoint_summary": {"stages": [{"stage_name": "faithfulness", "status": "completed", "retry_count": 0, "output_refs": []}]}},
+        "run_direction_states": [{"direction": "product_marketing", "state": "completed"}],
+        "recovery_projection": None,
     }
 
 
