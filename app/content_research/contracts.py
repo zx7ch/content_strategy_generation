@@ -200,22 +200,26 @@ class RunPolicySnapshot:
             raise ValueError("RunPolicySnapshot effective_policy_hash does not match effective_policy")
 
 
-def build_default_snapshot(*, snapshot_id: str, workflow_run_id: str, brief_id: str, plan_id: str, run_as_of_at: datetime | None = None, provider_capabilities: dict[str, dict[str, Any]] | None = None, direction_set_version: str = "formal_v1", direction_ids: tuple[str, ...] | None = None, report_compose_mode: str = "prose") -> tuple[RunPolicySnapshot, list[SamplePolicy], list[DirectionContract]]:
+def build_default_snapshot(*, snapshot_id: str, workflow_run_id: str, brief_id: str, plan_id: str, run_as_of_at: datetime | None = None, provider_capabilities: dict[str, dict[str, Any]] | None = None, direction_set_version: str = "formal_v1", direction_ids: tuple[str, ...] | None = None, direction_catalog: tuple[str, ...] | None = None, report_compose_mode: str = "prose") -> tuple[RunPolicySnapshot, list[SamplePolicy], list[DirectionContract]]:
     from app.content_research.admission.governance_keys import GOVERNANCE_POLICY_V1
     from app.content_research.workflow.direction_registry import ResearchDirectionRegistry
 
     as_of = run_as_of_at or utcnow()
     _require_aware(as_of, "run_as_of_at")
-    definitions_by_id = {
-        item.id: item for item in ResearchDirectionRegistry().list_directions()
-    }
-    requested_ids = direction_ids if direction_ids is not None else DIRECTION_CATALOG_V1
+    registered_definitions = ResearchDirectionRegistry().list_directions()
+    definitions_by_id = {item.id: item for item in registered_definitions}
+    requested_ids = direction_ids if direction_ids is not None else tuple(definitions_by_id)
     if not requested_ids:
         raise ValueError("requested direction ids must not be empty")
     if len(set(requested_ids)) != len(requested_ids):
         raise ValueError("requested direction ids must be unique")
-    if not set(requested_ids).issubset(DIRECTION_CATALOG_V1):
-        raise ValueError("requested direction ids contains a direction outside the catalog")
+    if not set(requested_ids).issubset(definitions_by_id):
+        raise ValueError("requested direction ids contains an unknown direction")
+    if direction_catalog is not None:
+        if direction_catalog != DIRECTION_CATALOG_V1:
+            raise ValueError("direction_catalog must match the Lite direction catalog")
+        if not set(requested_ids).issubset(direction_catalog):
+            raise ValueError("requested direction ids contains a direction outside the catalog")
     if report_compose_mode not in {"prose", "template_only"}:
         raise ValueError("invalid report_compose_mode")
     definitions = [definitions_by_id[direction_id] for direction_id in requested_ids]
@@ -223,8 +227,6 @@ def build_default_snapshot(*, snapshot_id: str, workflow_run_id: str, brief_id: 
         "schema_version": "content_research_policy_v2",
         "direction_set_version": direction_set_version,
         "direction_ids": list(requested_ids),
-        "direction_catalog_version": DIRECTION_CATALOG_VERSION,
-        "requested_direction_ids": list(requested_ids),
         "report_compose_mode": report_compose_mode,
         "llm_cost_policy": {
             "currency": "USD",
@@ -241,6 +243,11 @@ def build_default_snapshot(*, snapshot_id: str, workflow_run_id: str, brief_id: 
             }
         },
     }
+    if direction_catalog is not None:
+        policy |= {
+            "direction_catalog_version": DIRECTION_CATALOG_VERSION,
+            "requested_direction_ids": list(requested_ids),
+        }
     policies = [SamplePolicy(id=f"sp_{snapshot_id}_{item.id}", schema_version="content_research_sample_policy_v1", direction_id=item.id, minimum_samples=30 if item.id in {"ugc_community", "comment_insight"} else 3, minimum_independent_authors=5 if item.id in {"ugc_community", "comment_insight"} else 2, author_cap=3, metadata={"detail_fetch_cap": 30, "comment_limit": 30, "comment_top_level_only": True, "comment_reply_depth_limit": 0}) for item in definitions]
     contracts = [
         DirectionContract(

@@ -5,6 +5,7 @@ import pytest
 from app.content_research.contracts import (
     ADMISSION_REASON_CODES,
     CLAIM_EVIDENCE_STATES,
+    DIRECTION_CATALOG_V1,
     DIRECTION_RESULT_STATES,
     RunPolicySnapshot,
     SamplePolicy,
@@ -40,10 +41,15 @@ def test_snapshot_freezes_template_only_direction_set_without_registry_inference
         plan_id="rp_lite",
         direction_set_version="direction_set_v1",
         direction_ids=("product_marketing", "competitor_discovery", "content_performance"),
+        direction_catalog=DIRECTION_CATALOG_V1,
         report_compose_mode="template_only",
     )
     assert snapshot.effective_policy["direction_set_version"] == "direction_set_v1"
     assert snapshot.effective_policy["direction_ids"] == [
+        "product_marketing", "competitor_discovery", "content_performance"
+    ]
+    assert snapshot.effective_policy["direction_catalog_version"] == "direction_catalog_v1"
+    assert snapshot.effective_policy["requested_direction_ids"] == [
         "product_marketing", "competitor_discovery", "content_performance"
     ]
     assert snapshot.effective_policy["report_compose_mode"] == "template_only"

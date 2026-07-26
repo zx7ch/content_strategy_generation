@@ -40,6 +40,7 @@ class ContentResearchPresearchResponse(BaseModel):
     subject_confirmation: str
     competitor_tags: list[str]
     research_directions: list[str]
+    direction_catalog: list[str]
     custom_research_question: str
     custom_competitor_input: str = ""
     timeout_status: str

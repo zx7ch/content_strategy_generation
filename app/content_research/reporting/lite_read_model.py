@@ -14,11 +14,6 @@ from app.content_research.stores.base import ContentResearchStore
 from app.memory.workflow_store import WorkflowStore
 
 _LITE_FIELDS = {"content_text", "title"}
-_DIRECTION_SET_V1 = (
-    "product_marketing",
-    "competitor_discovery",
-    "content_performance",
-)
 _PUBLICATION_STATES = {
     "complete_verified_report",
     "partial_verified_report",
@@ -186,37 +181,49 @@ def _direction_states(report: dict[str, Any]) -> list[dict[str, Any]]:
     by_direction = {item.get("direction"): item for item in states if isinstance(item, dict)}
     requested_direction_ids = set(scope["direction_ids"])
     return [
-        {
-            "direction": direction_id,
-            "state": (
-                (by_direction.get(direction_id) or {}).get("state", "unavailable")
-                if direction_id in requested_direction_ids
-                else "not_requested"
-            ),
-            "reason_code": (
-                _single_reason((by_direction.get(direction_id) or {}).get("reason_codes"))
-                if direction_id in requested_direction_ids
-                else None
-            ),
-            "recovery_action": (
-                _single_reason((by_direction.get(direction_id) or {}).get("recovery_actions"))
-                if direction_id in requested_direction_ids
-                else None
-            ),
-        }
+        _direction_state_view(
+            direction_id,
+            by_direction.get(direction_id),
+            requested=direction_id in requested_direction_ids,
+        )
         for direction_id in DIRECTION_CATALOG_V1
     ]
+
+
+def _direction_state_view(
+    direction_id: str, result: dict[str, Any] | None, *, requested: bool
+) -> dict[str, Any]:
+    if not requested:
+        return {
+            "direction": direction_id,
+            "state": "not_requested",
+            "reason_code": None,
+            "recovery_action": None,
+        }
+    state = str((result or {}).get("state") or "")
+    if state in {"", "not_started", "not_requested"}:
+        return {
+            "direction": direction_id,
+            "state": "unavailable",
+            "reason_code": "collection_result_unavailable",
+            "recovery_action": None,
+        }
+    return {
+        "direction": direction_id,
+        "state": state,
+        "reason_code": _single_reason((result or {}).get("reason_codes")),
+        "recovery_action": _single_reason((result or {}).get("recovery_actions")),
+    }
 
 
 def _unavailable_direction_states(policy: dict[str, Any]) -> list[dict[str, Any]]:
     requested_direction_ids = set(_policy_scope(policy)["direction_ids"])
     return [
-        {
-            "direction": direction_id,
-            "state": "unavailable" if direction_id in requested_direction_ids else "not_requested",
-            "reason_code": None,
-            "recovery_action": None,
-        }
+        _direction_state_view(
+            direction_id,
+            None,
+            requested=direction_id in requested_direction_ids,
+        )
         for direction_id in DIRECTION_CATALOG_V1
     ]
 

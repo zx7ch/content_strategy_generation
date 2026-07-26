@@ -6,7 +6,7 @@ from app.content_research.contracts import build_default_snapshot
 from app.content_research.models import ResearchBriefRecord
 from app.content_research.persistence_models import StageCheckpointRecord
 from app.content_research.reporting.composer import ResearchReportComposer
-from app.content_research.reporting.lite_read_model import LiteReportReader
+from app.content_research.reporting.lite_read_model import LiteReportReader, _direction_states
 from app.content_research.reporting.publication_materializer import ReportPublicationMaterializer
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
 from app.memory.thread_store import ThreadStore
@@ -14,6 +14,29 @@ from app.memory.workflow_store import WorkflowStore
 from app.services.workflow_run_manager import WorkflowRunManager
 from tests.integration.test_content_research_report_store import _decision, _publication
 from tests.unit.test_content_research_report_composer import _snapshot
+
+
+def test_lite_direction_states_normalize_requested_not_started_to_unavailable():
+    states = _direction_states(
+        {
+            "release": {"direction_ids": ["product_marketing"]},
+            "run_direction_states": [
+                {
+                    "direction": "product_marketing",
+                    "state": "not_started",
+                    "reason_codes": [],
+                    "recovery_actions": [],
+                }
+            ],
+        }
+    )
+
+    assert states[0] == {
+        "direction": "product_marketing",
+        "state": "unavailable",
+        "reason_code": "collection_result_unavailable",
+        "recovery_action": None,
+    }
 
 
 @pytest.mark.asyncio

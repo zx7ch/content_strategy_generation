@@ -95,6 +95,18 @@ async def _create_presearch(client):
 
 
 @pytest.mark.asyncio
+async def test_presearch_exposes_fixed_lite_direction_catalog_separately_from_llm_suggestions(client):
+    presearch = await _create_presearch(client)
+
+    assert presearch["research_directions"] == ["产品营销", "用户评论痛点"]
+    assert presearch["direction_catalog"] == [
+        "product_marketing",
+        "competitor_discovery",
+        "content_performance",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_confirm_brief_creates_plan_directions_tasks_and_workflow_summary(client):
     presearch = await _create_presearch(client)
 
@@ -117,6 +129,15 @@ async def test_confirm_brief_creates_plan_directions_tasks_and_workflow_summary(
     assert payload["brief"]["payload"]["confirmed_subject"] == "徒步短裤"
     assert payload["brief"]["payload"]["selected_competitors"] == ["迪卡侬"]
     assert payload["brief"]["payload"]["custom_competitors"] == ["凯乐石"]
+    assert payload["brief"]["payload"]["direction_catalog"] == [
+        "product_marketing",
+        "competitor_discovery",
+        "content_performance",
+    ]
+    assert payload["brief"]["payload"]["requested_direction_ids"] == [
+        "product_marketing",
+        "competitor_discovery",
+    ]
     assert payload["plan"]["payload"]["priority_policy"]["version"] == "priority_v1"
     assert payload["plan"]["payload"]["evidence_boundary_policy"]["version"] == "evidence_boundary_v1"
     assert [item["payload"]["direction_id"] for item in payload["directions"]] == [

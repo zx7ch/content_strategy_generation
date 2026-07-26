@@ -542,6 +542,7 @@ class ContentResearchService:
                 "selected_competitors": confirmation.selected_competitors,
                 "custom_competitors": confirmation.custom_competitors,
                 "selected_directions": confirmation.selected_directions,
+                "requested_direction_ids": confirmation.selected_directions,
                 "custom_research_question": confirmation.custom_research_question,
             },
             updated_at=utcnow(),
@@ -560,7 +561,8 @@ class ContentResearchService:
             workflow_run_id=brief.workflow_run_id,
             brief_id=brief.id,
             plan_id=plan.id,
-            direction_ids=selected_direction_ids,
+            direction_ids=tuple(selected_direction_ids),
+            direction_catalog=DIRECTION_CATALOG_V1,
             provider_capabilities=_freeze_adapter_capabilities(self._source_registry),
         )
         saved_directions: list[ResearchDirectionRecord] = []
@@ -2203,6 +2205,7 @@ class ContentResearchService:
             "subject_confirmation": checklist.subject_confirmation,
             "competitor_tags": checklist.competitor_tags,
             "research_directions": checklist.research_directions,
+            "direction_catalog": list(DIRECTION_CATALOG_V1),
             "custom_research_question": checklist.custom_research_question,
             "custom_competitor_input": checklist.custom_competitor_input,
             "timeout_status": outcome.timeout_status,
@@ -2240,6 +2243,7 @@ class ContentResearchService:
             subject_confirmation=str(payload.get("subject_confirmation") or ""),
             competitor_tags=list(payload.get("competitor_tags") or []),
             research_directions=list(payload.get("research_directions") or []),
+            direction_catalog=list(payload.get("direction_catalog") or DIRECTION_CATALOG_V1),
             custom_research_question=str(payload.get("custom_research_question") or ""),
             custom_competitor_input=str(payload.get("custom_competitor_input") or ""),
             timeout_status=str(payload.get("timeout_status") or "none"),
