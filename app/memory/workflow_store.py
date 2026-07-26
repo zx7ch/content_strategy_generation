@@ -93,8 +93,9 @@ async def migrate_workflow_compat_columns(conn: aiosqlite.Connection) -> None:
 class WorkflowStore:
     """Persistence boundary for workflow tables introduced by restructure T1."""
 
-    def __init__(self, db_path: Optional[str] = None):
+    def __init__(self, db_path: Optional[str] = None, *, read_only: bool = False):
         self.db_path = db_path or settings.SQLITE_DB_PATH
+        self.read_only = read_only
         self._conn: Optional[aiosqlite.Connection] = None
         self._logger = get_logger(__name__, component="workflow_store")
 
@@ -108,12 +109,17 @@ class WorkflowStore:
     async def connect(self) -> None:
         if self._conn is not None:
             return
-        self._conn = await aiosqlite.connect(self.db_path)
+        if self.read_only:
+            self._conn = await aiosqlite.connect(f"file:{self.db_path}?mode=ro", uri=True)
+        else:
+            self._conn = await aiosqlite.connect(self.db_path)
         self._conn.row_factory = aiosqlite.Row
-        await self._conn.execute("PRAGMA journal_mode=WAL")
         await self._conn.execute("PRAGMA synchronous=NORMAL")
         await self._conn.execute("PRAGMA busy_timeout=5000")
-        await self.initialize_schema()
+        if self.read_only:
+            await self._conn.execute("PRAGMA query_only=ON")
+        else:
+            await self.initialize_schema()
 
     async def close(self) -> None:
         if self._conn is None:

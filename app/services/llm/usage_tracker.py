@@ -76,9 +76,11 @@ class LLMUsageEvent:
 
 
 class LLMUsageTracker:
-    def __init__(self, db_path: Optional[str] = None) -> None:
+    def __init__(self, db_path: Optional[str] = None, *, read_only: bool = False) -> None:
         self.db_path = db_path or settings.SQLITE_DB_PATH
+        self.read_only = read_only
         self._conn: aiosqlite.Connection | None = None
+        self._table_available = True
 
     async def __aenter__(self) -> "LLMUsageTracker":
         await self.connect()
@@ -90,12 +92,21 @@ class LLMUsageTracker:
     async def connect(self) -> None:
         if self._conn is not None:
             return
-        self._conn = await aiosqlite.connect(self.db_path)
+        if self.read_only:
+            self._conn = await aiosqlite.connect(f"file:{self.db_path}?mode=ro", uri=True)
+        else:
+            self._conn = await aiosqlite.connect(self.db_path)
         self._conn.row_factory = aiosqlite.Row
-        await self._conn.execute("PRAGMA journal_mode=WAL")
         await self._conn.execute("PRAGMA synchronous=NORMAL")
         await self._conn.execute("PRAGMA busy_timeout=5000")
-        await self._init_tables()
+        if self.read_only:
+            await self._conn.execute("PRAGMA query_only=ON")
+            async with self._conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='llm_usage_events'"
+            ) as cursor:
+                self._table_available = await cursor.fetchone() is not None
+        else:
+            await self._init_tables()
 
     async def close(self) -> None:
         if self._conn is None:
@@ -210,6 +221,8 @@ class LLMUsageTracker:
         assert self._conn is not None
         if field not in {"session_id", "job_id"}:
             raise ValueError(f"Unsupported summary field: {field}")
+        if not self._table_available:
+            return LLMUsageSummary()
         async with self._conn.execute(
             f"""
             SELECT
@@ -243,6 +256,8 @@ class LLMUsageTracker:
         assert self._conn is not None
         if field not in {"session_id", "job_id"}:
             raise ValueError(f"Unsupported step summary field: {field}")
+        if not self._table_available:
+            return []
 
         async with self._conn.execute(
             f"""
@@ -289,6 +304,8 @@ class LLMUsageTracker:
         assert self._conn is not None
         if field not in {"session_id", "job_id"}:
             raise ValueError(f"Unsupported event list field: {field}")
+        if not self._table_available:
+            return []
 
         async with self._conn.execute(
             f"""

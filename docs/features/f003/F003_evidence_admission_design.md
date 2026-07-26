@@ -953,19 +953,17 @@ scope metadata.
 
 ### Budget control and gap-fill loop
 
-External collection is the only non-replayable stage. `BudgetGuard` must be
-called immediately before every adapter request and atomically reserve the
-expected cost using an idempotency key. `BudgetLedger` commits or releases the
-reservation when the request resolves. Recovery inherits prior reservations and
-consumption; concurrent directions cannot independently observe and spend the
-same remaining budget.
+External collection is the only non-replayable stage. Its scope is bounded by
+the locked expert/query/detail/comment limits, while a completed `collect`
+checkpoint suppresses a duplicate adapter call for the same input fingerprint.
+Day1 has no pre-call budget reservation or source-call hard cap. Formal LLM
+calls append provider-reported actual usage after completion; unavailable usage
+is explicitly `cost_unknown` and is never estimated.
 
-`DirectionResultDecision` may request a recorded gap-fill action. The action
-returns to `BudgetGuard`, is bounded by the locked policy's attempt cap, and
-creates a new query group or collection attempt; it never mutates the original
-sample definition invisibly. If budget is exhausted, the result is downgraded
-with its existing admitted claims, weak signals, limitations, and a structured
-recovery action.
+`DirectionResultDecision` may request a recorded gap-fill action. It creates a
+new query group or collection attempt and never mutates the original sample
+definition invisibly. Recovery is user-triggered, at most twice per stage; it
+retains existing admitted claims, weak signals, limitations, and recorded usage.
 
 ### Cross-direction reconciliation
 

@@ -1,0 +1,158 @@
+from dataclasses import replace
+
+import httpx
+import pytest
+
+from app.api.routes.router import app
+from app.config import settings
+from app.content_research.contracts import build_default_snapshot
+from app.content_research.models import ResearchBriefRecord
+from app.content_research.persistence_models import StageCheckpointRecord
+from app.content_research.reporting.publication_materializer import ReportPublicationMaterializer
+from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
+from app.memory.thread_store import ThreadStore
+from app.services.workflow_run_manager import WorkflowRunManager
+from tests.integration.test_content_research_report_store import (
+    _decision,
+    _draft,
+    _publication,
+    _snapshot,
+)
+
+
+@pytest.mark.asyncio
+async def test_creator_timeline_api_exposes_one_materialized_report_result_and_replay_is_idempotent(
+    tmp_path, monkeypatch
+):
+    db_path = str(tmp_path / "published-report-timeline.db")
+    monkeypatch.setattr(settings, "SQLITE_DB_PATH", db_path)
+    store = SQLiteContentResearchStore(db_path)
+    thread_store = ThreadStore(db_path)
+    await thread_store.connect()
+    original_thread_store = getattr(app.state, "thread_store", None)
+    app.state.thread_store = thread_store
+    try:
+        thread = await thread_store.create_thread(title="调研报告")
+        async with WorkflowRunManager(db_path) as manager:
+            run = await manager.start_run(thread_id=thread["id"], user_id="user-1")
+        snapshot = replace(_snapshot(), workflow_run_id=run.run_id)
+        draft = replace(_draft(), workflow_run_id=run.run_id)
+        decision = replace(_decision(draft), workflow_run_id=run.run_id)
+        publication = replace(_publication(draft, decision), workflow_run_id=run.run_id)
+        store.save_result_snapshot(snapshot)
+        store.save_report_draft(draft.to_record())
+        store.save_report_faithfulness_decision(decision.to_record())
+        store.save_report_publication(publication.to_record())
+        async with WorkflowRunManager(db_path) as manager:
+            await manager.complete_run(run.run_id)
+
+        materializer = ReportPublicationMaterializer(store, db_path)
+        artifact = await materializer.materialize(publication.id)
+        await materializer.materialize(publication.id)
+
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            response = await client.get(f"/threads/{thread['id']}/timeline")
+            report_response = await client.get(f"/content-research/workflows/{run.run_id}/report")
+            lite_response = await client.get(
+                f"/content-research/workflows/{run.run_id}/lite-report"
+            )
+            legacy_response = await client.get(f"/content-research/workflows/{run.run_id}/results")
+        assert response.status_code == 200
+        results = [
+            message
+            for message in response.json()["messages"]
+            if message["message_type"] == "artifact_result" and message["run_id"] == run.run_id
+        ]
+        assert len(results) == 1
+        reference = results[0]["artifact_refs"][0]
+        assert reference["artifact_id"] == artifact.artifact_id
+        assert reference["artifact"]["payload_mode"] == "snapshot"
+        assert (
+            reference["artifact"]["materialized_payload_json"]["report_publication_id"]
+            == publication.id
+        )
+        assert report_response.status_code == 200, report_response.text
+        assert lite_response.status_code == 200, lite_response.text
+        assert legacy_response.status_code == 404
+        report = report_response.json()
+        assert report["workflow_terminal_state"] == "succeeded"
+        assert report["publication_state"] == "complete_verified_report"
+        assert report["artifact"]["artifact_id"] == artifact.artifact_id
+        assert report["publication"]["report_publication_id"] == publication.id
+        assert "items" not in report and "recommendations" not in report
+        lite = lite_response.json()
+        assert lite["publication"]["state"] == "complete_verified_report"
+        assert isinstance(lite["status_strip"]["admitted_finding_count"], int)
+        assert lite["sections"]["main_findings"] == []
+        assert lite["citations"] == []
+    finally:
+        app.state.thread_store = original_thread_store
+        await thread_store.close()
+
+
+@pytest.mark.asyncio
+async def test_lite_report_api_exposes_recovery_as_non_report_projection(tmp_path, monkeypatch):
+    db_path = str(tmp_path / "lite-recovery-api.db")
+    monkeypatch.setattr(settings, "SQLITE_DB_PATH", db_path)
+    store = SQLiteContentResearchStore(db_path)
+    thread_store = ThreadStore(db_path)
+    await thread_store.connect()
+    original_thread_store = getattr(app.state, "thread_store", None)
+    app.state.thread_store = thread_store
+    try:
+        thread = await thread_store.create_thread(title="恢复调研")
+        async with WorkflowRunManager(db_path) as manager:
+            run = await manager.start_run(thread_id=thread["id"], user_id="user-1")
+            await manager.fail_run(
+                run.run_id, {"code": "auth_expired", "message": "Cookie expired"}
+            )
+        store.save_brief(
+            ResearchBriefRecord(
+                id="brief_recovery_api",
+                workflow_run_id=run.run_id,
+                thread_id=thread["id"],
+                schema_version="content_research_brief_v1",
+                status="ready",
+                payload={
+                    "schema_version": "content_research_brief_payload_v1",
+                    "confirmed_subject": "Satisfy Running",
+                },
+            )
+        )
+        policy, _, _ = build_default_snapshot(
+            snapshot_id="policy_recovery_api",
+            workflow_run_id=run.run_id,
+            brief_id="brief_recovery_api",
+            plan_id="plan_recovery_api",
+            direction_set_version="direction_set_v1",
+            direction_ids=("product_marketing", "competitor_discovery", "content_performance"),
+            report_compose_mode="template_only",
+        )
+        store.save_run_policy_snapshot(policy)
+        store.save_stage_checkpoint(
+            StageCheckpointRecord(
+                "checkpoint_recovery_api",
+                "content_research_stage_checkpoint_v1",
+                {"reason_code": "auth_expired"},
+                workflow_run_id=run.run_id,
+                subagent_task_id="task_recovery_api",
+                stage_name="collect",
+                input_fingerprint="frozen-operation",
+                status="failed",
+            )
+        )
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            response = await client.get(f"/content-research/workflows/{run.run_id}/lite-report")
+
+        assert response.status_code == 200, response.text
+        payload = response.json()
+        assert payload["publication"] == {"state": None}
+        assert payload["recovery_projection"]["reason_code"] == "auth_expired"
+        assert payload["recovery_projection"]["next_action"] == "resume_run"
+        assert payload["frozen_scope"]["report_compose_mode"] == "template_only"
+        assert len(payload["run_direction_states"]) == 3
+    finally:
+        app.state.thread_store = original_thread_store
+        await thread_store.close()

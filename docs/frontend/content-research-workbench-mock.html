@@ -1,0 +1,1300 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Creator Workbench - Content Research Workflow</title>
+  <style>
+    :root {
+      --bg: #f6f7f8;
+      --surface: #ffffff;
+      --surface-2: #fafafa;
+      --line: #e5e7eb;
+      --line-strong: #d1d5db;
+      --text: #1f2937;
+      --muted: #6b7280;
+      --subtle: #9ca3af;
+      --black: #111827;
+      --green: #0f766e;
+      --green-bg: #ecfdf5;
+      --blue: #2563eb;
+      --blue-bg: #eff6ff;
+      --amber: #b45309;
+      --amber-bg: #fffbeb;
+      --red: #b91c1c;
+      --red-bg: #fef2f2;
+      --radius: 8px;
+      --shadow: 0 8px 24px rgba(15, 23, 42, 0.08);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      height: 100vh;
+      overflow: hidden;
+      color: var(--text);
+      background: var(--bg);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      letter-spacing: 0;
+    }
+
+    button,
+    input,
+    textarea {
+      font: inherit;
+    }
+
+    button {
+      border: 0;
+      cursor: pointer;
+    }
+
+    .app-shell {
+      display: grid;
+      grid-template-columns: 268px minmax(520px, 1fr) 360px;
+      height: 100vh;
+      min-width: 1120px;
+    }
+
+    .thread-sidebar {
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+      background: #fbfbfc;
+      border-right: 1px solid var(--line);
+    }
+
+    .sidebar-head {
+      padding: 16px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .brand-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 14px;
+    }
+
+    .brand-name {
+      font-size: 15px;
+      font-weight: 650;
+    }
+
+    .icon-btn {
+      width: 32px;
+      height: 32px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 6px;
+      color: var(--muted);
+      background: transparent;
+    }
+
+    .icon-btn:hover {
+      color: var(--black);
+      background: #f0f1f3;
+    }
+
+    .new-thread {
+      width: 100%;
+      height: 36px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      color: var(--black);
+      background: var(--surface);
+      font-size: 14px;
+      font-weight: 560;
+    }
+
+    .thread-list {
+      flex: 1;
+      min-height: 0;
+      overflow: auto;
+      padding: 12px 10px;
+    }
+
+    .thread-item {
+      padding: 10px;
+      border-radius: 7px;
+      margin-bottom: 4px;
+      cursor: pointer;
+    }
+
+    .thread-item.active {
+      background: #eef0f2;
+    }
+
+    .thread-title {
+      display: block;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      font-size: 14px;
+      font-weight: 560;
+    }
+
+    .thread-meta {
+      margin-top: 3px;
+      color: var(--subtle);
+      font-size: 12px;
+    }
+
+    .sidebar-foot {
+      padding: 14px 16px;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .chat-pane {
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+      background: var(--surface);
+    }
+
+    .chat-header {
+      height: 58px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 22px;
+      border-bottom: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.92);
+    }
+
+    .chat-title {
+      min-width: 0;
+    }
+
+    .chat-title h1 {
+      margin: 0;
+      font-size: 16px;
+      font-weight: 680;
+    }
+
+    .chat-title p {
+      margin: 2px 0 0;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .header-actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .status-pill {
+      height: 28px;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 0 10px;
+      border-radius: 999px;
+      color: var(--green);
+      background: var(--green-bg);
+      font-size: 12px;
+      font-weight: 600;
+    }
+
+    .dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: currentColor;
+    }
+
+    .messages {
+      flex: 1;
+      min-height: 0;
+      overflow: auto;
+      padding: 24px 28px 18px;
+      background:
+        linear-gradient(180deg, rgba(250, 250, 250, 0.95), rgba(255, 255, 255, 0.65) 120px),
+        var(--surface);
+    }
+
+    .message-row {
+      display: flex;
+      margin-bottom: 18px;
+    }
+
+    .message-row.user {
+      justify-content: flex-end;
+    }
+
+    .message {
+      max-width: min(720px, 82%);
+      padding: 12px 14px;
+      border-radius: 8px;
+      border: 1px solid transparent;
+      line-height: 1.55;
+      font-size: 14px;
+    }
+
+    .message.user {
+      color: #ffffff;
+      background: var(--black);
+    }
+
+    .message.assistant {
+      background: var(--surface);
+      border-color: var(--line);
+    }
+
+    .message.system {
+      width: 100%;
+      max-width: none;
+      padding: 0;
+      background: transparent;
+      border: 0;
+    }
+
+    .brief-panel,
+    .result-panel {
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--surface);
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+
+    .panel-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 16px 18px;
+      border-bottom: 1px solid var(--line);
+      background: var(--surface-2);
+    }
+
+    .panel-head h2 {
+      margin: 0;
+      font-size: 15px;
+      font-weight: 700;
+    }
+
+    .panel-head p {
+      margin: 4px 0 0;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .timer {
+      height: 28px;
+      display: inline-flex;
+      align-items: center;
+      padding: 0 9px;
+      border-radius: 6px;
+      color: var(--amber);
+      background: var(--amber-bg);
+      font-size: 12px;
+      font-weight: 620;
+      white-space: nowrap;
+    }
+
+    .panel-body {
+      padding: 16px 18px 18px;
+    }
+
+    .section {
+      padding: 14px 0;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .section:first-child {
+      padding-top: 0;
+    }
+
+    .section:last-child {
+      padding-bottom: 0;
+      border-bottom: 0;
+    }
+
+    .section-title {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 8px;
+      font-size: 13px;
+      font-weight: 680;
+    }
+
+    .section-note {
+      margin: 0 0 10px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.5;
+    }
+
+    .subject-box {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 10px;
+      align-items: start;
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      background: #ffffff;
+    }
+
+    .subject-box strong {
+      display: block;
+      margin-bottom: 4px;
+      font-size: 14px;
+    }
+
+    .subject-box span {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.5;
+    }
+
+    .btn {
+      height: 34px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      padding: 0 12px;
+      border-radius: 6px;
+      border: 1px solid var(--line-strong);
+      color: var(--text);
+      background: var(--surface);
+      font-size: 13px;
+      font-weight: 580;
+    }
+
+    .btn:hover {
+      border-color: var(--black);
+    }
+
+    .btn.primary {
+      color: #ffffff;
+      border-color: var(--black);
+      background: var(--black);
+    }
+
+    .btn.blue {
+      color: var(--blue);
+      border-color: #bfdbfe;
+      background: var(--blue-bg);
+    }
+
+    .tag-grid {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    .tag-check {
+      position: relative;
+    }
+
+    .tag-check input {
+      position: absolute;
+      inset: 0;
+      opacity: 0;
+      cursor: pointer;
+    }
+
+    .tag-check span {
+      min-height: 32px;
+      display: inline-flex;
+      align-items: center;
+      padding: 0 11px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      color: var(--text);
+      background: var(--surface);
+      font-size: 13px;
+      font-weight: 540;
+    }
+
+    .tag-check input:checked + span {
+      color: var(--blue);
+      border-color: #93c5fd;
+      background: var(--blue-bg);
+    }
+
+    .inline-input {
+      width: 100%;
+      height: 38px;
+      margin-top: 10px;
+      padding: 0 12px;
+      border: 1px solid var(--line-strong);
+      border-radius: 7px;
+      outline: none;
+      color: var(--text);
+      background: #ffffff;
+      font-size: 13px;
+    }
+
+    .inline-input:focus,
+    .composer-input:focus {
+      border-color: var(--black);
+    }
+
+    .panel-actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px;
+      padding-top: 16px;
+    }
+
+    .input-zone {
+      border-top: 1px solid var(--line);
+      background: var(--surface);
+      padding: 12px 18px 16px;
+    }
+
+    .ability-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 10px;
+      overflow-x: auto;
+    }
+
+    .ability-btn {
+      height: 32px;
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      padding: 0 10px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      color: var(--muted);
+      background: #ffffff;
+      font-size: 13px;
+      font-weight: 580;
+      white-space: nowrap;
+    }
+
+    .ability-btn.active {
+      color: var(--black);
+      border-color: var(--black);
+      background: #f3f4f6;
+    }
+
+    .composer {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 10px;
+      align-items: end;
+    }
+
+    .composer-input {
+      width: 100%;
+      min-height: 48px;
+      max-height: 120px;
+      resize: vertical;
+      padding: 12px 13px;
+      border: 1px solid var(--line-strong);
+      border-radius: 8px;
+      outline: none;
+      color: var(--text);
+      font-size: 14px;
+      line-height: 1.45;
+    }
+
+    .send-btn {
+      width: 44px;
+      height: 44px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 8px;
+      color: #ffffff;
+      background: var(--black);
+      font-size: 18px;
+    }
+
+    .workflow-pane {
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+      background: #fbfbfc;
+      border-left: 1px solid var(--line);
+    }
+
+    .workflow-head {
+      padding: 16px;
+      border-bottom: 1px solid var(--line);
+      background: var(--surface);
+    }
+
+    .workflow-head h2 {
+      margin: 0;
+      font-size: 15px;
+      font-weight: 700;
+    }
+
+    .workflow-head p {
+      margin: 4px 0 0;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .workflow-body {
+      flex: 1;
+      min-height: 0;
+      overflow: auto;
+      padding: 14px;
+    }
+
+    .step-list {
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--surface);
+      overflow: hidden;
+    }
+
+    .step {
+      display: grid;
+      grid-template-columns: 28px 1fr;
+      gap: 10px;
+      padding: 12px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .step:last-child {
+      border-bottom: 0;
+    }
+
+    .step-index {
+      width: 24px;
+      height: 24px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 999px;
+      color: var(--muted);
+      background: #f3f4f6;
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    .step.done .step-index {
+      color: var(--green);
+      background: var(--green-bg);
+    }
+
+    .step.active .step-index {
+      color: var(--blue);
+      background: var(--blue-bg);
+    }
+
+    .step-title {
+      font-size: 13px;
+      font-weight: 680;
+    }
+
+    .step-desc {
+      margin-top: 3px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.4;
+    }
+
+    .side-section {
+      margin-top: 14px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--surface);
+      overflow: hidden;
+    }
+
+    .side-section h3 {
+      margin: 0;
+      padding: 12px;
+      border-bottom: 1px solid var(--line);
+      background: var(--surface-2);
+      font-size: 13px;
+      font-weight: 700;
+    }
+
+    .side-section-body {
+      padding: 12px;
+    }
+
+    .mini-row {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 7px 0;
+      border-bottom: 1px solid #f0f1f3;
+      font-size: 12px;
+    }
+
+    .mini-row:last-child {
+      border-bottom: 0;
+    }
+
+    .mini-label {
+      color: var(--muted);
+    }
+
+    .mini-value {
+      text-align: right;
+      color: var(--text);
+      font-weight: 580;
+    }
+
+    .subagent-list {
+      display: grid;
+      gap: 8px;
+    }
+
+    .subagent {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      align-items: center;
+      gap: 8px;
+      padding: 9px;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      background: #ffffff;
+    }
+
+    .subagent strong {
+      display: block;
+      font-size: 12px;
+    }
+
+    .subagent span {
+      color: var(--muted);
+      font-size: 11px;
+    }
+
+    .state {
+      height: 22px;
+      display: inline-flex;
+      align-items: center;
+      padding: 0 7px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 650;
+    }
+
+    .state.queued {
+      color: var(--muted);
+      background: #f3f4f6;
+    }
+
+    .state.ready {
+      color: var(--green);
+      background: var(--green-bg);
+    }
+
+    .state.running {
+      color: var(--blue);
+      background: var(--blue-bg);
+    }
+
+    .result-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+
+    .result-table th {
+      text-align: left;
+      color: var(--muted);
+      background: var(--surface-2);
+      border-bottom: 1px solid var(--line);
+      padding: 9px;
+      font-weight: 650;
+    }
+
+    .result-table td {
+      border-bottom: 1px solid var(--line);
+      padding: 10px 9px;
+      vertical-align: top;
+    }
+
+    .result-table tr:last-child td {
+      border-bottom: 0;
+    }
+
+    .confidence {
+      height: 24px;
+      display: inline-flex;
+      align-items: center;
+      padding: 0 8px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    .confidence.high {
+      color: var(--green);
+      background: var(--green-bg);
+    }
+
+    .confidence.medium {
+      color: var(--amber);
+      background: var(--amber-bg);
+    }
+
+    .confidence.low {
+      color: var(--red);
+      background: var(--red-bg);
+    }
+
+    .source-link {
+      display: inline-flex;
+      align-items: center;
+      margin-top: 5px;
+      color: var(--blue);
+      font-size: 12px;
+      text-decoration: none;
+    }
+
+    .split-actions {
+      display: flex;
+      gap: 6px;
+    }
+
+    .action-icon {
+      width: 30px;
+      height: 30px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      color: var(--muted);
+      background: #ffffff;
+      font-size: 13px;
+    }
+
+    .action-icon:hover {
+      color: var(--black);
+      border-color: var(--black);
+    }
+
+    .trace-float {
+      position: fixed;
+      right: 384px;
+      bottom: 28px;
+      width: 390px;
+      border: 1px solid rgba(17, 24, 39, 0.14);
+      border-radius: 12px;
+      background: rgba(255, 255, 255, 0.96);
+      box-shadow: 0 18px 44px rgba(15, 23, 42, 0.18);
+      overflow: hidden;
+      z-index: 20;
+      backdrop-filter: blur(10px);
+    }
+
+    .trace-head {
+      height: 46px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 0 14px;
+      color: #ffffff;
+      background: #486b5b;
+    }
+
+    .trace-title {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+      font-size: 14px;
+      font-weight: 700;
+    }
+
+    .trace-actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: rgba(255, 255, 255, 0.82);
+      font-size: 13px;
+      white-space: nowrap;
+    }
+
+    .trace-step-pill {
+      display: inline-flex;
+      align-items: center;
+      height: 24px;
+      padding: 0 9px;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.16);
+      font-weight: 650;
+    }
+
+    .trace-summary {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      padding: 11px 14px;
+      border-bottom: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 580;
+    }
+
+    .trace-body {
+      padding: 12px;
+    }
+
+    .trace-card {
+      display: grid;
+      grid-template-columns: 42px 1fr auto;
+      gap: 10px;
+      align-items: center;
+      padding: 10px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: #ffffff;
+    }
+
+    .trace-score {
+      width: 28px;
+      height: 28px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 999px;
+      color: #486b5b;
+      background: #e7f0ea;
+      font-size: 13px;
+      font-weight: 800;
+    }
+
+    .trace-card-title {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 13px;
+      font-weight: 700;
+    }
+
+    .trace-card-meta {
+      margin-top: 4px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .trace-card-time {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 650;
+    }
+
+    .trace-model {
+      display: inline-flex;
+      align-items: center;
+      height: 20px;
+      padding: 0 6px;
+      border-radius: 5px;
+      color: #486b5b;
+      background: #e7f0ea;
+      font-size: 11px;
+      font-weight: 650;
+    }
+
+    @media (max-width: 1180px) {
+      .app-shell {
+        grid-template-columns: 248px minmax(520px, 1fr);
+        min-width: 860px;
+      }
+
+      .workflow-pane {
+        display: none;
+      }
+
+      .trace-float {
+        right: 24px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="thread-sidebar">
+      <div class="sidebar-head">
+        <div class="brand-row">
+          <div class="brand-name">Creator Workbench</div>
+          <button class="icon-btn" title="设置">⚙</button>
+        </div>
+        <button class="new-thread"><span>＋</span><span>新建会话</span></button>
+      </div>
+
+      <div class="thread-list">
+        <div class="thread-item active">
+          <span class="thread-title">徒步短裤内容调研</span>
+          <div class="thread-meta">Content Research · 进行中</div>
+        </div>
+        <div class="thread-item">
+          <span class="thread-title">6 月新品笔记生成</span>
+          <div class="thread-meta">Content Generation · 昨天</div>
+        </div>
+        <div class="thread-item">
+          <span class="thread-title">敏感肌策略复盘</span>
+          <div class="thread-meta">Strategy · 周二</div>
+        </div>
+      </div>
+
+      <div class="sidebar-foot">
+        当前品牌: 户外生活方式品牌<br />
+        工作区: Growth Lab
+      </div>
+    </aside>
+
+    <main class="chat-pane">
+      <header class="chat-header">
+        <div class="chat-title">
+          <h1>徒步短裤内容调研</h1>
+          <p>同一个对话窗口内发起、确认和推进调研 workflow</p>
+        </div>
+        <div class="header-actions">
+          <span class="status-pill"><span class="dot"></span>Research Brief 待确认</span>
+          <button class="icon-btn" title="更多">⋯</button>
+        </div>
+      </header>
+
+      <section class="messages">
+        <div class="message-row user">
+          <div class="message user">我想调研徒步短裤</div>
+        </div>
+
+        <div class="message-row">
+          <div class="message assistant">
+            我会先做一次轻量预检索,确认你要研究的主体、竞品范围和调研方向。这个阶段最多等待 10 秒,不会生成正式结论。
+          </div>
+        </div>
+
+        <div class="message-row">
+          <div class="message system">
+            <div class="brief-panel">
+              <div class="panel-head">
+                <div>
+                  <h2>Research Brief Checklist</h2>
+                  <p>确认后才会创建正式 Research Plan,并按方向分发给专项 subagent。</p>
+                </div>
+                <span class="timer">预检索 7.8s</span>
+              </div>
+
+              <div class="panel-body">
+                <div class="section">
+                  <div class="section-title">1. 主体识别</div>
+                  <div class="subject-box">
+                    <div>
+                      <strong>徒步短裤 · 品类/SKU</strong>
+                      <span>更可能是一个户外服饰品类,关联夏季徒步、轻量户外、速干、防晒、通勤户外风等使用场景。</span>
+                    </div>
+                    <button class="btn">修改</button>
+                  </div>
+                </div>
+
+                <div class="section">
+                  <div class="section-title">
+                    <span>2. 选择关注品牌</span>
+                    <span style="color: var(--muted); font-size: 12px;">可多选</span>
+                  </div>
+                  <p class="section-note">这些只是预检索建议,不是最终竞品结论。你也可以直接输入要关注的品牌。</p>
+                  <div class="tag-grid">
+                    <label class="tag-check"><input type="checkbox" checked /><span>迪卡侬</span></label>
+                    <label class="tag-check"><input type="checkbox" checked /><span>凯乐石</span></label>
+                    <label class="tag-check"><input type="checkbox" /><span>伯希和</span></label>
+                    <label class="tag-check"><input type="checkbox" checked /><span>Patagonia</span></label>
+                    <label class="tag-check"><input type="checkbox" /><span>Arc'teryx</span></label>
+                    <label class="tag-check"><input type="checkbox" /><span>Nike ACG</span></label>
+                  </div>
+                  <input class="inline-input" placeholder="补充品牌,用逗号分隔,例如 Montbell, The North Face" />
+                </div>
+
+                <div class="section">
+                  <div class="section-title">
+                    <span>3. 选择本轮调研方向</span>
+                    <span style="color: var(--muted); font-size: 12px;">决定 subagent 路由</span>
+                  </div>
+                  <div class="tag-grid">
+                    <label class="tag-check"><input type="checkbox" checked /><span>产品卖点表达</span></label>
+                    <label class="tag-check"><input type="checkbox" checked /><span>竞品品牌</span></label>
+                    <label class="tag-check"><input type="checkbox" /><span>品牌活动</span></label>
+                    <label class="tag-check"><input type="checkbox" checked /><span>用户评论痛点</span></label>
+                    <label class="tag-check"><input type="checkbox" /><span>UGC 社群互动</span></label>
+                    <label class="tag-check"><input type="checkbox" /><span>新品类机会</span></label>
+                  </div>
+                  <input class="inline-input" placeholder="补充你的调研问题,例如: 更关注小众品牌而不是大牌" />
+                </div>
+
+                <div class="panel-actions">
+                  <button class="btn">保存草稿</button>
+                  <button class="btn primary" onclick="showResults()">确认并开始调研</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="message-row" id="resultMessage" style="display: none;">
+          <div class="message system">
+            <div class="result-panel">
+              <div class="panel-head">
+                <div>
+                  <h2>第一轮调研结果</h2>
+                  <p>按相关性、机会分和证据充分度综合排序。低置信结果可作为线索,不作为确定结论。</p>
+                </div>
+                <button class="btn blue">展开证据视图</button>
+              </div>
+              <div class="panel-body" style="padding: 0;">
+                <table class="result-table">
+                  <thead>
+                    <tr>
+                      <th style="width: 42%;">候选品牌/发现</th>
+                      <th>排序理由</th>
+                      <th style="width: 92px;">置信度</th>
+                      <th style="width: 120px;">操作</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr>
+                      <td>
+                        <strong>凯乐石轻量徒步线</strong>
+                        <div class="source-link">3 个代表来源 · 缺少商品详情</div>
+                      </td>
+                      <td>与“轻量、速干、夏季徒步”高度相关,笔记和评论中均出现产品场景表达。</td>
+                      <td><span class="confidence high">high</span></td>
+                      <td>
+                        <div class="split-actions">
+                          <button class="action-icon" title="选择">✓</button>
+                          <button class="action-icon" title="稍后">?</button>
+                          <button class="action-icon" title="拒绝">×</button>
+                        </div>
+                      </td>
+                    </tr>
+                    <tr>
+                      <td>
+                        <strong>Montbell / 山系通勤短裤</strong>
+                        <div class="source-link">2 个代表来源 · 需要补充作者页</div>
+                      </td>
+                      <td>小众品牌潜力高,但小红书有效内容较少,更适合作为后续补证线索。</td>
+                      <td><span class="confidence low">low</span></td>
+                      <td>
+                        <div class="split-actions">
+                          <button class="action-icon" title="选择">✓</button>
+                          <button class="action-icon" title="稍后">?</button>
+                          <button class="action-icon" title="拒绝">×</button>
+                        </div>
+                      </td>
+                    </tr>
+                    <tr>
+                      <td>
+                        <strong>“速干不贴腿”卖点表达</strong>
+                        <div class="source-link">5 个代表来源 · 评论信号强</div>
+                      </td>
+                      <td>多条评论提到闷热、出汗、贴腿和版型问题,适合进入产品营销方向。</td>
+                      <td><span class="confidence medium">medium</span></td>
+                      <td>
+                        <div class="split-actions">
+                          <button class="action-icon" title="收录">＋</button>
+                          <button class="action-icon" title="证据">↗</button>
+                        </div>
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <footer class="input-zone">
+        <div class="ability-row">
+          <button class="ability-btn">普通对话</button>
+          <button class="ability-btn active">⌕ 内容调研</button>
+          <button class="ability-btn">✎ 笔记生成</button>
+          <button class="ability-btn">◇ 策略复盘</button>
+          <button class="ability-btn">▦ 选题库</button>
+        </div>
+        <div class="composer">
+          <textarea class="composer-input" placeholder="输入品类、品牌或 SKU,例如: Satisfy Running / 徒步短裤 / 越野跑背心"></textarea>
+          <button class="send-btn" title="发送">↑</button>
+        </div>
+      </footer>
+    </main>
+
+    <aside class="workflow-pane">
+      <div class="workflow-head">
+        <h2>Content Research</h2>
+        <p>当前 workflow 状态和调研计划</p>
+      </div>
+
+      <div class="workflow-body">
+        <div class="step-list">
+          <div class="step done">
+            <div class="step-index">1</div>
+            <div>
+              <div class="step-title">Research Seed</div>
+              <div class="step-desc">用户输入: 徒步短裤</div>
+            </div>
+          </div>
+          <div class="step active">
+            <div class="step-index">2</div>
+            <div>
+              <div class="step-title">Research Brief</div>
+              <div class="step-desc">确认主体、竞品 tag 和调研方向</div>
+            </div>
+          </div>
+          <div class="step">
+            <div class="step-index">3</div>
+            <div>
+              <div class="step-title">Subagent Research</div>
+              <div class="step-desc">按方向执行专项调研</div>
+            </div>
+          </div>
+          <div class="step">
+            <div class="step-index">4</div>
+            <div>
+              <div class="step-title">Brand Decision</div>
+              <div class="step-desc">选择需要进一步查看的品牌</div>
+            </div>
+          </div>
+          <div class="step">
+            <div class="step-index">5</div>
+            <div>
+              <div class="step-title">Content Decision</div>
+              <div class="step-desc">选择重点关注的品牌内容</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="side-section">
+          <h3>已确认 Brief</h3>
+          <div class="side-section-body">
+            <div class="mini-row">
+              <span class="mini-label">主体</span>
+              <span class="mini-value">徒步短裤</span>
+            </div>
+            <div class="mini-row">
+              <span class="mini-label">类型</span>
+              <span class="mini-value">品类/SKU</span>
+            </div>
+            <div class="mini-row">
+              <span class="mini-label">竞品</span>
+              <span class="mini-value">迪卡侬, 凯乐石, Patagonia</span>
+            </div>
+            <div class="mini-row">
+              <span class="mini-label">方向</span>
+              <span class="mini-value">卖点, 竞品, 评论</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="side-section">
+          <h3>Subagent Tasks</h3>
+          <div class="side-section-body">
+            <div class="subagent-list">
+              <div class="subagent">
+                <div>
+                  <strong>ProductMarketingResearchAgent</strong>
+                  <span>产品卖点表达</span>
+                </div>
+                <span class="state queued">queued</span>
+              </div>
+              <div class="subagent">
+                <div>
+                  <strong>CompetitorDiscoveryAgent</strong>
+                  <span>竞品品牌</span>
+                </div>
+                <span class="state queued">queued</span>
+              </div>
+              <div class="subagent">
+                <div>
+                  <strong>CommentInsightAgent</strong>
+                  <span>用户评论痛点</span>
+                </div>
+                <span class="state queued">queued</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="side-section">
+          <h3>展示规则</h3>
+          <div class="side-section-body">
+            <div class="mini-row">
+              <span class="mini-label">排序</span>
+              <span class="mini-value">相关性 + 机会 + 证据</span>
+            </div>
+            <div class="mini-row">
+              <span class="mini-label">置信度</span>
+              <span class="mini-value">high / medium / low</span>
+            </div>
+            <div class="mini-row">
+              <span class="mini-label">证据</span>
+              <span class="mini-value">正式调研后生成</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </aside>
+
+    <div class="trace-float">
+      <div class="trace-head">
+        <div class="trace-title">⌁ Agent 决策日志 · Trace</div>
+        <div class="trace-actions">
+          <span class="trace-step-pill">2 步</span>
+          <span>⌄</span>
+          <span>×</span>
+        </div>
+      </div>
+      <div class="trace-summary">
+        <span>累计 4,826 tokens</span>
+        <span>3 次调用</span>
+        <span>￥0.04 预估</span>
+      </div>
+      <div class="trace-body">
+        <div class="trace-card">
+          <div class="trace-score">92</div>
+          <div>
+            <div class="trace-card-title">Research Brief <span class="trace-model">gpt-4o-mini</span></div>
+            <div class="trace-card-meta">主体识别 + 竞品 tag + 调研方向 · 1,284 tok</div>
+          </div>
+          <div class="trace-card-time">7.8s</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    function showResults() {
+      var result = document.getElementById("resultMessage");
+      result.style.display = "flex";
+      result.scrollIntoView({ behavior: "smooth", block: "start" });
+
+      var status = document.querySelector(".status-pill");
+      status.innerHTML = '<span class="dot"></span>第一轮结果待筛选';
+
+      var steps = document.querySelectorAll(".step");
+      steps[1].classList.remove("active");
+      steps[1].classList.add("done");
+      steps[2].classList.add("done");
+      steps[3].classList.add("active");
+
+      document.querySelectorAll(".state").forEach(function (node) {
+        node.className = "state ready";
+        node.textContent = "ready";
+      });
+    }
+  </script>
+</body>
+</html>

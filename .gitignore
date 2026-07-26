@@ -99,3 +99,6 @@ instructions/
 
 # ML models (large binaries)
 models/
+
+# Local browser-network captures may contain session credentials and request signatures.
+*.har

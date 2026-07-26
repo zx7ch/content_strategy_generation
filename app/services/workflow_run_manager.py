@@ -8,8 +8,8 @@ tables directly.
 from __future__ import annotations
 
 import json
-import uuid
-from typing import Any, Awaitable, Callable, Optional, TypeVar
+from collections.abc import Awaitable, Callable
+from typing import Any, Optional, TypeVar
 
 import aiosqlite
 
@@ -51,6 +51,7 @@ class WorkflowRunManager:
     def __init__(self, db_path: Optional[str] = None):
         self.db_path = db_path or settings.SQLITE_DB_PATH
         self._conn: Optional[aiosqlite.Connection] = None
+        self._transaction_depth = 0
 
     async def __aenter__(self) -> "WorkflowRunManager":
         await self.connect()
@@ -66,7 +67,6 @@ class WorkflowRunManager:
             pass
         self._conn = await aiosqlite.connect(self.db_path)
         self._conn.row_factory = aiosqlite.Row
-        await self._conn.execute("PRAGMA journal_mode=WAL")
         await self._conn.execute("PRAGMA synchronous=NORMAL")
         await self._conn.execute("PRAGMA busy_timeout=5000")
 
@@ -78,14 +78,67 @@ class WorkflowRunManager:
 
     async def _transaction(self, fn: Callable[[], Awaitable[T]]) -> T:
         assert self._conn is not None
+        if self._transaction_depth:
+            return await fn()
         await self._conn.execute("BEGIN IMMEDIATE")
+        self._transaction_depth += 1
         try:
             result = await fn()
         except Exception:
             await self._conn.rollback()
             raise
+        finally:
+            self._transaction_depth -= 1
         await self._conn.commit()
         return result
+
+    async def complete_brief_and_plan_atomically(
+        self,
+        *,
+        workflow_run_id: str,
+        task_specs: list[dict],
+        confirmation_writer: Callable[[aiosqlite.Connection, list[str]], Awaitable[None]],
+    ) -> list[str]:
+        """Commit workflow transitions and confirmation facts in one transaction."""
+
+        async def op() -> list[str]:
+            await self.start_step(workflow_run_id, "brief_confirm")
+            await self.complete_step(
+                workflow_run_id,
+                "brief_confirm",
+                artifact_refs=[{"type": "content_research_brief_confirmed"}],
+            )
+            await self.advance_to_next_step(workflow_run_id)
+            await self.start_step(workflow_run_id, "plan_build")
+            await self.complete_step(
+                workflow_run_id,
+                "plan_build",
+                artifact_refs=[
+                    {"type": "content_research_plan"},
+                    {"type": "content_research_subagent_task_specs", "count": len(task_specs)},
+                ],
+            )
+            await self.advance_to_next_step(workflow_run_id)
+            formal_step = await self.start_step(workflow_run_id, "formal_research")
+            child_tasks = await self.create_child_tasks(
+                run_id=workflow_run_id,
+                step_id=formal_step.step_id,
+                tasks=[
+                    {
+                        "task_type": str(
+                            spec.get("task_type") or "content_research_source_collect"
+                        ),
+                        "slot_index": spec.get("sequence_no"),
+                        "max_attempts": 3,
+                        "checkpoint": {"direction_id": spec.get("direction_id")},
+                    }
+                    for spec in task_specs
+                ],
+            )
+            await confirmation_writer(self._conn, [task.child_task_id for task in child_tasks])
+            return [task.child_task_id for task in child_tasks]
+
+        return await self._transaction(op)
 
     async def _fetch_run_row(self, run_id: str) -> aiosqlite.Row:
         assert self._conn is not None
@@ -409,7 +462,9 @@ class WorkflowRunManager:
             if run["status"] == WorkflowRunStatus.PAUSED.value:
                 return self._run(run)
             if run["status"] != WorkflowRunStatus.PAUSING.value:
-                raise WorkflowTransitionError(f"ack_pause_at_boundary not allowed from {run['status']}")
+                raise WorkflowTransitionError(
+                    f"ack_pause_at_boundary not allowed from {run['status']}"
+                )
             step = await self._fetch_step_row(run_id, step_name)
             if step["status"] == WorkflowStepStatus.RUNNING.value:
                 await self._conn.execute(
@@ -457,7 +512,9 @@ class WorkflowRunManager:
             if run["status"] == WorkflowRunStatus.CANCELLED.value:
                 return self._run(run)
             if run["status"] != WorkflowRunStatus.CANCELLING.value:
-                raise WorkflowTransitionError(f"ack_cancel_at_boundary not allowed from {run['status']}")
+                raise WorkflowTransitionError(
+                    f"ack_cancel_at_boundary not allowed from {run['status']}"
+                )
             step = await self._fetch_step_row(run_id, step_name)
             if step["status"] in {"pending", "running", "retrying"}:
                 await self._conn.execute(
@@ -607,7 +664,9 @@ class WorkflowRunManager:
             assert self._conn is not None
             run = await self._fetch_run_row(run_id)
             if run["status"] != WorkflowRunStatus.RUNNING.value:
-                raise WorkflowTransitionError(f"start_step requires running run, got {run['status']}")
+                raise WorkflowTransitionError(
+                    f"start_step requires running run, got {run['status']}"
+                )
             step = await self._fetch_step_row(run_id, step_name)
             if step["status"] not in {"pending", "retrying"}:
                 raise WorkflowTransitionError(f"start_step not allowed from {step['status']}")
@@ -677,7 +736,9 @@ class WorkflowRunManager:
                 )
                 return self._step(await self._fetch_step_row(run_id, step_name))
             if run["status"] != WorkflowRunStatus.RUNNING.value:
-                raise WorkflowTransitionError(f"complete_step requires running run, got {run['status']}")
+                raise WorkflowTransitionError(
+                    f"complete_step requires running run, got {run['status']}"
+                )
             if step["status"] != "running":
                 raise WorkflowTransitionError(f"complete_step not allowed from {step['status']}")
             await self._conn.execute(
@@ -802,9 +863,7 @@ class WorkflowRunManager:
 
         return await self._transaction(op)
 
-    async def skip_step(
-        self, run_id: str, step_name: str, reason: str = "skipped"
-    ) -> WorkflowStep:
+    async def skip_step(self, run_id: str, step_name: str, reason: str = "skipped") -> WorkflowStep:
         async def op() -> WorkflowStep:
             assert self._conn is not None
             run = await self._fetch_run_row(run_id)
@@ -878,7 +937,9 @@ class WorkflowRunManager:
             assert self._conn is not None
             run = await self._fetch_run_row(run_id)
             if run["status"] in self.TERMINAL_RUN_STATUSES or run["status"] == "cancelling":
-                raise WorkflowTransitionError(f"create_child_tasks not allowed from {run['status']}")
+                raise WorkflowTransitionError(
+                    f"create_child_tasks not allowed from {run['status']}"
+                )
             step = await self._fetch_step_row_by_id(step_id)
             if step["run_id"] != run_id:
                 raise WorkflowTransitionError("create_child_tasks step does not belong to run")
@@ -904,7 +965,9 @@ class WorkflowRunManager:
                         item.get("proposal_id"),
                         int(item.get("max_attempts", 3)),
                         item.get("input_hash"),
-                        _json_dump(item.get("checkpoint")) if item.get("checkpoint") is not None else None,
+                        _json_dump(item.get("checkpoint"))
+                        if item.get("checkpoint") is not None
+                        else None,
                     ),
                 )
                 created.append(self._child_task(await self._fetch_child_task_row(child_task_id)))
@@ -929,9 +992,13 @@ class WorkflowRunManager:
             child = await self._fetch_child_task_row(child_task_id)
             run = await self._fetch_run_row(child["run_id"])
             if run["status"] != WorkflowRunStatus.RUNNING.value:
-                raise WorkflowTransitionError(f"start_child_task requires running run, got {run['status']}")
+                raise WorkflowTransitionError(
+                    f"start_child_task requires running run, got {run['status']}"
+                )
             if child["status"] not in {"pending", "retrying"}:
-                raise WorkflowTransitionError(f"start_child_task not allowed from {child['status']}")
+                raise WorkflowTransitionError(
+                    f"start_child_task not allowed from {child['status']}"
+                )
             await self._conn.execute(
                 """
                 UPDATE workflow_child_tasks
@@ -964,11 +1031,17 @@ class WorkflowRunManager:
             child = await self._fetch_child_task_row(child_task_id)
             run = await self._fetch_run_row(child["run_id"])
             if run["status"] in {"cancelling", "cancelled"}:
-                raise WorkflowTransitionError(f"complete_child_task not allowed from {run['status']}")
+                raise WorkflowTransitionError(
+                    f"complete_child_task not allowed from {run['status']}"
+                )
             if run["status"] != WorkflowRunStatus.RUNNING.value:
-                raise WorkflowTransitionError(f"complete_child_task requires running run, got {run['status']}")
+                raise WorkflowTransitionError(
+                    f"complete_child_task requires running run, got {run['status']}"
+                )
             if child["status"] != WorkflowStepStatus.RUNNING.value:
-                raise WorkflowTransitionError(f"complete_child_task not allowed from {child['status']}")
+                raise WorkflowTransitionError(
+                    f"complete_child_task not allowed from {child['status']}"
+                )
             await self._conn.execute(
                 """
                 UPDATE workflow_child_tasks
@@ -1002,8 +1075,13 @@ class WorkflowRunManager:
             # terminal state while its parent research step remains open for a
             # user-triggered retry.  Requeueing it preserves the same child ID
             # and its event history instead of creating a duplicate task.
-            if child["status"] not in {WorkflowStepStatus.RUNNING.value, WorkflowStepStatus.FAILED.value}:
-                raise WorkflowTransitionError(f"retry_child_task not allowed from {child['status']}")
+            if child["status"] not in {
+                WorkflowStepStatus.RUNNING.value,
+                WorkflowStepStatus.FAILED.value,
+            }:
+                raise WorkflowTransitionError(
+                    f"retry_child_task not allowed from {child['status']}"
+                )
             code, message = self._normalize_error(error)
             await self._conn.execute(
                 """
@@ -1077,7 +1155,9 @@ class WorkflowRunManager:
             if child["status"] == WorkflowStepStatus.CANCELLED.value:
                 return self._child_task(child)
             if child["status"] not in {"pending", "running", "retrying"}:
-                raise WorkflowTransitionError(f"cancel_child_task not allowed from {child['status']}")
+                raise WorkflowTransitionError(
+                    f"cancel_child_task not allowed from {child['status']}"
+                )
             await self._conn.execute(
                 """
                 UPDATE workflow_child_tasks
@@ -1116,11 +1196,22 @@ class WorkflowRunManager:
         async def op() -> WorkflowArtifact:
             assert self._conn is not None
             run = await self._fetch_run_row(run_id)
-            if run["status"] in self.TERMINAL_RUN_STATUSES or run["status"] == "cancelling":
-                raise WorkflowTransitionError(f"attach_artifact not allowed from {run['status']}")
             type_value = (
-                artifact_type.value if isinstance(artifact_type, WorkflowArtifactType) else str(artifact_type)
+                artifact_type.value
+                if isinstance(artifact_type, WorkflowArtifactType)
+                else str(artifact_type)
             )
+            # A terminal successful run may append its single final result.
+            # This preserves the Creator contract (complete first, then emit
+            # artifact_result) without reopening a completed workflow.
+            terminal_final_result = (
+                run["status"] == WorkflowRunStatus.SUCCEEDED.value
+                and type_value == WorkflowArtifactType.FINAL_RESULT.value
+            )
+            if (
+                run["status"] in self.TERMINAL_RUN_STATUSES or run["status"] == "cancelling"
+            ) and not terminal_final_result:
+                raise WorkflowTransitionError(f"attach_artifact not allowed from {run['status']}")
             mode_value = (
                 payload_mode.value
                 if isinstance(payload_mode, WorkflowArtifactPayloadMode)

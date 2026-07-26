@@ -14,6 +14,18 @@ def _required(*values: str) -> None:
         raise ValueError("required identity or relationship field is missing")
 
 
+def _forbid_legacy_report_payload(value: Any) -> None:
+    if isinstance(value, dict):
+        forbidden = {"evidence_bundle_id", "evidence_bundle_ids", "items", "recommendations"}
+        if forbidden & set(value):
+            raise ValueError("report payload cannot contain legacy bundle/result fields")
+        for nested in value.values():
+            _forbid_legacy_report_payload(nested)
+    elif isinstance(value, list | tuple):
+        for nested in value:
+            _forbid_legacy_report_payload(nested)
+
+
 @dataclass(frozen=True)
 class TypedPersistenceRecord:
     id: str
@@ -40,35 +52,41 @@ class CanonicalSourceRecord(TypedPersistenceRecord):
 
 @dataclass(frozen=True)
 class DirectionSourceProjectionRecord(TypedPersistenceRecord):
+    workflow_run_id: str = ""
     research_direction_id: str = ""
     canonical_source_id: str = ""
     evidence_packet_id: str = ""
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        _required(self.research_direction_id, self.canonical_source_id, self.evidence_packet_id)
+        _required(self.workflow_run_id, self.research_direction_id, self.canonical_source_id, self.evidence_packet_id)
 
 
 @dataclass(frozen=True)
 class DirectionalEvidencePacketRecord(TypedPersistenceRecord):
+    workflow_run_id: str = ""
     research_direction_id: str = ""
     canonical_source_id: str = ""
     field_projection_hash: str = ""
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        _required(self.research_direction_id, self.canonical_source_id, self.field_projection_hash)
+        _required(self.workflow_run_id, self.research_direction_id, self.canonical_source_id, self.field_projection_hash)
 
 
 @dataclass(frozen=True)
 class ClaimCandidateRecord(TypedPersistenceRecord):
+    workflow_run_id: str = ""
     research_direction_id: str = ""
     evidence_packet_id: str = ""
     statement: str = ""
+    intent_id: str = ""
+    claim_type: str = ""
+    requested_state: str = "pending_admission"
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        _required(self.research_direction_id, self.evidence_packet_id, self.statement)
+        _required(self.workflow_run_id, self.research_direction_id, self.evidence_packet_id, self.statement, self.intent_id, self.claim_type, self.requested_state)
 
 
 @dataclass(frozen=True)
@@ -130,19 +148,26 @@ class AggregateClaimRecord(TypedPersistenceRecord):
 
 @dataclass(frozen=True)
 class StageCheckpointRecord(TypedPersistenceRecord):
+    workflow_run_id: str = ""
     subagent_task_id: str = ""
     stage_name: str = ""
     input_fingerprint: str = ""
     status: str = "pending"
     retry_count: int = 0
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        _required(self.subagent_task_id, self.stage_name, self.input_fingerprint)
-        if self.stage_name not in {"collect", "packet", "facts", "admission", "reconcile", "aggregate", "compose", "faithfulness"}:
+        _required(self.workflow_run_id, self.subagent_task_id, self.stage_name, self.input_fingerprint)
+        if self.stage_name not in {"collect", "collect_page", "operation", "selection", "selection_revision", "detail", "comments", "comments_page", "packet", "facts", "admission", "reconcile", "aggregate", "compose", "faithfulness"}:
             raise ValueError("invalid checkpoint stage")
         if self.retry_count < 0:
             raise ValueError("checkpoint retry_count cannot be negative")
+        if self.finished_at is not None and self.started_at is None:
+            raise ValueError("finished checkpoint requires started_at")
+        if self.started_at is not None and self.finished_at is not None and self.finished_at < self.started_at:
+            raise ValueError("checkpoint finished_at cannot precede started_at")
 
 
 @dataclass(frozen=True)
@@ -165,10 +190,85 @@ class BudgetLedgerEntryRecord(TypedPersistenceRecord):
 
 
 @dataclass(frozen=True)
-class ReportFaithfulnessDecisionRecord(TypedPersistenceRecord):
+class ReportDraftRecord(TypedPersistenceRecord):
+    workflow_run_id: str = ""
     research_plan_id: str = ""
-    result_snapshot_id: str = ""
+    governed_snapshot_id: str = ""
+    governed_snapshot_version: str = ""
+    input_fingerprint: str = ""
+    policy_version: str = ""
+    algorithm_version: str = ""
+    previous_version_id: str | None = None
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        _required(self.research_plan_id, self.result_snapshot_id)
+        _forbid_legacy_report_payload(self.payload)
+        _required(
+            self.workflow_run_id,
+            self.research_plan_id,
+            self.governed_snapshot_id,
+            self.governed_snapshot_version,
+            self.input_fingerprint,
+            self.policy_version,
+            self.algorithm_version,
+        )
+
+
+@dataclass(frozen=True)
+class ReportFaithfulnessDecisionRecord(TypedPersistenceRecord):
+    workflow_run_id: str = ""
+    research_plan_id: str = ""
+    governed_snapshot_id: str = ""
+    governed_snapshot_version: str = ""
+    input_fingerprint: str = ""
+    policy_version: str = ""
+    algorithm_version: str = ""
+    report_draft_id: str = ""
+    previous_version_id: str | None = None
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        _forbid_legacy_report_payload(self.payload)
+        _required(
+            self.workflow_run_id,
+            self.research_plan_id,
+            self.governed_snapshot_id,
+            self.governed_snapshot_version,
+            self.input_fingerprint,
+            self.policy_version,
+            self.algorithm_version,
+            self.report_draft_id,
+        )
+
+
+@dataclass(frozen=True)
+class ReportPublicationRecord(TypedPersistenceRecord):
+    workflow_run_id: str = ""
+    research_plan_id: str = ""
+    governed_snapshot_id: str = ""
+    governed_snapshot_version: str = ""
+    input_fingerprint: str = ""
+    policy_version: str = ""
+    algorithm_version: str = ""
+    report_draft_id: str = ""
+    faithfulness_decision_id: str = ""
+    publication_state: str = ""
+    previous_version_id: str | None = None
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        _forbid_legacy_report_payload(self.payload)
+        _required(
+            self.workflow_run_id,
+            self.research_plan_id,
+            self.governed_snapshot_id,
+            self.governed_snapshot_version,
+            self.input_fingerprint,
+            self.policy_version,
+            self.algorithm_version,
+            self.report_draft_id,
+            self.faithfulness_decision_id,
+            self.publication_state,
+        )
+        if self.publication_state not in {"complete_verified_report", "partial_verified_report", "evidence_only_report"}:
+            raise ValueError("invalid report publication state")

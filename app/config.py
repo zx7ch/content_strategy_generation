@@ -9,7 +9,7 @@ from importlib.metadata import PackageNotFoundError, version as _pkg_version
 from pathlib import Path
 from typing import List
 
-from pydantic import AliasChoices, Field, model_validator
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Single source of truth: pyproject.toml [project] version.
@@ -21,9 +21,13 @@ except PackageNotFoundError:
     _RUNTIME_VERSION = "dev"
 
 
-def _env_alias(name: str) -> AliasChoices:
-    """Allow both canonical name and XHS_* alias for backward compatibility."""
-    return AliasChoices(name, f"XHS_{name}")
+def _env_alias(name: str) -> str:
+    """Use the one current, canonical environment variable name.
+
+    The historic ``XHS_<NAME>`` aliases are deliberately unsupported: keeping
+    two names for one setting makes the active configuration ambiguous.
+    """
+    return name
 
 
 class Settings(BaseSettings):
@@ -59,6 +63,7 @@ class Settings(BaseSettings):
     DEEPSEEK_API_KEY: str = ""
     MINIMAX_API_KEY: str = ""
     KIMI_API_KEY: str = ""
+    KIMI_BASE_URL: str = "https://api.kimi.com/coding/v1"
 
     ANTHROPIC_MODEL: str = "claude-opus-4-6"
     OPENAI_MODEL: str = "gpt-4o-mini"

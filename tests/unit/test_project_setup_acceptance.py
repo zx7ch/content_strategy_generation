@@ -13,7 +13,7 @@ def test_p0_1_gitmodules_configured_for_spider_submodule():
     content = (ROOT / ".gitmodules").read_text(encoding="utf-8")
     assert '[submodule "app/ingest/xhs_spider"]' in content
     assert "path = app/ingest/xhs_spider" in content
-    assert "Spider_XHS.git" in content
+    assert "url = https://github.com/lipomzx/Spider_XHS" in content
     # locked to commit by default (no branch tracking)
     assert "branch =" not in content
 
@@ -26,8 +26,8 @@ def test_p0_2_env_example_contains_required_variables():
         "QUALITY_SCORE_THRESHOLD=",
         "RAG_EMBEDDING_MODEL=",
         "REINDEX_MAX_ATTEMPTS=",
-        "XHS_SESSION_ALIVE_HOURS=",
-        "XHS_JOB_POLL_INTERVAL_MS=",
+        "SESSION_ALIVE_HOURS=",
+        "JOB_POLL_INTERVAL_MS=",
     ]
     for item in required:
         assert item in content

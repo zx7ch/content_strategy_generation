@@ -131,12 +131,19 @@ class ContentResearchTraceResponse(BaseModel):
     runtime_child_tasks: list[dict] = Field(default_factory=list)
     usage_summary: dict = Field(default_factory=dict)
     external_api_summary: dict = Field(default_factory=dict)
+    provider_operations: list[dict] = Field(default_factory=list)
     usage_steps: list[dict] = Field(default_factory=list)
     usage_events: list[dict] = Field(default_factory=list)
 
 
 class ContentResearchSourceCollectionRequest(BaseModel):
+    operation: str = "discover_candidates"
     query: str | None = None
+    note_id: str | None = None
+    note_url: str | None = None
+    cursor: str | None = None
+    top_level_only: bool = True
+    required_fields: list[str] = Field(default_factory=list)
     source_kind: str = "search_result"
     # The server owns collection breadth. Clients may request a lower bounded
     # value for API use, but ordinary Creator runs use the full safe ceiling.
@@ -150,11 +157,59 @@ class ContentResearchSourceCollectionResponse(BaseModel):
     workflow_run_id: str
     provider: str
     source_kind: str
+    operation: str = "discover_candidates"
     status: str
     failure_reason: str | None = None
     cookie_status: str = "unknown"
     items: list[dict] = Field(default_factory=list)
     metadata: dict = Field(default_factory=dict)
+    next_cursor: str | None = None
+    completeness: str = "complete"
+    field_availability: dict[str, str] = Field(default_factory=dict)
+    retryable: bool = False
+
+
+class XHSQRLoginResponse(BaseModel):
+    attempt_id: str
+    status: str
+    qr_image_data_url: str | None = None
+    failure_code: str | None = None
+
+
+class ContentResearchDirectionEvidenceResponse(BaseModel):
+    schema_version: str = CONTENT_RESEARCH_API_SCHEMA_VERSION
+    workflow_run_id: str
+    direction_id: str
+    status: str = "not_started"
+    counts: dict[str, int] = Field(default_factory=dict)
+    query_plan_hash: str | None = None
+    candidate_manifest_hash: str | None = None
+    query_groups: list[dict] = Field(default_factory=list)
+    selection_policy: dict = Field(default_factory=dict)
+    coverage_unmet_query_group_ids: list[str] = Field(default_factory=list)
+    selection_revisions: list[dict] = Field(default_factory=list)
+    comment_collection: dict = Field(default_factory=dict)
+    candidates: list[dict] = Field(default_factory=list)
+    selections: list[dict] = Field(default_factory=list)
+    exclusions: list[dict] = Field(default_factory=list)
+    packets: list[dict] = Field(default_factory=list)
+    direction_result: dict = Field(default_factory=dict)
+    weak_signals: list[dict] = Field(default_factory=list)
+    offset: int = 0
+    limit: int = 50
+
+
+class ContentResearchGovernanceResponse(BaseModel):
+    schema_version: str = CONTENT_RESEARCH_API_SCHEMA_VERSION
+    workflow_run_id: str
+    research_plan_id: str
+    governed_snapshot_identity: dict = Field(default_factory=dict)
+    cross_direction_records: list[dict] = Field(default_factory=list)
+    aggregate_claims: list[dict] = Field(default_factory=list)
+    cross_direction_total: int = 0
+    aggregate_total: int = 0
+    offset: int = 0
+    limit: int = 50
 
 
 class ContentResearchFormalResearchResponse(BaseModel):
@@ -194,27 +249,6 @@ class ContentResearchWorkflowActionResponse(BaseModel):
     sync_status: str = "local_only"
 
 
-class ResultItem(BaseModel):
-    result_item_id: str
-    claim: str
-    summary: str
-    evidence_bundle_id: str
-    evidence_bundle_ids: list[str] = Field(default_factory=list)
-    support_level: str
-    claim_status: str
-    priority: dict = Field(default_factory=dict)
-    priority_label: str = "do_not_prioritize"
-    evidence_state: str = "signal"
-    evidence_grade: str = "C"
-    claim_scope: dict = Field(default_factory=dict)
-    next_action: dict = Field(default_factory=dict)
-    decision_card: dict = Field(default_factory=dict)
-    risk_flags: list[str] = Field(default_factory=list)
-    missing_evidence: list[dict] = Field(default_factory=list)
-    analysis_trace: dict = Field(default_factory=dict)
-    source_count: int = 0
-
-
 class SnapshotResponse(BaseModel):
     schema_version: str = CONTENT_RESEARCH_API_SCHEMA_VERSION
     snapshot_id: str
@@ -226,26 +260,56 @@ class SnapshotResponse(BaseModel):
     status: str
     title: str
     executive_summary: str
-    items: list[ResultItem] = Field(default_factory=list)
-    findings: list[dict] = Field(default_factory=list)
-    recommendations: list[dict] = Field(default_factory=list)
-    evidence_bundle_ids: list[str] = Field(default_factory=list)
-    claim_count: int = 0
-    supported_claim_count: int = 0
-    unsupported_claim_count: int = 0
-    citation_coverage_score: float | None = None
-    faithfulness_score: float | None = None
-    answer_relevancy_score: float | None = None
-    derivation_completeness_score: float | None = None
-    evidence_boundary_calibration_score: float | None = None
-    decision_summary: dict = Field(default_factory=dict)
-    decision_cards: list[dict] = Field(default_factory=list)
-    priority_summary: dict = Field(default_factory=dict)
-    evidence_boundary_summary: dict = Field(default_factory=dict)
     limitations: list[dict] = Field(default_factory=list)
-    abstentions: list[dict] = Field(default_factory=list)
-    metadata: dict = Field(default_factory=dict)
+    governed_snapshot: dict = Field(default_factory=dict)
     created_at: str
+
+
+class ContentResearchPublishedReportResponse(BaseModel):
+    """The single public read model for one materialized report publication."""
+
+    schema_version: str = CONTENT_RESEARCH_API_SCHEMA_VERSION
+    workflow_run_id: str
+    workflow_terminal_state: str
+    publication_state: str
+    artifact: dict = Field(default_factory=dict)
+    publication: dict = Field(default_factory=dict)
+    sections: list[dict] = Field(default_factory=list)
+    citation_groups: list[dict] = Field(default_factory=list)
+    citation_total: int = 0
+    citation_offset: int = 0
+    citation_limit: int = 50
+    claim_cards: list[dict] = Field(default_factory=list)
+    weak_signals: list[dict] = Field(default_factory=list)
+    cross_direction_records: list[dict] = Field(default_factory=list)
+    aggregate_claims: list[dict] = Field(default_factory=list)
+    limitations_recovery: list[dict] = Field(default_factory=list)
+    release: dict = Field(default_factory=dict)
+    run_direction_states: list[dict] = Field(default_factory=list)
+    trace: dict = Field(
+        default_factory=dict,
+        description=(
+            "Optional expanded audit projection. Report business fields never expose usage; "
+            "only this safe aggregate may include known token/cost values and cost_unknown."
+        ),
+    )
+
+
+class ContentResearchLiteReportResponse(BaseModel):
+    """Stable narrow projection of the formal F003 report contract."""
+
+    schema_version: str = CONTENT_RESEARCH_API_SCHEMA_VERSION
+    workflow_run_id: str
+    workflow_execution_state: str
+    subject: str | None = None
+    frozen_scope: dict = Field(default_factory=dict)
+    collected_at: str | None = None
+    publication: dict = Field(default_factory=dict)
+    sections: dict = Field(default_factory=dict)
+    status_strip: dict = Field(default_factory=dict)
+    citations: list[dict] = Field(default_factory=list)
+    run_direction_states: list[dict] = Field(default_factory=list)
+    recovery_projection: dict | None = None
 
 
 class EvidenceBundleView(BaseModel):

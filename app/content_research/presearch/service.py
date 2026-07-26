@@ -114,7 +114,9 @@ class PresearchService:
     async def _run_llm(self, request: PresearchInput) -> PresearchOutcome:
         assert self._llm is not None
         try:
-            response = await self._llm.generate(
+            # Provider SDK defaults can wait for minutes; presearch is an
+            # interactive UI boundary and must fall back within its hard cutoff.
+            response = await asyncio.wait_for(self._llm.generate(
                 LLMRequest(
                     messages=build_presearch_messages(request.seed_text, request.user_note),
                     task_type="content_research.presearch",
@@ -128,12 +130,15 @@ class PresearchService:
                         user_id=request.user_id,
                     ),
                 )
-            )
+            ), timeout=self.hard_cutoff_seconds)
             return PresearchOutcome(
                 status="completed",
                 checklist=self._parse_checklist(response.content),
                 fallback_used=False,
             )
+        except asyncio.TimeoutError:
+            # The caller owns the final-timeout state transition.
+            raise
         except Exception as exc:  # noqa: BLE001 - presearch must fall back instead of blocking UX.
             return self.fallback(
                 request,

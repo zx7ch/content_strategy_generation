@@ -5,6 +5,7 @@ import json
 import pytest
 
 from app.content_research.api_schemas import ContentResearchBriefConfirmRequest
+from app.content_research.persistence_models import StageCheckpointRecord
 from app.content_research.presearch.service import PresearchService
 from app.content_research.service import (
     ContentResearchNotFoundError,
@@ -170,3 +171,196 @@ async def test_trace_returns_zero_usage_defaults_when_no_usage_rows(service):
 async def test_trace_missing_workflow_raises_content_research_not_found(service):
     with pytest.raises(ContentResearchNotFoundError):
         await service.get_workflow_trace("run_missing")
+
+
+@pytest.mark.asyncio
+async def test_trace_projects_durable_provider_failure_without_raw_request(service):
+    presearch = await _confirmed_workflow(service)
+    service._store.save_stage_checkpoint(
+        StageCheckpointRecord(
+            id="scp-provider-failure",
+            schema_version="content_research_stage_checkpoint_v1",
+            workflow_run_id=presearch.workflow_run_id,
+            subagent_task_id="sat-provider",
+            stage_name="operation",
+            input_fingerprint="fingerprint-1",
+            status="auth_required",
+            payload={
+                "workflow_run_id": presearch.workflow_run_id,
+                "operation": "discover",
+                "operation_fingerprint": "fingerprint-1",
+                "operation_state": "auth_required",
+                "request": {"query": "徒步短裤"},
+                "completion": {
+                    "failure_code": "auth_required",
+                    "failure_reason": "auth_required",
+                    "retryable": False,
+                    "recovery_action": "更新小红书登录态后继续。",
+                },
+            },
+        )
+    )
+
+    trace = await service.get_workflow_trace(presearch.workflow_run_id)
+
+    assert trace.provider_operations == [{
+        "operation_fingerprint": "fingerprint-1",
+        "operation": "discover",
+        "provider": None,
+        "provider_operation": None,
+        "source_kind": None,
+        "result_status": None,
+        "item_count": None,
+        "completeness": None,
+        "cookie_status": None,
+        "status": "auth_required",
+        "started_at": None,
+        "finished_at": None,
+        "failure_code": "auth_required",
+        "failure_reason": "auth_required",
+        "retryable": False,
+        "recovery_action": "更新小红书登录态后继续。",
+    }]
+
+
+@pytest.mark.asyncio
+async def test_trace_projects_provider_access_rejection_with_safe_browser_session_recovery(service):
+    presearch = await _confirmed_workflow(service)
+    service._store.save_stage_checkpoint(
+        StageCheckpointRecord(
+            id="scp-provider-access-rejected",
+            schema_version="content_research_stage_checkpoint_v1",
+            workflow_run_id=presearch.workflow_run_id,
+            subagent_task_id="sat-provider",
+            stage_name="operation",
+            input_fingerprint="fingerprint-detail-1",
+            status="failed",
+            payload={
+                "workflow_run_id": presearch.workflow_run_id,
+                "operation": "collect_note_detail",
+                "operation_fingerprint": "fingerprint-detail-1",
+                "operation_state": "failed",
+                "request": {
+                    "note_id": "note-1",
+                    "xsec_token": "must-not-reach-trace",
+                    "cookie": "must-not-reach-trace",
+                },
+                "completion": {
+                    "provider": "xiaohongshu",
+                    "provider_operation": "collect_note_detail",
+                    "source_kind": "note_detail",
+                    "result_status": "failed",
+                    "item_count": 0,
+                    "completeness": "unavailable",
+                    "cookie_status": "valid",
+                    "failure_code": "provider_access_rejected",
+                    "failure_reason": "provider_access_rejected",
+                    "retryable": False,
+                    "recovery_action": "笔记详情请求的浏览器安全上下文不兼容；请启用或更新兼容的浏览器会话详情采集提供者后重新发起调研。",
+                },
+            },
+        )
+    )
+
+    trace = await service.get_workflow_trace(presearch.workflow_run_id)
+
+    assert trace.provider_operations == [{
+        "operation_fingerprint": "fingerprint-detail-1",
+        "operation": "collect_note_detail",
+        "provider": "xiaohongshu",
+        "provider_operation": "collect_note_detail",
+        "source_kind": "note_detail",
+        "result_status": "failed",
+        "item_count": 0,
+        "completeness": "unavailable",
+        "cookie_status": "valid",
+        "status": "failed",
+        "started_at": None,
+        "finished_at": None,
+        "failure_code": "provider_access_rejected",
+        "failure_reason": "provider_access_rejected",
+        "retryable": False,
+        "recovery_action": "笔记详情请求的浏览器安全上下文不兼容；请启用或更新兼容的浏览器会话详情采集提供者后重新发起调研。",
+    }]
+    assert trace.external_api_summary == {
+        "call_count": 1,
+        "completed_count": 0,
+        "failed_count": 1,
+        "by_provider": {"xiaohongshu": 1},
+        "by_operation": {"collect_note_detail": 1},
+    }
+    assert "must-not-reach-trace" not in trace.model_dump_json()
+
+
+@pytest.mark.asyncio
+async def test_direction_evidence_uses_post_detail_selection_for_coverage_and_counts(service):
+    presearch = await _confirmed_workflow(service)
+    base_payload = {
+        "workflow_run_id": presearch.workflow_run_id,
+        "direction_id": "product_marketing",
+    }
+    service._store.save_stage_checkpoint(
+        StageCheckpointRecord(
+            id="scp-selection-before-detail",
+            schema_version="content_research_stage_checkpoint_v1",
+            workflow_run_id=presearch.workflow_run_id,
+            subagent_task_id="sat-product",
+            stage_name="selection",
+            input_fingerprint="selection-fingerprint",
+            status="completed",
+            payload={
+                **base_payload,
+                "selection": {
+                    "status": "complete",
+                    "selected_source_count": 3,
+                    "eligible_source_count": 3,
+                    "independent_source_count": 3,
+                    "coverage_unmet_query_group_ids": [],
+                    "decisions": [],
+                },
+            },
+        )
+    )
+    service._store.save_stage_checkpoint(
+        StageCheckpointRecord(
+            id="scp-detail-final-selection",
+            schema_version="content_research_stage_checkpoint_v1",
+            workflow_run_id=presearch.workflow_run_id,
+            subagent_task_id="sat-product",
+            stage_name="detail",
+            input_fingerprint="selection-fingerprint",
+            status="completed",
+            payload={
+                **base_payload,
+                "selection": {
+                    "status": "incomplete",
+                    "selected_source_count": 2,
+                    "eligible_source_count": 2,
+                    "independent_source_count": 2,
+                    "coverage_unmet_query_group_ids": ["qg_missing"],
+                    "decisions": [],
+                },
+            },
+        )
+    )
+    service._store.save_stage_checkpoint(
+        StageCheckpointRecord(
+            id="scp-packet-final-selection",
+            schema_version="content_research_stage_checkpoint_v1",
+            workflow_run_id=presearch.workflow_run_id,
+            subagent_task_id="sat-product",
+            stage_name="packet",
+            input_fingerprint="selection-fingerprint",
+            status="completed",
+            payload={**base_payload, "status": "incomplete", "packet_ids": []},
+        )
+    )
+
+    evidence = service.get_direction_evidence(
+        workflow_run_id=presearch.workflow_run_id,
+        direction_id="product_marketing",
+    )
+
+    assert evidence.status == "incomplete"
+    assert evidence.counts["selected_source_count"] == 2
+    assert evidence.coverage_unmet_query_group_ids == ["qg_missing"]

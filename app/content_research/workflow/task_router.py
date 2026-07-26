@@ -5,25 +5,30 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import Any
 
-from app.content_research.agents import build_default_subagent_registry
 from app.content_research.agents.base import (
     ContentResearchSubagent,
-    SubagentExecutionContext,
     SubagentExecutionResult,
 )
-from app.content_research.analysis import DirectionalAnalysisService
-from app.content_research.evidence import EvidenceBundleService, EvidenceService
 from app.content_research.models import (
     ObservationEventRecord,
     SubagentTaskRecord,
     TraceRecord,
     utcnow,
 )
-from app.content_research.runtime import CheckpointRuntime, canonical_fingerprint
 from app.content_research.sources import SourceAdapterRegistry
-from app.content_research.sources.base import SourceCollectionResult
+from app.content_research.sources.base import (
+    CollectCommentsRequest,
+    CollectNoteDetailRequest,
+    DiscoverCandidatesRequest,
+    SourceOperationResult,
+)
 from app.content_research.stores.base import ContentResearchStore
 from app.content_research.workflow.direction_registry import ResearchDirectionDefinition
+from app.content_research.workflow.directional_pipeline import (
+    DirectionalExecutionPipeline,
+    OperationOutcomeUnknownError,
+    QueryGroup,
+)
 
 
 class SubagentTaskRouter:
@@ -32,25 +37,11 @@ class SubagentTaskRouter:
         *,
         store: ContentResearchStore | None = None,
         source_registry: SourceAdapterRegistry | None = None,
-        evidence_service: EvidenceService | None = None,
-        bundle_service: EvidenceBundleService | None = None,
         agents: dict[str, ContentResearchSubagent] | None = None,
-        analysis_service: DirectionalAnalysisService | None = None,
     ) -> None:
         self._store = store
         self._source_registry = source_registry or SourceAdapterRegistry()
-        self._evidence_service = evidence_service
-        self._bundle_service = bundle_service
-        if agents is not None:
-            self._agents = agents
-        elif evidence_service is not None and bundle_service is not None:
-            self._agents = build_default_subagent_registry(
-                evidence_service=evidence_service,
-                bundle_service=bundle_service,
-                analysis_service=analysis_service,
-            )
-        else:
-            self._agents = {}
+        self._agents = dict(agents or {})
 
     def build_task_specs(
         self,
@@ -105,34 +96,15 @@ class SubagentTaskRouter:
         provider: str = "xiaohongshu",
         source_kind: str = "search_result",
         limit: int = 10,
-        source_result: SourceCollectionResult | None = None,
+        source_result: SourceOperationResult | None = None,
     ) -> SubagentTaskRecord:
         if self._store is None:
             raise ValueError("SubagentTaskRouter requires a store to execute tasks")
-        agent_name = str(task.payload.get("agent_name") or task.payload.get("input_payload", {}).get("agent_name") or "")
-        if not agent_name:
-            agent_name = str(task.payload.get("agent_type") or "")
-        agent = self._agents.get(agent_name)
-        if agent is None:
-            raise ValueError(f"Unsupported content research subagent: {agent_name}")
-        db_path = getattr(self._store, "_db_path", None)
-        checkpoint_runtime = CheckpointRuntime(db_path) if db_path else None
-        collect_fingerprint = canonical_fingerprint({
-            "task_id": task.id, "stage": "collect", "input": task.payload.get("input_payload", {}),
-        })
-        if checkpoint_runtime is not None and checkpoint_runtime.is_completed(
-            subagent_task_id=task.id, stage_name="collect", input_fingerprint=collect_fingerprint,
-        ):
-            return self._store.get_subagent_task(task.id) or task
-
+        agent_name = "DirectionalExecutionPipeline"
         trace = self._ensure_trace(task, trace_id)
         sequence_no = self._next_observation_sequence(trace.id)
         started = replace(task, status="running", updated_at=utcnow())
         self._store.save_subagent_task(started)
-        if checkpoint_runtime is not None:
-            checkpoint_runtime.checkpoint(
-                subagent_task_id=task.id, stage_name="collect", input_fingerprint=collect_fingerprint, status="running",
-            )
         self._append_event(trace, sequence_no, "task_started", "subagent_task_started", started, {"agent_name": agent_name})
         sequence_no += 1
         self._append_event(
@@ -146,25 +118,36 @@ class SubagentTaskRouter:
         sequence_no += 1
 
         try:
-            result = await agent.execute(
-                SubagentExecutionContext(
-                    task=started,
-                    source_registry=self._source_registry,
-                    provider=provider,
-                    source_kind=source_kind,
-                    query=self._query_for_task(started),
-                    limit=limit,
-                    source_result=source_result,
-                )
+            result = await self._execute_direction_pipeline(
+                task=started, provider=provider, limit=limit, source_result=source_result,
             )
+        except OperationOutcomeUnknownError as exc:
+            pending = self._terminal_task(
+                started,
+                status="outcome_unknown",
+                result=SubagentExecutionResult(
+                    status="outcome_unknown",
+                    findings=[],
+                    evidence_records=[],
+                    missing_evidence=[{"reason": "collection_outcome_pending_confirmation", "operation": exc.operation}],
+                    failure_reason="collection_outcome_pending_confirmation",
+                    metadata={
+                        "recovery_action": "confirm_collection_outcome_before_retry",
+                        "operation": exc.operation,
+                    },
+                ),
+            )
+            self._append_event(
+                trace,
+                sequence_no,
+                "task_pending_confirmation",
+                "subagent_task_outcome_unknown",
+                pending,
+                {"error_message": str(exc), "recoverable": True, "recovery_action": "confirm_collection_outcome_before_retry"},
+            )
+            return pending
         except Exception as exc:
             failed = self._terminal_task(started, status="failed", result=None, error=str(exc))
-            if checkpoint_runtime is not None:
-                checkpoint_runtime.checkpoint(
-                    subagent_task_id=task.id, stage_name="collect", input_fingerprint=collect_fingerprint,
-                    status="failed_recoverable", failure={"code": "agent_execution_failed", "message": str(exc), "recoverable": True},
-                    retry_count=1,
-                )
             self._append_event(
                 trace,
                 sequence_no,
@@ -177,12 +160,6 @@ class SubagentTaskRouter:
 
         sequence_no = self._append_result_events(trace, sequence_no, started, result)
         terminal = self._terminal_task(started, status=result.status, result=result)
-        if checkpoint_runtime is not None and result.status in {"completed", "partial_completed"}:
-            refs = (result.evidence_bundle.id,) if result.evidence_bundle else ()
-            checkpoint_runtime.checkpoint(
-                subagent_task_id=task.id, stage_name="collect", input_fingerprint=collect_fingerprint,
-                status="completed", output_refs=refs,
-            )
         terminal_event = "subagent_task_completed" if result.status in {"completed", "partial_completed"} else "subagent_task_failed"
         self._append_event(
             trace,
@@ -199,6 +176,97 @@ class SubagentTaskRouter:
             },
         )
         return terminal
+
+    async def _execute_direction_pipeline(
+        self, *, task: SubagentTaskRecord, provider: str, limit: int, source_result: SourceOperationResult | None,
+    ) -> SubagentExecutionResult:
+        input_payload = dict(task.payload.get("input_payload") or {})
+        direction = dict(input_payload.get("direction") or {})
+        direction_id = str(direction.get("id") or task.direction_id or "")
+        if not direction_id:
+            raise ValueError("direction task requires direction id")
+        snapshot = self._store.get_run_policy_snapshot_for_workflow(task.workflow_run_id)
+        if snapshot is None:
+            raise ValueError("direction task requires run policy snapshot")
+        contracts = {item.direction_id: item for item in self._store.list_direction_contracts(snapshot.id)}
+        contract = contracts.get(direction_id)
+        if contract is None:
+            raise ValueError(f"direction contract not found: {direction_id}")
+        policy = self._store.get_sample_policy(contract.sample_policy_id)
+        if policy is None:
+            raise ValueError(f"sample policy not found: {contract.sample_policy_id}")
+        adapter = self._source_registry.get(provider)
+
+        async def discover(group: QueryGroup) -> SourceOperationResult:
+            if source_result is not None:
+                result = source_result
+            else:
+                result = await adapter.discover_candidates(DiscoverCandidatesRequest(
+                    workflow_run_id=task.workflow_run_id, query=group.query, limit=min(limit, group.candidate_limit), sort=group.sort, cursor=group.cursor,
+                    context={"subagent_task_id": task.id, "direction_id": direction_id, "query_group_id": group.id},
+                ))
+            return SourceOperationResult(
+                provider=result.provider,
+                operation=result.operation,
+                source_kind=result.source_kind,
+                status=result.status,
+                items=[{**item, "query_priority": group.priority} for item in result.items if isinstance(item, dict)],
+                failure_reason=result.failure_reason,
+                cookie_status=result.cookie_status,
+                next_cursor=result.next_cursor,
+                completeness=result.completeness,
+                field_availability=result.field_availability,
+                retryable=result.retryable,
+                metadata=result.metadata,
+            )
+
+        async def collect_detail(candidate: dict[str, Any]) -> SourceOperationResult:
+            return await adapter.collect_note_detail(CollectNoteDetailRequest(
+                workflow_run_id=task.workflow_run_id,
+                note_id=str(candidate.get("canonical_id") or ""), note_url=str(candidate.get("source_url") or ""),
+                required_fields=contract.required_note_fields,
+                context={"subagent_task_id": task.id, "direction_id": direction_id},
+            ))
+
+        async def collect_comments(candidate: dict[str, Any]) -> SourceOperationResult:
+            return await adapter.collect_comments(CollectCommentsRequest(
+                workflow_run_id=task.workflow_run_id,
+                parent_note_id=str(candidate.get("canonical_id") or ""),
+                note_url=str(candidate.get("source_url") or ""),
+                limit=int(candidate.get("_collection_limit") or policy.comment_limit),
+                cursor=candidate.get("_collection_cursor"),
+                top_level_only=bool(candidate.get("_collection_top_level_only", policy.comment_top_level_only)),
+                reply_depth_limit=int(candidate.get("_collection_reply_depth_limit", policy.comment_reply_depth_limit)),
+                context={"subagent_task_id": task.id, "direction_id": direction_id, "sample_policy_id": policy.id},
+            ))
+
+        run = await (
+            await DirectionalExecutionPipeline.open_async(
+                self._store._db_path, workflow_run_id=task.workflow_run_id
+            )
+        ).execute(
+            workflow_run_id=task.workflow_run_id, subagent_task_id=task.id, direction_id=direction_id,
+            subject=str(input_payload.get("confirmed_subject") or ""),
+            questions=[str(item) for item in direction.get("questions") or []],
+            competitors=[str(item) for item in input_payload.get("competitors") or []],
+            author_cap=policy.author_cap, minimum_samples=policy.minimum_samples,
+            minimum_independent_authors=policy.minimum_independent_authors, detail_fetch_cap=policy.detail_fetch_cap, snapshot_id=snapshot.id,
+            discover=discover, collect_detail=collect_detail,
+            collect_comments=collect_comments if contract.required_comment_fields else None,
+            required_comment_fields=contract.required_comment_fields,
+            comment_limit=policy.comment_limit,
+            comment_top_level_only=policy.comment_top_level_only,
+            comment_reply_depth_limit=policy.comment_reply_depth_limit,
+            comment_policy_id=policy.id,
+            run_as_of_at=snapshot.run_as_of_at,
+            admission_contract=contract, admission_policy=policy, policy_snapshot=snapshot,
+        )
+        return SubagentExecutionResult(
+            status="completed" if run.selection.status == "complete" else "partial_completed",
+            findings=[], evidence_records=[],
+            missing_evidence=[] if run.selection.status == "complete" else [{"reason": run.selection.status}],
+            metadata={"direction_id": direction_id, "packet_ids": list(run.packet_ids), "selection_status": run.selection.status},
+        )
 
     def _ensure_trace(self, task: SubagentTaskRecord, trace_id: str | None) -> TraceRecord:
         assert self._store is not None

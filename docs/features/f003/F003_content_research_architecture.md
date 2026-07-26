@@ -461,12 +461,14 @@ Content Research 不再以 local-first 作为长期约束。启动 Content Resea
 eligibility。任何“笔记数”必须同时声明 run、查询范围、as-of 时间和 eligibility
 口径。
 
-### ADR-019:预算在外部调用前原子预留
+### ADR-019:实际用量账本只记录、不拦截
 
-`BudgetGuard` 位于 `Collector` 之前，使用 idempotency key 原子 `reserve` 预算；
-调用结束后 `BudgetLedger` commit 或 release。并发方向和恢复任务继承既有
-reservation/consumption，禁止因重试放大外部抓取、反爬风险或成本。预算不足应
-产生受策略约束的降级结果，而不是丢失已完成成果。
+Day1 不设置调用前预算预占、硬成本阀门或 source API 次数上限。每个正式研究
+LLM 调用完成后，以 usage event id 幂等写入 provider 实际返回的 token/cost；
+provider 未返回 usage 时写入 `cost_unknown`，绝不估算为零。并发安全由账本的
+唯一 idempotency key 保证；避免重复调用则由阶段 checkpoint 和既有专家/查询/
+详情/评论限制负责。Trace 向用户显示调用数、token、已知成本和未知成本状态，
+用户可暂停或终止运行。
 
 ### ADR-020:阶段级 Checkpoint 是唯一恢复事实源
 
@@ -616,7 +618,7 @@ flowchart TD
     Query["Locked Query Plan<br/>QueryGroup、query plan hash"]
     Pool["方向候选池<br/>canonical note identity 去重"]
     SourceRegistry["全局 SourceRegistry<br/>方向内共享 canonical source identity<br/>方向投影独立计数，禁止证据重复计数"]
-    Guard["BudgetGuard<br/>采集前校验方向 / 阶段配额<br/>超限降级，不中断"]
+    Ledger["LLM Cost Ledger<br/>调用完成后记录实际用量<br/>不拦截、不预占"]
     Adapter["Source Adapter<br/>搜索卡 → 详情字段 → 评论字段"]
     Packet["Directional Evidence Packets<br/>字段投影、availability、retrieval context<br/>新增：as-of 时间戳"]
     Facts["Fact Extractor<br/>仅抽取字段支持的 facts"]
@@ -624,7 +626,7 @@ flowchart TD
     Admission["ClaimAdmissionEvaluator<br/>确定性规则优先 + 有界 LLM 兜底<br/>所有兜底判定同样落 Evidence Layer"]
     Weak["弱信号池<br/>降级 claim 的明确去向"]
     Result["DirectionResultDecision<br/>方向状态、已准入 Claim、限制、弱信号、补采动作"]
-    Specialist --> Query --> Pool --> SourceRegistry --> Guard --> Adapter --> Packet --> Facts --> Candidate --> Admission --> Result
+    Specialist --> Query --> Pool --> SourceRegistry --> Adapter --> Packet --> Facts --> Candidate --> Admission --> Result
     Admission -->|"降级"| Weak --> Result
   end
   Task --> Specialist
@@ -1975,7 +1977,7 @@ GET  /content-research/workflows/{workflow_run_id}
 GET  /content-research/workflows/{workflow_run_id}/events
 GET  /content-research/workflows/{workflow_run_id}/trace
 
-GET  /content-research/workflows/{workflow_run_id}/results
+GET  /content-research/workflows/{workflow_run_id}/report
 GET  /content-research/evidence-bundles/{bundle_id}
 
 POST /content-research/workflows/{workflow_run_id}/brand-decisions
@@ -1984,6 +1986,9 @@ POST /content-research/workflows/{workflow_run_id}/content-decisions
 POST /content-research/workflows/{workflow_run_id}/manual-links
 POST /content-research/workflows/{workflow_run_id}/browser-observations
 ```
+
+`/content-research/workflows/{workflow_run_id}/results` 已由 R4 删除；该旧路径必须返回
+`404`，不能作为 Creator 或任何正式读取链的回退。
 
 ### 14.2 Trace API
 

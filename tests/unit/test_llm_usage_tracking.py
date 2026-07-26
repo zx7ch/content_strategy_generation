@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import sqlite3
+
 import aiosqlite
 import pytest
 
 from app.services.llm import (
     LLMCallContext,
     LLMUsageEventInput,
+    LLMUsageSummary,
     LLMUsageTracker,
     ModelPricing,
     PricingCalculator,
@@ -47,6 +50,17 @@ def test_pricing_calculator_unknown_model_returns_zero_cost() -> None:
     )
 
     assert cost == UsageCost()
+
+
+@pytest.mark.asyncio
+async def test_read_only_usage_tracker_returns_empty_when_table_is_not_bootstrapped(tmp_path) -> None:
+    db_path = str(tmp_path / "empty-usage.db")
+    sqlite3.connect(db_path).close()
+
+    async with LLMUsageTracker(db_path, read_only=True) as tracker:
+        assert await tracker.summarize_job("run-empty") == LLMUsageSummary()
+        assert await tracker.summarize_job_steps("run-empty") == []
+        assert await tracker.list_job_events("run-empty") == []
 
 
 @pytest.mark.asyncio

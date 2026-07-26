@@ -4,20 +4,31 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import asdict, replace
 from typing import Any, Protocol
 
+import aiosqlite
+
+from app.content_research.admission.cross_direction import (
+    ActionHypothesisRequest,
+    CrossDirectionGovernanceService,
+)
 from app.content_research.advancement import DecisionAdvancementService
-from app.content_research.analysis import DirectionalAnalysisLLM, DirectionalAnalysisService
+from app.content_research.analysis import DirectionalAnalysisLLM
 from app.content_research.api_schemas import (
     CONTENT_RESEARCH_API_SCHEMA_VERSION,
     P0_WORKFLOW_ACTIONS,
     ContentResearchBriefConfirmRequest,
     ContentResearchBriefResponse,
+    ContentResearchDirectionEvidenceResponse,
     ContentResearchDirectionResponse,
     ContentResearchFormalResearchResponse,
+    ContentResearchGovernanceResponse,
+    ContentResearchLiteReportResponse,
     ContentResearchPlanResponse,
     ContentResearchPresearchResponse,
+    ContentResearchPublishedReportResponse,
     ContentResearchSourceCollectionRequest,
     ContentResearchSourceCollectionResponse,
     ContentResearchSubagentTaskResponse,
@@ -30,14 +41,19 @@ from app.content_research.api_schemas import (
     HumanDecisionRequest,
     HumanDecisionResponse,
     HumanDecisionsResponse,
-    ResultItem,
     SnapshotResponse,
 )
+from app.content_research.async_dispatch import AsyncFormalResearchDispatchRepository
 from app.content_research.contracts import build_default_snapshot
 from app.content_research.decision_policy import DecisionPolicyService
 from app.content_research.decisions import ResearchDecisionService
 from app.content_research.evidence import EvidenceBundleService, EvidenceService
-from app.content_research.evidence.models import EvidenceBundleRecord, EvidenceRecord
+from app.content_research.evidence.governance_reader import (
+    GovernanceReadModelReader,
+    safe_public_projection,
+)
+from app.content_research.evidence.models import EvidenceRecord
+from app.content_research.evidence.packet_reader import PacketEvidenceReader
 from app.content_research.models import (
     ObservationEventRecord,
     ResearchBriefRecord,
@@ -49,17 +65,41 @@ from app.content_research.models import (
     utcnow,
 )
 from app.content_research.observation import ContentResearchTraceService
+from app.content_research.persistence_models import (
+    ClaimAdmissionDecisionRecord,
+    ClaimCandidateRecord,
+    DirectionalEvidencePacketRecord,
+    DirectionResultDecisionRecord,
+    StageCheckpointRecord,
+    WeakSignalRecord,
+)
 from app.content_research.presearch.service import (
     PresearchInput,
     PresearchOutcome,
     PresearchService,
 )
+from app.content_research.reporting.execution import ReportExecutionService
+from app.content_research.reporting.faithfulness import (
+    LLMReportSemanticAuditor,
+    ReportSemanticAuditor,
+    UnavailableReportSemanticAuditor,
+)
+from app.content_research.reporting.lite_read_model import LiteReportReader
+from app.content_research.reporting.publication_materializer import ReportPublicationMaterializer
+from app.content_research.reporting.read_model import (
+    PublishedReportNotFoundError,
+    PublishedReportReader,
+)
+from app.content_research.runtime import canonical_fingerprint
 from app.content_research.sources import (
     SourceAdapterRegistry,
-    SourceCollectionRequest,
+)
+from app.content_research.sources.base import (
+    CollectCommentsRequest,
+    CollectNoteDetailRequest,
+    DiscoverCandidatesRequest,
 )
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
-from app.content_research.synthesis import synthesize_snapshot
 from app.content_research.workflow import (
     BriefConfirmation,
     ResearchDirectionRegistry,
@@ -89,7 +129,13 @@ class WorkflowRuntime(Protocol):
 
     async def mark_presearch_ready(self, workflow_run_id: str) -> None: ...
 
-    async def complete_brief_and_plan(self, *, workflow_run_id: str, task_specs: list[dict]) -> list[str]: ...
+    async def complete_brief_and_plan_atomically(
+        self,
+        *,
+        workflow_run_id: str,
+        task_specs: list[dict],
+        confirmation_writer: Callable[[aiosqlite.Connection, list[str]], Awaitable[None]],
+    ) -> list[str]: ...
 
     async def get_runtime_snapshot(self, workflow_run_id: str) -> dict: ...
 
@@ -112,7 +158,9 @@ class WorkflowRuntime(Protocol):
 
     async def acknowledge_pause_at_safe_boundary(self, *, workflow_run_id: str) -> dict: ...
 
-    async def complete_formal_research(self, *, workflow_run_id: str, task_outcomes: list[dict], artifact_refs: list[dict]) -> bool: ...
+    async def complete_formal_research(
+        self, *, workflow_run_id: str, task_outcomes: list[dict], artifact_refs: list[dict]
+    ) -> bool: ...
 
 
 class WorkflowRunManagerRuntime:
@@ -130,7 +178,11 @@ class WorkflowRunManagerRuntime:
                 run.run_id,
                 [
                     {"step_name": "presearch", "phase": WorkflowPhase.INTAKE, "max_attempts": 1},
-                    {"step_name": "brief_confirm", "phase": WorkflowPhase.INTAKE, "max_attempts": 1},
+                    {
+                        "step_name": "brief_confirm",
+                        "phase": WorkflowPhase.INTAKE,
+                        "max_attempts": 1,
+                    },
                     {"step_name": "plan_build", "phase": WorkflowPhase.INTAKE, "max_attempts": 1},
                     {
                         "step_name": "formal_research",
@@ -151,42 +203,19 @@ class WorkflowRunManagerRuntime:
             )
             await manager.advance_to_next_step(workflow_run_id)
 
-    async def complete_brief_and_plan(self, *, workflow_run_id: str, task_specs: list[dict]) -> list[str]:
+    async def complete_brief_and_plan_atomically(
+        self,
+        *,
+        workflow_run_id: str,
+        task_specs: list[dict],
+        confirmation_writer: Callable[[aiosqlite.Connection, list[str]], Awaitable[None]],
+    ) -> list[str]:
         async with WorkflowRunManager(self._db_path) as manager:
-            await manager.start_step(workflow_run_id, "brief_confirm")
-            await manager.complete_step(
-                workflow_run_id,
-                "brief_confirm",
-                artifact_refs=[{"type": "content_research_brief_confirmed"}],
+            return await manager.complete_brief_and_plan_atomically(
+                workflow_run_id=workflow_run_id,
+                task_specs=task_specs,
+                confirmation_writer=confirmation_writer,
             )
-            await manager.advance_to_next_step(workflow_run_id)
-
-            await manager.start_step(workflow_run_id, "plan_build")
-            await manager.complete_step(
-                workflow_run_id,
-                "plan_build",
-                artifact_refs=[
-                    {"type": "content_research_plan"},
-                    {"type": "content_research_subagent_task_specs", "count": len(task_specs)},
-                ],
-            )
-            await manager.advance_to_next_step(workflow_run_id)
-
-            formal_research_step = await manager.start_step(workflow_run_id, "formal_research")
-            child_tasks = await manager.create_child_tasks(
-                run_id=workflow_run_id,
-                step_id=formal_research_step.step_id,
-                tasks=[
-                    {
-                        "task_type": str(spec.get("task_type") or "content_research_source_collect"),
-                        "slot_index": index,
-                        "checkpoint": spec,
-                        "max_attempts": 1,
-                    }
-                    for index, spec in enumerate(task_specs)
-                ],
-            )
-            return [task.child_task_id for task in child_tasks]
 
     async def get_runtime_snapshot(self, workflow_run_id: str) -> dict:
         async with WorkflowStore(self._db_path) as store:
@@ -199,8 +228,15 @@ class WorkflowRunManagerRuntime:
             "child_tasks": [task.model_dump(mode="json") for task in child_tasks],
         }
 
-    async def complete_formal_research(self, *, workflow_run_id: str, task_outcomes: list[dict], artifact_refs: list[dict]) -> bool:
+    async def complete_formal_research(
+        self, *, workflow_run_id: str, task_outcomes: list[dict], artifact_refs: list[dict]
+    ) -> bool:
         snapshot = await self.get_runtime_snapshot(workflow_run_id)
+        # A successful formal run is immutable.  Retrying its public action is
+        # a safe replay request, not permission to complete the runtime a
+        # second time (which the workflow manager correctly rejects).
+        if str((snapshot.get("run") or {}).get("status") or "") == "succeeded":
+            return True
         child_by_id = {str(task["child_task_id"]): task for task in snapshot["child_tasks"]}
         expected_child_ids = set(child_by_id)
         outcome_child_ids = {str(outcome["child_task_id"]) for outcome in task_outcomes}
@@ -218,19 +254,27 @@ class WorkflowRunManagerRuntime:
                 if child_status == "succeeded" and succeeded:
                     continue
                 if child_status == "failed" and succeeded:
-                    await manager.retry_child_task(child_id, "retrying failed content research subagent")
+                    await manager.retry_child_task(
+                        child_id, "retrying failed content research subagent"
+                    )
                     child_status = "retrying"
                 if child_status in {"pending", "retrying"}:
                     await manager.start_child_task(child_id)
                 if succeeded:
-                    await manager.complete_child_task(child_id, artifact_refs=outcome.get("artifact_refs") or [])
+                    await manager.complete_child_task(
+                        child_id, artifact_refs=outcome.get("artifact_refs") or []
+                    )
                 elif child_status != "failed":
-                    await manager.fail_child_task(child_id, outcome.get("error") or "subagent execution failed")
+                    await manager.fail_child_task(
+                        child_id, outcome.get("error") or "subagent execution failed"
+                    )
             if any(outcome["status"] == "failed" for outcome in task_outcomes):
                 # A failed specialist is visible and retryable, but it cannot
                 # silently advance the parent step or expose decision UI.
                 return False
-            await manager.complete_step(workflow_run_id, "formal_research", artifact_refs=artifact_refs)
+            await manager.complete_step(
+                workflow_run_id, "formal_research", artifact_refs=artifact_refs
+            )
             await manager.complete_run(workflow_run_id)
         return True
 
@@ -262,7 +306,9 @@ class WorkflowRunManagerRuntime:
         status_value = run.status.value if run is not None else ""
         if status_value in {"running", "pausing", "paused"}:
             async with WorkflowRunManager(self._db_path) as manager:
-                cancelled = await manager.cancel_run(workflow_run_id, reason="content_research_ended")
+                cancelled = await manager.cancel_run(
+                    workflow_run_id, reason="content_research_ended"
+                )
                 cancel_status = cancelled.status.value
         elif run is not None:
             cancel_status = status_value
@@ -284,15 +330,16 @@ class WorkflowRunManagerRuntime:
         async with WorkflowStore(self._db_path) as workflow_store:
             await workflow_store.delete_run(workflow_run_id)
         SQLiteContentResearchStore(self._db_path).delete_workflow(workflow_run_id)
-        async with ThreadStore(self._db_path) as thread_store:
-            await thread_store.delete_thread(thread_id)
         return {
             "schema_version": CONTENT_RESEARCH_API_SCHEMA_VERSION,
             "ended": True,
             "workflow_run_id": workflow_run_id,
             "thread_id": thread_id,
             "active_run_cleared": True,
-            "resources_destroyed": True,
+            # Ending a research run must never delete the Creator conversation:
+            # users can revise the checklist and launch a subsequent run in the
+            # same chronological chat history.
+            "resources_destroyed": False,
             "cancel_status": cancel_status,
         }
 
@@ -321,6 +368,8 @@ class ContentResearchService:
         workflow_runtime: WorkflowRuntime,
         source_registry: SourceAdapterRegistry | None = None,
         analysis_llm: DirectionalAnalysisLLM | None = None,
+        report_semantic_auditor: ReportSemanticAuditor | None = None,
+        dispatch_wake_event: asyncio.Event | None = None,
     ) -> None:
         self._store = store
         self._presearch = presearch
@@ -331,11 +380,23 @@ class ContentResearchService:
         self._source_registry = source_registry or SourceAdapterRegistry()
         self._bundle_service = EvidenceBundleService(store)
         self._evidence_service = EvidenceService(store)
-        analysis_service = DirectionalAnalysisService(llm=analysis_llm, db_path=store._db_path) if analysis_llm is not None else None
-        self._task_router = SubagentTaskRouter(store=store, source_registry=self._source_registry, evidence_service=self._evidence_service, bundle_service=self._bundle_service, analysis_service=analysis_service)
-        self._decision_service = ResearchDecisionService(store=store, workflow_runtime=workflow_runtime)
+        self._task_router = SubagentTaskRouter(store=store, source_registry=self._source_registry)
+        self._decision_service = ResearchDecisionService(
+            store=store, workflow_runtime=workflow_runtime
+        )
         self._decision_advancement_service = DecisionAdvancementService(store=store)
         self._decision_policy_service = DecisionPolicyService(store)
+        self._cross_direction_governance = CrossDirectionGovernanceService(store)
+        self._report_execution = ReportExecutionService(store)
+        self._dispatch = AsyncFormalResearchDispatchRepository(store._db_path)
+        self._dispatch_wake_event = dispatch_wake_event
+        # A configured analysis LLM also supplies the bounded report reviewer.
+        # Without one, publication remains safely non-complete.
+        self._report_semantic_auditor = report_semantic_auditor or (
+            LLMReportSemanticAuditor(analysis_llm)
+            if analysis_llm is not None
+            else UnavailableReportSemanticAuditor()
+        )
 
     async def submit_presearch(
         self,
@@ -402,7 +463,11 @@ class ContentResearchService:
         )
         await self._workflow_runtime.mark_presearch_ready(workflow_run_id)
 
-        if llm_task is not None and not llm_task.done() and outcome.timeout_status == "first_timeout":
+        if (
+            llm_task is not None
+            and not llm_task.done()
+            and outcome.timeout_status == "first_timeout"
+        ):
             asyncio.create_task(
                 self._finalize_hard_cutoff(
                     request=request,
@@ -432,13 +497,16 @@ class ContentResearchService:
             raise ContentResearchNotFoundError(f"Research brief not found: {brief_id}")
         if brief.status == "final_timeout":
             raise ContentResearchValidationError("Cannot confirm a final-timeout brief")
-        directions = self._direction_registry.require_many(confirmation_request.selected_directions)
+        selected_direction_ids = self._direction_registry.canonicalize_many(
+            confirmation_request.selected_directions
+        )
+        directions = self._direction_registry.require_many(selected_direction_ids)
         confirmation = BriefConfirmation(
             confirmed_subject=confirmation_request.confirmed_subject.strip(),
             subject_type=confirmation_request.subject_type.strip() or "unknown",
             selected_competitors=_dedupe(confirmation_request.selected_competitors),
             custom_competitors=_dedupe(confirmation_request.custom_competitors),
-            selected_directions=confirmation_request.selected_directions,
+            selected_directions=selected_direction_ids,
             custom_research_question=confirmation_request.custom_research_question.strip(),
         )
         plan_id = _new_id("rp")
@@ -474,7 +542,6 @@ class ContentResearchService:
             },
             updated_at=utcnow(),
         )
-        self._store.save_brief(updated_brief)
         plan = ResearchPlanRecord(
             id=plan_id,
             brief_id=brief.id,
@@ -484,20 +551,18 @@ class ContentResearchService:
             status="draft",
             payload=plan_payload,
         )
-        self._store.save_plan(plan)
         snapshot, sample_policies, direction_contracts = build_default_snapshot(
-            snapshot_id=_new_id("rps"), workflow_run_id=brief.workflow_run_id,
-            brief_id=brief.id, plan_id=plan.id,
+            snapshot_id=_new_id("rps"),
+            workflow_run_id=brief.workflow_run_id,
+            brief_id=brief.id,
+            plan_id=plan.id,
+            direction_ids=selected_direction_ids,
+            provider_capabilities=_freeze_adapter_capabilities(self._source_registry),
         )
-        self._store.save_run_policy_snapshot(snapshot)
-        for sample_policy in sample_policies:
-            self._store.save_sample_policy(sample_policy)
-        for direction_contract in direction_contracts:
-            self._store.save_direction_contract(direction_contract)
-
+        saved_directions: list[ResearchDirectionRecord] = []
         saved_tasks: list[SubagentTaskRecord] = []
         for index, direction in enumerate(directions):
-            self._store.save_direction(
+            saved_directions.append(
                 ResearchDirectionRecord(
                     id=_new_id("rd"),
                     plan_id=plan.id,
@@ -519,39 +584,49 @@ class ContentResearchService:
                 )
             )
             saved_tasks.append(
-                self._store.save_subagent_task(
-                    SubagentTaskRecord(
-                        id=_new_id("sat"),
-                        workflow_run_id=brief.workflow_run_id,
-                        thread_id=brief.thread_id,
-                        schema_version="content_research_subagent_task_v1",
-                        status="queued",
-                        plan_id=plan.id,
-                        direction_id=direction.id,
-                        payload={**task_specs[index], "sequence_no": index + 1},
-                    )
+                SubagentTaskRecord(
+                    id=_new_id("sat"),
+                    workflow_run_id=brief.workflow_run_id,
+                    thread_id=brief.thread_id,
+                    schema_version="content_research_subagent_task_v1",
+                    status="queued",
+                    plan_id=plan.id,
+                    direction_id=direction.id,
+                    payload={**task_specs[index], "sequence_no": index + 1},
                 )
             )
 
-        workflow_child_task_ids = await self._workflow_runtime.complete_brief_and_plan(
+        async def persist_confirmation(
+            conn: aiosqlite.Connection, workflow_child_task_ids: list[str]
+        ) -> None:
+            await self._dispatch.persist_confirmation(
+                conn,
+                brief=updated_brief,
+                plan=plan,
+                snapshot=snapshot,
+                sample_policies=sample_policies,
+                direction_contracts=direction_contracts,
+                directions=saved_directions,
+                tasks=saved_tasks,
+                workflow_child_task_ids=workflow_child_task_ids,
+            )
+
+        await self._workflow_runtime.complete_brief_and_plan_atomically(
             workflow_run_id=brief.workflow_run_id,
             task_specs=[task.payload for task in saved_tasks],
+            confirmation_writer=persist_confirmation,
         )
-        for task, workflow_child_task_id in zip(saved_tasks, workflow_child_task_ids, strict=False):
-            self._store.save_subagent_task(
-                replace(
-                    task,
-                    payload={**task.payload, "workflow_child_task_id": workflow_child_task_id},
-                    updated_at=utcnow(),
-                )
-            )
+        if self._dispatch_wake_event is not None:
+            self._dispatch_wake_event.set()
 
         return await self.get_workflow_summary(brief.workflow_run_id)
 
     def get_policy_snapshot(self, workflow_run_id: str) -> dict[str, Any]:
         snapshot = self._store.get_run_policy_snapshot_for_workflow(workflow_run_id)
         if snapshot is None:
-            raise ContentResearchNotFoundError(f"Policy snapshot not found for workflow: {workflow_run_id}")
+            raise ContentResearchNotFoundError(
+                f"Policy snapshot not found for workflow: {workflow_run_id}"
+            )
         contracts = self._store.list_direction_contracts(snapshot.id)
         policies = [self._store.get_sample_policy(item.sample_policy_id) for item in contracts]
         return {
@@ -560,15 +635,20 @@ class ContentResearchService:
             "workflow_run_id": snapshot.workflow_run_id,
             "effective_policy": snapshot.effective_policy,
             "effective_policy_hash": snapshot.effective_policy_hash,
+            "validation_result": snapshot.validation_result,
             "run_as_of_at": snapshot.run_as_of_at.isoformat(),
             "sample_policies": [asdict(item) for item in policies if item is not None],
             "direction_contracts": [asdict(item) for item in contracts],
         }
 
-    async def get_workflow_summary(self, workflow_run_id: str) -> ContentResearchWorkflowSummaryResponse:
+    async def get_workflow_summary(
+        self, workflow_run_id: str
+    ) -> ContentResearchWorkflowSummaryResponse:
         brief = self._store.get_brief_by_workflow(workflow_run_id)
         if brief is None:
-            raise ContentResearchNotFoundError(f"Content research workflow not found: {workflow_run_id}")
+            raise ContentResearchNotFoundError(
+                f"Content research workflow not found: {workflow_run_id}"
+            )
         plans = self._store.list_plans_for_brief(brief.id)
         plan = plans[-1] if plans else None
         directions = self._store.list_directions_for_plan(plan.id) if plan else []
@@ -597,7 +677,9 @@ class ContentResearchService:
             directions=[
                 ContentResearchDirectionResponse(
                     id=item.id,
-                    name=str(item.payload.get("name") or item.payload.get("direction_id") or item.id),
+                    name=str(
+                        item.payload.get("name") or item.payload.get("direction_id") or item.id
+                    ),
                     direction_type=str(item.payload.get("direction_type") or ""),
                     priority=item.priority,
                     status=item.status,
@@ -621,10 +703,14 @@ class ContentResearchService:
             local_cache_id=brief.id,
         )
 
-    async def list_workflow_events(self, workflow_run_id: str) -> ContentResearchWorkflowEventsResponse:
+    async def list_workflow_events(
+        self, workflow_run_id: str
+    ) -> ContentResearchWorkflowEventsResponse:
         brief = self._store.get_brief_by_workflow(workflow_run_id)
         if brief is None:
-            raise ContentResearchNotFoundError(f"Content research workflow not found: {workflow_run_id}")
+            raise ContentResearchNotFoundError(
+                f"Content research workflow not found: {workflow_run_id}"
+            )
         return ContentResearchWorkflowEventsResponse(
             workflow_run_id=workflow_run_id,
             events=await self._workflow_runtime.list_events(workflow_run_id),
@@ -633,7 +719,9 @@ class ContentResearchService:
     async def get_workflow_trace(self, workflow_run_id: str) -> ContentResearchTraceResponse:
         brief = self._store.get_brief_by_workflow(workflow_run_id)
         if brief is None:
-            raise ContentResearchNotFoundError(f"Content research workflow not found: {workflow_run_id}")
+            raise ContentResearchNotFoundError(
+                f"Content research workflow not found: {workflow_run_id}"
+            )
         return await self._trace_service.build_trace(workflow_run_id=workflow_run_id, brief=brief)
 
     async def submit_brand_decision(
@@ -667,7 +755,9 @@ class ContentResearchService:
     def list_human_decisions(self, workflow_run_id: str) -> HumanDecisionsResponse:
         brief = self._store.get_brief_by_workflow(workflow_run_id)
         if brief is None:
-            raise ContentResearchNotFoundError(f"Content research workflow not found: {workflow_run_id}")
+            raise ContentResearchNotFoundError(
+                f"Content research workflow not found: {workflow_run_id}"
+            )
         return self._decision_service.list_decisions(workflow_run_id)
 
     async def _submit_human_decision(
@@ -680,7 +770,9 @@ class ContentResearchService:
     ) -> HumanDecisionResponse:
         brief = self._store.get_brief_by_workflow(workflow_run_id)
         if brief is None:
-            raise ContentResearchNotFoundError(f"Content research workflow not found: {workflow_run_id}")
+            raise ContentResearchNotFoundError(
+                f"Content research workflow not found: {workflow_run_id}"
+            )
         response = await self._decision_service.submit_decision(
             brief=brief,
             target_type=target_type,
@@ -688,8 +780,12 @@ class ContentResearchService:
             user_id=user_id,
         )
         if response.idempotent_replay:
-            advancement = self._decision_advancement_service.describe(brief=brief, decision=response)
-            return response.model_copy(update={"advancement": {**response.advancement, **advancement}})
+            advancement = self._decision_advancement_service.describe(
+                brief=brief, decision=response
+            )
+            return response.model_copy(
+                update={"advancement": {**response.advancement, **advancement}}
+            )
         advancement = self._decision_advancement_service.advance(brief=brief, decision=response)
         await self._workflow_runtime.append_event(
             workflow_run_id=workflow_run_id,
@@ -711,7 +807,11 @@ class ContentResearchService:
         limit: int = 20,
     ) -> ContentResearchSubagentTaskResponse:
         task = next(
-            (item for item in self._store.list_subagent_tasks_for_workflow(workflow_run_id) if item.id == task_id),
+            (
+                item
+                for item in self._store.list_subagent_tasks_for_workflow(workflow_run_id)
+                if item.id == task_id
+            ),
             None,
         )
         if task is None:
@@ -731,74 +831,500 @@ class ContentResearchService:
     ) -> SnapshotResponse:
         brief = self._store.get_brief_by_workflow(workflow_run_id)
         if brief is None:
-            raise ContentResearchNotFoundError(f"Content research workflow not found: {workflow_run_id}")
+            raise ContentResearchNotFoundError(
+                f"Content research workflow not found: {workflow_run_id}"
+            )
         plans = self._store.list_plans_for_brief(brief.id)
         plan = plans[-1] if plans else None
         existing = self._store.list_result_snapshots_for_workflow(workflow_run_id)
         snapshot_version = str(len(existing) + 1)
-        bundles = [
-            self._decision_policy_service.apply_to_bundle(bundle)
-            for bundle in self._store.list_evidence_bundles_for_workflow(workflow_run_id)
-        ]
-        result_items = [_result_item_from_bundle(bundle) for bundle in bundles]
-        result_items.sort(key=_priority_sort_key)
-        result_items = [_with_ranked_decision_card(item, rank) for rank, item in enumerate(result_items, start=1)]
-
-        synthesis = synthesize_snapshot(result_items)
-        limitations = synthesis["limitations"]
-        abstentions = _snapshot_abstentions(result_items, bundles)
-        supported_count = sum(1 for item in result_items if item.evidence_state in {"verified", "partially_supported"})
-        unsupported_count = len(result_items) - supported_count
+        direction_records = self._store.list_directions_for_plan(plan.id) if plan else []
+        governed = self._build_governed_snapshot(
+            workflow_run_id=workflow_run_id,
+            plan_id=plan.id if plan else None,
+            direction_records=direction_records,
+        )
+        governed_input_fingerprint = _governed_input_fingerprint(governed)
         snapshot = ResearchResultSnapshotRecord(
             id=_new_id("rrs"),
             workflow_run_id=workflow_run_id,
             research_brief_id=brief.id,
             research_plan_id=plan.id if plan else None,
-            schema_version="content_research_result_snapshot_v1",
+            schema_version="content_research_governed_snapshot_v2",
             snapshot_version=snapshot_version,
             result_type=result_type,
-            status="ready" if result_items and unsupported_count == 0 else ("partial" if result_items else "partial"),
+            status=governed["publication_state"],
             title=_snapshot_title(brief, result_type),
-            executive_summary=synthesis["executive_summary"],
-            findings=[item.model_dump(mode="json") for item in result_items],
-            recommendations=synthesis["recommendations"],
-            evidence_bundle_ids=[bundle.id for bundle in bundles],
-            claim_count=len(result_items),
-            supported_claim_count=supported_count,
-            unsupported_claim_count=unsupported_count,
-            citation_coverage_score=_average_metric(bundles, "citation_coverage", "citation_coverage_score"),
-            faithfulness_score=_average_metric(bundles, "faithfulness_metrics", "faithfulness_score"),
-            answer_relevancy_score=_average_metric(bundles, "retrieval_metrics", "query_relevance_score"),
-            derivation_completeness_score=_derivation_score(result_items),
-            evidence_boundary_calibration_score=_evidence_boundary_calibration_score(result_items),
-            decision_summary=_decision_summary(result_items),
-            decision_cards=[item.decision_card for item in result_items],
-            priority_summary=_priority_summary(result_items),
-            evidence_boundary_summary=_evidence_boundary_summary(result_items),
-            limitations=limitations,
-            abstentions=abstentions,
+            executive_summary=governed["executive_summary"],
+            findings=list(governed["claim_cards"]),
+            limitations=list(governed["limitations_recovery"]),
             metadata={
-                "schema_version": "content_research_result_snapshot_metadata_v1",
-                "bundle_count": len(bundles),
-                "created_from": "evidence_bundles",
-                "synthesis_version": "content_research_main_synthesis_v1",
+                "schema_version": "content_research_governed_snapshot_metadata_v2",
+                "governed_snapshot": governed,
+                "governed_input_fingerprint": governed_input_fingerprint,
             },
         )
         saved = self._store.save_result_snapshot(snapshot)
         return self._snapshot_response(saved)
 
-    def get_workflow_results(self, workflow_run_id: str) -> SnapshotResponse:
+    async def get_published_report(
+        self,
+        *,
+        workflow_run_id: str,
+        research_plan_id: str | None = None,
+        publication_id: str | None = None,
+        citation_offset: int = 0,
+        citation_limit: int = 50,
+    ) -> ContentResearchPublishedReportResponse:
+        try:
+            payload = await PublishedReportReader(self._store, self._store._db_path).read(
+                workflow_run_id=workflow_run_id,
+                research_plan_id=research_plan_id,
+                publication_id=publication_id,
+                citation_offset=citation_offset,
+                citation_limit=citation_limit,
+            )
+        except PublishedReportNotFoundError as exc:
+            raise ContentResearchNotFoundError(str(exc)) from exc
+        return ContentResearchPublishedReportResponse(**payload)
+
+    async def get_lite_report(
+        self,
+        *,
+        workflow_run_id: str,
+        research_plan_id: str | None = None,
+        publication_id: str | None = None,
+    ) -> ContentResearchLiteReportResponse:
+        try:
+            payload = await LiteReportReader(self._store, self._store._db_path).read(
+                workflow_run_id=workflow_run_id,
+                research_plan_id=research_plan_id,
+                publication_id=publication_id,
+            )
+        except PublishedReportNotFoundError as exc:
+            raise ContentResearchNotFoundError(str(exc)) from exc
+        return ContentResearchLiteReportResponse(**payload)
+
+    def _build_governed_snapshot(
+        self,
+        *,
+        workflow_run_id: str,
+        plan_id: str | None,
+        direction_records: list[ResearchDirectionRecord],
+    ) -> dict[str, Any]:
+        policy = self._store.get_run_policy_snapshot_for_workflow(workflow_run_id)
+        if policy is None:
+            raise ContentResearchValidationError(
+                "Governed snapshot requires a frozen policy snapshot"
+            )
+        direction_ids = {
+            str(item.payload.get("direction_id") or item.payload.get("direction_type") or item.id)
+            for item in direction_records
+        }
+        direction_results = [
+            item
+            for item in self._store.list_typed_records(DirectionResultDecisionRecord)
+            if item.policy_snapshot_id == policy.id and item.research_direction_id in direction_ids
+        ]
+        candidates_by_id = {
+            item.id: item
+            for direction_id in direction_ids
+            for item in self._store.list_claim_candidates(workflow_run_id, direction_id)
+        }
+        decisions = [
+            item
+            for item in self._store.list_typed_records(ClaimAdmissionDecisionRecord)
+            if item.claim_candidate_id in candidates_by_id
+        ]
+        admitted = sorted(
+            (item for item in decisions if item.decision == "admitted"),
+            key=lambda item: item.claim_candidate_id,
+        )
+        decision_ids = {item.id for item in decisions}
+        weak_signals = sorted(
+            (
+                item
+                for item in self._store.list_typed_records(WeakSignalRecord)
+                if item.admission_decision_id in decision_ids
+            ),
+            key=lambda item: item.id,
+        )
+        governance_read = (
+            GovernanceReadModelReader(self._store).read_all(
+                workflow_run_id=workflow_run_id,
+                research_plan_id=plan_id,
+            )
+            if plan_id is not None
+            else None
+        )
+        claim_cards = [
+            _governed_claim_card(
+                candidate=candidates_by_id[item.claim_candidate_id],
+                decision=item,
+                packet=self._store.get_typed_record(
+                    DirectionalEvidencePacketRecord,
+                    candidates_by_id[item.claim_candidate_id].evidence_packet_id,
+                ),
+            )
+            for item in admitted
+        ]
+        citation_groups = _citation_groups(claim_cards)
+        report_section_refs = _report_section_refs(
+            claim_cards=claim_cards,
+            weak_signals=weak_signals,
+            governance_read=governance_read,
+        )
+        result_by_direction = {item.research_direction_id: item for item in direction_results}
+        direction_views = [
+            {
+                "direction_id": direction_id,
+                "state": (
+                    result_by_direction.get(direction_id).payload.get("state")
+                    if direction_id in result_by_direction
+                    else "not_started"
+                ),
+                "direction_result_id": (
+                    result_by_direction[direction_id].id
+                    if direction_id in result_by_direction
+                    else None
+                ),
+                "admitted_claim_ids": list(
+                    (
+                        result_by_direction.get(direction_id).payload.get("admitted_claim_ids")
+                        if direction_id in result_by_direction
+                        else []
+                    )
+                    or []
+                ),
+                "limitations": list(
+                    (
+                        result_by_direction.get(direction_id).payload.get("limitations")
+                        if direction_id in result_by_direction
+                        else []
+                    )
+                    or []
+                ),
+                "recovery_actions": list(
+                    (
+                        result_by_direction.get(direction_id).payload.get("recovery_actions")
+                        if direction_id in result_by_direction
+                        else []
+                    )
+                    or []
+                ),
+            }
+            for direction_id in sorted(direction_ids)
+        ]
+        tasks = self._store.list_subagent_tasks_for_workflow(workflow_run_id)
+        workflow_execution_state = (
+            "completed"
+            if tasks
+            and all(item.status in {"completed", "partial_completed", "failed"} for item in tasks)
+            else "pending"
+        )
+        publication_state = "partial_verified_report" if claim_cards else "evidence_only_report"
+        limitations = [
+            {
+                "direction_id": item["direction_id"],
+                "limitations": item["limitations"],
+                "recovery_actions": item["recovery_actions"],
+            }
+            for item in direction_views
+            if item["limitations"]
+            or item["recovery_actions"]
+            or item["state"] != "formal_directional_result"
+        ]
+        return {
+            "schema_version": "content_research_governed_snapshot_v2",
+            "workflow_execution_state": workflow_execution_state,
+            "publication_state": publication_state,
+            "publication_reason": "admitted_claims_available"
+            if claim_cards
+            else "no_admitted_claims",
+            "policy_scope": {
+                "policy_snapshot_id": policy.id,
+                "effective_policy_hash": policy.effective_policy_hash,
+                "run_as_of_at": policy.run_as_of_at.isoformat(),
+                # The report is a projection of the immutable run policy.  Do
+                # not infer release scope from the records that happened to be
+                # materialized by a worker.
+                "direction_set_version": policy.effective_policy.get("direction_set_version"),
+                "direction_ids": list(policy.effective_policy.get("direction_ids") or []),
+                "report_compose_mode": policy.effective_policy.get("report_compose_mode"),
+                "contract_versions": sorted(
+                    {
+                        item.schema_version
+                        for item in self._store.list_direction_contracts(policy.id)
+                    }
+                ),
+            },
+            "direction_results": direction_views,
+            "claim_cards": claim_cards,
+            "citation_groups": citation_groups,
+            "weak_signals": [
+                _weak_signal_display(
+                    item,
+                    decision=next(
+                        (
+                            decision
+                            for decision in decisions
+                            if decision.id == item.admission_decision_id
+                        ),
+                        None,
+                    ),
+                    candidate=candidates_by_id.get(
+                        next(
+                            (
+                                decision.claim_candidate_id
+                                for decision in decisions
+                                if decision.id == item.admission_decision_id
+                            ),
+                            "",
+                        )
+                    ),
+                )
+                for item in weak_signals
+            ],
+            "cross_direction_records": list(
+                governance_read.cross_direction_records if governance_read else []
+            ),
+            "aggregate_claims": list(governance_read.aggregate_claims if governance_read else []),
+            "report_section_refs": report_section_refs,
+            "limitations_recovery": limitations,
+            "checkpoint_summary": _checkpoint_summary(self._store, workflow_run_id),
+            "faithfulness_audit": {"state": "pending"},
+            "executive_summary": _governed_summary(claim_cards, publication_state),
+            "research_plan_id": plan_id,
+        }
+
+    def get_governance_read_model(
+        self,
+        *,
+        workflow_run_id: str,
+        research_plan_id: str | None = None,
+        offset: int = 0,
+        limit: int = 50,
+    ) -> ContentResearchGovernanceResponse:
+        """Return the sole public read model for cross-direction governance."""
         brief = self._store.get_brief_by_workflow(workflow_run_id)
         if brief is None:
-            raise ContentResearchNotFoundError(f"Content research workflow not found: {workflow_run_id}")
-        snapshots = self._store.list_result_snapshots_for_workflow(workflow_run_id)
-        if not snapshots:
-            return self.create_result_snapshot(workflow_run_id)
-        # Focus snapshots record selected follow-up work. The regular Creator
-        # result surface must keep serving the research snapshot until the
-        # deep-research completion flow explicitly promotes a final insight.
-        visible = [snapshot for snapshot in snapshots if snapshot.result_type != "final_insight_focus"]
-        return self._snapshot_response(visible[-1] if visible else snapshots[-1])
+            raise ContentResearchNotFoundError(
+                f"Content research workflow not found: {workflow_run_id}"
+            )
+        plans = self._store.list_plans_for_brief(brief.id)
+        if not plans:
+            raise ContentResearchNotFoundError(
+                f"Content research plan not found for workflow: {workflow_run_id}"
+            )
+        plan_id = research_plan_id or plans[-1].id
+        if not any(item.id == plan_id for item in plans):
+            raise ContentResearchNotFoundError(
+                f"Content research plan not found for workflow: {plan_id}"
+            )
+        policy = self._store.get_run_policy_snapshot_for_workflow(workflow_run_id)
+        if policy is None:
+            raise ContentResearchValidationError(
+                "Governance read model requires a frozen policy snapshot"
+            )
+        try:
+            read = GovernanceReadModelReader(self._store).read(
+                workflow_run_id=workflow_run_id,
+                research_plan_id=plan_id,
+                offset=offset,
+                limit=limit,
+            )
+        except ValueError as exc:
+            raise ContentResearchValidationError(str(exc)) from exc
+        return ContentResearchGovernanceResponse(
+            workflow_run_id=read.workflow_run_id,
+            research_plan_id=read.research_plan_id,
+            governed_snapshot_identity={
+                "schema_version": "content_research_governed_snapshot_v2",
+                "workflow_run_id": workflow_run_id,
+                "research_plan_id": read.research_plan_id,
+                "policy_snapshot_id": policy.id,
+                "effective_policy_hash": policy.effective_policy_hash,
+            },
+            cross_direction_records=read.cross_direction_records,
+            aggregate_claims=read.aggregate_claims,
+            cross_direction_total=read.cross_direction_total,
+            aggregate_total=read.aggregate_total,
+            offset=read.offset,
+            limit=read.limit,
+        )
+
+    def get_direction_evidence(
+        self,
+        *,
+        workflow_run_id: str,
+        direction_id: str,
+        offset: int = 0,
+        limit: int = 50,
+    ) -> ContentResearchDirectionEvidenceResponse:
+        """Expose the persisted direction read model without provider raw data."""
+        brief = self._store.get_brief_by_workflow(workflow_run_id)
+        if brief is None:
+            raise ContentResearchNotFoundError(
+                f"Content research workflow not found: {workflow_run_id}"
+            )
+        if offset < 0 or not 1 <= limit <= 50:
+            raise ContentResearchValidationError(
+                "offset must be non-negative and limit must be 1..50"
+            )
+        plan = self._store.list_plans_for_brief(brief.id)
+        direction_records = self._store.list_directions_for_plan(plan[-1].id) if plan else []
+        known_directions = {
+            value
+            for item in direction_records
+            for value in (
+                str(item.payload.get("direction_id") or ""),
+                str(item.payload.get("direction_type") or ""),
+            )
+            if value
+        }
+        if direction_id not in known_directions:
+            raise ContentResearchNotFoundError(
+                f"Content research direction not found: {direction_id}"
+            )
+
+        packet_read = PacketEvidenceReader(self._store).read_direction(
+            workflow_run_id=workflow_run_id,
+            direction_id=direction_id,
+            offset=offset,
+            limit=limit,
+        )
+        checkpoints = packet_read.checkpoints
+        collect = next(
+            (item for item in reversed(checkpoints) if item.stage_name == "collect"), None
+        )
+        selection_checkpoint = next(
+            (item for item in reversed(checkpoints) if item.stage_name == "selection"), None
+        )
+        detail_checkpoint = next(
+            (item for item in reversed(checkpoints) if item.stage_name == "detail"), None
+        )
+        packet_checkpoint = next(
+            (item for item in reversed(checkpoints) if item.stage_name == "packet"), None
+        )
+        comment_checkpoint = next(
+            (item for item in reversed(checkpoints) if item.stage_name == "comments"), None
+        )
+        selection_revisions = [
+            item
+            for item in checkpoints
+            if item.stage_name == "selection_revision"
+            and item.payload.get("base_selection_fingerprint")
+            == (selection_checkpoint.input_fingerprint if selection_checkpoint else None)
+        ]
+        # Detail collection can invalidate an initially complete selection:
+        # a selected search card only becomes usable after its required detail
+        # fields are collected.  The final detail checkpoint is therefore the
+        # authoritative selection state for counts, coverage and status.
+        selection = (
+            detail_checkpoint.payload.get("selection") if detail_checkpoint else None
+        ) or (
+            selection_checkpoint.payload.get("selection") if selection_checkpoint else {}
+        ) or {}
+        decisions = list(selection.get("decisions") or [])
+        candidates = list((collect.payload.get("candidates") if collect else []) or [])
+        packets = packet_read.packets
+        projections = packet_read.projections
+        selected = [item for item in decisions if item.get("selected")]
+        excluded = [item for item in decisions if not item.get("selected")]
+        packet_views = [
+            _safe_read_model(
+                {
+                    "packet_id": item.id,
+                    "canonical_source_id": item.canonical_source_id,
+                    **item.payload,
+                }
+            )
+            for item in packets
+        ]
+        projection_by_packet = {item.evidence_packet_id: item for item in projections}
+        for packet in packet_views:
+            projection = projection_by_packet.get(packet["packet_id"])
+            if projection:
+                packet["selection"] = _safe_read_model(projection.payload)
+        candidate_ids = {
+            item.id for item in self._store.list_claim_candidates(workflow_run_id, direction_id)
+        }
+        admission_ids = {
+            item.id
+            for item in self._store.list_typed_records(ClaimAdmissionDecisionRecord)
+            if item.claim_candidate_id in candidate_ids
+        }
+        snapshot = self._store.get_run_policy_snapshot_for_workflow(workflow_run_id)
+        direction_result = next(
+            (
+                item.payload
+                for item in reversed(self._store.list_typed_records(DirectionResultDecisionRecord))
+                if item.research_direction_id == direction_id
+                and snapshot is not None
+                and item.policy_snapshot_id == snapshot.id
+            ),
+            {},
+        )
+        weak_signals = [
+            item.payload
+            for item in self._store.list_typed_records(WeakSignalRecord)
+            if item.admission_decision_id in admission_ids
+        ]
+        return ContentResearchDirectionEvidenceResponse(
+            workflow_run_id=workflow_run_id,
+            direction_id=direction_id,
+            status=str(
+                (packet_checkpoint.payload.get("status") if packet_checkpoint else None)
+                or selection.get("status")
+                or "not_started"
+            ),
+            counts={
+                "selected_source_count": int(selection.get("selected_source_count") or 0),
+                "eligible_source_count": int(selection.get("eligible_source_count") or 0),
+                "independent_source_count": self._store.count_run_independent_sources(
+                    workflow_run_id
+                ),
+            },
+            query_plan_hash=selection.get("query_plan_hash"),
+            candidate_manifest_hash=selection.get("candidate_manifest_hash"),
+            query_groups=list((collect.payload.get("query_groups") if collect else []) or []),
+            selection_policy=dict(
+                (
+                    selection_checkpoint.payload.get("selection_policy")
+                    if selection_checkpoint
+                    else collect.payload.get("selection_policy")
+                    if collect
+                    else {}
+                )
+                or {}
+            ),
+            coverage_unmet_query_group_ids=list(
+                selection.get("coverage_unmet_query_group_ids") or []
+            ),
+            selection_revisions=[
+                _safe_read_model(
+                    {key: value for key, value in item.payload.items() if key != "candidates"}
+                )
+                for item in selection_revisions
+            ],
+            comment_collection=_safe_read_model(
+                {
+                    key: value
+                    for key, value in (
+                        comment_checkpoint.payload if comment_checkpoint else {}
+                    ).items()
+                    if key != "packet_ids"
+                }
+            ),
+            candidates=[_safe_read_model(item) for item in candidates[offset : offset + limit]],
+            selections=[_safe_read_model(item) for item in selected[offset : offset + limit]],
+            exclusions=[_safe_read_model(item) for item in excluded[offset : offset + limit]],
+            packets=packet_views,
+            direction_result=direction_result,
+            weak_signals=weak_signals,
+            offset=offset,
+            limit=limit,
+        )
 
     def get_evidence_bundle_view(self, bundle_id: str) -> EvidenceBundleView:
         expanded = self._bundle_service.expand_bundle(bundle_id)
@@ -855,11 +1381,15 @@ class ContentResearchService:
     ) -> ContentResearchWorkflowActionResponse:
         action = request.action.strip()
         if action not in P0_WORKFLOW_ACTIONS:
-            raise ContentResearchValidationError(f"Unsupported Content Research workflow action: {action}")
+            raise ContentResearchValidationError(
+                f"Unsupported Content Research workflow action: {action}"
+            )
 
         brief = self._store.get_brief_by_workflow(workflow_run_id)
         if brief is None:
-            raise ContentResearchNotFoundError(f"Content research workflow not found: {workflow_run_id}")
+            raise ContentResearchNotFoundError(
+                f"Content research workflow not found: {workflow_run_id}"
+            )
 
         if action == "confirm_brief":
             confirmation = ContentResearchBriefConfirmRequest(**request.payload)
@@ -886,17 +1416,40 @@ class ContentResearchService:
             )
 
         if action == "pause_formal_research":
-            result = await self._workflow_runtime.pause_content_research_run(workflow_run_id=workflow_run_id)
-            return self._action_response(workflow_run_id=workflow_run_id, action=action, status=result["status"], result=result, local_cache_id=brief.id)
+            result = await self._workflow_runtime.pause_content_research_run(
+                workflow_run_id=workflow_run_id
+            )
+            return self._action_response(
+                workflow_run_id=workflow_run_id,
+                action=action,
+                status=result["status"],
+                result=result,
+                local_cache_id=brief.id,
+            )
 
         if action == "resume_formal_research":
-            result = await self._workflow_runtime.resume_content_research_run(workflow_run_id=workflow_run_id)
-            return self._action_response(workflow_run_id=workflow_run_id, action=action, status=result["status"], result=result, local_cache_id=brief.id)
+            result = await self._workflow_runtime.resume_content_research_run(
+                workflow_run_id=workflow_run_id
+            )
+            return self._action_response(
+                workflow_run_id=workflow_run_id,
+                action=action,
+                status=result["status"],
+                result=result,
+                local_cache_id=brief.id,
+            )
 
         if action not in {"start_formal_research", "retry_formal_research"}:
-            raise ContentResearchValidationError(f"Unsupported Content Research workflow action: {action}")
+            raise ContentResearchValidationError(
+                f"Unsupported Content Research workflow action: {action}"
+            )
         source_request = ContentResearchSourceCollectionRequest(**request.payload)
-        formal_result = await self.start_formal_research(workflow_run_id=workflow_run_id, request=source_request)
+        retry = action == "retry_formal_research"
+        if retry:
+            self._requeue_recoverable_tasks(workflow_run_id)
+        formal_result = await self.dispatch_formal_research(
+            workflow_run_id=workflow_run_id, request=source_request, retry_completed=retry
+        )
         return self._action_response(
             workflow_run_id=workflow_run_id,
             action=action,
@@ -904,6 +1457,125 @@ class ContentResearchService:
             result=formal_result.model_dump(mode="json"),
             local_cache_id=brief.id,
         )
+
+    async def dispatch_formal_research(
+        self,
+        *,
+        workflow_run_id: str,
+        request: ContentResearchSourceCollectionRequest,
+        retry_completed: bool = False,
+    ) -> ContentResearchFormalResearchResponse:
+        """Persisted task state is the recovery source; HTTP only dispatches it.
+
+        A provider request may take tens of seconds. Keeping it attached to the
+        Creator action fetch starves the user-visible Trace/recovery flow.
+        """
+        dispatch = await self._dispatch.enqueue(
+            workflow_run_id=workflow_run_id,
+            provider=request.provider,
+            source_kind=request.source_kind,
+            limit=request.limit,
+            retry_completed=retry_completed,
+        )
+        tasks = self._store.list_subagent_tasks_for_workflow(workflow_run_id)
+        if self._dispatch_wake_event is not None:
+            self._dispatch_wake_event.set()
+        return ContentResearchFormalResearchResponse(
+            workflow_run_id=workflow_run_id,
+            status=str(dispatch["status"]),
+            task_count=len(tasks),
+            completed_task_count=sum(task.status == "completed" for task in tasks),
+            partial_completed_task_count=sum(task.status == "partial_completed" for task in tasks),
+            provider=request.provider,
+            source_kind=request.source_kind,
+            limit_per_specialist=request.limit,
+        )
+
+    def _requeue_recoverable_tasks(self, workflow_run_id: str) -> None:
+        """Make only explicitly recoverable provider failures eligible for a user retry.
+
+        A completed dispatch can represent an evidence-only report, so its job
+        state alone cannot decide whether replay is safe.  Provider-operation
+        checkpoints are the durable source for that decision.
+        """
+        checkpoints = self._store.list_typed_records(StageCheckpointRecord)
+        recoverable_codes = {"auth_required", "timeout", "transient_error", "rate_limited", "unavailable"}
+        requeued = False
+        for task in self._store.list_subagent_tasks_for_workflow(workflow_run_id):
+            operations = [
+                checkpoint
+                for checkpoint in checkpoints
+                if checkpoint.workflow_run_id == workflow_run_id
+                and checkpoint.subagent_task_id == task.id
+                and checkpoint.stage_name == "operation"
+            ]
+            if any(checkpoint.status == "outcome_unknown" for checkpoint in operations):
+                continue
+            recoverable_operation_fingerprints = {
+                checkpoint.input_fingerprint
+                for checkpoint in operations
+                if str(
+                    (checkpoint.payload.get("completion") or {}).get("failure_code")
+                    or ""
+                )
+                in recoverable_codes
+            }
+            if not recoverable_operation_fingerprints:
+                continue
+            recoverable_operations = {
+                str(checkpoint.payload.get("operation") or "")
+                for checkpoint in operations
+                if checkpoint.input_fingerprint in recoverable_operation_fingerprints
+            }
+            # Search pages feed every following directional boundary.  A
+            # failed discover attempt may have left an empty aggregate
+            # ``collect`` checkpoint behind; replaying it would skip the
+            # provider entirely.  Retire only the derived boundaries for this
+            # direction, while completed provider operations remain intact.
+            reset_discover_derived_stages = (
+                {"collect", "selection", "selection_revision", "detail"}
+                if "discover" in recoverable_operations
+                else set()
+            )
+            # Retire the whole recoverable operation lifecycle, including its
+            # earlier ``running`` checkpoint.  Otherwise the next pipeline
+            # attempt sees that stale start record as an unknown outcome and
+            # refuses to call the provider.  Failed collection pages are
+            # retired for the same reason; completed siblings stay reusable.
+            for checkpoint in checkpoints:
+                if checkpoint.workflow_run_id != workflow_run_id or checkpoint.subagent_task_id != task.id:
+                    continue
+                is_recoverable_operation = (
+                    checkpoint.stage_name == "operation"
+                    and checkpoint.input_fingerprint in recoverable_operation_fingerprints
+                )
+                is_recoverable_collect_page = (
+                    checkpoint.stage_name == "collect_page"
+                    and str(checkpoint.payload.get("failure_reason") or "")
+                    in recoverable_codes
+                )
+                is_discover_derived_checkpoint = (
+                    checkpoint.stage_name in reset_discover_derived_stages
+                )
+                if (
+                    is_recoverable_operation
+                    or is_recoverable_collect_page
+                    or is_discover_derived_checkpoint
+                ):
+                    self._store.save_stage_checkpoint(
+                        replace(checkpoint, status="superseded")
+                    )
+            payload = dict(task.payload)
+            payload.pop("output_payload", None)
+            payload["status"] = "queued"
+            self._store.save_subagent_task(
+                replace(task, status="queued", payload=payload, updated_at=utcnow())
+            )
+            requeued = True
+        if not requeued:
+            raise ContentResearchValidationError(
+                "No recoverable Content Research provider failure is available for retry."
+            )
 
     async def start_formal_research(
         self,
@@ -919,7 +1591,15 @@ class ContentResearchService:
         """
         brief = self._store.get_brief_by_workflow(workflow_run_id)
         if brief is None:
-            raise ContentResearchNotFoundError(f"Content research workflow not found: {workflow_run_id}")
+            raise ContentResearchNotFoundError(
+                f"Content research workflow not found: {workflow_run_id}"
+            )
+        async with ThreadStore(self._store._db_path) as thread_store:
+            if await thread_store.get_thread(brief.thread_id) is None:
+                raise ContentResearchValidationError(
+                    "Content research cannot start because its Creator thread no longer exists. "
+                    "Create a new checklist from an active Creator conversation."
+                )
         await self._execute_formal_research(
             brief=brief,
             provider=request.provider,
@@ -934,7 +1614,7 @@ class ContentResearchService:
                 "error": (task.payload.get("output_payload") or {}).get("error_message"),
             }
             for task in tasks
-            if task.status == "failed"
+            if task.status in {"failed", "outcome_unknown"}
         ]
         completed = sum(task.status == "completed" for task in tasks)
         partial_completed = sum(task.status == "partial_completed" for task in tasks)
@@ -958,7 +1638,9 @@ class ContentResearchService:
     ) -> ContentResearchSourceCollectionResponse:
         brief = self._store.get_brief_by_workflow(workflow_run_id)
         if brief is None:
-            raise ContentResearchNotFoundError(f"Content research workflow not found: {workflow_run_id}")
+            raise ContentResearchNotFoundError(
+                f"Content research workflow not found: {workflow_run_id}"
+            )
         query = (request.query or "").strip() or self._source_query_from_brief(brief)
         if not query:
             raise ContentResearchValidationError("source collection query is required")
@@ -974,31 +1656,72 @@ class ContentResearchService:
             event_name="source_collection_started",
             payload={
                 "schema_version": "content_research_observation_event_v1",
-                "source_kind": request.source_kind,
+                "operation": request.operation,
                 "provider": request.provider,
                 "query": query,
                 "limit": request.limit,
                 "sort": request.sort,
             },
         )
-        result = await self._source_registry.get(request.provider).collect(
-            SourceCollectionRequest(
-                workflow_run_id=workflow_run_id,
-                query=query,
-                source_kind=request.source_kind,
-                limit=request.limit,
-                sort=request.sort,
-                context={"thread_id": brief.thread_id, "brief_id": brief.id},
+        adapter = self._source_registry.get(request.provider)
+        context = {"thread_id": brief.thread_id, "brief_id": brief.id}
+        if request.operation == "discover_candidates":
+            result = await adapter.discover_candidates(
+                DiscoverCandidatesRequest(
+                    workflow_run_id=workflow_run_id,
+                    query=query,
+                    limit=request.limit,
+                    sort=request.sort,
+                    cursor=request.cursor,
+                    context=context,
+                )
             )
-        )
+        elif request.operation == "collect_note_detail":
+            if not request.note_id:
+                raise ContentResearchValidationError(
+                    "note_id is required for note detail collection"
+                )
+            result = await adapter.collect_note_detail(
+                CollectNoteDetailRequest(
+                    workflow_run_id=workflow_run_id,
+                    note_id=request.note_id,
+                    note_url=request.note_url or "",
+                    required_fields=tuple(request.required_fields),
+                    context=context,
+                )
+            )
+        elif request.operation == "collect_comments":
+            if not request.note_id:
+                raise ContentResearchValidationError("note_id is required for comment collection")
+            result = await adapter.collect_comments(
+                CollectCommentsRequest(
+                    workflow_run_id=workflow_run_id,
+                    parent_note_id=request.note_id,
+                    note_url=request.note_url or "",
+                    limit=request.limit,
+                    cursor=request.cursor,
+                    top_level_only=request.top_level_only,
+                    context=context,
+                )
+            )
+        else:
+            raise ContentResearchValidationError(
+                f"unsupported source collection operation: {request.operation}"
+            )
         result_payload = asdict(result)
-        event_name = "source_collection_completed" if result.status in {"completed", "empty"} else "source_collection_failed"
+        event_name = (
+            "source_collection_completed"
+            if result.status in {"completed", "empty"}
+            else "source_collection_failed"
+        )
         self._append_event(
             trace_id=trace.id,
             workflow_run_id=workflow_run_id,
             thread_id=brief.thread_id,
             sequence_no=sequence_no + 1,
-            event_type="task_completed" if result.status in {"completed", "empty"} else "task_failed",
+            event_type="task_completed"
+            if result.status in {"completed", "empty"}
+            else "task_failed",
             event_name=event_name,
             payload={
                 "schema_version": "content_research_observation_event_v1",
@@ -1009,11 +1732,16 @@ class ContentResearchService:
             workflow_run_id=workflow_run_id,
             provider=result.provider,
             source_kind=result.source_kind,
+            operation=result.operation,
             status=result.status,
             failure_reason=result.failure_reason,
             cookie_status=result.cookie_status,
             items=result.items,
             metadata=result.metadata,
+            next_cursor=result.next_cursor,
+            completeness=result.completeness,
+            field_availability=result.field_availability,
+            retryable=result.retryable,
         )
 
     async def _execute_formal_research(
@@ -1028,7 +1756,9 @@ class ContentResearchService:
         # Failed specialists stay on the same parent Run until the user asks
         # for a retry.  Completed siblings are reused; only the failed work is
         # executed again.
-        executable_tasks = [task for task in tasks if task.status in {"queued", "pending", "failed"}]
+        executable_tasks = [
+            task for task in tasks if task.status in {"queued", "pending", "failed"}
+        ]
         terminals = await asyncio.gather(
             *(
                 self._task_router.execute_task(
@@ -1049,23 +1779,61 @@ class ContentResearchService:
                 workflow_run_id=brief.workflow_run_id,
             )
             return
+        recoverable_codes = {
+            "auth_required",
+            "timeout",
+            "transient_error",
+            "rate_limited",
+            "unavailable",
+        }
+        recoverable_failure_by_task = {
+            checkpoint.subagent_task_id: str(
+                (checkpoint.payload.get("completion") or {}).get("failure_code")
+            )
+            for checkpoint in self._store.list_typed_records(StageCheckpointRecord)
+            if checkpoint.workflow_run_id == brief.workflow_run_id
+            and checkpoint.stage_name == "operation"
+            and checkpoint.status != "superseded"
+            and str(
+                (checkpoint.payload.get("completion") or {}).get("failure_code")
+                or ""
+            )
+            in recoverable_codes
+        }
         outcomes: list[dict] = []
         for task in tasks:
             terminal = terminal_by_id.get(task.id) or task
-            if terminal.status not in {"completed", "partial_completed", "failed"}:
+            if terminal.status not in {
+                "completed",
+                "partial_completed",
+                "failed",
+                "outcome_unknown",
+            }:
                 raise ContentResearchValidationError(
                     f"Subagent task did not reach a terminal state: {terminal.id} ({terminal.status})"
                 )
             output = dict(terminal.payload.get("output_payload") or {})
             child_id = str(terminal.payload.get("workflow_child_task_id") or "")
             if child_id:
-                bundle_id = str(output.get("evidence_bundle_id") or "")
-                outcomes.append({
-                    "child_task_id": child_id,
-                    "status": terminal.status,
-                    "error": output.get("error_message"),
-                    "artifact_refs": [{"type": "content_research_evidence_bundle", "id": bundle_id}] if bundle_id else [],
-                })
+                requires_recovery = terminal.id in recoverable_failure_by_task
+                outcomes.append(
+                    {
+                        "child_task_id": child_id,
+                        # An interrupted provider operation has no safe replay
+                        # path.  Preserve its richer task status while making
+                        # the parent workflow enter its standard retry state.
+                        "status": "failed"
+                        if terminal.status == "outcome_unknown" or requires_recovery
+                        else terminal.status,
+                        "error": output.get("error_message")
+                        or recoverable_failure_by_task.get(terminal.id),
+                        "artifact_refs": self._governed_artifact_refs(
+                            workflow_run_id=brief.workflow_run_id,
+                            direction_id=str(terminal.direction_id or ""),
+                            packet_ids=list((output.get("metadata") or {}).get("packet_ids") or []),
+                        ),
+                    }
+                )
         complete = getattr(self._workflow_runtime, "complete_formal_research", None)
         failed_outcomes = [outcome for outcome in outcomes if outcome["status"] == "failed"]
         if failed_outcomes:
@@ -1081,21 +1849,154 @@ class ContentResearchService:
                 event_type="formal_research_needs_retry",
                 payload={
                     "schema_version": "content_research_workflow_event_payload_v1",
-                    "failed_subagent_task_ids": [outcome["child_task_id"] for outcome in failed_outcomes],
+                    "failed_subagent_task_ids": [
+                        outcome["child_task_id"] for outcome in failed_outcomes
+                    ],
                     "message": "One or more research specialists failed; retry is required before results can be finalized.",
                 },
             )
             return
 
-        snapshot = self.create_result_snapshot(brief.workflow_run_id)
+        plans = self._store.list_plans_for_brief(brief.id)
+        if not plans:
+            raise ContentResearchValidationError(
+                f"Formal governance requires a research plan: {brief.workflow_run_id}"
+            )
+        governance = self._cross_direction_governance.execute(
+            workflow_run_id=brief.workflow_run_id,
+            research_plan_id=plans[-1].id,
+            subagent_task_id=f"governance:{plans[-1].id}",
+            action_hypotheses=_requested_action_hypotheses(
+                question=str(brief.payload.get("custom_research_question") or ""),
+                claim_ids=tuple(_admitted_claim_ids_for_run(self._store, brief.workflow_run_id)),
+            ),
+        )
+        governance_refs = _unique_artifact_refs(
+            [
+                {"type": "content_research_reconciliation", "id": item.id}
+                for item in (*governance.overlaps, *governance.contradictions)
+            ]
+            + [
+                {"type": "content_research_aggregate", "id": item.id}
+                for item in governance.aggregates
+            ]
+        )
+
         if complete is not None:
+            artifact_refs = _unique_artifact_refs(
+                [ref for outcome in outcomes for ref in outcome["artifact_refs"]] + governance_refs
+            )
             await complete(
                 workflow_run_id=brief.workflow_run_id,
                 task_outcomes=outcomes,
-                artifact_refs=[
-                    {"type": "content_research_result_snapshot", "id": snapshot.snapshot_id},
-                ],
+                artifact_refs=artifact_refs,
             )
+            # Creator's terminal-run contract is deliberate: only after the
+            # workflow reaches a terminal success state may the final report
+            # artifact and its single timeline message become visible.
+            report_artifact_ref = await self._publish_report_after_workflow_completion(
+                workflow_run_id=brief.workflow_run_id,
+                thread_id=brief.thread_id,
+            )
+            if report_artifact_ref is not None:
+                artifact_refs = _unique_artifact_refs([*artifact_refs, report_artifact_ref])
+            await self._workflow_runtime.append_event(
+                workflow_run_id=brief.workflow_run_id,
+                thread_id=brief.thread_id,
+                event_type="formal_research_governed_completed",
+                payload={
+                    "schema_version": "content_research_governed_completion_v1",
+                    "workflow_execution_state": "completed",
+                    "publication_state": report_artifact_ref["publication_state"]
+                    if report_artifact_ref
+                    else "not_published",
+                    "report_publication_id": report_artifact_ref["id"]
+                    if report_artifact_ref
+                    else None,
+                    "artifact_refs": artifact_refs,
+                    "governance_replayed": governance.replayed,
+                },
+            )
+
+    async def _publish_report_after_workflow_completion(
+        self, *, workflow_run_id: str, thread_id: str
+    ) -> dict[str, str] | None:
+        """Publish only after Creator has recorded the terminal workflow state."""
+        async with WorkflowStore(self._store._db_path) as workflow_store:
+            run = await workflow_store.get_run(workflow_run_id)
+        if run is None or run.status.value != "succeeded":
+            return None
+        async with ThreadStore(self._store._db_path) as thread_store:
+            if await thread_store.get_thread(thread_id) is None:
+                raise ContentResearchValidationError(
+                    f"Creator thread is required to publish formal report: {thread_id}"
+                )
+        snapshot_response = self.create_result_snapshot(
+            workflow_run_id, result_type="governed_research_report"
+        )
+        snapshot = next(
+            item
+            for item in self._store.list_result_snapshots_for_workflow(workflow_run_id)
+            if item.id == snapshot_response.snapshot_id
+        )
+        publication = await self._report_execution.execute(snapshot, self._report_semantic_auditor)
+        artifact = await ReportPublicationMaterializer(
+            self._store, self._store._db_path
+        ).materialize(publication.id)
+        return {
+            "type": "content_research_report_publication",
+            "id": publication.id,
+            "artifact_id": artifact.artifact_id,
+            "publication_state": publication.publication_state,
+        }
+
+    def _governed_artifact_refs(
+        self,
+        *,
+        workflow_run_id: str,
+        direction_id: str,
+        packet_ids: list[str],
+    ) -> list[dict]:
+        """Return run-scoped formal artifacts; legacy bundles are never completion inputs."""
+        snapshot = self._store.get_run_policy_snapshot_for_workflow(workflow_run_id)
+        direction_result = next(
+            (
+                item
+                for item in reversed(self._store.list_typed_records(DirectionResultDecisionRecord))
+                if item.research_direction_id == direction_id
+                and snapshot is not None
+                and item.policy_snapshot_id == snapshot.id
+            ),
+            None,
+        )
+        candidate_ids = {
+            item.id for item in self._store.list_claim_candidates(workflow_run_id, direction_id)
+        }
+        all_decisions = [
+            item
+            for item in self._store.list_typed_records(ClaimAdmissionDecisionRecord)
+            if item.claim_candidate_id in candidate_ids
+        ]
+        decisions = [item for item in all_decisions if item.decision == "admitted"]
+        decision_ids = {item.id for item in all_decisions}
+        weak_signals = [
+            item
+            for item in self._store.list_typed_records(WeakSignalRecord)
+            if item.admission_decision_id in decision_ids
+        ]
+        refs = [
+            {"type": "content_research_directional_packet", "id": packet_id}
+            for packet_id in packet_ids
+        ]
+        if direction_result is not None:
+            refs.append({"type": "content_research_direction_result", "id": direction_result.id})
+        refs.extend(
+            {"type": "content_research_admitted_decision", "id": item.id} for item in decisions
+        )
+        refs.extend(
+            {"type": "content_research_weak_signal", "id": item.id} for item in weak_signals
+        )
+        return _unique_artifact_refs(refs)
 
     @staticmethod
     def _action_response(
@@ -1249,7 +2150,9 @@ class ContentResearchService:
             workflow_run_id=workflow_run_id,
             thread_id=thread_id,
             sequence_no=sequence_no,
-            event_type="task_completed" if outcome.timeout_status != "final_timeout" else "task_failed",
+            event_type="task_completed"
+            if outcome.timeout_status != "final_timeout"
+            else "task_failed",
             event_name=event_name,
             payload={
                 "schema_version": "content_research_observation_event_v1",
@@ -1306,6 +2209,7 @@ class ContentResearchService:
 
     @staticmethod
     def _snapshot_response(snapshot: ResearchResultSnapshotRecord) -> SnapshotResponse:
+        governed = dict(snapshot.metadata.get("governed_snapshot") or {})
         return SnapshotResponse(
             snapshot_id=snapshot.id,
             workflow_run_id=snapshot.workflow_run_id,
@@ -1316,25 +2220,8 @@ class ContentResearchService:
             status=snapshot.status,
             title=snapshot.title,
             executive_summary=snapshot.executive_summary,
-            items=[ResultItem(**item) for item in snapshot.findings],
-            findings=snapshot.findings,
-            recommendations=snapshot.recommendations,
-            evidence_bundle_ids=snapshot.evidence_bundle_ids,
-            claim_count=snapshot.claim_count,
-            supported_claim_count=snapshot.supported_claim_count,
-            unsupported_claim_count=snapshot.unsupported_claim_count,
-            citation_coverage_score=snapshot.citation_coverage_score,
-            faithfulness_score=snapshot.faithfulness_score,
-            answer_relevancy_score=snapshot.answer_relevancy_score,
-            derivation_completeness_score=snapshot.derivation_completeness_score,
-            evidence_boundary_calibration_score=snapshot.evidence_boundary_calibration_score,
-            decision_summary=snapshot.decision_summary,
-            decision_cards=snapshot.decision_cards,
-            priority_summary=snapshot.priority_summary,
-            evidence_boundary_summary=snapshot.evidence_boundary_summary,
             limitations=snapshot.limitations,
-            abstentions=snapshot.abstentions,
-            metadata=snapshot.metadata,
+            governed_snapshot=governed,
             created_at=snapshot.created_at.isoformat(),
         )
 
@@ -1382,94 +2269,6 @@ def _dedupe(values: list[str]) -> list[str]:
     return result
 
 
-def _result_item_from_bundle(bundle: EvidenceBundleRecord) -> ResultItem:
-    card = bundle.decision_card or DecisionPolicyService().build_decision_card(bundle)
-    priority = dict(card.get("priority") or {})
-    evidence = dict(card.get("evidence") or {})
-    claim_scope = dict(card.get("claim_scope") or {})
-    next_action = dict(card.get("next_action") or {})
-    evidence_state = str(evidence.get("state") or bundle.evidence_state or "signal")
-    evidence_grade = str(evidence.get("grade") or bundle.evidence_grade or "C")
-    priority_label = str(priority.get("label") or bundle.priority.get("label") or "do_not_prioritize")
-    source_count = int(bundle.coverage.get("source_count") or bundle.coverage.get("accepted_evidence_count") or 0)
-    missing_evidence = _normalize_missing_evidence(evidence.get("missing_evidence") or bundle.missing_evidence)
-    claim_status = _claim_status(evidence_state)
-    risk_flags = _risk_flags(bundle, evidence_state, missing_evidence)
-    return ResultItem(
-        result_item_id=f"ri_{bundle.id}",
-        claim=bundle.summary,
-        summary=bundle.summary,
-        evidence_bundle_id=bundle.id,
-        evidence_bundle_ids=[bundle.id],
-        support_level=_support_level(evidence_state),
-        claim_status=claim_status,
-        priority=priority,
-        priority_label=priority_label,
-        evidence_state=evidence_state,
-        evidence_grade=evidence_grade,
-        claim_scope=claim_scope,
-        next_action=next_action,
-        decision_card=card,
-        risk_flags=risk_flags,
-        missing_evidence=missing_evidence,
-        source_count=source_count,
-    )
-
-
-def _priority_sort_key(item: ResultItem) -> tuple[int, str]:
-    order = {
-        "high_priority": 0,
-        "high_potential_needs_more_evidence": 1,
-        "evidence_backed_reference": 2,
-        "useful_but_lower_priority": 3,
-        "do_not_prioritize": 4,
-    }
-    return (order.get(item.priority_label, 9), item.result_item_id)
-
-
-def _with_ranked_decision_card(item: ResultItem, rank: int) -> ResultItem:
-    priority = dict(item.priority)
-    priority["rank"] = rank
-    card = dict(item.decision_card)
-    card["priority"] = priority
-    return item.model_copy(update={"priority": priority, "decision_card": card})
-
-
-def _claim_status(evidence_state: str) -> str:
-    if evidence_state == "invalid":
-        return "unsupported"
-    if evidence_state in {"signal", "case_only"}:
-        return "evidence_insufficient"
-    return "supported"
-
-
-def _support_level(evidence_state: str) -> str:
-    if evidence_state == "invalid":
-        return "unsupported"
-    if evidence_state == "verified":
-        return "high"
-    if evidence_state == "partially_supported":
-        return "medium"
-    return "signal"
-
-
-def _risk_flags(
-    bundle: EvidenceBundleRecord,
-    evidence_state: str,
-    missing_evidence: list[dict[str, Any]],
-) -> list[str]:
-    flags: list[str] = []
-    if evidence_state == "invalid":
-        flags.append("unsupported_claim")
-    if evidence_state in {"signal", "case_only"}:
-        flags.append("evidence_insufficient")
-    if missing_evidence:
-        flags.append("missing_evidence")
-    if bundle.unsupported_claim_count > 0:
-        flags.append("unsupported_claim_count")
-    return flags
-
-
 def _normalize_missing_evidence(values: Any) -> list[dict[str, Any]]:
     if not isinstance(values, list):
         return []
@@ -1489,51 +2288,6 @@ def _normalize_missing_evidence(values: Any) -> list[dict[str, Any]]:
     return normalized
 
 
-def _snapshot_limitations(result_items: list[ResultItem], bundles: list[EvidenceBundleRecord]) -> list[dict[str, Any]]:
-    if not bundles:
-        return [
-            {
-                "schema_version": "content_research_result_limitation_v1",
-                "reason": "no_evidence_bundles",
-                "message": "No evidence bundles are available for this workflow yet.",
-            }
-        ]
-    limitations: list[dict[str, Any]] = []
-    for item in result_items:
-        if item.claim_status != "supported":
-            limitations.append(
-                {
-                    "schema_version": "content_research_result_limitation_v1",
-                    "result_item_id": item.result_item_id,
-                    "evidence_bundle_id": item.evidence_bundle_id,
-                    "reason": item.claim_status,
-                    "risk_flags": item.risk_flags,
-                }
-            )
-    return limitations
-
-
-def _snapshot_abstentions(result_items: list[ResultItem], bundles: list[EvidenceBundleRecord]) -> list[dict[str, Any]]:
-    if bundles:
-        return [
-            {
-                "schema_version": "content_research_result_abstention_v1",
-                "result_item_id": item.result_item_id,
-                "evidence_bundle_id": item.evidence_bundle_id,
-                "reason": item.claim_status,
-            }
-            for item in result_items
-            if item.claim_status == "unsupported"
-        ]
-    return [
-        {
-            "schema_version": "content_research_result_abstention_v1",
-            "reason": "no_supported_claims",
-            "message": "The workflow has no evidence-backed result items yet.",
-        }
-    ]
-
-
 def _snapshot_title(brief: ResearchBriefRecord, result_type: str) -> str:
     subject = str(
         brief.payload.get("seed_text")
@@ -1544,95 +2298,29 @@ def _snapshot_title(brief: ResearchBriefRecord, result_type: str) -> str:
     return f"{subject} 内容调研"
 
 
-def _snapshot_summary(items: list[ResultItem]) -> str:
-    if not items:
-        return "暂时没有可展示的证据结论，请先完成内容采集。"
-    supported = [item for item in items if item.evidence_state in {"verified", "partially_supported"}]
-    if supported:
-        return supported[0].summary
-    return "当前线索的证据仍不足，建议查看限制说明后再决定是否采用。"
-
-
-def _snapshot_recommendations(items: list[ResultItem]) -> list[dict[str, Any]]:
-    recommendations: list[dict[str, Any]] = []
-    for item in items:
-        if item.priority_label == "high_priority":
-            action = "Use this finding as a candidate input for the next research decision."
-        else:
-            action = "Collect more evidence before treating this signal as a conclusion."
-        recommendations.append(
-            {
-                "schema_version": "content_research_recommendation_v1",
-                "recommendation_id": f"rec_{item.result_item_id}",
-                "action": item.next_action.get("proposal") or action,
-                "action_type": item.next_action.get("type") or "review",
-                "based_on_findings": [item.result_item_id],
-                "evidence_bundle_ids": item.evidence_bundle_ids,
-            }
-        )
-    return recommendations
-
-
-def _decision_summary(items: list[ResultItem]) -> dict[str, Any]:
-    return {
-        "schema_version": "content_research_decision_summary_v1",
-        "item_count": len(items),
-        "priority": _priority_summary(items),
-        "evidence_boundary": _evidence_boundary_summary(items),
-    }
-
-
-def _evidence_boundary_summary(items: list[ResultItem]) -> dict[str, Any]:
-    counts: dict[str, int] = {}
-    for item in items:
-        counts[item.evidence_state] = counts.get(item.evidence_state, 0) + 1
-    return {
-        "schema_version": "content_research_evidence_boundary_summary_v1",
-        "states": counts,
-    }
-
-
-def _priority_summary(items: list[ResultItem]) -> dict[str, Any]:
-    counts: dict[str, int] = {}
-    for item in items:
-        counts[item.priority_label] = counts.get(item.priority_label, 0) + 1
-    return {
-        "schema_version": "content_research_priority_summary_v1",
-        "item_count": len(items),
-        "labels": counts,
-    }
-
-
-def _average_metric(bundles: list[EvidenceBundleRecord], attr_name: str, metric_name: str) -> float | None:
-    values = []
-    for bundle in bundles:
-        source = getattr(bundle, attr_name)
-        if isinstance(source, dict) and metric_name in source:
-            value = _optional_float(source.get(metric_name))
-            if value is not None:
-                values.append(value)
-    return sum(values) / len(values) if values else None
-
-
-def _evidence_boundary_calibration_score(items: list[ResultItem]) -> float | None:
-    if not items:
+def _freeze_adapter_capabilities(
+    registry: SourceAdapterRegistry,
+) -> dict[str, dict[str, Any]] | None:
+    """Read adapter capabilities once while creating a run, then persist them in its snapshot."""
+    adapter = registry.get("xiaohongshu")
+    capability_method = getattr(adapter, "capabilities", None)
+    if not callable(capability_method):
         return None
-    supported = sum(1 for item in items if item.evidence_state in {"verified", "partially_supported"})
-    return supported / len(items)
-
-
-def _derivation_score(items: list[ResultItem]) -> float | None:
-    if not items:
-        return None
-    supported = sum(1 for item in items if item.claim_status == "supported")
-    return supported / len(items)
-
-
-def _optional_float(value: Any) -> float | None:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
+    capabilities = capability_method()
+    return {
+        "xiaohongshu": {
+            "adapter_version": type(adapter).__name__,
+            **{
+                item.operation: {
+                    "status": item.status,
+                    "fields": list(item.fields),
+                    **item.limits,
+                    "failure_retryability": item.failure_retryability,
+                }
+                for item in capabilities
+            },
+        }
+    }
 
 
 def _evidence_record_view(record: EvidenceRecord) -> dict[str, Any]:
@@ -1654,3 +2342,227 @@ def _evidence_record_view(record: EvidenceRecord) -> dict[str, Any]:
         "metadata": record.metadata,
         "collected_at": record.collected_at.isoformat(),
     }
+
+
+def _safe_read_model(value: Any) -> Any:
+    """Defence in depth for a public evidence view.
+
+    Packet construction already omits provider raw data; this additionally
+    prevents a future metadata field from leaking a token or raw response.
+    """
+    forbidden = {"raw_payload", "access_token", "token", "cookie", "cookies", "authorization"}
+    if isinstance(value, dict):
+        return {
+            key: _safe_read_model(item)
+            for key, item in value.items()
+            if key.lower() not in forbidden
+        }
+    if isinstance(value, list):
+        return [_safe_read_model(item) for item in value]
+    return value
+
+
+def _citation_groups(claim_cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "citation_id": f"citation_{index}",
+            "citation_group_id": f"citation_{index}",
+            "display_index": index,
+            "claim_candidate_id": card["claim_candidate_id"],
+            "admission_decision_id": card["admission_decision_id"],
+            "evidence_refs": safe_public_projection(card["evidence_refs"]),
+            "preview_ref": safe_public_projection((card["evidence_refs"] or [None])[0]),
+            "report_section_ref": {"section": "formal_observations", "index": index - 1},
+        }
+        for index, card in enumerate(claim_cards, start=1)
+    ]
+
+
+def _weak_signal_display(
+    item: WeakSignalRecord,
+    *,
+    decision: ClaimAdmissionDecisionRecord | None,
+    candidate: ClaimCandidateRecord | None,
+) -> dict[str, Any]:
+    payload = safe_public_projection(item.payload)
+    return {
+        "weak_signal_id": item.id,
+        "admission_decision_id": item.admission_decision_id,
+        "reason_codes": list(payload.get("reason_codes") or []),
+        "limitations": list(payload.get("limitations") or []),
+        "recovery_actions": list(payload.get("recovery_actions") or []),
+        "display_state": str(payload.get("display_state") or "weak_signal"),
+        "claim_candidate_id": candidate.id if candidate else None,
+        "direction_id": candidate.research_direction_id if candidate else None,
+        "evidence_packet_id": candidate.evidence_packet_id if candidate else None,
+        "evidence_refs": safe_public_projection(list(candidate.payload.get("quote_refs") or []))
+        if candidate
+        else [],
+        "computed_metrics": safe_public_projection(
+            dict(decision.payload.get("computed_metrics") or {})
+        )
+        if decision
+        else {},
+    }
+
+
+def _report_section_refs(
+    *,
+    claim_cards: list[dict[str, Any]],
+    weak_signals: list[WeakSignalRecord],
+    governance_read: Any,
+) -> dict[str, list[str]]:
+    return {
+        "formal_observations": [item["claim_candidate_id"] for item in claim_cards],
+        "weak_signals": [item.id for item in weak_signals],
+        "cross_direction": [
+            item["cross_direction_record_id"]
+            for item in (governance_read.cross_direction_records if governance_read else [])
+        ],
+        "aggregate_observations": [
+            item["aggregate_claim_id"]
+            for item in (governance_read.aggregate_claims if governance_read else [])
+        ],
+    }
+
+
+def _safe_trace_summary(store: Any, workflow_run_id: str) -> dict[str, Any]:
+    traces = store.list_traces_for_workflow(workflow_run_id)
+    event_counts: dict[str, int] = {}
+    event_total = 0
+    for trace in traces:
+        for event in store.list_observation_events(trace.id):
+            event_total += 1
+            event_counts[event.event_type] = event_counts.get(event.event_type, 0) + 1
+    return {
+        "trace_count": len(traces),
+        "trace_ids": [item.id for item in traces],
+        "trace_statuses": [item.status for item in traces],
+        "observation_event_count": event_total,
+        "observation_event_types": dict(sorted(event_counts.items())),
+    }
+
+
+def _checkpoint_summary(store: Any, workflow_run_id: str) -> dict[str, Any]:
+    checkpoints = [
+        item
+        for item in store.list_typed_records(StageCheckpointRecord)
+        if item.workflow_run_id == workflow_run_id
+    ]
+    return {
+        "workflow_run_id": workflow_run_id,
+        "state": "available",
+        "stages": [
+            {
+                "checkpoint_id": item.id,
+                "stage_name": item.stage_name,
+                "status": item.status,
+                "input_fingerprint": item.input_fingerprint,
+                "retry_count": item.retry_count,
+                "output_refs": safe_public_projection(list(item.payload.get("output_refs") or [])),
+                "failure": safe_public_projection(item.payload.get("failure")),
+            }
+            for item in sorted(checkpoints, key=lambda item: (item.stage_name, item.id))
+        ],
+        "trace_summary": _safe_trace_summary(store, workflow_run_id),
+    }
+
+
+def _governed_input_fingerprint(governed: dict[str, Any]) -> str:
+    return canonical_fingerprint(
+        {
+            "policy_scope": governed["policy_scope"],
+            "research_plan_id": governed["research_plan_id"],
+            "direction_results": governed["direction_results"],
+            "claim_ids": [item["claim_candidate_id"] for item in governed["claim_cards"]],
+            "weak_signal_ids": [item["weak_signal_id"] for item in governed["weak_signals"]],
+            "cross_direction_ids": [
+                item["cross_direction_record_id"] for item in governed["cross_direction_records"]
+            ],
+            "aggregate_ids": [item["aggregate_claim_id"] for item in governed["aggregate_claims"]],
+        }
+    )
+
+
+def _admitted_claim_ids_for_run(store: Any, workflow_run_id: str) -> list[str]:
+    candidates = {
+        item.id
+        for item in store.list_typed_records(ClaimCandidateRecord)
+        if item.workflow_run_id == workflow_run_id
+    }
+    return sorted(
+        item.claim_candidate_id
+        for item in store.list_typed_records(ClaimAdmissionDecisionRecord)
+        if item.decision == "admitted" and item.claim_candidate_id in candidates
+    )
+
+
+def _requested_action_hypotheses(
+    *,
+    question: str,
+    claim_ids: tuple[str, ...],
+) -> tuple[ActionHypothesisRequest, ...]:
+    normalized = question.strip()
+    request_markers = ("下一步", "行动建议", "行动方案", "下一步建议")
+    if (
+        not normalized
+        or not claim_ids
+        or not any(marker in normalized for marker in request_markers)
+    ):
+        return ()
+    return (
+        ActionHypothesisRequest(
+            statement=normalized,
+            claim_ids=claim_ids,
+            request_origin="user_requested_next_steps",
+        ),
+    )
+
+
+def _unique_artifact_refs(refs: list[dict]) -> list[dict]:
+    unique: list[dict] = []
+    seen: set[tuple[str, str, str]] = set()
+    for ref in refs:
+        key = (str(ref.get("type") or ""), str(ref.get("id") or ""), str(ref.get("status") or ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(ref)
+    return unique
+
+
+def _governed_claim_card(
+    *,
+    candidate: Any,
+    decision: ClaimAdmissionDecisionRecord,
+    packet: DirectionalEvidencePacketRecord | None,
+) -> dict[str, Any]:
+    payload = dict(candidate.payload)
+    evidence_packet_id = candidate.evidence_packet_id
+    return {
+        "claim_candidate_id": candidate.id,
+        "admission_decision_id": decision.id,
+        "direction_id": candidate.research_direction_id,
+        "claim_type": candidate.claim_type,
+        "admission_state": decision.decision,
+        "statement": candidate.statement,
+        "scope": dict(payload.get("scope") or {}),
+        "evidence_packet_id": evidence_packet_id,
+        "canonical_source_id": packet.canonical_source_id if packet is not None else None,
+        "evidence_refs": list(payload.get("quote_refs") or []),
+        "computed_metrics": dict(decision.payload.get("computed_metrics") or {}),
+        "limitations": list(
+            decision.payload.get("limitations") or decision.payload.get("reason_codes") or []
+        ),
+    }
+
+
+def _governed_summary(claim_cards: list[dict], publication_state: str) -> str:
+    if not claim_cards:
+        return "本轮没有已准入的正式观察；仅保留证据范围、限制与补采建议。"
+    prefix = (
+        "本轮已有可追溯的正式观察"
+        if publication_state == "partial_verified_report"
+        else "本轮已有正式观察"
+    )
+    return f"{prefix}：{claim_cards[0]['statement']}"

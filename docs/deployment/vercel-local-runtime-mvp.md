@@ -32,10 +32,10 @@ The frontend must call the local runtime from browser-side code. Vercel server c
 After the Vercel production domain is available, add it to the local runtime `.env`:
 
 ```bash
-XHS_RUNTIME_SERVICE_NAME=xhs-agent-runtime
-XHS_RUNTIME_VERSION=0.1.0
-XHS_RUNTIME_API_CONTRACT=local-runtime-v1
-XHS_CORS_ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:3000,https://your-app.vercel.app
+RUNTIME_SERVICE_NAME=xhs-agent-runtime
+RUNTIME_VERSION=0.1.0
+RUNTIME_API_CONTRACT=local-runtime-v1
+CORS_ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:3000,https://content-strategy-generation.vercel.app
 ```
 
 Start the runtime on loopback:
@@ -71,7 +71,7 @@ For the MVP, backend updates are manual:
 2. User downloads the new version.
 3. User installs over the old version.
 4. Existing local data under the configured SQLite and Chroma paths is preserved.
-5. The updated runtime reports its new `XHS_RUNTIME_VERSION` through `/health`.
+5. The updated runtime reports its new `RUNTIME_VERSION` through `/health`.
 
 Before shipping an installer update, include:
 
@@ -126,7 +126,7 @@ Users configure their API keys by placing a `.env` file next to the executable:
 
 ```bash
 ANTHROPIC_API_KEY=sk-ant-...
-XHS_CORS_ALLOWED_ORIGINS=https://your-app.vercel.app
+CORS_ALLOWED_ORIGINS=https://content-strategy-generation.vercel.app
 ```
 
 ### Key files

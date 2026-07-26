@@ -134,12 +134,12 @@
                     <div class="action-bar"><button class="btn btn-primary" onclick="alert('新建品牌配置')">+ 新建品牌</button></div>
                 </div>
                 <div class="stats-grid">
-                    <div class="stat-card"><div class="stat-value">3</div><div class="stat-label">活跃品牌</div></div>
-                    <div class="stat-card"><div class="stat-value">12</div><div class="stat-label">接入账号</div></div>
+                    <div class="stat-card"><div class="stat-value">1</div><div class="stat-label">活跃品牌</div></div>
+                    <div class="stat-card"><div class="stat-value">1</div><div class="stat-label">接入账号</div></div>
                 </div>
                 <table class="data-table">
                     <thead><tr><th>品牌名称</th><th>阶段</th><th>目标受众</th><th>状态</th><th>操作</th></tr></thead>
-                    <tbody><tr><td>轻量户外</td><td>增长期 (Growth)</td><td>25-34岁 女性</td><td><span class="status status-success">运行中</span></td><td><button class="btn">配置</button></td></tr></tbody>
+                    <tbody><tr><td>温和修护</td><td>增长期 (Growth)</td><td>25-35岁 女性</td><td><span class="status status-success">运行中</span></td><td><button class="btn">配置</button></td></tr></tbody>
                 </table>
             </div>
 
@@ -149,14 +149,17 @@
                     <div class="action-bar"><button class="btn" onclick="switchPage('decisions')">执行决策</button><button class="btn btn-primary" onclick="alert('生成中...')">刷新选题</button></div>
                 </div>
                 <div class="stats-grid">
-                    <div class="stat-card"><div class="stat-value">142</div><div class="stat-label">总候选数</div></div>
-                    <div class="stat-card"><div class="stat-value">0.88</div><div class="stat-label">最高得分</div></div>
+                    <div class="stat-card"><div class="stat-value">3</div><div class="stat-label">总候选数</div></div>
+                    <div class="stat-card"><div class="stat-value">36</div><div class="stat-label">检索素材数</div></div>
+                    <div class="stat-card"><div class="stat-value">6</div><div class="stat-label">标签建议数</div></div>
+                    <div class="stat-card"><div class="stat-value">0.91</div><div class="stat-label">最高得分</div></div>
                 </div>
                 <table class="data-table">
                     <thead><tr><th>选题标题</th><th>类型</th><th>核心假设</th><th>综合得分</th><th>来源</th></tr></thead>
                     <tbody>
-                        <tr><td>通勤场景下的轻量装备选择</td><td>场景 (Scenario)</td><td>痛点：通勤与户外切换不便</td><td>0.88 <span class="text-muted">(高)</span></td><td>竞品分析</td></tr>
-                        <tr><td>敏感肌换季护肤攻略</td><td>问题 (Problem)</td><td>缺口：缺乏温和配方推荐</td><td>0.76 <span class="text-muted">(中)</span></td><td>评论洞察</td></tr>
+                        <tr><td>换季敏感肌先稳住屏障</td><td>问题 (Problem)</td><td>痛点：泛红、刺痛和干痒来自屏障不稳定</td><td>0.91 <span class="text-muted">(高)</span></td><td>36篇内容检索</td></tr>
+                        <tr><td>精简护肤不是少用而是用对</td><td>方法 (How-to)</td><td>机会：用清洁、保湿、防晒三步降低换季决策成本</td><td>0.87 <span class="text-muted">(高)</span></td><td>策略生成</td></tr>
+                        <tr><td>泛红期成分避坑清单</td><td>清单 (Checklist)</td><td>缺口：用户需要酸类和高浓度功效成分的避坑提示</td><td>0.84 <span class="text-muted">(高)</span></td><td>评论洞察</td></tr>
                     </tbody>
                 </table>
             </div>
@@ -164,16 +167,17 @@
             <div id="decisions" class="page-content hidden">
                 <div class="page-header"><h1 class="page-title">决策批次 (Decision Batches)</h1><div class="action-bar"><button class="btn btn-primary" onclick="alert('决策流已启动')">执行决策流 (Run Decision)</button></div></div>
                 <div class="stats-grid">
-                    <div class="stat-card"><div class="stat-value">0.45</div><div class="stat-label">预期奖励分</div></div>
+                    <div class="stat-card"><div class="stat-value">0.87</div><div class="stat-label">预期奖励分</div></div>
                     <div class="stat-card"><div class="stat-value">3</div><div class="stat-label">已选数量</div></div>
-                    <div class="stat-card"><div class="stat-value">0.08</div><div class="stat-label">探索概率</div></div>
+                    <div class="stat-card"><div class="stat-value">0.12</div><div class="stat-label">探索概率</div></div>
                 </div>
                 <h3>本次选题结果</h3>
                 <table class="data-table">
                     <thead><tr><th>选题</th><th>策略得分</th><th>模式</th><th>操作</th></tr></thead>
                     <tbody>
-                        <tr><td>轻量徒步装备实测</td><td>0.91 (Baseline)</td><td>利用 (Exploitation)</td><td><button class="btn">发布</button></td></tr>
-                        <tr><td>办公室瑜伽 10分钟</td><td>0.65 (Exploration)</td><td>探索 (Exploration)</td><td><button class="btn">预览</button></td></tr>
+                        <tr><td>换季敏感肌先稳住屏障</td><td>0.91 (Baseline)</td><td>利用 (Exploitation)</td><td><button class="btn">发布</button></td></tr>
+                        <tr><td>精简护肤不是少用而是用对</td><td>0.87 (Baseline)</td><td>利用 (Exploitation)</td><td><button class="btn">发布</button></td></tr>
+                        <tr><td>泛红期成分避坑清单</td><td>0.84 (Exploration)</td><td>探索 (Exploration)</td><td><button class="btn">预览</button></td></tr>
                     </tbody>
                 </table>
             </div>
@@ -182,19 +186,23 @@
                 <div class="page-header"><h1 class="page-title">发布记录 (Publish Records)</h1><div class="action-bar"><button class="btn btn-primary">手动发布</button></div></div>
                 <table class="data-table">
                     <thead><tr><th>内容标题</th><th>渠道</th><th>发布时间</th><th>决策来源</th><th>状态</th></tr></thead>
-                    <tbody><tr><td>周末露营好物分享</td><td>小红书-官方号</td><td>2026-04-10 09:30</td><td>Batch #20260410A</td><td><span class="status status-success">已发布</span></td></tr></tbody>
+                    <tbody>
+                        <tr><td>换季敏感肌先稳住屏障</td><td>小红书-官方号</td><td>待排期</td><td>Batch #20260526A</td><td><span class="status status-pending">发布候选</span></td></tr>
+                        <tr><td>精简护肤不是少用而是用对</td><td>小红书-官方号</td><td>待排期</td><td>Batch #20260526A</td><td><span class="status status-pending">发布候选</span></td></tr>
+                        <tr><td>泛红期成分避坑清单</td><td>小红书-官方号</td><td>待排期</td><td>Batch #20260526A</td><td><span class="status status-pending">发布候选</span></td></tr>
+                    </tbody>
                 </table>
             </div>
 
             <div id="performance" class="page-content hidden">
                 <div class="page-header"><h1 class="page-title">绩效与反馈 (Performance)</h1><div class="action-bar"><button class="btn btn-primary">导入数据</button></div></div>
                 <div class="stats-grid">
-                    <div class="stat-card"><div class="stat-value">4.5%</div><div class="stat-label">平均互动率</div></div>
-                    <div class="stat-card"><div class="stat-value">0.365</div><div class="stat-label">复合奖励分 (168h)</div></div>
+                    <div class="stat-card"><div class="stat-value">待回收</div><div class="stat-label">平均互动率</div></div>
+                    <div class="stat-card"><div class="stat-value">0.87</div><div class="stat-label">预估复合奖励分</div></div>
                 </div>
                 <table class="data-table">
                     <thead><tr><th>关联选题</th><th>曝光/点击</th><th>转化代理</th><th>奖励分</th></tr></thead>
-                    <tbody><tr><td>轻量徒步装备</td><td>12,000 / 850</td><td>8.0% (加购)</td><td>0.44 (短期)</td></tr></tbody>
+                    <tbody><tr><td>敏感肌换季护肤笔记</td><td>待发布</td><td>发布候选</td><td>0.87 (预估)</td></tr></tbody>
                 </table>
             </div>
 
@@ -202,7 +210,7 @@
                 <div class="page-header"><h1 class="page-title">离线评估 (Evaluation)</h1><div class="action-bar"><button class="btn btn-primary" onclick="alert('开始评估')">运行评估</button></div></div>
                 <div class="detail-grid">
                     <div class="card"><h3>策略对比</h3><p>Baseline vs Thompson Sampling</p><ul style="margin-top: 10px; color: #555;"><li>样本量: 1,200</li><li>覆盖率: 98%</li><li>ESS Ratio: 0.85</li></ul></div>
-                    <div class="card"><h3>评估结果</h3><p>新策略提升: <strong style="color: #006640;">+12.4%</strong></p><p style="font-size: 0.9em; color: #888;">主要收益来自 Problem 类型的选题优化</p></div>
+                    <div class="card"><h3>评估结果</h3><p>新策略提升: <strong style="color: #006640;">+12.4%</strong></p><p style="font-size: 0.9em; color: #888;">主要收益来自敏感肌 Problem 类型的选题优化</p></div>
                 </div>
                 <h3>失败案例分析</h3>
                 <table class="data-table">
@@ -219,7 +227,7 @@
                 <div class="creator-top">
                     <button class="new-chat-btn">+ 新建对话</button>
                     <div class="history-list">
-                        <div class="history-item active" data-id="chat1"><div class="history-title">户外选题文案生成</div><div class="history-more">...</div><div class="context-menu"><div class="context-menu-item">置顶</div><div class="context-menu-item">重命名</div><div class="context-menu-item">分享</div><div class="context-menu-item danger">删除</div></div></div>
+                        <div class="history-item active" data-id="chat1"><div class="history-title">敏感肌换季护肤笔记</div><div class="history-more">...</div><div class="context-menu"><div class="context-menu-item">置顶</div><div class="context-menu-item">重命名</div><div class="context-menu-item">分享</div><div class="context-menu-item danger">删除</div></div></div>
                         <div class="history-item" data-id="chat2"><div class="history-title">品牌文案优化</div><div class="history-more">...</div><div class="context-menu"><div class="context-menu-item">置顶</div><div class="context-menu-item">重命名</div><div class="context-menu-item">分享</div><div class="context-menu-item danger">删除</div></div></div>
                     </div>
                 </div>

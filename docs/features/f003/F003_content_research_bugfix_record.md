@@ -1,5 +1,54 @@
 # F003 Content Research Bugfix Record
 
+## 2026-07-26: Gate 2 Single-Direction Report Materialisation
+
+### Symptom
+
+- A live authenticated `product_marketing` run had four independent sources, full QueryGroup coverage and eight frozen citation groups, but materialised `evidence_only_report`.
+- Its report release projection omitted the frozen direction-set fields.
+
+### Root Cause
+
+- With no directional limitation, the composer emitted its deterministic `limitations_scope` fallback card while the faithfulness evaluator recognised only persisted limitation/recovery IDs. It incorrectly emitted `limitation_reference_unknown`.
+- The product-marketing admission strategy promoted an entire note `content_text` body to one direct claim. The semantic audit correctly rejected such mixed, unbounded prose for unsupported entities, aggregate wording and causal language.
+- Brief confirmation froze the default direction set rather than the user's selected canonical direction IDs; the governed snapshot then failed to copy the policy release scope.
+
+### Fix
+
+- Confirmation freezes exactly the selected canonical direction IDs; governed snapshots project `direction_set_version`, `direction_ids` and `report_compose_mode` from that immutable policy.
+- Composer and evaluator now share the scope-card identity rule, so the no-limitation fallback is valid only for the matching governed policy scope.
+- Product-marketing candidates now preserve one bounded, verbatim first non-empty observation with exact quote offsets. Admission rejects unbounded, non-verbatim or outcome-claiming candidates before report composition.
+- No semantic/audit rule was relaxed. Genuine semantic failures still withdraw prose and retain reason codes.
+
+### Verification and Residual
+
+- 37 focused unit/integration/API tests and Ruff pass, including a no-fixture single-direction API E2E that verifies a cited report and frozen scope.
+- The old seven-direction concurrent E2E currently exposes `sqlite3.OperationalError: database is locked` while parallel tasks synchronously append observation events. This is an independent Gate 2 concurrency residual: the single-direction Gate 2 slice is covered, but the parallel write path must move to the established async persistence seam before the all-direction workflow can be treated as clean.
+
+## 2026-07-26: Direct Observation Semantic-Audit False Positive
+
+### Symptom
+
+- After the report materialisation repair, a new authenticated live run correctly froze its single direction and passed deterministic citation checks, but an LLM semantic reviewer still labelled verbatim, admitted observations as `scope_expansion` / `unsupported_entities` and downgraded the report.
+
+### Fix
+
+- Added an explicit audit split: when every prose line is exactly an admitted claim statement and deterministic checks prove citation ownership, quote integrity and scope, the built-in LLM auditor records semantic review as `not_applicable` rather than reinterpreting source text. This is a proof-based classification, not an ignored failure.
+- Custom/test auditors and any prose with aggregate, cross-direction, weak-signal or other transformed material still execute the semantic-audit path. Deterministic changes, causal upgrades, invalid citations and unknown references still fail.
+
+### Verification
+
+- Report faithfulness/publication/read-model tests: 21 passed; Ruff passed.
+- Authenticated live run `run_de8687533d3746ad824ae68342e5033d`: `complete_verified_report`, 8 citations, `formal_v1/[product_marketing]`, four independent sources and zero coverage gap. Safe trace projection retained two retryable detail failures without exposing credential/raw-payload fields.
+
+## 2026-07-19: Day 3 Closure Contract Repair
+
+- Normalized governance vocabulary to JSON-stable lists; the frozen policy store round-trip now passes.
+- Deleted old `claim_count` result assertion and v1 snapshot fixture. Governed snapshot reuse now requires a deterministic upstream-input fingerprint, so changed admission/governance outputs append a fresh immutable v2 snapshot.
+- Added explicit next-step request handling with `request_origin=user_requested_next_steps`; ordinary research runs do not create an action hypothesis.
+- Added optional validated governance plan scope, stricter secret aliases, citation preview refs, weak-signal evidence/metrics, and checkpoint audit projections.
+- Verification: current Content Research unit/integration/API-E2E suite — 234 passed; changed-file Ruff, router import ordering, and `git diff --check` passed.
+
 ## 2026-07-11: Fact-to-Evidence Closure and Failed-Specialist Recovery Barrier
 
 ### Symptom

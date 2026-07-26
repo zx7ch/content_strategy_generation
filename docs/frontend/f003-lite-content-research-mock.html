@@ -1,0 +1,355 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>F003 Lite · 报告页 Mock v5（正式发布三档 + workflow 恢复卡）</title>
+  <style>
+    :root { --ink:#20232a; --muted:#6f7580; --line:#e8e8ec; --paper:#fff; --bg:#f6f6f8; --brand:#5b57e8; --brand-soft:#efefff; --warn:#a45112; --warn-bg:#fff6ec; --good:#18794e; --good-bg:#edfaf3; }
+    *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.65 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;padding-top:42px}
+    /* mock-only state switcher */
+    .statebar{position:fixed;top:0;left:0;right:0;z-index:90;background:#20232a;color:#e8e8ec;display:flex;align-items:center;gap:8px;padding:8px 16px;font:12px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace}
+    .statebar .lab{color:#9a9fb0;margin-right:4px}
+    .statebar button{border:1px solid #4a4f60;background:transparent;color:#cfd3e0;border-radius:6px;padding:4px 10px;font:inherit;cursor:pointer}
+    .statebar button.active{background:var(--brand);border-color:var(--brand);color:#fff}
+    .statebar .hint{margin-left:auto;color:#6f7580}
+    .shell{max-width:1160px;margin:0 auto;min-height:100vh;display:grid;grid-template-columns:220px minmax(0,1fr) 260px;background:var(--paper);box-shadow:0 0 0 1px #eee}
+    aside{padding:20px;border-right:1px solid var(--line);background:#fbfbfc}.right{border-left:1px solid var(--line);border-right:0}.logo{font-weight:750;font-size:16px}.sub{font-size:12px;color:var(--muted);margin-top:3px}.new{margin:25px 0 15px;padding:9px 12px;border:1px solid #dedee5;border-radius:8px;background:#fff;font-weight:650}.history{font-size:13px;padding:10px 8px;border-radius:7px;margin-bottom:5px}.history.active{background:var(--brand-soft);color:#3e3bba;font-weight:650}
+    main{padding:28px 44px 110px;min-width:0}.crumb{font-size:12px;color:var(--muted);margin-bottom:25px}.message{display:flex;gap:12px;margin:0 0 24px}.avatar{flex:0 0 29px;height:29px;border-radius:9px;display:grid;place-items:center;font-size:12px;font-weight:750}.avatar.user{background:#ebebef}.avatar.ai{background:var(--brand);color:#fff}.bubble{min-width:0;max-width:750px}.user-text{display:inline-block;background:#f0f0f3;border-radius:12px;padding:10px 14px}
+    .report{border:1px solid var(--line);border-radius:13px;padding:20px 21px;background:#fff;box-shadow:0 2px 8px #11111108}.report h1{font-size:20px;margin:0 0 6px;line-height:1.35}.report h2{font-size:15px;margin:26px 0 9px}.report p{margin:7px 0}
+    .meta{display:flex;gap:7px;flex-wrap:wrap;color:var(--muted);font-size:12px}.chip{padding:2px 8px;border-radius:100px;background:#f3f3f5}.chip.good{background:var(--good-bg);color:var(--good)}.chip.warn{background:var(--warn-bg);color:var(--warn)}a.chip{text-decoration:none;color:#403db4;background:var(--brand-soft)}
+    .strip{font-size:12.5px;color:var(--muted);margin-top:9px;padding:7px 10px;background:#fbfbfc;border:1px solid var(--line);border-radius:8px}
+    .h2-note{font-size:12px;color:var(--muted);margin:-4px 0 9px}
+    .card{border:1px solid var(--line);border-radius:10px;padding:13px 14px;margin-top:10px}.card-top{display:flex;justify-content:space-between;gap:12px;align-items:flex-start}.card-title{font-weight:700}.badge{white-space:nowrap;font-size:12px;border-radius:99px;padding:2px 8px;background:var(--good-bg);color:var(--good)}.badge.obs{background:#f3f3f5;color:#565b64}.scope{font-size:12px;color:var(--muted);margin:5px 0 0}
+    .weak{border-left:3px solid #c8c8d0;padding:4px 0 4px 11px;color:#565b64;margin-top:10px}
+    .limit{background:#fbfbfc;border:1px solid var(--line);border-radius:9px;padding:12px 13px}
+    /* brief card */
+    .brief{border:1px solid var(--line);border-radius:13px;padding:16px 18px;background:#fff;box-shadow:0 2px 8px #11111108}
+    .brief .b-top{display:flex;justify-content:space-between;align-items:center;gap:10px}
+    .brief .b-title{font-weight:750;font-size:15px}
+    .brief table{width:100%;border-collapse:collapse;margin-top:10px;font-size:13px}
+    .brief td{padding:5px 0;border-top:1px dashed var(--line);vertical-align:top}
+    .brief td:first-child{width:92px;color:var(--muted);font-size:12px;padding-top:7px}
+    .brief .b-foot{margin-top:10px;font-size:12px;color:var(--muted)}
+    /* insufficient direction panel */
+    .ins{border:1px solid #f0c7a4;background:var(--warn-bg);border-radius:10px;padding:13px 14px;margin-top:10px}
+    .ins .t{font-weight:700;color:#813c0d}
+    .ins .r{font-size:13px;color:#61371c;margin-top:4px}
+    .ins .a{font-size:12.5px;color:#61371c;margin-top:7px;padding-top:7px;border-top:1px dashed #e8c9a8}
+    /* recovery card */
+    .reco{border:1px solid #f0c7a4;background:var(--warn-bg);border-radius:13px;padding:18px 19px}
+    .reco h1{font-size:18px;margin:0 0 8px;color:#813c0d}
+    .reco .done{margin:10px 0;padding:10px 12px;background:#ffffffa0;border-radius:8px;font-size:13px}
+    .reco .done li{margin:4px 0 4px 16px}
+    .reco .fail{font-size:13px;color:#61371c;margin:10px 0}
+    .btn-primary{display:inline-block;margin-top:10px;background:var(--brand);color:#fff;border:0;border-radius:9px;padding:10px 18px;font:14px/1.2 inherit;font-weight:650;cursor:pointer}
+    .reco .n{font-size:12px;color:#61371c;margin-top:9px}
+    .evonly-notice{border-left:3px solid var(--warn);background:var(--warn-bg);border-radius:0 8px 8px 0;padding:11px 13px;font-size:13.5px;color:#61371c;margin-bottom:6px}
+    /* citations */
+    .cite{color:#4e4aba;font-weight:650;font-size:11.5px;vertical-align:super;position:relative;padding:0 1px;white-space:nowrap;cursor:pointer;border-radius:2px}
+    .cite:hover{text-decoration:underline}.cite:focus-visible{outline:1.5px solid var(--brand);outline-offset:1px}
+    .cite.weak{color:var(--warn);border-bottom:1px dashed #d9a05f}
+    .cite .pop{display:none;position:absolute;left:50%;transform:translateX(-50%);bottom:135%;width:290px;background:#fff;border:1px solid var(--line);border-radius:10px;box-shadow:0 10px 28px #1b1b3a20;padding:10px 12px;z-index:40;white-space:normal;cursor:default;text-align:left}
+    .cite:hover .pop,.cite:focus-within .pop{display:block}
+    .cite .pop::before{content:"";position:absolute;top:100%;left:0;right:0;height:16px}
+    .cite .pop::after{content:"";position:absolute;top:100%;left:50%;transform:translateX(-50%);border:6px solid transparent;border-top-color:#fff}
+    .cite .pop .q{display:block;font-size:12px;line-height:1.6;color:var(--ink);font-weight:400}
+    .cite .pop .s{display:block;font-size:11px;color:var(--muted);margin-top:5px;font-weight:400}
+    .cite .pop .f{display:block;margin-top:7px;padding-top:7px;border-top:1px dashed var(--line);font-size:11px;font-weight:400}
+    .note-link{color:#4e4aba;cursor:pointer;text-decoration:none;font-weight:650}.note-link:hover{text-decoration:underline}
+    .no-src{color:var(--muted);font-style:normal}
+    /* evidence list */
+    .ev{display:flex;gap:10px;padding:10px 8px;border-bottom:1px dashed var(--line);scroll-margin-top:60px;border-radius:8px;transition:background .4s}
+    .ev:last-child{border-bottom:0}
+    .ev .n{flex:0 0 24px;height:19px;margin-top:2px;border-radius:6px;background:var(--brand-soft);color:#403db4;font-size:11px;font-weight:750;display:grid;place-items:center}
+    .ev .q{font-size:13px;line-height:1.6}.ev .s{font-size:12px;color:var(--muted);margin-top:3px}
+    .ev.hl{background:#f1f0ff}.ev.hl .n{background:var(--brand);color:#fff}
+    .tag-weak{font-size:11px;border-radius:99px;padding:1px 7px;background:#f3f3f5;color:var(--muted);margin-left:6px;vertical-align:1px}
+    .right h3{font-size:13px;margin:4px 0 10px}.status{border:1px solid var(--line);padding:12px;border-radius:9px;margin-bottom:16px}.status strong{display:block;font-size:13px}.status span{font-size:12px;color:var(--muted)}.list{font-size:12px;color:#4f5560;padding-left:17px}.list li{margin:6px 0}
+    #backpill{position:fixed;right:24px;bottom:24px;z-index:60;display:none;background:#20232a;color:#fff;border:0;border-radius:99px;padding:10px 16px;font:13px/1 -apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif;cursor:pointer;box-shadow:0 6px 20px #00000030}
+    #backpill.show{display:block}
+    .overlay{position:fixed;inset:0;background:#1b1b3a33;opacity:0;pointer-events:none;transition:opacity .25s;z-index:70}.overlay.show{opacity:1;pointer-events:auto}
+    .drawer{position:fixed;top:0;right:0;height:100vh;height:100dvh;width:min(420px,92vw);background:#fff;box-shadow:-12px 0 40px #1b1b3a22;transform:translateX(102%);transition:transform .28s ease;z-index:71;display:flex;flex-direction:column}
+    .drawer.show{transform:none}
+    .d-head{padding:15px 18px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:flex-start;gap:12px}
+    .d-kicker{font-size:11px;color:var(--muted);letter-spacing:.04em;margin-bottom:4px}.d-title{font-weight:750;font-size:15px;line-height:1.45}
+    .d-close{border:0;background:#f0f0f3;border-radius:8px;width:28px;height:28px;cursor:pointer;flex:0 0 28px;font-size:14px;color:#565b64}
+    .d-body{padding:14px 18px 26px;overflow-y:auto}
+    .d-meta{font-size:12px;color:var(--muted);display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
+    .d-sec{font-size:11.5px;font-weight:750;color:var(--muted);margin:18px 0 6px;letter-spacing:.05em}
+    .d-text{font-size:13.5px;line-height:1.85}
+    mark{background:#ffefc2;border-radius:3px;padding:0 2px}
+    .d-foot{margin-top:20px;font-size:11.5px;color:var(--muted);border-top:1px solid var(--line);padding-top:10px}
+    [hidden]{display:none!important}
+    @media(max-width:850px){.shell{display:block}.shell aside{display:none}.right{display:none}main{padding:22px 16px 80px}}
+  </style>
+</head>
+<body>
+  <div class="statebar">
+    <span class="lab">Mock 预览：</span>
+    <button data-s="complete" class="active">complete_verified_report</button>
+    <button data-s="partial">partial_verified_report</button>
+    <button data-s="failure">workflow 恢复卡</button>
+    <button data-s="evonly">evidence_only_report</button>
+    <span class="hint">仅 mock 开关，非产品 UI</span>
+  </div>
+
+  <div class="shell">
+    <aside>
+      <div class="logo">Creator Workbench</div><div class="sub">内容研究 · 对话工作台</div>
+      <button class="new">＋ 新建对话</button>
+      <div class="history active">夏季通勤短裤研究</div>
+      <div class="history">防晒衣内容机会</div>
+      <div class="history">竞品活动复盘</div>
+    </aside>
+
+    <main>
+      <div class="crumb">内容研究 / 夏季通勤短裤 / Lite 调研</div>
+      <section class="message">
+        <div class="avatar user">我</div>
+        <div class="bubble"><div class="user-text">帮我调研「夏季通勤短裤」在小红书上的内容情况。</div></div>
+      </section>
+
+      <section class="message">
+        <div class="avatar ai">AI</div>
+        <div class="bubble" style="max-width:750px;min-width:0;width:100%">
+
+          <!-- Brief 确认卡（冻结 scope，所有状态共用） -->
+          <div class="brief">
+            <div class="b-top"><div class="b-title">研究 Brief</div><span class="chip good">已确认 · scope 已冻结</span></div>
+            <table>
+              <tr><td>调研主体</td><td>品类词「夏季通勤短裤」（小红书）</td></tr>
+              <tr><td>开放方向</td><td>竞品候选 · 产品表达 · 内容样本<span style="color:var(--muted)">（direction_set_v1；本次证据不足也保留方向状态）</span></td></tr>
+              <tr><td>采样上限</td><td>每方向 20 条 · policy v0.3.1</td></tr>
+              <tr><td>Run</td><td>#R-20260721-04 · 冻结于 2026-07-21 14:02</td></tr>
+            </table>
+            <div class="b-foot">冻结后不再变更；刷新或重复点击沿用同一 run，不重复采集。</div>
+          </div>
+
+          <!-- ============ STATE: complete_verified_report / template_only ============ -->
+          <div class="st-block" data-state="complete" style="margin-top:22px">
+            <div class="report">
+              <h1>夏季通勤短裤 · 调研结果</h1>
+              <div class="meta"><span class="chip good">complete_verified_report</span><span class="chip">template_only</span><span class="chip">截至 2026-07-21</span><span class="chip">3 个方向完成</span><a class="chip" href="#ev-c">7 条证据可溯源</a></div>
+              <div class="strip">3 个方向完成 · 2 条已验证发现 · 1 条样本观察 · 1 条线索（证据不足）</div>
+
+              <h2>核心发现</h2>
+              <article class="card">
+                <div class="card-top"><div><div class="card-title">通勤语境是样本中最集中的价值表达</div><div class="scope">产品表达 · 3 个独立来源 · 字段：正文</div></div><span class="badge">已验证</span></div>
+                <p>样本正文反复以「办公室空调」「地铁通勤」「久坐」等使用语境描述产品<span class="cite" tabindex="0" role="link" data-ev="evc1">[1]<span class="pop"><span class="q">“面料轻薄，办公室空调房也不会闷；搭配衬衫可以直接通勤。”</span><span class="s">笔记 #N-024 · 正文 · 2026-07-12</span><span class="f"><span class="note-link" data-note="N-024">查看原笔记 →</span></span></span></span><span class="cite" tabindex="0" role="link" data-ev="evc2">[2]<span class="pop"><span class="q">“地铁通勤 40 分钟也不皱，下班直接穿去吃饭。”</span><span class="s">笔记 #N-027 · 正文 · 2026-07-10</span><span class="f"><span class="note-link" data-note="N-027">查看原笔记 →</span></span></span></span><span class="cite" tabindex="0" role="link" data-ev="evc3">[3]<span class="pop"><span class="q">“久坐不勒肚子，开会一整天也舒服。”</span><span class="s">笔记 #N-033 · 正文 · 2026-07-08</span><span class="f"><span class="note-link" data-note="N-033">查看原笔记 →</span></span></span></span>。</p>
+                <p class="scope">仅描述内容如何表达，不声称真实产品效果；仅代表本次冻结策略下采集的样本。</p>
+              </article>
+              <article class="card">
+                <div class="card-top"><div><div class="card-title">样本中出现的竞品候选：K 牌、O 牌</div><div class="scope">竞品候选 · 2 个独立来源 · 字段：正文</div></div><span class="badge">已验证</span></div>
+                <p>样本正文中直接以知名品牌为参照描述候选产品：K 牌被与 Lululemon 对比<span class="cite" tabindex="0" role="link" data-ev="evc4">[4]<span class="pop"><span class="q">“比 Lululemon 的通勤短裤轻不少，价格只有三分之一。”</span><span class="s">笔记 #N-041 · 正文 · 2026-07-09</span><span class="f"><span class="note-link" data-note="N-041">查看原笔记 →</span></span></span></span>，O 牌被作为 Satisfy Running 的替代提及<span class="cite" tabindex="0" role="link" data-ev="evc5">[5]<span class="pop"><span class="q">“Satisfy 的短裤好看但太难买。后来选了 O 牌，版型接近。”</span><span class="s">笔记 #N-044 · 正文 · 2026-07-07</span><span class="f"><span class="note-link" data-note="N-044">查看原笔记 →</span></span></span></span>。</p>
+                <p class="scope">仅表示本次样本中的直接提及，不宣称市场地位或份额。</p>
+              </article>
+
+              <h2>样本观察</h2>
+              <article class="card">
+                <div class="card-top"><div><div class="card-title">可观察形式：搭配对比与细节演示</div><div class="scope">内容样本 · 2 个来源 · 字段：标题 / 正文</div></div><span class="badge obs">样本观察</span></div>
+                <p>样本中可直接观察到「前后搭配对比」「面料/口袋近景」「通勤场景切换」等形式<span class="cite" tabindex="0" role="link" data-ev="evc6">[6]<span class="pop"><span class="q">“一条短裤三种通勤搭配｜会议室、通勤路上、下班约会”</span><span class="s">笔记 #N-031 · 标题 · 2026-07-09</span><span class="f"><span class="note-link" data-note="N-031">查看原笔记 →</span></span></span></span><span class="cite" tabindex="0" role="link" data-ev="evc7">[7]<span class="pop"><span class="q">“前后对比 + 面料近景：抗皱测试在通勤前后各拍一次。”</span><span class="s">笔记 #N-035 · 正文 · 2026-07-06</span><span class="f"><span class="no-src">来源不可跳转 · 仅保存原文片段与采集时间</span></span></span></span>。仅描述样本形式，不推导内容效果或转化。</p>
+              </article>
+              <div class="weak"><strong>线索 · 口袋需求：</strong>样本正文中反复出现「没口袋 / 希望增加口袋」的表达<span class="cite weak" tabindex="0" role="link" data-ev="evc8">[8]<span class="pop"><span class="q">“没口袋 / 希望增加口袋”类表达，出现于 3 条笔记正文。</span><span class="s">笔记 #N-022 / #N-029 / #N-036 · 正文 · 未达方向间门槛</span><span class="f">查看原笔记：<span class="note-link" data-note="N-022">#N-022</span> · <span class="note-link" data-note="N-029">#N-029</span> · <span class="note-link" data-note="N-036">#N-036</span></span></span></span>，未达到准入门槛，仅供参考，不作为结论。</div>
+
+              <h2 id="ev-c">证据与来源</h2>
+              <div class="h2-note">正文中 [n] 编号的完整出处，每条可追溯；来源链接缺失时明确标注。</div>
+              <div class="h2-note">跳转状态示例：<strong>未保存来源链接；可查看原文片段与采集时间</strong>／<strong>来源链接当前不可打开（平台限制）；可查看已保存原文片段</strong>。两者不能用同一文案。</div>
+              <div class="ev" id="evc1"><div class="n">1</div><div><div class="q">“面料轻薄，办公室空调房也不会闷；搭配衬衫可以直接通勤。”</div><div class="s">笔记 <span class="note-link" data-note="N-024">#N-024</span> · 正文 / content_text · 采集于 2026-07-21 · <span class="note-link" data-note="N-024">查看原笔记 →</span></div></div></div>
+              <div class="ev" id="evc2"><div class="n">2</div><div><div class="q">“地铁通勤 40 分钟也不皱，下班直接穿去吃饭。”</div><div class="s">笔记 <span class="note-link" data-note="N-027">#N-027</span> · 正文 / content_text · 采集于 2026-07-21 · <span class="note-link" data-note="N-027">查看原笔记 →</span></div></div></div>
+              <div class="ev" id="evc3"><div class="n">3</div><div><div class="q">“久坐不勒肚子，开会一整天也舒服。”</div><div class="s">笔记 <span class="note-link" data-note="N-033">#N-033</span> · 正文 / content_text · 采集于 2026-07-21 · <span class="note-link" data-note="N-033">查看原笔记 →</span></div></div></div>
+              <div class="ev" id="evc4"><div class="n">4</div><div><div class="q">“比 Lululemon 的通勤短裤轻不少，价格只有三分之一。”</div><div class="s">笔记 <span class="note-link" data-note="N-041">#N-041</span> · 正文 / content_text · 采集于 2026-07-21 · <span class="note-link" data-note="N-041">查看原笔记 →</span></div></div></div>
+              <div class="ev" id="evc5"><div class="n">5</div><div><div class="q">“Satisfy 的短裤好看但太难买。后来选了 O 牌，版型接近。”</div><div class="s">笔记 <span class="note-link" data-note="N-044">#N-044</span> · 正文 / content_text · 采集于 2026-07-21 · <span class="note-link" data-note="N-044">查看原笔记 →</span></div></div></div>
+              <div class="ev" id="evc6"><div class="n">6</div><div><div class="q">“一条短裤三种通勤搭配｜会议室、通勤路上、下班约会”</div><div class="s">笔记 <span class="note-link" data-note="N-031">#N-031</span> · 标题 / title · 采集于 2026-07-21 · <span class="note-link" data-note="N-031">查看原笔记 →</span></div></div></div>
+              <div class="ev" id="evc7"><div class="n">7</div><div><div class="q">“前后对比 + 面料近景：抗皱测试在通勤前后各拍一次。”</div><div class="s">笔记 #N-035 · 正文 / content_text · 采集于 2026-07-21 · <span class="no-src">来源不可跳转（仅保存原文片段与采集时间）</span></div></div></div>
+              <div class="ev" id="evc8"><div class="n">8</div><div><div class="q">“没口袋 / 希望增加口袋”类表达，出现于 3 条笔记正文。<span class="tag-weak">未达方向间门槛</span></div><div class="s">笔记 <span class="note-link" data-note="N-022">#N-022</span> / <span class="note-link" data-note="N-029">#N-029</span> / <span class="note-link" data-note="N-036">#N-036</span> · 正文 / content_text · 采集于 2026-07-21</div></div></div>
+
+              <h2>研究限制</h2>
+              <div class="limit">本报告只由已准入 claim 生成。样本来自本次冻结策略下采集的笔记，不代表平台总体；互动指标不用于推导转化、偏好或因果；未开放方向（评论洞察、关键词增长等）不在本报告范围内。</div>
+            </div>
+          </div>
+
+          <!-- ============ STATE: partial_verified_report / template_only ============ -->
+          <div class="st-block" data-state="partial" style="margin-top:22px" hidden>
+            <div class="report">
+              <h1>夏季通勤短裤 · 调研结果</h1>
+              <div class="meta"><span class="chip warn">partial_verified_report</span><span class="chip">template_only</span><span class="chip">截至 2026-07-21</span><span class="chip">2 个方向完成 · 1 个方向证据不足</span><a class="chip" href="#ev-p">6 条证据可溯源</a></div>
+              <div class="strip">2 个方向完成 · 1 条已验证发现 · 1 条样本观察 · 1 条线索 · 竞品候选方向证据不足</div>
+
+              <h2>核心发现</h2>
+              <article class="card">
+                <div class="card-top"><div><div class="card-title">通勤语境是样本中最集中的价值表达</div><div class="scope">产品表达 · 3 个独立来源 · 字段：正文</div></div><span class="badge">已验证</span></div>
+                <p>样本正文反复以「办公室空调」「地铁通勤」「久坐」等使用语境描述产品<span class="cite" tabindex="0" role="link" data-ev="evp1">[1]<span class="pop"><span class="q">“面料轻薄，办公室空调房也不会闷；搭配衬衫可以直接通勤。”</span><span class="s">笔记 #N-024 · 正文 · 2026-07-12</span><span class="f"><span class="note-link" data-note="N-024">查看原笔记 →</span></span></span></span><span class="cite" tabindex="0" role="link" data-ev="evp2">[2]<span class="pop"><span class="q">“地铁通勤 40 分钟也不皱，下班直接穿去吃饭。”</span><span class="s">笔记 #N-027 · 正文 · 2026-07-10</span><span class="f"><span class="note-link" data-note="N-027">查看原笔记 →</span></span></span></span><span class="cite" tabindex="0" role="link" data-ev="evp3">[3]<span class="pop"><span class="q">“久坐不勒肚子，开会一整天也舒服。”</span><span class="s">笔记 #N-033 · 正文 · 2026-07-08</span><span class="f"><span class="note-link" data-note="N-033">查看原笔记 →</span></span></span></span>。</p>
+                <p class="scope">仅描述内容如何表达，不声称真实产品效果；仅代表本次冻结策略下采集的样本。</p>
+              </article>
+
+              <h2>方向状态</h2>
+              <div class="ins">
+                <div class="t">竞品候选方向 · 证据不足（来源为空）</div>
+                <div class="r">本次按冻结策略未找到符合条件的样本。这<strong>不表示市场上没有竞品</strong>，只表示本次采集未覆盖。</div>
+                <div class="a">恢复动作：调整采样策略后重新发起一轮 Lite 调研（已完成的其他方向不受影响）。</div>
+              </div>
+
+              <h2>样本观察</h2>
+              <article class="card">
+                <div class="card-top"><div><div class="card-title">可观察形式：搭配对比与细节演示</div><div class="scope">内容样本 · 2 个来源 · 字段：标题 / 正文</div></div><span class="badge obs">样本观察</span></div>
+                <p>样本中可直接观察到「前后搭配对比」「面料/口袋近景」「通勤场景切换」等形式<span class="cite" tabindex="0" role="link" data-ev="evp4">[4]<span class="pop"><span class="q">“一条短裤三种通勤搭配｜会议室、通勤路上、下班约会”</span><span class="s">笔记 #N-031 · 标题 · 2026-07-09</span><span class="f"><span class="note-link" data-note="N-031">查看原笔记 →</span></span></span></span><span class="cite" tabindex="0" role="link" data-ev="evp5">[5]<span class="pop"><span class="q">“前后对比 + 面料近景：抗皱测试在通勤前后各拍一次。”</span><span class="s">笔记 #N-035 · 正文 · 2026-07-06</span><span class="f"><span class="no-src">来源不可跳转 · 仅保存原文片段与采集时间</span></span></span></span>。仅描述样本形式，不推导内容效果或转化。</p>
+              </article>
+              <div class="weak"><strong>线索 · 口袋需求：</strong>样本正文中反复出现「没口袋 / 希望增加口袋」的表达<span class="cite weak" tabindex="0" role="link" data-ev="evp6">[6]<span class="pop"><span class="q">“没口袋 / 希望增加口袋”类表达，出现于 3 条笔记正文。</span><span class="s">笔记 #N-022 / #N-029 / #N-036 · 正文 · 未达方向间门槛</span><span class="f">查看原笔记：<span class="note-link" data-note="N-022">#N-022</span> · <span class="note-link" data-note="N-029">#N-029</span> · <span class="note-link" data-note="N-036">#N-036</span></span></span></span>，未达到准入门槛，仅供参考，不作为结论。</div>
+
+              <h2 id="ev-p">证据与来源</h2>
+              <div class="h2-note">正文中 [n] 编号的完整出处，每条可追溯；来源链接缺失时明确标注。</div>
+              <div class="ev" id="evp1"><div class="n">1</div><div><div class="q">“面料轻薄，办公室空调房也不会闷；搭配衬衫可以直接通勤。”</div><div class="s">笔记 <span class="note-link" data-note="N-024">#N-024</span> · 正文 / content_text · 采集于 2026-07-21 · <span class="note-link" data-note="N-024">查看原笔记 →</span></div></div></div>
+              <div class="ev" id="evp2"><div class="n">2</div><div><div class="q">“地铁通勤 40 分钟也不皱，下班直接穿去吃饭。”</div><div class="s">笔记 <span class="note-link" data-note="N-027">#N-027</span> · 正文 / content_text · 采集于 2026-07-21 · <span class="note-link" data-note="N-027">查看原笔记 →</span></div></div></div>
+              <div class="ev" id="evp3"><div class="n">3</div><div><div class="q">“久坐不勒肚子，开会一整天也舒服。”</div><div class="s">笔记 <span class="note-link" data-note="N-033">#N-033</span> · 正文 / content_text · 采集于 2026-07-21 · <span class="note-link" data-note="N-033">查看原笔记 →</span></div></div></div>
+              <div class="ev" id="evp4"><div class="n">4</div><div><div class="q">“一条短裤三种通勤搭配｜会议室、通勤路上、下班约会”</div><div class="s">笔记 <span class="note-link" data-note="N-031">#N-031</span> · 标题 / title · 采集于 2026-07-21 · <span class="note-link" data-note="N-031">查看原笔记 →</span></div></div></div>
+              <div class="ev" id="evp5"><div class="n">5</div><div><div class="q">“前后对比 + 面料近景：抗皱测试在通勤前后各拍一次。”</div><div class="s">笔记 #N-035 · 正文 / content_text · 采集于 2026-07-21 · <span class="no-src">来源不可跳转（仅保存原文片段与采集时间）</span></div></div></div>
+              <div class="ev" id="evp6"><div class="n">6</div><div><div class="q">“没口袋 / 希望增加口袋”类表达，出现于 3 条笔记正文。<span class="tag-weak">未达方向间门槛</span></div><div class="s">笔记 <span class="note-link" data-note="N-022">#N-022</span> / <span class="note-link" data-note="N-029">#N-029</span> / <span class="note-link" data-note="N-036">#N-036</span> · 正文 / content_text · 采集于 2026-07-21</div></div></div>
+
+              <h2>研究限制</h2>
+              <div class="limit">本报告只由已准入 claim 生成。竞品候选方向因来源为空未产出结果，未以空结论补齐。样本不代表平台总体；互动指标不用于推导转化、偏好或因果。</div>
+            </div>
+          </div>
+
+          <!-- ============ STATE: workflow recovery / publication: none ============ -->
+          <div class="st-block" data-state="failure" style="margin-top:22px" hidden>
+            <div class="reco">
+              <div class="meta" style="margin-bottom:8px"><span class="chip warn">workflow 恢复卡</span><span class="chip">publication: none</span><span class="chip">run #R-20260721-04</span></div>
+              <h1>调研中断：Cookie 已失效</h1>
+              <div class="fail">详情采集阶段因认证失效（auth_expired）中断。已完成的采集与判断均已保存，<strong>不会重复执行</strong>。</div>
+              <div class="done">
+                <strong>已保存的阶段</strong>
+                <li>Brief 确认与 scope 冻结</li>
+                <li>搜索采集：3 个方向共 41 条（已完成，不重复）</li>
+                <li>详情采集：12 / 58 条（中断点已记录）</li>
+              </div>
+              <div class="fail">未完成：详情采集（剩余 46 条）、准入判断、报告生成。</div>
+              <button class="btn-primary">更新 Cookie 后继续</button>
+              <div class="n">恢复后沿用同一 run 与最终报告；不会创建第二个 run 或第二份报告。</div>
+            </div>
+          </div>
+
+          <!-- ============ STATE: evidence_only_report / template_only ============ -->
+          <div class="st-block" data-state="evonly" style="margin-top:22px" hidden>
+            <div class="report">
+              <h1>夏季通勤短裤 · 已保存依据</h1>
+              <div class="meta"><span class="chip warn">evidence_only_report</span><span class="chip">template_only</span><span class="chip">截至 2026-07-21</span></div>
+              <div class="evonly-notice" style="margin-top:10px">本 run 的引用材料无法完整投影为正式报告，按安全回退仅显示已保存依据与限制，<strong>未生成叙述性结论</strong>。</div>
+
+              <h2>已保存依据</h2>
+              <div class="ev"><div class="n">·</div><div><div class="q">“面料轻薄，办公室空调房也不会闷；搭配衬衫可以直接通勤。”</div><div class="s">笔记 <span class="note-link" data-note="N-024">#N-024</span> · 正文 / content_text · 采集于 2026-07-21 · <span class="note-link" data-note="N-024">查看原笔记 →</span></div></div></div>
+              <div class="ev"><div class="n">·</div><div><div class="q">“地铁通勤 40 分钟也不皱，下班直接穿去吃饭。”</div><div class="s">笔记 <span class="note-link" data-note="N-027">#N-027</span> · 正文 / content_text · 采集于 2026-07-21 · <span class="note-link" data-note="N-027">查看原笔记 →</span></div></div></div>
+              <div class="ev"><div class="n">·</div><div><div class="q">“比 Lululemon 的通勤短裤轻不少，价格只有三分之一。”</div><div class="s">笔记 <span class="note-link" data-note="N-041">#N-041</span> · 正文 / content_text · 采集于 2026-07-21 · <span class="note-link" data-note="N-041">查看原笔记 →</span></div></div></div>
+              <div class="ev"><div class="n">·</div><div><div class="q">“前后对比 + 面料近景：抗皱测试在通勤前后各拍一次。”</div><div class="s">笔记 #N-035 · 正文 / content_text · 采集于 2026-07-21 · <span class="no-src">来源不可跳转（仅保存原文片段与采集时间）</span></div></div></div>
+
+              <h2>研究限制</h2>
+              <div class="limit">以上仅为已保存的原始依据，不构成结论；样本不代表平台总体。当引用材料修复并完整投影后，本 run 仍以同一份 artifact 呈现，不生成第二份报告。</div>
+            </div>
+          </div>
+
+        </div>
+      </section>
+    </main>
+
+    <aside class="right">
+      <h3>研究运行</h3>
+      <div class="status st-status" data-state="complete"><strong>complete_verified_report · template_only</strong><span>3 个方向完成；2 条已验证发现、1 条样本观察、1 条线索。</span></div>
+      <div class="status st-status" data-state="partial" hidden><strong>partial_verified_report · template_only</strong><span>竞品候选方向来源为空；已验证发现正常发布，方向没有被移除。</span></div>
+      <div class="status st-status" data-state="failure" hidden><strong>workflow 恢复卡 · publication: none · auth_expired</strong><span>详情采集中断；已完成阶段已保存，提供唯一恢复动作，不产生报告 artifact。</span></div>
+      <div class="status st-status" data-state="evonly" hidden><strong>evidence_only_report · template_only</strong><span>引用材料不完整；仅显示已保存依据，无叙述性结论。</span></div>
+      <h3>可用操作</h3>
+      <ul class="list"><li>点击正文 [n] 查看证据</li><li>查看原笔记（hover 引用号或证据区进入）</li><li>来源不可跳转时显示已保存片段</li><li>发起补采 / 重试（按状态可用）</li></ul>
+    </aside>
+  </div>
+
+  <button id="backpill">↩ 返回引用处</button>
+  <div class="overlay" id="overlay"></div>
+  <div class="drawer" id="drawer" aria-hidden="true">
+    <div class="d-head">
+      <div><div class="d-kicker">原笔记 · 采集样本</div><div class="d-title" id="d-title"></div><div class="d-meta" id="d-meta"></div></div>
+      <button class="d-close" id="d-close" aria-label="关闭">✕</button>
+    </div>
+    <div class="d-body" id="d-body"></div>
+  </div>
+
+  <script>
+    var NOTES = {
+      'N-024': {title:'今夏最满意的通勤短裤｜空调房友好', author:'@阿梨的衣橱', date:'2026-07-12', stats:'赞 2.1k · 藏 860 · 评 134',
+        body:'最近通勤出镜率最高的一条短裤，分享给同样怕热的姐妹。面料轻薄，办公室空调房也不会闷；搭配衬衫可以直接通勤。坐一天基本不皱，下班有约也不用回家换。',
+        hl:['面料轻薄，办公室空调房也不会闷；搭配衬衫可以直接通勤。']},
+      'N-027': {title:'一周穿搭记录｜地铁通勤篇', author:'@赶地铁的梨', date:'2026-07-10', stats:'赞 986 · 藏 402 · 评 88',
+        body:'这周的通勤穿搭合集。周二那条西装短裤是最近新宠：地铁通勤 40 分钟也不皱，下班直接穿去吃饭。其余几天以长裤为主。',
+        hl:['地铁通勤 40 分钟也不皱，下班直接穿去吃饭。']},
+      'N-033': {title:'久坐党友好下装分享', author:'@工位养生中', date:'2026-07-08', stats:'赞 1.5k · 藏 723 · 评 96',
+        body:'作为每天坐 10 个小时的人，分享几条久坐友好的下装。这条西装短裤最惊喜：久坐不勒肚子，开会一整天也舒服。面料垂感好，站起来不用偷偷抻裤子。',
+        hl:['久坐不勒肚子，开会一整天也舒服。']},
+      'N-041': {title:'4 条通勤短裤上身对比', author:'@买手阿灿', date:'2026-07-09', stats:'赞 1.1k · 藏 503 · 评 77',
+        body:'四条热门款上身对比。国产 K 牌这条最惊喜：比 Lululemon 的通勤短裤轻不少，价格只有三分之一。',
+        hl:['比 Lululemon 的通勤短裤轻不少，价格只有三分之一。']},
+      'N-044': {title:'Satisfy Running 平替找到了？', author:'@跑步通勤两不误', date:'2026-07-07', stats:'赞 688 · 藏 291 · 评 65',
+        body:'Satisfy 的短裤好看但太难买。后来选了 O 牌，版型接近，通勤也能穿。',
+        hl:['Satisfy 的短裤好看但太难买。','后来选了 O 牌，版型接近，通勤也能穿。']},
+      'N-031': {title:'一条短裤三种通勤搭配｜会议室、通勤路上、下班约会', author:'@胶囊衣橱计划', date:'2026-07-09', stats:'赞 3.4k · 藏 1.9k · 评 210',
+        body:'同一条黑色短裤的三个场景切换：配西装外套进会议室，配纯色 T 恤赶路，配针织下班约会。图 4-6 是面料近景和口袋细节。',
+        hl:['一条短裤三种通勤搭配｜会议室、通勤路上、下班约会']},
+      'N-022': {title:'通勤包 + iPad + 短裤的夏天', author:'@极简通勤', date:'2026-07-05', stats:'赞 542 · 藏 188 · 评 61',
+        body:'夏天的通勤装备精简到这三样。短裤凉快是凉快，就是手机只能拿手里，希望增加口袋。',
+        hl:['希望增加口袋']},
+      'N-029': {title:'夏天通勤穿什么｜一周记录', author:'@周五不加班', date:'2026-07-03', stats:'赞 431 · 藏 96 · 评 54',
+        body:'记录了一周的通勤穿搭，短裤出镜三次，主要图凉快。唯一的遗憾是没口袋。',
+        hl:['没口袋']},
+      'N-036': {title:'短裤合集｜五条上身对比', author:'@衣柜断舍离', date:'2026-07-01', stats:'赞 876 · 藏 350 · 评 92',
+        body:'五条热门短裤的上身对比，从版型、面料、价格三个维度打分。五条里四条没口袋，想要能装手机的。',
+        hl:['没口袋','想要能装手机的']}
+    };
+
+    /* mock state switcher */
+    var sbtns=document.querySelectorAll('.statebar button');
+    sbtns.forEach(function(b){
+      b.addEventListener('click',function(){
+        sbtns.forEach(function(x){x.classList.remove('active');});
+        b.classList.add('active');
+        document.querySelectorAll('.st-block').forEach(function(x){x.hidden=x.dataset.state!==b.dataset.s;});
+        document.querySelectorAll('.st-status').forEach(function(x){x.hidden=x.dataset.state!==b.dataset.s;});
+        window.scrollTo({top:0});
+      });
+    });
+
+    var backpill=document.getElementById('backpill'),lastY=null;
+    function jumpTo(id){
+      var t=document.getElementById(id);if(!t)return;
+      lastY=window.scrollY;backpill.classList.add('show');
+      t.scrollIntoView({behavior:'smooth',block:'center'});
+      t.classList.add('hl');setTimeout(function(){t.classList.remove('hl');},2000);
+    }
+    backpill.addEventListener('click',function(){if(lastY!==null)window.scrollTo({top:lastY,behavior:'smooth'});backpill.classList.remove('show');});
+
+    document.querySelectorAll('.cite').forEach(function(c){
+      c.addEventListener('click',function(e){jumpTo(c.dataset.ev);});
+      c.addEventListener('keydown',function(e){if(e.key==='Enter'||e.key===' '){e.preventDefault();jumpTo(c.dataset.ev);}});
+    });
+    document.querySelectorAll('.cite .pop').forEach(function(p){
+      p.addEventListener('click',function(e){e.stopPropagation();});
+    });
+
+    var overlay=document.getElementById('overlay'),drawer=document.getElementById('drawer');
+    function hi(text,hls){hls.forEach(function(h){if(text.indexOf(h)>-1)text=text.split(h).join('<mark>'+h+'</mark>');});return text;}
+    function openNote(id){
+      var n=NOTES[id];if(!n)return;
+      document.getElementById('d-title').innerHTML=hi(n.title,n.hl);
+      document.getElementById('d-meta').innerHTML='<span class="chip">'+id+'</span><span class="chip">'+n.author+'</span><span class="chip">'+n.date+'</span><span class="chip">'+n.stats+'</span>';
+      var html='<div class="d-sec">已引用正文</div><div class="d-text">'+hi(n.body,n.hl)+'</div>';
+      html+='<div class="d-foot">Mock 数据 · 实际产品中此处为采集详情：原文片段、来源链接（如存在）、field_path、采集时间与 payload/field hash。</div>';
+      document.getElementById('d-body').innerHTML=html;
+      overlay.classList.add('show');drawer.classList.add('show');drawer.setAttribute('aria-hidden','false');
+    }
+    function closeNote(){overlay.classList.remove('show');drawer.classList.remove('show');drawer.setAttribute('aria-hidden','true');}
+    document.querySelectorAll('.note-link').forEach(function(l){
+      l.addEventListener('click',function(e){e.preventDefault();e.stopPropagation();openNote(l.dataset.note);});
+    });
+    overlay.addEventListener('click',closeNote);
+    document.getElementById('d-close').addEventListener('click',closeNote);
+    document.addEventListener('keydown',function(e){if(e.key==='Escape')closeNote();});
+  </script>
+</body>
+</html>

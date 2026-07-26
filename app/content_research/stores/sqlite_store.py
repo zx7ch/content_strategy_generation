@@ -35,7 +35,9 @@ from app.content_research.persistence_models import (
     DirectionalEvidencePacketRecord,
     DirectionResultDecisionRecord,
     DirectionSourceProjectionRecord,
+    ReportDraftRecord,
     ReportFaithfulnessDecisionRecord,
+    ReportPublicationRecord,
     StageCheckpointRecord,
     TypedPersistenceRecord,
     WeakSignalRecord,
@@ -106,17 +108,19 @@ _TypedRecordT = TypeVar("_TypedRecordT", bound=TypedPersistenceRecord)
 
 _TYPED_RECORD_TABLES: dict[type[TypedPersistenceRecord], tuple[str, tuple[str, ...]]] = {
     CanonicalSourceRecord: ("content_research_canonical_sources", ("platform", "platform_source_kind", "platform_source_id", "canonical_url")),
-    DirectionSourceProjectionRecord: ("content_research_direction_source_projections", ("research_direction_id", "canonical_source_id", "evidence_packet_id")),
-    DirectionalEvidencePacketRecord: ("content_research_directional_evidence_packets", ("research_direction_id", "canonical_source_id", "field_projection_hash")),
-    ClaimCandidateRecord: ("content_research_claim_candidates", ("research_direction_id", "evidence_packet_id", "statement")),
+    DirectionSourceProjectionRecord: ("content_research_direction_source_projections", ("workflow_run_id", "research_direction_id", "canonical_source_id", "evidence_packet_id")),
+    DirectionalEvidencePacketRecord: ("content_research_directional_evidence_packets", ("workflow_run_id", "research_direction_id", "canonical_source_id", "field_projection_hash")),
+    ClaimCandidateRecord: ("content_research_claim_candidates", ("workflow_run_id", "research_direction_id", "evidence_packet_id", "statement", "intent_id", "claim_type", "requested_state")),
     ClaimAdmissionDecisionRecord: ("content_research_claim_admission_decisions", ("research_direction_id", "claim_candidate_id", "decision", "policy_snapshot_id")),
     DirectionResultDecisionRecord: ("content_research_direction_result_decisions", ("research_direction_id", "policy_snapshot_id")),
     WeakSignalRecord: ("content_research_weak_signals", ("admission_decision_id",)),
     CrossDirectionRecord: ("content_research_cross_direction_records", ("research_plan_id", "record_type")),
     AggregateClaimRecord: ("content_research_aggregate_claims", ("research_plan_id", "aggregate_type")),
-    StageCheckpointRecord: ("content_research_stage_checkpoints", ("subagent_task_id", "stage_name", "input_fingerprint", "status", "retry_count")),
+    StageCheckpointRecord: ("content_research_stage_checkpoints", ("workflow_run_id", "subagent_task_id", "stage_name", "input_fingerprint", "status", "retry_count", "started_at", "finished_at")),
     BudgetLedgerEntryRecord: ("content_research_budget_ledger_entries", ("research_plan_id", "research_direction_id", "idempotency_key", "reservation_status", "reserved_amount", "consumed_amount", "stage_checkpoint_id")),
-    ReportFaithfulnessDecisionRecord: ("content_research_report_faithfulness_decisions", ("research_plan_id", "result_snapshot_id")),
+    ReportDraftRecord: ("content_research_report_drafts", ("workflow_run_id", "research_plan_id", "governed_snapshot_id", "governed_snapshot_version", "input_fingerprint", "policy_version", "algorithm_version", "previous_version_id")),
+    ReportFaithfulnessDecisionRecord: ("content_research_report_faithfulness_decisions", ("workflow_run_id", "research_plan_id", "governed_snapshot_id", "governed_snapshot_version", "input_fingerprint", "policy_version", "algorithm_version", "report_draft_id", "previous_version_id")),
+    ReportPublicationRecord: ("content_research_report_publications", ("workflow_run_id", "research_plan_id", "governed_snapshot_id", "governed_snapshot_version", "input_fingerprint", "policy_version", "algorithm_version", "report_draft_id", "faithfulness_decision_id", "publication_state", "previous_version_id")),
 }
 
 
@@ -131,7 +135,9 @@ class SQLiteContentResearchStore:
         conn = sqlite3.connect(self._db_path, timeout=30)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA busy_timeout=30000")
-        conn.execute("PRAGMA journal_mode=WAL")
+        # WAL is a database-level bootstrap setting. Re-applying it on every
+        # Trace/read connection can wait behind a checkpoint writer and turns
+        # an otherwise read-only request into a lock-contending operation.
         conn.execute("PRAGMA foreign_keys=ON")
         return conn
 
@@ -930,6 +936,23 @@ class SQLiteContentResearchStore:
         if row is None:
             raise ValueError(f"missing {relation}: {record_id}")
 
+    def _require_result_snapshot(
+        self,
+        snapshot_id: str,
+        workflow_run_id: str,
+        research_plan_id: str,
+        snapshot_version: str,
+    ) -> None:
+        snapshot = self.get_result_snapshot(snapshot_id)
+        if snapshot is None:
+            raise ValueError(f"missing governed snapshot: {snapshot_id}")
+        if (
+            snapshot.workflow_run_id != workflow_run_id
+            or snapshot.research_plan_id != research_plan_id
+            or snapshot.snapshot_version != snapshot_version
+        ):
+            raise ValueError("governed snapshot identity does not match report record")
+
     def _get_typed_record(
         self,
         table: str,
@@ -975,10 +998,14 @@ class SQLiteContentResearchStore:
         record_type: type[TypedPersistenceRecord],
         fields: tuple[str, ...],
     ) -> TypedPersistenceRecord:
+        values = {
+            field: _parse_dt(row[field]) if field in {"started_at", "finished_at"} and row[field] else row[field]
+            for field in fields
+        }
         return record_type(
             id=row["id"], schema_version=row["schema_version"], payload=_loads(row["payload_json"]),
             metadata=_loads(row["metadata_json"]), created_at=_parse_dt(row["created_at"]),
-            **{field: row[field] for field in fields},
+            **values,
         )
 
     def save_canonical_source(self, source: CanonicalSourceRecord) -> CanonicalSourceRecord:
@@ -999,15 +1026,54 @@ class SQLiteContentResearchStore:
     def save_direction_source_projection(self, record: DirectionSourceProjectionRecord) -> DirectionSourceProjectionRecord:
         self._require_typed_parent("content_research_canonical_sources", record.canonical_source_id, "canonical source")
         self._require_typed_parent("content_research_directional_evidence_packets", record.evidence_packet_id, "evidence packet")
-        return self._save_typed_record("content_research_direction_source_projections", record, {"research_direction_id": record.research_direction_id, "canonical_source_id": record.canonical_source_id, "evidence_packet_id": record.evidence_packet_id})  # type: ignore[return-value]
+        return self._save_typed_record("content_research_direction_source_projections", record, {"workflow_run_id": record.workflow_run_id, "research_direction_id": record.research_direction_id, "canonical_source_id": record.canonical_source_id, "evidence_packet_id": record.evidence_packet_id})  # type: ignore[return-value]
 
     def save_directional_evidence_packet(self, record: DirectionalEvidencePacketRecord) -> DirectionalEvidencePacketRecord:
         self._require_typed_parent("content_research_canonical_sources", record.canonical_source_id, "canonical source")
-        return self._save_typed_record("content_research_directional_evidence_packets", record, {"research_direction_id": record.research_direction_id, "canonical_source_id": record.canonical_source_id, "field_projection_hash": record.field_projection_hash})  # type: ignore[return-value]
+        return self._save_typed_record("content_research_directional_evidence_packets", record, {"workflow_run_id": record.workflow_run_id, "research_direction_id": record.research_direction_id, "canonical_source_id": record.canonical_source_id, "field_projection_hash": record.field_projection_hash})  # type: ignore[return-value]
+
+    def list_direction_source_projections(self, workflow_run_id: str, research_direction_id: str, *, offset: int = 0, limit: int = 50) -> list[DirectionSourceProjectionRecord]:
+        if offset < 0 or limit < 1:
+            raise ValueError("offset must be non-negative and limit must be positive")
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM content_research_direction_source_projections WHERE workflow_run_id = ? AND research_direction_id = ? ORDER BY created_at ASC, id ASC LIMIT ? OFFSET ?",
+                (workflow_run_id, research_direction_id, limit, offset),
+            ).fetchall()
+        return [self._row_to_typed_record(row, DirectionSourceProjectionRecord, ("workflow_run_id", "research_direction_id", "canonical_source_id", "evidence_packet_id")) for row in rows]  # type: ignore[return-value]
+
+    def count_run_independent_sources(self, workflow_run_id: str) -> int:
+        """Count the complete canonical union without exposing paginated projections."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(DISTINCT canonical_source_id) FROM content_research_direction_source_projections WHERE workflow_run_id = ?",
+                (workflow_run_id,),
+            ).fetchone()
+        return int(row[0] if row else 0)
+
+    def list_directional_evidence_packets(self, workflow_run_id: str, research_direction_id: str, *, offset: int = 0, limit: int = 50) -> list[DirectionalEvidencePacketRecord]:
+        if offset < 0 or limit < 1:
+            raise ValueError("offset must be non-negative and limit must be positive")
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM content_research_directional_evidence_packets WHERE workflow_run_id = ? AND research_direction_id = ? ORDER BY created_at ASC, id ASC LIMIT ? OFFSET ?",
+                (workflow_run_id, research_direction_id, limit, offset),
+            ).fetchall()
+        return [self._row_to_typed_record(row, DirectionalEvidencePacketRecord, ("workflow_run_id", "research_direction_id", "canonical_source_id", "field_projection_hash")) for row in rows]  # type: ignore[return-value]
 
     def save_claim_candidate(self, record: ClaimCandidateRecord) -> ClaimCandidateRecord:
         self._require_typed_parent("content_research_directional_evidence_packets", record.evidence_packet_id, "evidence packet")
-        return self._save_typed_record("content_research_claim_candidates", record, {"research_direction_id": record.research_direction_id, "evidence_packet_id": record.evidence_packet_id, "statement": record.statement})  # type: ignore[return-value]
+        packet = self.get_typed_record(DirectionalEvidencePacketRecord, record.evidence_packet_id)
+        assert packet is not None
+        from app.content_research.admission.candidates import validate_candidate_packet
+        validate_candidate_packet(record, packet)
+        return self._save_typed_record("content_research_claim_candidates", record, {"workflow_run_id": record.workflow_run_id, "research_direction_id": record.research_direction_id, "evidence_packet_id": record.evidence_packet_id, "statement": record.statement, "intent_id": record.intent_id, "claim_type": record.claim_type, "requested_state": record.requested_state})  # type: ignore[return-value]
+
+    def list_claim_candidates(self, workflow_run_id: str, research_direction_id: str) -> list[ClaimCandidateRecord]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT * FROM content_research_claim_candidates WHERE workflow_run_id = ? AND research_direction_id = ? ORDER BY created_at ASC, id ASC", (workflow_run_id, research_direction_id)).fetchall()
+        fields = ("workflow_run_id", "research_direction_id", "evidence_packet_id", "statement", "intent_id", "claim_type", "requested_state")
+        return [self._row_to_typed_record(row, ClaimCandidateRecord, fields) for row in rows]  # type: ignore[return-value]
 
     def save_claim_admission_decision(self, record: ClaimAdmissionDecisionRecord) -> ClaimAdmissionDecisionRecord:
         self._require_typed_parent("content_research_claim_candidates", record.claim_candidate_id, "claim candidate")
@@ -1029,18 +1095,65 @@ class SQLiteContentResearchStore:
         return self._save_typed_record("content_research_aggregate_claims", record, {"research_plan_id": record.research_plan_id, "aggregate_type": record.aggregate_type})  # type: ignore[return-value]
 
     def save_stage_checkpoint(self, record: StageCheckpointRecord) -> StageCheckpointRecord:
-        return self._save_typed_record("content_research_stage_checkpoints", record, {"subagent_task_id": record.subagent_task_id, "stage_name": record.stage_name, "input_fingerprint": record.input_fingerprint, "status": record.status, "retry_count": record.retry_count})  # type: ignore[return-value]
+        values = {
+            "workflow_run_id": record.workflow_run_id,
+            "subagent_task_id": record.subagent_task_id,
+            "stage_name": record.stage_name,
+            "input_fingerprint": record.input_fingerprint,
+            "status": record.status,
+            "retry_count": record.retry_count,
+            "started_at": _fmt_dt(record.started_at) if record.started_at else None,
+            "finished_at": _fmt_dt(record.finished_at) if record.finished_at else None,
+        }
+        columns = ("id", "schema_version", *values, "payload_json", "metadata_json", "created_at")
+        placeholders = ", ".join("?" for _ in columns)
+        updates = ", ".join(f"{column} = excluded.{column}" for column in columns if column != "id")
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO content_research_stage_checkpoints "
+                f"({', '.join(columns)}) VALUES ({placeholders}) "
+                f"ON CONFLICT(id) DO UPDATE SET {updates}",
+                (
+                    record.id,
+                    record.schema_version,
+                    *values.values(),
+                    _dumps(record.payload),
+                    _dumps(record.metadata),
+                    _fmt_dt(record.created_at),
+                ),
+            )
+        return record
 
     def save_budget_ledger_entry(self, record: BudgetLedgerEntryRecord) -> BudgetLedgerEntryRecord:
         if record.stage_checkpoint_id:
             self._require_typed_parent("content_research_stage_checkpoints", record.stage_checkpoint_id, "stage checkpoint")
         return self._save_typed_record("content_research_budget_ledger_entries", record, {"research_plan_id": record.research_plan_id, "research_direction_id": record.research_direction_id, "idempotency_key": record.idempotency_key, "reservation_status": record.reservation_status, "reserved_amount": record.reserved_amount, "consumed_amount": record.consumed_amount, "stage_checkpoint_id": record.stage_checkpoint_id})  # type: ignore[return-value]
 
+    def save_report_draft(self, record: ReportDraftRecord) -> ReportDraftRecord:
+        self._require_result_snapshot(record.governed_snapshot_id, record.workflow_run_id, record.research_plan_id, record.governed_snapshot_version)
+        return self._save_typed_record(
+            "content_research_report_drafts",
+            record,
+            {"workflow_run_id": record.workflow_run_id, "research_plan_id": record.research_plan_id, "governed_snapshot_id": record.governed_snapshot_id, "governed_snapshot_version": record.governed_snapshot_version, "input_fingerprint": record.input_fingerprint, "policy_version": record.policy_version, "algorithm_version": record.algorithm_version, "previous_version_id": record.previous_version_id},
+        )  # type: ignore[return-value]
+
     def save_report_faithfulness_decision(self, record: ReportFaithfulnessDecisionRecord) -> ReportFaithfulnessDecisionRecord:
+        self._require_result_snapshot(record.governed_snapshot_id, record.workflow_run_id, record.research_plan_id, record.governed_snapshot_version)
+        self._require_typed_parent("content_research_report_drafts", record.report_draft_id, "report draft")
         return self._save_typed_record(
             "content_research_report_faithfulness_decisions",
             record,
-            {"research_plan_id": record.research_plan_id, "result_snapshot_id": record.result_snapshot_id},
+            {"workflow_run_id": record.workflow_run_id, "research_plan_id": record.research_plan_id, "governed_snapshot_id": record.governed_snapshot_id, "governed_snapshot_version": record.governed_snapshot_version, "input_fingerprint": record.input_fingerprint, "policy_version": record.policy_version, "algorithm_version": record.algorithm_version, "report_draft_id": record.report_draft_id, "previous_version_id": record.previous_version_id},
+        )  # type: ignore[return-value]
+
+    def save_report_publication(self, record: ReportPublicationRecord) -> ReportPublicationRecord:
+        self._require_result_snapshot(record.governed_snapshot_id, record.workflow_run_id, record.research_plan_id, record.governed_snapshot_version)
+        self._require_typed_parent("content_research_report_drafts", record.report_draft_id, "report draft")
+        self._require_typed_parent("content_research_report_faithfulness_decisions", record.faithfulness_decision_id, "report faithfulness decision")
+        return self._save_typed_record(
+            "content_research_report_publications",
+            record,
+            {"workflow_run_id": record.workflow_run_id, "research_plan_id": record.research_plan_id, "governed_snapshot_id": record.governed_snapshot_id, "governed_snapshot_version": record.governed_snapshot_version, "input_fingerprint": record.input_fingerprint, "policy_version": record.policy_version, "algorithm_version": record.algorithm_version, "report_draft_id": record.report_draft_id, "faithfulness_decision_id": record.faithfulness_decision_id, "publication_state": record.publication_state, "previous_version_id": record.previous_version_id},
         )  # type: ignore[return-value]
 
     @staticmethod

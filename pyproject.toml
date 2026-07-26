@@ -36,6 +36,10 @@ dependencies = [
     "pydantic>=2.5.0",
     "pydantic-settings>=2.1.0",
     "httpx>=0.25.0",
+    "websocket-client>=1.8.0",
+    "curl_cffi==0.15.0",
+    "qrcode>=8.0",
+    "Pillow>=10.0",
     "python-dotenv>=1.0.0",
 ]
 

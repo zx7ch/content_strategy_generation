@@ -516,7 +516,7 @@ export async function initializeWorkspaceContext(): Promise<{ workspace_id: stri
       `Agent Runtime API 契约不匹配：当前 ${health.api_contract}，需要 ${REQUIRED_API_CONTRACT}。请升级本地 runtime。`
     );
   }
-  if (compareSemver(health.version, MIN_BACKEND_VERSION) < 0) {
+  if (!isLocalRuntimeVersion(health.version) && compareSemver(health.version, MIN_BACKEND_VERSION) < 0) {
     throw new Error(
       `Agent Runtime 版本过低：当前 ${health.version}，需要 ${MIN_BACKEND_VERSION} 或更高。请升级本地 runtime。`
     );
@@ -531,6 +531,10 @@ export async function initializeWorkspaceContext(): Promise<{ workspace_id: stri
   const workspace = await getDefaultWorkspace();
   setWorkspaceContext(workspace.workspace_id, workspace.user_id);
   return workspace;
+}
+
+function isLocalRuntimeVersion(version: string): boolean {
+  return ["dev", "development", "local"].includes(version.trim().toLowerCase());
 }
 
 function compareSemver(current: string, minimum: string): number {

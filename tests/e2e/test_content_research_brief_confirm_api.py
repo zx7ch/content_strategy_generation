@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 
+import aiosqlite
 import httpx
 import pytest
 
@@ -13,14 +14,28 @@ from app.services.llm.types import LLMResponse, TokenUsage
 
 
 class FakeRuntime:
+    def __init__(self, db_path: str) -> None:
+        self._db_path = db_path
+
     async def start_presearch_run(self, *, thread_id: str, user_id: str, seed_text: str) -> str:
         return "run_confirm_1"
 
     async def mark_presearch_ready(self, workflow_run_id: str) -> None:
         return None
 
-    async def complete_brief_and_plan(self, *, workflow_run_id: str, task_specs: list[dict]) -> list[str]:
-        return [f"child_{index}" for index, _spec in enumerate(task_specs)]
+    async def complete_brief_and_plan_atomically(
+        self, *, workflow_run_id: str, task_specs: list[dict], confirmation_writer
+    ) -> list[str]:
+        child_ids = [f"child_{index}" for index, _spec in enumerate(task_specs)]
+        async with aiosqlite.connect(self._db_path) as conn:
+            await conn.execute("BEGIN IMMEDIATE")
+            try:
+                await confirmation_writer(conn, child_ids)
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
+        return child_ids
 
     async def get_runtime_snapshot(self, workflow_run_id: str) -> dict:
         return {
@@ -59,7 +74,7 @@ async def client(tmp_path):
     app.state.content_research_service = ContentResearchService(
         store=SQLiteContentResearchStore(str(tmp_path / "content_research.db")),
         presearch=PresearchService(FakeLLM(), first_feedback_timeout_seconds=0.05, hard_cutoff_seconds=0.1),
-        workflow_runtime=FakeRuntime(),
+        workflow_runtime=FakeRuntime(str(tmp_path / "content_research.db")),
     )
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as c:
@@ -119,8 +134,14 @@ async def test_confirm_brief_creates_plan_directions_tasks_and_workflow_summary(
     snapshot_payload = snapshot.json()
     assert snapshot_payload["workflow_run_id"] == presearch["workflow_run_id"]
     assert snapshot_payload["effective_policy_hash"]
-    assert len(snapshot_payload["direction_contracts"]) == 7
-    assert len(snapshot_payload["sample_policies"]) == 7
+    assert snapshot_payload["effective_policy"]["direction_ids"] == [
+        "product_marketing",
+        "comment_insight",
+    ]
+    assert len(snapshot_payload["direction_contracts"]) == 2
+    assert len(snapshot_payload["sample_policies"]) == 2
+    assert snapshot_payload["validation_result"]["schema_version"] == "content_research_admission_capability_preflight_v1"
+    assert snapshot_payload["validation_result"]["directions"]["product_marketing"]["status"] == "formal_directional_result"
 
 
 @pytest.mark.asyncio

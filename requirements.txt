@@ -9,6 +9,10 @@ langgraph
 pydantic
 pydantic-settings
 httpx
+websocket-client
+curl_cffi==0.15.0
+qrcode
+Pillow
 python-dotenv
 
 # LLM providers

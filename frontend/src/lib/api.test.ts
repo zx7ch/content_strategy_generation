@@ -144,6 +144,31 @@ test("initializeWorkspaceContext succeeds when health and workspace both respond
   assert.equal(callCount, 3, "should call /health, /runtime/prewarm, then /workspaces/default");
 });
 
+test("initializeWorkspaceContext accepts local dev runtime version", async () => {
+  setWorkspaceContext("", "");
+  globalThis.fetch = (async (input) => {
+    const url = typeof input === "string" ? input : input instanceof URL ? input.href : (input as Request).url;
+    if (url.endsWith("/health")) {
+      return new Response(
+        JSON.stringify({ status: "healthy", version: "dev", api_contract: REQUIRED_API_CONTRACT }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      );
+    }
+    if (url.endsWith("/runtime/prewarm")) {
+      return new Response(null, { status: 202 });
+    }
+    return new Response(JSON.stringify({ workspace_id: "ws-dev", user_id: "u-dev" }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" }
+    });
+  }) as typeof fetch;
+
+  const result = await initializeWorkspaceContext();
+
+  assert.deepEqual(result, { workspace_id: "ws-dev", user_id: "u-dev" });
+  assert.deepEqual(getWorkspaceContext(), { workspaceId: "ws-dev", userId: "u-dev" });
+});
+
 test("initializeWorkspaceContext throws when health returns non-ok status", async () => {
   setWorkspaceContext("", "");
   globalThis.fetch = (async () => new Response("error", { status: 500 })) as typeof fetch;

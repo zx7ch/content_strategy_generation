@@ -8,7 +8,7 @@ from typing import Any, Protocol
 from app.content_research.evidence.models import EvidenceBundleRecord, EvidenceRecord
 from app.content_research.models import SubagentTaskRecord
 from app.content_research.sources import SourceAdapterRegistry
-from app.content_research.sources.base import SourceCollectionResult
+from app.content_research.sources.base import SourceOperationResult
 
 
 @dataclass(frozen=True)
@@ -19,7 +19,7 @@ class SubagentExecutionContext:
     source_kind: str = "search_result"
     query: str = ""
     limit: int = 10
-    source_result: SourceCollectionResult | None = None
+    source_result: SourceOperationResult | None = None
 
 
 @dataclass(frozen=True)

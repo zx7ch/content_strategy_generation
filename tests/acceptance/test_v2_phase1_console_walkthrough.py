@@ -79,7 +79,16 @@ def _run_process(
             time.sleep(0.1)
         else:  # pragma: no cover - startup failure
             if process.stdout is not None:
-                output.append(process.stdout.read())
+                # `read()` waits for EOF, but the process is still alive here.
+                # Terminate it before collecting diagnostics so a failed
+                # readiness probe cannot hang the acceptance harness forever.
+                process.terminate()
+                try:
+                    stdout, _ = process.communicate(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    stdout, _ = process.communicate(timeout=5)
+                output.append(stdout)
             raise AssertionError(f"{name} did not start in time:\n{''.join(output)}")
         yield
     finally:

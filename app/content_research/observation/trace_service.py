@@ -10,6 +10,7 @@ from pydantic import BaseModel
 
 from app.content_research.api_schemas import ContentResearchTraceResponse
 from app.content_research.models import ObservationEventRecord, ResearchBriefRecord, TraceRecord
+from app.content_research.persistence_models import StageCheckpointRecord
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
 from app.memory.workflow_store import WorkflowStore
 from app.services.llm.usage_tracker import LLMUsageSummary, LLMUsageTracker
@@ -35,13 +36,15 @@ class ContentResearchTraceService:
             for event in self._store.list_observation_events(trace.id)
         ]
 
-        async with WorkflowStore(self._db_path) as workflow_store:
+        # Trace is a query-only projection: opening it must not DDL/commit or
+        # join a writer's lock queue while a provider is collecting evidence.
+        async with WorkflowStore(self._db_path, read_only=True) as workflow_store:
             run = await workflow_store.get_run(workflow_run_id)
             runtime_steps = await workflow_store.list_steps(workflow_run_id)
             runtime_child_tasks = await workflow_store.list_child_tasks(workflow_run_id)
             workflow_events = await workflow_store.list_events(workflow_run_id)
 
-        async with LLMUsageTracker(self._db_path) as usage_tracker:
+        async with LLMUsageTracker(self._db_path, read_only=True) as usage_tracker:
             usage_summary = await usage_tracker.summarize_job(workflow_run_id)
             usage_steps = await usage_tracker.summarize_job_steps(workflow_run_id)
             usage_events = await usage_tracker.list_job_events(workflow_run_id)
@@ -62,6 +65,7 @@ class ContentResearchTraceService:
         usage_events_dicts = [_json_dict(event) for event in usage_events]
         workflow_event_dicts = [_json_dict(event) for event in workflow_events]
         observation_event_dicts = [_observation_event_dict(event) for event in observation_events]
+        provider_operations = _provider_operations(self._store, workflow_run_id)
 
         return ContentResearchTraceResponse(
             workflow_run_id=workflow_run_id,
@@ -82,7 +86,10 @@ class ContentResearchTraceService:
             runtime_steps=[_json_dict(step) for step in runtime_steps],
             runtime_child_tasks=[_json_dict(task) for task in runtime_child_tasks],
             usage_summary=_usage_summary_dict(usage_summary),
-            external_api_summary=_external_api_summary(observation_event_dicts),
+            external_api_summary=_external_api_summary(
+                observation_event_dicts, provider_operations
+            ),
+            provider_operations=provider_operations,
             usage_steps=usage_steps_dicts,
             usage_events=usage_events_dicts,
         )
@@ -142,7 +149,9 @@ def _usage_summary_dict(summary: LLMUsageSummary) -> dict:
     return _json_safe(asdict(summary))
 
 
-def _external_api_summary(observation_events: list[dict]) -> dict:
+def _external_api_summary(
+    observation_events: list[dict], provider_operations: list[dict]
+) -> dict:
     """Summarize source-adapter calls for UI observability, never for recovery."""
     started = [event for event in observation_events if event.get("event_name") == "source_collection_started"]
     completed = [event for event in observation_events if event.get("event_name") == "source_collection_completed"]
@@ -155,13 +164,52 @@ def _external_api_summary(observation_events: list[dict]) -> dict:
         operation = str(payload.get("operation") or "collect")
         by_provider[provider] = by_provider.get(provider, 0) + 1
         by_operation[operation] = by_operation.get(operation, 0) + 1
+    for operation in provider_operations:
+        provider = str(operation.get("provider") or "unknown")
+        operation_name = str(operation.get("provider_operation") or operation.get("operation") or "collect")
+        by_provider[provider] = by_provider.get(provider, 0) + 1
+        by_operation[operation_name] = by_operation.get(operation_name, 0) + 1
     return {
-        "call_count": len(started),
-        "completed_count": len(completed),
-        "failed_count": len(failed),
+        "call_count": len(started) + len(provider_operations),
+        "completed_count": len(completed) + sum(item.get("status") == "completed" for item in provider_operations),
+        "failed_count": len(failed) + sum(item.get("status") not in {"completed", "running"} for item in provider_operations),
         "by_provider": by_provider,
         "by_operation": by_operation,
     }
+
+
+def _provider_operations(store: SQLiteContentResearchStore, workflow_run_id: str) -> list[dict]:
+    """Return safe, durable provider-operation outcomes for Trace projection."""
+    records = [
+        item for item in store.list_typed_records(StageCheckpointRecord)
+        if item.workflow_run_id == workflow_run_id and item.stage_name == "operation"
+    ]
+    latest: dict[str, Any] = {}
+    for record in sorted(records, key=lambda item: (item.created_at, item.id)):
+        fingerprint = str(record.payload.get("operation_fingerprint") or "")
+        if fingerprint:
+            latest[fingerprint] = record
+    return [
+        {
+            "operation_fingerprint": fingerprint,
+            "operation": record.payload.get("operation"),
+            "provider": (record.payload.get("completion") or {}).get("provider"),
+            "provider_operation": (record.payload.get("completion") or {}).get("provider_operation"),
+            "source_kind": (record.payload.get("completion") or {}).get("source_kind"),
+            "result_status": (record.payload.get("completion") or {}).get("result_status"),
+            "item_count": (record.payload.get("completion") or {}).get("item_count"),
+            "completeness": (record.payload.get("completion") or {}).get("completeness"),
+            "cookie_status": (record.payload.get("completion") or {}).get("cookie_status"),
+            "status": record.status,
+            "started_at": record.started_at,
+            "finished_at": record.finished_at,
+            "failure_code": (record.payload.get("completion") or {}).get("failure_code"),
+            "failure_reason": (record.payload.get("completion") or {}).get("failure_reason"),
+            "retryable": bool((record.payload.get("completion") or {}).get("retryable")),
+            "recovery_action": (record.payload.get("completion") or {}).get("recovery_action"),
+        }
+        for fingerprint, record in sorted(latest.items())
+    ]
 
 
 def _json_safe(value: Any) -> Any:

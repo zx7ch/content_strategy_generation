@@ -1,0 +1,1186 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>F003 内容调研 - 嵌入式对话 Mock</title>
+  <style>
+    :root {
+      --bg: #f6f7f8;
+      --surface: #ffffff;
+      --soft: #f3f4f6;
+      --soft-2: #f8fafc;
+      --line: #e5e7eb;
+      --line-strong: #d1d5db;
+      --ink: #111827;
+      --text: #1f2937;
+      --muted: #6b7280;
+      --quiet: #9ca3af;
+      --accent: #276749;
+      --accent-soft: #edf7f1;
+      --blue: #2563eb;
+      --blue-soft: #eff6ff;
+      --amber: #b45309;
+      --amber-soft: #fffbeb;
+      --red: #b91c1c;
+      --red-soft: #fef2f2;
+      --shadow: 0 14px 42px rgba(15, 23, 42, 0.08);
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      height: 100vh;
+      overflow: hidden;
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, "PingFang SC", "Microsoft YaHei", sans-serif;
+      letter-spacing: 0;
+    }
+
+    button, input, textarea { font: inherit; }
+    button { cursor: pointer; border: 0; }
+
+    .shell {
+      display: grid;
+      grid-template-columns: 260px minmax(560px, 1fr) 320px;
+      height: 100vh;
+      min-width: 1120px;
+    }
+
+    .sidebar {
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+      border-right: 1px solid var(--line);
+      background: #fbfbfc;
+    }
+
+    .sidebar-head {
+      padding: 16px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .workspace {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 14px;
+      font-weight: 700;
+      color: var(--ink);
+    }
+
+    .new-chat {
+      width: 100%;
+      height: 36px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface);
+      color: var(--ink);
+      font-weight: 650;
+    }
+
+    .threads {
+      flex: 1;
+      min-height: 0;
+      overflow: auto;
+      padding: 12px 10px;
+    }
+
+    .thread {
+      padding: 10px;
+      margin-bottom: 5px;
+      border-radius: 8px;
+      color: var(--muted);
+    }
+
+    .thread.active {
+      background: #eef0f2;
+      color: var(--ink);
+    }
+
+    .thread-title {
+      display: block;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-size: 14px;
+      font-weight: 650;
+    }
+
+    .thread-meta {
+      margin-top: 4px;
+      font-size: 12px;
+      color: var(--quiet);
+    }
+
+    .main {
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+      background: var(--surface);
+    }
+
+    .topbar {
+      min-height: 62px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 18px;
+      padding: 0 22px;
+      border-bottom: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.94);
+    }
+
+    .topbar h1 {
+      margin: 0;
+      font-size: 16px;
+      color: var(--ink);
+    }
+
+    .topbar p {
+      margin: 3px 0 0;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .stage-tabs {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: var(--soft-2);
+    }
+
+    .stage-tab {
+      height: 30px;
+      padding: 0 12px;
+      border-radius: 999px;
+      background: transparent;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 650;
+    }
+
+    .stage-tab.active {
+      background: var(--ink);
+      color: #fff;
+    }
+
+    .messages {
+      flex: 1;
+      min-height: 0;
+      overflow: auto;
+      padding: 26px 22px 18px;
+      background:
+        linear-gradient(#ffffff, rgba(255,255,255,0.92)),
+        radial-gradient(circle at 18% 0%, rgba(237,247,241,0.8), transparent 34%);
+    }
+
+    .dayline {
+      display: flex;
+      justify-content: center;
+      margin-bottom: 20px;
+      color: var(--quiet);
+      font-size: 12px;
+    }
+
+    .msg {
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
+      margin-bottom: 18px;
+    }
+
+    .msg.user {
+      justify-content: flex-end;
+    }
+
+    .avatar {
+      width: 30px;
+      height: 30px;
+      flex: 0 0 auto;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 50%;
+      background: var(--soft);
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 800;
+    }
+
+    .bubble {
+      max-width: min(760px, 86%);
+      border-radius: 16px;
+      padding: 12px 14px;
+      font-size: 14px;
+      line-height: 1.65;
+    }
+
+    .assistant .bubble {
+      border: 1px solid var(--line);
+      background: var(--surface);
+      box-shadow: 0 4px 18px rgba(15, 23, 42, 0.04);
+    }
+
+    .user .bubble {
+      background: var(--ink);
+      color: #fff;
+      border-bottom-right-radius: 5px;
+    }
+
+    .bubble p {
+      margin: 0;
+    }
+
+    .research-block {
+      max-width: min(820px, 92%);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: var(--surface);
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+
+    .block-head {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 16px 16px 12px;
+      border-bottom: 1px solid var(--line);
+      background: #fbfcfb;
+    }
+
+    .eyebrow {
+      color: var(--accent);
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: .04em;
+      text-transform: uppercase;
+    }
+
+    .block-title {
+      margin: 4px 0 0;
+      color: var(--ink);
+      font-size: 17px;
+      line-height: 1.45;
+      font-weight: 760;
+    }
+
+    .block-subtitle {
+      margin: 4px 0 0;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.55;
+    }
+
+    .mini-status {
+      white-space: nowrap;
+      height: 28px;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 0 10px;
+      border-radius: 999px;
+      background: var(--accent-soft);
+      color: var(--accent);
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    .dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: currentColor;
+    }
+
+    .block-body {
+      padding: 16px;
+    }
+
+    .inline-field {
+      display: grid;
+      grid-template-columns: 96px 1fr;
+      gap: 12px;
+      align-items: start;
+      padding: 10px 0;
+      border-bottom: 1px solid #f0f1f3;
+    }
+
+    .inline-field:last-child {
+      border-bottom: 0;
+    }
+
+    .field-label {
+      color: var(--quiet);
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    .field-value {
+      color: var(--text);
+      font-size: 14px;
+      line-height: 1.6;
+    }
+
+    .chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    .chip {
+      min-height: 30px;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 5px 11px;
+      border: 1px solid #cfe3d6;
+      border-radius: 999px;
+      background: var(--accent-soft);
+      color: var(--accent);
+      font-size: 13px;
+      font-weight: 650;
+    }
+
+    .chip.neutral {
+      border-color: var(--line);
+      background: var(--soft-2);
+      color: var(--muted);
+    }
+
+    .chip.blue {
+      border-color: #bfdbfe;
+      background: var(--blue-soft);
+      color: var(--blue);
+    }
+
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 16px;
+    }
+
+    .btn {
+      height: 34px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 0 13px;
+      border-radius: 9px;
+      font-size: 13px;
+      font-weight: 700;
+    }
+
+    .btn.primary {
+      background: var(--ink);
+      color: #fff;
+    }
+
+    .btn.secondary {
+      border: 1px solid var(--line);
+      background: var(--surface);
+      color: var(--ink);
+    }
+
+    .btn.ghost {
+      background: var(--soft);
+      color: var(--muted);
+    }
+
+    .cards {
+      display: grid;
+      gap: 10px;
+    }
+
+    .decision-card {
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: var(--surface);
+      padding: 13px;
+    }
+
+    .card-top {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+    }
+
+    .card-title {
+      margin: 0;
+      color: var(--ink);
+      font-size: 15px;
+      font-weight: 760;
+    }
+
+    .card-desc {
+      margin: 5px 0 0;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.55;
+    }
+
+    .badges {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-top: 10px;
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      min-height: 22px;
+      padding: 3px 7px;
+      border-radius: 999px;
+      background: var(--soft);
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 700;
+    }
+
+    .badge.good {
+      background: var(--accent-soft);
+      color: var(--accent);
+    }
+
+    .badge.warn {
+      background: var(--amber-soft);
+      color: var(--amber);
+    }
+
+    .card-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 7px;
+      margin-top: 12px;
+    }
+
+    .tiny-btn {
+      height: 29px;
+      padding: 0 10px;
+      border-radius: 8px;
+      border: 1px solid var(--line);
+      background: var(--soft-2);
+      color: var(--ink);
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    .tiny-btn.selected {
+      border-color: #bad7c4;
+      background: var(--accent-soft);
+      color: var(--accent);
+    }
+
+    .report {
+      display: grid;
+      gap: 14px;
+    }
+
+    .report-section {
+      padding: 12px 0 0;
+      border-top: 1px solid var(--line);
+    }
+
+    .report-section:first-child {
+      padding-top: 0;
+      border-top: 0;
+    }
+
+    .report-section h3 {
+      margin: 0 0 8px;
+      color: var(--ink);
+      font-size: 14px;
+    }
+
+    .report-section ul {
+      margin: 0;
+      padding-left: 18px;
+      color: var(--text);
+      font-size: 13px;
+      line-height: 1.75;
+    }
+
+    .report-bubble {
+      max-width: min(820px, 92%);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      border-bottom-left-radius: 5px;
+      padding: 16px 18px;
+      background: var(--surface);
+      box-shadow: 0 4px 18px rgba(15, 23, 42, 0.04);
+      font-size: 14px;
+      line-height: 1.72;
+    }
+
+    .report-bubble h2 {
+      margin: 0 0 10px;
+      color: var(--ink);
+      font-size: 18px;
+      line-height: 1.45;
+    }
+
+    .report-bubble h3 {
+      margin: 18px 0 7px;
+      color: var(--ink);
+      font-size: 14px;
+    }
+
+    .report-bubble p {
+      margin: 8px 0;
+    }
+
+    .report-bubble ul {
+      margin: 7px 0 0;
+      padding-left: 18px;
+    }
+
+    .report-bubble li {
+      margin: 5px 0;
+    }
+
+    .evidence-link {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 1px 6px;
+      border-radius: 999px;
+      background: var(--blue-soft);
+      color: var(--blue);
+      font-size: 12px;
+      font-weight: 700;
+      text-decoration: none;
+      vertical-align: baseline;
+    }
+
+    .inline-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 16px;
+      padding-top: 14px;
+      border-top: 1px solid var(--line);
+    }
+
+    .composer {
+      border-top: 1px solid var(--line);
+      padding: 14px 20px 18px;
+      background: var(--surface);
+    }
+
+    .mode-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 10px;
+    }
+
+    .mode-pill {
+      height: 28px;
+      display: inline-flex;
+      align-items: center;
+      padding: 0 11px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      background: var(--surface);
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    .mode-pill.active {
+      border-color: #bad7c4;
+      background: var(--accent-soft);
+      color: var(--accent);
+    }
+
+    .input-wrap {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 10px;
+      align-items: end;
+      border: 1px solid var(--line-strong);
+      border-radius: 14px;
+      padding: 10px;
+      background: var(--surface);
+    }
+
+    textarea {
+      width: 100%;
+      height: 48px;
+      resize: none;
+      border: 0;
+      outline: 0;
+      color: var(--ink);
+      line-height: 1.5;
+    }
+
+    .send {
+      width: 38px;
+      height: 38px;
+      border-radius: 11px;
+      background: var(--ink);
+      color: #fff;
+      font-size: 18px;
+    }
+
+    .inspector {
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+      border-left: 1px solid var(--line);
+      background: #fbfbfc;
+    }
+
+    .inspector-head {
+      padding: 18px 16px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .inspector-head h2 {
+      margin: 0;
+      color: var(--ink);
+      font-size: 15px;
+    }
+
+    .inspector-head p {
+      margin: 5px 0 0;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.5;
+    }
+
+    .panel {
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .panel-title {
+      margin: 0 0 10px;
+      color: var(--ink);
+      font-size: 13px;
+      font-weight: 800;
+    }
+
+    .steps {
+      display: grid;
+      gap: 9px;
+    }
+
+    .step {
+      display: grid;
+      grid-template-columns: 22px 1fr;
+      gap: 8px;
+      align-items: start;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .step-dot {
+      width: 22px;
+      height: 22px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 999px;
+      background: var(--soft);
+      color: var(--quiet);
+      font-size: 11px;
+      font-weight: 800;
+    }
+
+    .step.done .step-dot,
+    .step.active .step-dot {
+      background: var(--accent-soft);
+      color: var(--accent);
+    }
+
+    .step.active {
+      color: var(--ink);
+      font-weight: 700;
+    }
+
+    .kv {
+      display: grid;
+      gap: 9px;
+      font-size: 12px;
+    }
+
+    .kv-row {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      color: var(--muted);
+    }
+
+    .kv-row strong {
+      color: var(--ink);
+      font-weight: 700;
+      text-align: right;
+    }
+
+    .stage-view { display: none; }
+    .stage-view.active { display: block; }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <div class="sidebar-head">
+        <div class="workspace">
+          <span>品牌增长实验室</span>
+          <span>⌘</span>
+        </div>
+        <button class="new-chat">+ 新建对话</button>
+      </div>
+      <div class="threads">
+        <div class="thread active">
+          <span class="thread-title">徒步短裤内容调研</span>
+          <div class="thread-meta">内容调研 · 进行中</div>
+        </div>
+        <div class="thread">
+          <span class="thread-title">轻量户外 7 月选题</span>
+          <div class="thread-meta">普通对话 · 昨天</div>
+        </div>
+        <div class="thread">
+          <span class="thread-title">越野跑背心竞品观察</span>
+          <div class="thread-meta">内容调研 · 周二</div>
+        </div>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <div>
+          <h1>Creator Workbench</h1>
+          <p>同一个对话线程中发起、确认并推进内容调研</p>
+        </div>
+        <nav class="stage-tabs" aria-label="四阶段 mock 切换">
+          <button class="stage-tab active" data-stage="stage-1">1 预检索</button>
+          <button class="stage-tab" data-stage="stage-2">2 选品牌</button>
+          <button class="stage-tab" data-stage="stage-3">3 选内容</button>
+          <button class="stage-tab" data-stage="stage-4">4 报告</button>
+        </nav>
+      </header>
+
+      <section class="messages">
+        <div class="dayline">今天 14:20</div>
+
+        <div class="msg user">
+          <div class="bubble">
+            帮我调研一下小红书上「徒步短裤」这个品类，想看竞品品牌、内容打法和用户评论痛点。
+          </div>
+        </div>
+
+        <div class="stage-view active" id="stage-1">
+          <div class="msg assistant">
+            <div class="avatar">AI</div>
+            <div class="bubble">
+              <p>收到。我会先做一轮轻量预检索，确认本轮调研对象和边界，然后再进入正式调研。</p>
+            </div>
+          </div>
+
+          <div class="msg assistant">
+            <div class="avatar">AI</div>
+            <article class="research-block">
+              <div class="block-head">
+                <div>
+                  <div class="eyebrow">Content Research · Pre-research</div>
+                  <h2 class="block-title">在开始前，请确认几个关键点</h2>
+                  <p class="block-subtitle">我先帮你把需求拆成调研对象、想对比的品牌和要看的内容方向。你确认后，我再开始正式调研。</p>
+                </div>
+                <div class="mini-status"><span class="dot"></span>等待确认</div>
+              </div>
+              <div class="block-body">
+                <div class="inline-field">
+                  <div class="field-label">你的需求</div>
+                  <div class="field-value">帮我调研一下小红书上「徒步短裤」这个品类，想看竞品品牌、内容打法和用户评论痛点。</div>
+                </div>
+                <div class="inline-field">
+                  <div class="field-label">调研对象</div>
+                  <div class="field-value">
+                    我理解你这次想研究的是「徒步短裤」这个品类，而不是某一个固定品牌。是否准确？
+                    <div class="chips" style="margin-top: 10px;">
+                      <span class="chip">准确，继续</span>
+                      <span class="chip neutral">大致准确，我补充一下</span>
+                      <span class="chip neutral">不准确，修改对象</span>
+                    </div>
+                  </div>
+                </div>
+                <div class="inline-field">
+                  <div class="field-label">候选品牌</div>
+                  <div class="field-value">
+                    我会先找和这个品类相关、值得对比的品牌。你可以先勾选确定想看的，也可以稍后让我继续补充。
+                    <div class="chips" style="margin-top: 10px;">
+                      <span class="chip blue">Salomon</span>
+                      <span class="chip blue">凯乐石</span>
+                      <span class="chip blue">迪卡侬</span>
+                      <span class="chip neutral">+ 添加其他品牌</span>
+                    </div>
+                  </div>
+                </div>
+                <div class="inline-field">
+                  <div class="field-label">调研方向</div>
+                  <div class="field-value">
+                    下面这些方向会决定我接下来怎么找资料、怎么整理结果。建议先选 2-4 个，范围会更聚焦。
+                    <div class="chips" style="margin-top: 10px;">
+                      <span class="chip">竞品品牌</span>
+                      <span class="chip">产品卖点怎么讲</span>
+                      <span class="chip">用户评论痛点</span>
+                      <span class="chip">小红书爆文内容</span>
+                      <span class="chip neutral">相关品类词</span>
+                      <span class="chip neutral">品牌账号表现</span>
+                    </div>
+                  </div>
+                </div>
+                <div class="inline-field">
+                  <div class="field-label">补充问题</div>
+                  <div class="field-value">
+                    <input style="width: 100%; height: 38px; border: 1px solid var(--line); border-radius: 9px; padding: 0 11px; outline: none;" value="更关注小众品牌如何把功能卖点讲得像生活方式内容" />
+                  </div>
+                </div>
+                <div class="actions">
+                  <button class="btn primary">确认并开始调研</button>
+                  <button class="btn secondary">修改调研主体</button>
+                  <button class="btn secondary">补充品牌/约束</button>
+                </div>
+              </div>
+            </article>
+          </div>
+        </div>
+
+        <div class="stage-view" id="stage-2">
+          <div class="msg assistant">
+            <div class="avatar">AI</div>
+            <div class="bubble">
+              <p>我完成了第一轮扫描：先扩展了近似品类词和营销表达，再从这些词关联到品牌、账号和店铺线索。下面这些品牌值得你决定是否继续关注。</p>
+            </div>
+          </div>
+
+          <div class="msg assistant">
+            <div class="avatar">AI</div>
+            <article class="research-block">
+              <div class="block-head">
+                <div>
+                  <div class="eyebrow">Content Research · Brand Selection</div>
+                  <h2 class="block-title">选择下一步进一步关注的品牌</h2>
+                  <p class="block-subtitle">这里的筛选标准不是“是否知名”，而是是否值得作为本轮品类调研的对照对象。</p>
+                </div>
+                <div class="mini-status"><span class="dot"></span>人工决策点 1</div>
+              </div>
+              <div class="block-body">
+                <div class="cards">
+                  <section class="decision-card">
+                    <div class="card-top">
+                      <div>
+                        <h3 class="card-title">Salomon</h3>
+                        <p class="card-desc">偏专业户外与越野跑场景，内容里常出现轻量、速干、山野穿搭等表达；账号内容质量高，但店铺承接数据还需要补证。</p>
+                      </div>
+                      <span class="badge good">高优先级</span>
+                    </div>
+                    <div class="badges">
+                      <span class="badge good">证据状态：部分支持</span>
+                      <span class="badge">证据等级 B</span>
+                      <span class="badge">来源 8 条</span>
+                      <span class="badge">账号信号强</span>
+                      <span class="badge warn">需补评论证据</span>
+                    </div>
+                    <div class="card-actions">
+                      <button class="tiny-btn selected">深入调研</button>
+                      <button class="tiny-btn">观察</button>
+                      <button class="tiny-btn">忽略</button>
+                      <button class="tiny-btn">查看证据</button>
+                    </div>
+                  </section>
+
+                  <section class="decision-card">
+                    <div class="card-top">
+                      <div>
+                        <h3 class="card-title">凯乐石</h3>
+                        <p class="card-desc">更贴近国内户外用户，内容覆盖徒步、露营和通勤户外混合场景；适合看国内品牌如何讲“专业但日常可穿”。</p>
+                      </div>
+                      <span class="badge good">高潜力需补证</span>
+                    </div>
+                    <div class="badges">
+                      <span class="badge good">证据状态：线索</span>
+                      <span class="badge">证据等级 C</span>
+                      <span class="badge">来源 5 条</span>
+                      <span class="badge warn">店铺数据待补</span>
+                    </div>
+                    <div class="card-actions">
+                      <button class="tiny-btn selected">深入调研</button>
+                      <button class="tiny-btn">观察</button>
+                      <button class="tiny-btn">忽略</button>
+                      <button class="tiny-btn">查看证据</button>
+                    </div>
+                  </section>
+
+                  <section class="decision-card">
+                    <div class="card-top">
+                      <div>
+                        <h3 class="card-title">迪卡侬</h3>
+                        <p class="card-desc">大众价格带代表，适合做价格与基础功能表达参照；如果本轮更关注营销表达，可放入观察而不是深挖。</p>
+                      </div>
+                      <span class="badge">证据参考</span>
+                    </div>
+                    <div class="badges">
+                      <span class="badge good">证据状态：已验证</span>
+                      <span class="badge">证据等级 B</span>
+                      <span class="badge">来源 11 条</span>
+                    </div>
+                    <div class="card-actions">
+                      <button class="tiny-btn">深入调研</button>
+                      <button class="tiny-btn selected">观察</button>
+                      <button class="tiny-btn">忽略</button>
+                      <button class="tiny-btn">查看证据</button>
+                    </div>
+                  </section>
+                </div>
+                <div class="actions">
+                  <button class="btn primary">确认品牌选择，继续深挖</button>
+                  <button class="btn secondary">手动添加品牌</button>
+                </div>
+              </div>
+            </article>
+          </div>
+        </div>
+
+        <div class="stage-view" id="stage-3">
+          <div class="msg user">
+            <div class="bubble">重点看 Salomon 和凯乐石，迪卡侬先放观察。</div>
+          </div>
+          <div class="msg assistant">
+            <div class="avatar">AI</div>
+            <div class="bubble">
+              <p>好的。我围绕 Salomon 和凯乐石继续深挖了品牌相关笔记、账号内容、评论和可见店铺线索。下面是我建议你选择进入最终报告的内容方向。</p>
+            </div>
+          </div>
+
+          <div class="msg assistant">
+            <div class="avatar">AI</div>
+            <article class="research-block">
+              <div class="block-head">
+                <div>
+                  <div class="eyebrow">Content Research · Content Selection</div>
+                  <h2 class="block-title">选择指定品牌下你感兴趣的内容信号</h2>
+                  <p class="block-subtitle">选中的内容会进入最终报告的重点分析；观察项会保留在附录。</p>
+                </div>
+                <div class="mini-status"><span class="dot"></span>人工决策点 2</div>
+              </div>
+              <div class="block-body">
+                <div class="cards">
+                  <section class="decision-card">
+                    <div class="card-top">
+                      <div>
+                        <h3 class="card-title">Salomon：山系穿搭 + 功能短裤</h3>
+                        <p class="card-desc">高赞内容经常把短裤放在「山系穿搭」「轻徒步」「夏季户外」场景中，而不是单纯讲参数。</p>
+                      </div>
+                      <span class="badge good">优先执行</span>
+                    </div>
+                    <div class="badges">
+                      <span class="badge good">证据状态：部分支持</span>
+                      <span class="badge">代表来源 6 条</span>
+                      <span class="badge">claim scope：内容表达</span>
+                    </div>
+                    <div class="card-actions">
+                      <button class="tiny-btn selected">重点关注</button>
+                      <button class="tiny-btn">观察</button>
+                      <button class="tiny-btn">忽略</button>
+                      <button class="tiny-btn">展开证据</button>
+                    </div>
+                  </section>
+
+                  <section class="decision-card">
+                    <div class="card-top">
+                      <div>
+                        <h3 class="card-title">凯乐石：通勤到户外的一裤多穿</h3>
+                        <p class="card-desc">用户更关心是否日常可穿、是否显腿型、是否透气，评论区对版型和尺码反馈密集。</p>
+                      </div>
+                      <span class="badge good">高潜力需补证</span>
+                    </div>
+                    <div class="badges">
+                      <span class="badge good">证据状态：线索</span>
+                      <span class="badge">代表来源 4 条</span>
+                      <span class="badge warn">缺少长期使用反馈</span>
+                    </div>
+                    <div class="card-actions">
+                      <button class="tiny-btn selected">重点关注</button>
+                      <button class="tiny-btn">观察</button>
+                      <button class="tiny-btn">忽略</button>
+                      <button class="tiny-btn">展开证据</button>
+                    </div>
+                  </section>
+
+                  <section class="decision-card">
+                    <div class="card-top">
+                      <div>
+                        <h3 class="card-title">评论痛点：尺码、摩擦、口袋安全感</h3>
+                        <p class="card-desc">评论里反复出现「大腿摩擦」「口袋能不能装手机」「腰头松紧」等购买前疑虑。</p>
+                      </div>
+                      <span class="badge good">优先执行</span>
+                    </div>
+                    <div class="badges">
+                      <span class="badge good">证据状态：部分支持</span>
+                      <span class="badge">代表来源 9 条</span>
+                      <span class="badge">claim scope：用户需求</span>
+                    </div>
+                    <div class="card-actions">
+                      <button class="tiny-btn selected">重点关注</button>
+                      <button class="tiny-btn">观察</button>
+                      <button class="tiny-btn">忽略</button>
+                      <button class="tiny-btn">展开证据</button>
+                    </div>
+                  </section>
+                </div>
+                <div class="actions">
+                  <button class="btn primary">确认内容选择，生成报告</button>
+                  <button class="btn secondary">继续补采更多内容</button>
+                </div>
+              </div>
+            </article>
+          </div>
+        </div>
+
+        <div class="stage-view" id="stage-4">
+          <div class="msg user">
+            <div class="bubble">这些都放进报告，尤其是评论痛点。</div>
+          </div>
+          <div class="msg assistant">
+            <div class="avatar">AI</div>
+            <div class="report-bubble">
+              <h2>这是本轮「徒步短裤」内容调研报告</h2>
+              <p>我把本轮调研按“品类词与营销表达 → 竞品品牌 → 品牌相关内容 → 用户评论痛点”的路径整理如下。你选择重点关注 Salomon、凯乐石，并把迪卡侬作为价格带参照，所以报告不会把主题收窄成某一个品牌，而是围绕「徒步短裤」这个品类来输出。</p>
+
+              <h3>1. 近似品类词与营销表达</h3>
+              <p>围绕「徒步短裤」，小红书内容里更常出现的近似品类词包括「轻量徒步短裤」「夏季户外短裤」「速干登山短裤」「山系短裤」。营销表达上，“轻量、速干、不闷、显腿型、通勤也能穿”比单纯强调面料参数更容易进入内容标题和正文 <a class="evidence-link" href="#">证据 01</a>。</p>
+
+              <h3>2. 竞品与品牌筛选判断</h3>
+              <p>本轮更值得深挖的不是所有出现过的品牌，而是能代表不同内容打法的品牌。Salomon 代表专业户外与山系审美，凯乐石代表国内户外用户与日常化场景，迪卡侬适合作为大众价格带参照 <a class="evidence-link" href="#">证据 02</a>。账号数据上，Salomon 的内容调性更稳定；凯乐石更适合观察“专业功能如何被讲得日常”；店铺承接数据目前还不完整，应标记为待补证 <a class="evidence-link" href="#">缺失证据</a>。</p>
+
+              <h3>3. 品牌相关内容机会</h3>
+              <ul>
+                <li>Salomon 相关内容更适合拆解“山系穿搭 + 功能短裤”的表达方式，标题通常不会只讲短裤，而是把短裤放进轻徒步、夏季户外、越野跑周边场景 <a class="evidence-link" href="#">证据 03</a>。</li>
+                <li>凯乐石相关内容更适合观察“一裤多穿”的用户语境，尤其是通勤到户外、日常到周末出行的转换场景 <a class="evidence-link" href="#">证据 04</a>。</li>
+              </ul>
+
+              <h3>4. 评论痛点</h3>
+              <p>评论里最值得转化成内容选题的痛点有三个：尺码是否准确、大腿摩擦和闷热问题、口袋能不能安全放手机。这些问题比“面料科技”更接近购买前的真实犹豫，可以直接变成测评、避坑或选购指南类内容 <a class="evidence-link" href="#">证据 05</a>。</p>
+
+              <h3>5. 可直接转成选题的机会</h3>
+              <ul>
+                <li>「徒步短裤怎么选，先看这 4 个容易被忽略的细节」。</li>
+                <li>「一条短裤从通勤穿到轻徒步，真实体验有哪些坑」。</li>
+                <li>「夏天户外短裤别只看速干，口袋和腰头更影响体验」。</li>
+              </ul>
+
+              <div class="inline-actions">
+                <button class="btn primary">基于报告生成选题</button>
+                <button class="btn secondary">展开完整证据</button>
+                <button class="btn secondary">导出报告</button>
+                <button class="btn ghost">继续追问</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <footer class="composer">
+        <div class="mode-row">
+          <span class="mode-pill">普通对话</span>
+          <span class="mode-pill active">内容调研</span>
+          <span class="mode-pill">笔记生成</span>
+          <span class="mode-pill">策略复盘</span>
+        </div>
+        <div class="input-wrap">
+          <textarea placeholder="继续补充要求、追问结果，或输入新的品类/品牌/SKU..."></textarea>
+          <button class="send">↑</button>
+        </div>
+      </footer>
+    </main>
+
+    <aside class="inspector">
+      <div class="inspector-head">
+        <h2>内容调研状态</h2>
+        <p>右侧只显示结构化进度和证据入口，主决策始终在中间对话里完成。</p>
+      </div>
+
+      <section class="panel">
+        <h3 class="panel-title">阶段</h3>
+        <div class="steps">
+          <div class="step done" data-step="stage-1">
+            <span class="step-dot">1</span>
+            <span>Pre-research：确认调研对象</span>
+          </div>
+          <div class="step" data-step="stage-2">
+            <span class="step-dot">2</span>
+            <span>人工确认进一步关注的品牌</span>
+          </div>
+          <div class="step" data-step="stage-3">
+            <span class="step-dot">3</span>
+            <span>人工确认指定品牌感兴趣内容</span>
+          </div>
+          <div class="step" data-step="stage-4">
+            <span class="step-dot">4</span>
+            <span>输出调研报告</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h3 class="panel-title">已确认信息</h3>
+        <div class="kv">
+          <div class="kv-row"><span>调研主体</span><strong>徒步短裤</strong></div>
+          <div class="kv-row"><span>主体类型</span><strong>品类 / SKU，可切换</strong></div>
+          <div class="kv-row"><span>方向</span><strong>品类词、竞品、内容、评论</strong></div>
+          <div class="kv-row"><span>已选品牌</span><strong>Salomon、凯乐石</strong></div>
+          <div class="kv-row"><span>观察品牌</span><strong>迪卡侬</strong></div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h3 class="panel-title">证据与 Trace</h3>
+        <div class="kv">
+          <div class="kv-row"><span>素材</span><strong>28 条</strong></div>
+          <div class="kv-row"><span>Evidence Bundle</span><strong>7 个</strong></div>
+          <div class="kv-row"><span>缺失证据</span><strong>3 项</strong></div>
+        </div>
+        <div class="actions">
+          <button class="btn secondary">查看 Trace</button>
+          <button class="btn secondary">证据包</button>
+        </div>
+      </section>
+    </aside>
+  </div>
+
+  <script>
+    const tabs = document.querySelectorAll(".stage-tab");
+    const views = document.querySelectorAll(".stage-view");
+    const steps = document.querySelectorAll(".step");
+
+    const stageOrder = ["stage-1", "stage-2", "stage-3", "stage-4"];
+
+    function activate(stageId) {
+      tabs.forEach((tab) => tab.classList.toggle("active", tab.dataset.stage === stageId));
+      views.forEach((view) => view.classList.toggle("active", view.id === stageId));
+      const activeIndex = stageOrder.indexOf(stageId);
+      steps.forEach((step) => {
+        const index = stageOrder.indexOf(step.dataset.step);
+        step.classList.toggle("done", index < activeIndex);
+        step.classList.toggle("active", index === activeIndex);
+      });
+    }
+
+    tabs.forEach((tab) => {
+      tab.addEventListener("click", () => activate(tab.dataset.stage));
+    });
+  </script>
+</body>
+</html>
