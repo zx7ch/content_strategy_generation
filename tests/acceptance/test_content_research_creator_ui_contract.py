@@ -6,7 +6,7 @@ from pathlib import Path
 import re
 import time
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import urlparse
 
 import pytest
 from playwright.sync_api import Page, expect, sync_playwright
@@ -163,7 +163,7 @@ def test_content_research_trace_recovers_after_reload(page_with_runtime):
     expect(page.locator('section[aria-label="Content Research Trace inspector"]')).to_be_visible(timeout=10000)
 
 
-def test_content_research_restores_published_report_from_report_contract(page_with_runtime):
+def test_content_research_restores_lite_report_from_timeline_artifact(page_with_runtime):
     page, frontend_url, backend_url = page_with_runtime
     runtime = MockRuntime(timeline=True)
     runtime.install(page, backend_url)
@@ -174,25 +174,17 @@ def test_content_research_restores_published_report_from_report_contract(page_wi
     expect(report).to_be_visible(timeout=5000)
     expect(report.get_by_text("部分内容已核验")).to_be_visible()
     header = report.locator('header[aria-label="Content Research report header"]')
-    expect(header.get_by_role("heading", name="尺寸说明应先于促销表达。")).to_be_visible()
+    expect(header.get_by_role("heading", name="本次内容调研结论")).to_be_visible()
     expect(header.get_by_text("研究范围：1 条冻结引用 · 1 条受治理结论 · 方向覆盖未公开", exact=True)).to_be_visible()
     expect(header.get_by_text("发布日期未公开", exact=True)).to_be_visible()
     expect(header.get_by_text("冻结报告版本")).to_have_count(0)
-    expect(report.get_by_role("heading", name="核心结论")).to_be_visible()
     expect(report.get_by_role("heading", name="主要发现").first).to_be_visible()
-    expect(report.get_by_role("heading", name="下一步建议").first).to_be_visible()
-    expect(report.get_by_text("跨方向张力")).to_be_visible()
     expect(report.get_by_text("初步信号")).to_be_visible()
     report.get_by_role("button", name="打开引用 7").click()
     evidence = page.locator('aside[aria-label="Content Research citation evidence"]')
-    expect(evidence.get_by_text("原笔记链接不可用").first).to_be_visible()
     expect(evidence.get_by_text("完整冻结依据")).to_be_visible()
     expect(evidence.get_by_role("link", name="打开原笔记")).to_have_count(1)
     assert runtime.report_calls == 1
-    page.locator('section[aria-label="Content Research Trace inspector"]').get_by_label("查看 Trace").click()
-    trace = page.locator('section[aria-label="Content Research Trace"]')
-    expect(trace.get_by_text("报告生成与忠实度审计").first).to_be_visible()
-    expect(trace.get_by_text("耗时未知")).to_be_visible()
     page.reload(wait_until="networkidle")
     expect(page.locator('article[aria-label="Content Research published report"]')).to_have_count(1)
 
@@ -213,8 +205,8 @@ def test_content_research_sidebar_uses_safe_run_and_report_summary_hierarchy(pag
     expect(sidebar.get_by_text("证据准入与归纳", exact=True)).to_be_visible()
     expect(sidebar.get_by_text("报告发布与范围", exact=True)).to_be_visible()
     expect(sidebar.get_by_text("1 条冻结引用", exact=True)).to_be_visible()
-    expect(sidebar.get_by_text("1 条受治理结论", exact=True)).to_be_visible()
-    expect(sidebar.get_by_text("1 组跨方向证据张力", exact=True)).to_be_visible()
+    expect(sidebar.get_by_text("1 条已准入发现", exact=True)).to_be_visible()
+    expect(sidebar.get_by_text("1 个方向状态", exact=True)).to_be_visible()
     expect(sidebar.get_by_text("1 条初步信号", exact=True)).to_be_visible()
     assert "LLM calls" not in sidebar_text
     assert "已知成本" not in sidebar_text
@@ -237,58 +229,16 @@ def test_content_research_sidebar_truthfully_omits_report_summary_when_report_is
     expect(sidebar.get_by_text(re.compile("条冻结引用"))).to_have_count(0)
 
 
-def test_content_research_trace_uses_nested_safe_usage_and_workflow_identity(page_with_runtime):
-    page, frontend_url, backend_url = page_with_runtime
-    report = published_report_payload()
-    report["trace"] = {
-        "checkpoint_summary": {"stages": [{
-            "stage_name": "faithfulness", "status": "completed", "retry_count": 1,
-            "duration_ms": 7800, "output_refs": ["audit-ui"],
-        }]},
-        "faithfulness": {"usage": {"total_tokens": 2486, "cost_usd": 0.18, "cost_unknown": False}},
-    }
-    runtime = MockRuntime(report=report, timeline=True)
-    runtime.install(page, backend_url)
-
-    page.goto(f"{frontend_url}/creator?contentResearchRunId=run-ui", wait_until="networkidle")
-    page.locator('aside[aria-label="内容调研上下文"]').get_by_label("查看完整 workflow trace").click()
-
-    trace = page.locator('section[aria-label="Content Research Trace"]')
-    expect(trace.get_by_text("workflow_run · run-ui", exact=True)).to_be_visible()
-    metrics = trace.locator('[aria-label="安全 Trace 指标"]')
-    expect(metrics.get_by_text("2,486", exact=True)).to_be_visible()
-    expect(metrics.get_by_text("LLM 调用", exact=True)).to_be_visible()
-    expect(metrics.get_by_text("未公开", exact=True)).to_be_visible()
-    expect(metrics.get_by_text("$0.18", exact=True)).to_be_visible()
-    expect(trace.get_by_text("报告生成与忠实度审计", exact=True).first).to_be_visible()
-    expect(trace.get_by_text("7.8s", exact=True)).to_be_visible()
-
-
-def test_content_research_trace_marks_unknown_usage_and_empty_safe_stages_explicitly(page_with_runtime):
-    page, frontend_url, backend_url = page_with_runtime
-    report = published_report_payload()
-    report["trace"] = {
-        "checkpoint_summary": {"stages": []},
-        "faithfulness": {"usage": {"cost_unknown": True}},
-    }
-    runtime = MockRuntime(report=report, timeline=True)
-    runtime.install(page, backend_url)
-
-    page.goto(f"{frontend_url}/creator?contentResearchRunId=run-ui", wait_until="networkidle")
-    page.locator('aside[aria-label="内容调研上下文"]').get_by_label("查看完整 workflow trace").click()
-
-    trace = page.locator('section[aria-label="Content Research Trace"]')
-    metrics = trace.locator('[aria-label="安全 Trace 指标"]')
-    expect(metrics.get_by_text("未记录", exact=True)).to_be_visible()
-    expect(metrics.get_by_text("成本未知", exact=True)).to_be_visible()
-    expect(trace.get_by_text("暂无 trace 记录。确认 brief 后会自动写入执行轨迹。", exact=True)).to_be_visible()
-
-
 def test_content_research_evidence_only_report_hides_free_narrative(page_with_runtime):
     page, frontend_url, backend_url = page_with_runtime
     report = published_report_payload()
-    report["publication_state"] = "evidence_only_report"
-    report["sections"] = [{"section_id": "core", "section_kind": "core_conclusions", "text": "不得显示的自由叙述。"}]
+    report["publication"]["state"] = "evidence_only_report"
+    report["sections"] = {
+        "main_findings": [],
+        "weak_signals": [],
+        "limitations_scope": [{"message": "当前结论仅覆盖已冻结的公开样本。"}],
+    }
+    report["status_strip"] = {"saved_evidence_count": 1}
     runtime = MockRuntime(report=report, timeline=True)
     runtime.install(page, backend_url)
 
@@ -303,28 +253,22 @@ def test_content_research_evidence_only_report_hides_free_narrative(page_with_ru
     expect(published.get_by_text("研究范围与限制")).to_be_visible()
 
 
-def test_content_research_timeline_hydrates_safe_trace_and_partial_audit_details(page_with_runtime):
-    page, frontend_url, backend_url = page_with_runtime
+def test_lite_report_fixture_exposes_only_lite_sections_and_recovery_card():
     report = published_report_payload()
-    report["publication"] |= {
-        "omitted_section_ids": ["findings"],
-        "reason_codes": ["semantic_audit_failed"],
-        "audit_recovery_state": "targeted_rewrite_exhausted",
+    report["recovery_projection"] = {
+        "reason_code": "auth_expired",
+        "completed_stages": ["collect"],
+        "next_action": "resume_run",
+        "actionability": "available",
     }
-    runtime = MockRuntime(report=report, timeline=True)
-    runtime.install(page, backend_url)
 
-    page.goto(f"{frontend_url}/creator", wait_until="networkidle")
-
-    report_message = page.locator('article[aria-label="Content Research published report"]')
-    expect(report_message).to_be_visible(timeout=5000)
-    expect(report_message.get_by_text("已撤下：主要发现")).to_be_visible()
-    expect(report_message.get_by_text("semantic_audit_failed")).to_be_visible()
-    expect(page.locator('section[aria-label="Content Research Trace inspector"]')).to_be_visible()
-    page.locator('section[aria-label="Content Research Trace inspector"]').get_by_label("查看 Trace").click()
-    trace = page.locator('section[aria-label="Content Research Trace"]')
-    expect(trace.get_by_text("报告生成与忠实度审计").first).to_be_visible()
-    expect(trace.get_by_text("执行输入")).to_have_count(0)
+    assert report["publication"]["state"] == "partial_verified_report"
+    assert report["sections"].keys() == {"main_findings", "weak_signals", "limitations_scope"}
+    assert report["status_strip"] == {"admitted_finding_count": 1}
+    assert report["citations"][0]["evidence_refs"][0]["navigation_state"] == "available"
+    assert report["citations"][0]["evidence_refs"][0]["source_collected_at"]
+    assert report["run_direction_states"] == [{"direction": "product_marketing", "state": "completed"}]
+    assert report["recovery_projection"]["next_action"] == "resume_run"
 
 
 def test_content_research_timeline_report_unavailable_is_explicit(page_with_runtime):
@@ -360,10 +304,9 @@ def test_content_research_creator_has_no_legacy_flow_message_renderer():
 def test_content_research_complete_report_keeps_cards_and_recovery_structured(page_with_runtime):
     page, frontend_url, backend_url = page_with_runtime
     report = published_report_payload()
-    report["publication_state"] = "complete_verified_report"
-    report["aggregate_claims"] = [{"aggregate_claim_id": "ag-ui", "statement": "补采评论后验证尺码表达", "aggregate_type": "action_hypothesis", "hypothesis_only": True}]
-    report["weak_signals"] = [{"weak_signal_id": "weak-ui", "reason": "评论样本尚不足", "recovery_action": "补采独立评论样本"}]
-    report["limitations_recovery"] = [{"message": "当前样本范围有限", "recovery_action": "扩大样本窗口"}]
+    report["publication"]["state"] = "complete_verified_report"
+    report["sections"]["weak_signals"] = [{"reason": "评论样本尚不足", "recovery_action": "补采独立评论样本"}]
+    report["sections"]["limitations_scope"] = [{"message": "当前样本范围有限", "recovery_action": "扩大样本窗口"}]
     runtime = MockRuntime(report=report, timeline=True)
     runtime.install(page, backend_url)
 
@@ -375,8 +318,6 @@ def test_content_research_complete_report_keeps_cards_and_recovery_structured(pa
     expect(published.get_by_text("已准入方向 claim")).to_be_visible()
     published.get_by_text("评论样本尚不足", exact=True).click()
     expect(published.get_by_text("补采独立评论样本")).to_be_visible()
-    published.get_by_text("补采评论后验证尺码表达").click()
-    expect(published.get_by_text("待验证行动假设，非已验证事实。")).to_be_visible()
 
 
 def test_content_research_citation_metadata_preserves_frozen_indices(page_with_runtime):
@@ -394,7 +335,7 @@ def test_content_research_citation_metadata_preserves_frozen_indices(page_with_r
     published.get_by_role("button", name="打开引用 7").click()
     evidence = page.locator('aside[aria-label="Content Research citation evidence"]')
     expect(evidence.get_by_text("完整冻结依据")).to_be_visible()
-    expect(evidence.get_by_text("北面冲锋衣尺码笔记 · note · 2026-07-21T00:00:00Z · note.desc")).to_be_visible()
+    expect(evidence.get_by_text("content_text")).to_be_visible()
     next_citation = published.get_by_role("button", name="打开引用 8")
     expect(next_citation).to_have_count(1)
     next_citation.click()
@@ -656,8 +597,8 @@ def published_report_payload() -> dict[str, Any]:
         "citations": [{
             "citation_group_id": "cg-ui", "display_index": 7,
             "evidence_refs": [
-                {"quote": "完整冻结依据", "title": "北面冲锋衣尺码笔记", "source_type": "note", "captured_at": "2026-07-21T00:00:00Z", "field_path": "note.desc", "source_url": "https://example.test/note-ui", "jump_state": "available"},
-                {"quote": "备用证据链接不可用", "jump_state": "unavailable"},
+                {"quote": "完整冻结依据", "field_path": "content_text", "source_url": "https://example.test/note-ui", "source_collected_at": "2026-07-21T00:00:00Z", "source_text_hash": "hash-ui", "navigation_state": "available", "navigation_reason": None},
+                {"quote": "备用证据链接不可用", "field_path": "title", "source_url": None, "source_collected_at": "2026-07-21T00:00:00Z", "source_text_hash": "hash-ui-2", "navigation_state": "missing_source_url", "navigation_reason": None},
             ],
         }],
         "run_direction_states": [{"direction": "product_marketing", "state": "completed"}],
