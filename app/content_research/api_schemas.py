@@ -269,36 +269,6 @@ class SnapshotResponse(BaseModel):
     created_at: str
 
 
-class ContentResearchPublishedReportResponse(BaseModel):
-    """The single public read model for one materialized report publication."""
-
-    schema_version: str = CONTENT_RESEARCH_API_SCHEMA_VERSION
-    workflow_run_id: str
-    workflow_terminal_state: str
-    publication_state: str
-    artifact: dict = Field(default_factory=dict)
-    publication: dict = Field(default_factory=dict)
-    sections: list[dict] = Field(default_factory=list)
-    citation_groups: list[dict] = Field(default_factory=list)
-    citation_total: int = 0
-    citation_offset: int = 0
-    citation_limit: int = 50
-    claim_cards: list[dict] = Field(default_factory=list)
-    weak_signals: list[dict] = Field(default_factory=list)
-    cross_direction_records: list[dict] = Field(default_factory=list)
-    aggregate_claims: list[dict] = Field(default_factory=list)
-    limitations_recovery: list[dict] = Field(default_factory=list)
-    release: dict = Field(default_factory=dict)
-    run_direction_states: list[dict] = Field(default_factory=list)
-    trace: dict = Field(
-        default_factory=dict,
-        description=(
-            "Optional expanded audit projection. Report business fields never expose usage; "
-            "only this safe aggregate may include known token/cost values and cost_unknown."
-        ),
-    )
-
-
 class ContentResearchLiteReportResponse(BaseModel):
     """Stable narrow projection of the formal F003 report contract."""
 
@@ -314,42 +284,6 @@ class ContentResearchLiteReportResponse(BaseModel):
     citations: list[dict] = Field(default_factory=list)
     run_direction_states: list[dict] = Field(default_factory=list)
     recovery_projection: dict | None = None
-
-
-class EvidenceBundleView(BaseModel):
-    schema_version: str = CONTENT_RESEARCH_API_SCHEMA_VERSION
-    bundle_id: str
-    workflow_run_id: str
-    research_brief_id: str | None = None
-    research_plan_id: str | None = None
-    research_direction_id: str | None = None
-    status: str
-    bundle_type: str
-    bundle_version: str
-    summary: str
-    coverage: dict = Field(default_factory=dict)
-    retrieval_metrics: dict = Field(default_factory=dict)
-    faithfulness_metrics: dict = Field(default_factory=dict)
-    cross_source_metrics: dict = Field(default_factory=dict)
-    contradiction_summary: dict = Field(default_factory=dict)
-    citation_coverage: dict = Field(default_factory=dict)
-    unsupported_claim_count: int = 0
-    missing_evidence: list[dict] = Field(default_factory=list)
-    priority_policy_id: str | None = None
-    evidence_boundary_policy_id: str | None = None
-    decision_card: dict = Field(default_factory=dict)
-    priority: dict = Field(default_factory=dict)
-    evidence_state: str = "signal"
-    evidence_grade: str = "C"
-    claim_scope: dict = Field(default_factory=dict)
-    next_action: dict = Field(default_factory=dict)
-    items: list[dict] = Field(default_factory=list)
-    evidence_by_role: dict[str, list[dict]] = Field(default_factory=dict)
-    lineage_by_evidence_id: dict[str, list[dict]] = Field(default_factory=dict)
-    source_links: list[dict] = Field(default_factory=list)
-    metadata: dict = Field(default_factory=dict)
-    created_at: str
-    updated_at: str
 
 
 class HumanDecisionRequest(BaseModel):
