@@ -55,7 +55,10 @@ class ContentResearchBriefConfirmRequest(BaseModel):
     subject_type: str = "unknown"
     selected_competitors: list[str] = Field(default_factory=list)
     custom_competitors: list[str] = Field(default_factory=list)
-    selected_directions: list[str] = Field(min_length=1)
+    selected_directions: list[str] = Field(
+        min_length=1,
+        description="Non-empty requested subset of the Lite direction catalog.",
+    )
     custom_research_question: str = ""
 
 

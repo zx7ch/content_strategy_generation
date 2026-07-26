@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.content_research.contracts import DIRECTION_CATALOG_V1
 from app.content_research.persistence_models import StageCheckpointRecord
 from app.content_research.reporting.read_model import (
     PublishedReportNotFoundError,
@@ -168,7 +169,9 @@ def _frozen_scope(report: dict[str, Any]) -> dict[str, Any]:
 def _policy_scope(policy: dict[str, Any]) -> dict[str, Any]:
     return {
         "direction_set_version": policy.get("direction_set_version"),
-        "direction_ids": list(policy.get("direction_ids") or []),
+        "direction_ids": list(
+            policy.get("requested_direction_ids") or policy.get("direction_ids") or []
+        ),
         "report_compose_mode": policy.get("report_compose_mode") or "prose",
     }
 
@@ -181,30 +184,40 @@ def _direction_states(report: dict[str, Any]) -> list[dict[str, Any]]:
     )
     scope = _frozen_scope(report)
     by_direction = {item.get("direction"): item for item in states if isinstance(item, dict)}
+    requested_direction_ids = set(scope["direction_ids"])
     return [
         {
             "direction": direction_id,
-            "state": (by_direction.get(direction_id) or {}).get("state", "unavailable"),
-            "reason_code": _single_reason(
-                (by_direction.get(direction_id) or {}).get("reason_codes")
+            "state": (
+                (by_direction.get(direction_id) or {}).get("state", "unavailable")
+                if direction_id in requested_direction_ids
+                else "not_requested"
             ),
-            "recovery_action": _single_reason(
-                (by_direction.get(direction_id) or {}).get("recovery_actions")
+            "reason_code": (
+                _single_reason((by_direction.get(direction_id) or {}).get("reason_codes"))
+                if direction_id in requested_direction_ids
+                else None
+            ),
+            "recovery_action": (
+                _single_reason((by_direction.get(direction_id) or {}).get("recovery_actions"))
+                if direction_id in requested_direction_ids
+                else None
             ),
         }
-        for direction_id in scope["direction_ids"]
+        for direction_id in DIRECTION_CATALOG_V1
     ]
 
 
 def _unavailable_direction_states(policy: dict[str, Any]) -> list[dict[str, Any]]:
+    requested_direction_ids = set(_policy_scope(policy)["direction_ids"])
     return [
         {
             "direction": direction_id,
-            "state": "unavailable",
+            "state": "unavailable" if direction_id in requested_direction_ids else "not_requested",
             "reason_code": None,
             "recovery_action": None,
         }
-        for direction_id in _policy_scope(policy)["direction_ids"]
+        for direction_id in DIRECTION_CATALOG_V1
     ]
 
 

@@ -21,7 +21,14 @@ DIRECTION_RESULT_STATES = (
     "incomplete",
     "insufficient_evidence",
     "unavailable",
+    "not_requested",
 )
+DIRECTION_CATALOG_V1 = (
+    "product_marketing",
+    "competitor_discovery",
+    "content_performance",
+)
+DIRECTION_CATALOG_VERSION = "direction_catalog_v1"
 ADMISSION_REASON_CODES = (
     "missing_blocking_field",
     "warning_field_unavailable",
@@ -199,17 +206,25 @@ def build_default_snapshot(*, snapshot_id: str, workflow_run_id: str, brief_id: 
 
     as_of = run_as_of_at or utcnow()
     _require_aware(as_of, "run_as_of_at")
-    definitions = ResearchDirectionRegistry().list_directions()
-    selected_ids = direction_ids or tuple(item.id for item in definitions)
+    definitions_by_id = {
+        item.id: item for item in ResearchDirectionRegistry().list_directions()
+    }
+    requested_ids = direction_ids if direction_ids is not None else DIRECTION_CATALOG_V1
+    if not requested_ids:
+        raise ValueError("requested direction ids must not be empty")
+    if len(set(requested_ids)) != len(requested_ids):
+        raise ValueError("requested direction ids must be unique")
+    if not set(requested_ids).issubset(DIRECTION_CATALOG_V1):
+        raise ValueError("requested direction ids contains a direction outside the catalog")
     if report_compose_mode not in {"prose", "template_only"}:
         raise ValueError("invalid report_compose_mode")
-    definitions = [item for item in definitions if item.id in selected_ids]
-    if len(definitions) != len(selected_ids):
-        raise ValueError("direction_ids contains an unknown direction")
+    definitions = [definitions_by_id[direction_id] for direction_id in requested_ids]
     policy = {
         "schema_version": "content_research_policy_v2",
         "direction_set_version": direction_set_version,
-        "direction_ids": list(selected_ids),
+        "direction_ids": list(requested_ids),
+        "direction_catalog_version": DIRECTION_CATALOG_VERSION,
+        "requested_direction_ids": list(requested_ids),
         "report_compose_mode": report_compose_mode,
         "llm_cost_policy": {
             "currency": "USD",

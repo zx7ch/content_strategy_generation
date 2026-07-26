@@ -105,7 +105,7 @@ async def test_confirm_brief_creates_plan_directions_tasks_and_workflow_summary(
             "subject_type": "category",
             "selected_competitors": ["迪卡侬"],
             "custom_competitors": ["凯乐石"],
-            "selected_directions": ["product_marketing", "comment_insight"],
+            "selected_directions": ["product_marketing", "competitor_discovery"],
             "custom_research_question": "关注夏季轻量户外",
         },
     )
@@ -121,7 +121,7 @@ async def test_confirm_brief_creates_plan_directions_tasks_and_workflow_summary(
     assert payload["plan"]["payload"]["evidence_boundary_policy"]["version"] == "evidence_boundary_v1"
     assert [item["payload"]["direction_id"] for item in payload["directions"]] == [
         "product_marketing",
-        "comment_insight",
+        "competitor_discovery",
     ]
     assert [item["status"] for item in payload["subagent_tasks"]] == ["queued", "queued"]
 
@@ -136,7 +136,7 @@ async def test_confirm_brief_creates_plan_directions_tasks_and_workflow_summary(
     assert snapshot_payload["effective_policy_hash"]
     assert snapshot_payload["effective_policy"]["direction_ids"] == [
         "product_marketing",
-        "comment_insight",
+        "competitor_discovery",
     ]
     assert len(snapshot_payload["direction_contracts"]) == 2
     assert len(snapshot_payload["sample_policies"]) == 2
@@ -145,7 +145,19 @@ async def test_confirm_brief_creates_plan_directions_tasks_and_workflow_summary(
 
 
 @pytest.mark.asyncio
-async def test_confirm_brief_rejects_unknown_direction(client):
+@pytest.mark.parametrize(
+    "requested",
+    [
+        ["product_marketing"],
+        ["competitor_discovery"],
+        ["content_performance"],
+        ["product_marketing", "competitor_discovery"],
+        ["product_marketing", "content_performance"],
+        ["competitor_discovery", "content_performance"],
+        ["product_marketing", "competitor_discovery", "content_performance"],
+    ],
+)
+async def test_confirm_freezes_catalog_and_requested_subset(client, requested):
     presearch = await _create_presearch(client)
 
     response = await client.post(
@@ -153,7 +165,45 @@ async def test_confirm_brief_rejects_unknown_direction(client):
         json={
             "confirmed_subject": "徒步短裤",
             "subject_type": "category",
-            "selected_directions": ["unknown_direction"],
+            "selected_directions": requested,
+        },
+    )
+
+    assert response.status_code == 200
+    policy = await client.get(
+        f"/content-research/workflows/{presearch['workflow_run_id']}/policy-snapshot"
+    )
+    assert policy.status_code == 200
+    assert policy.json()["effective_policy"]["direction_catalog_version"] == "direction_catalog_v1"
+    assert policy.json()["effective_policy"]["requested_direction_ids"] == requested
+
+
+@pytest.mark.asyncio
+async def test_confirm_brief_rejects_empty_requested_direction_selection(client):
+    presearch = await _create_presearch(client)
+
+    response = await client.post(
+        f"/content-research/briefs/{presearch['brief_id']}/confirm",
+        json={
+            "confirmed_subject": "徒步短裤",
+            "subject_type": "category",
+            "selected_directions": [],
+        },
+    )
+
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_confirm_brief_rejects_direction_outside_lite_catalog(client):
+    presearch = await _create_presearch(client)
+
+    response = await client.post(
+        f"/content-research/briefs/{presearch['brief_id']}/confirm",
+        json={
+            "confirmed_subject": "徒步短裤",
+            "subject_type": "category",
+            "selected_directions": ["comment_insight"],
         },
     )
 

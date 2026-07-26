@@ -44,7 +44,7 @@ from app.content_research.api_schemas import (
     SnapshotResponse,
 )
 from app.content_research.async_dispatch import AsyncFormalResearchDispatchRepository
-from app.content_research.contracts import build_default_snapshot
+from app.content_research.contracts import DIRECTION_CATALOG_V1, build_default_snapshot
 from app.content_research.decision_policy import DecisionPolicyService
 from app.content_research.decisions import ResearchDecisionService
 from app.content_research.evidence import EvidenceBundleService, EvidenceService
@@ -500,6 +500,10 @@ class ContentResearchService:
         selected_direction_ids = self._direction_registry.canonicalize_many(
             confirmation_request.selected_directions
         )
+        if not set(selected_direction_ids).issubset(DIRECTION_CATALOG_V1):
+            raise ContentResearchValidationError(
+                "Selected directions must belong to the Lite direction catalog"
+            )
         directions = self._direction_registry.require_many(selected_direction_ids)
         confirmation = BriefConfirmation(
             confirmed_subject=confirmation_request.confirmed_subject.strip(),
