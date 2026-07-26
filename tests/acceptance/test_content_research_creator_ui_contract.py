@@ -553,11 +553,9 @@ class MockRuntime:
         if path == "/content-research/workflows/run-ui/trace":
             fulfill_json(route, trace_payload(self.current_source))
             return
-        if path == "/content-research/workflows/run-ui/report":
+        if path == "/content-research/workflows/run-ui/lite-report":
             self.report_calls += 1
-            offset = int(parse_qs(url.query).get("citation_offset", ["0"])[0])
-            self.report_offsets.append(offset)
-            fulfill_json(route, self.report_pages.get(offset, self.report) if self.report_status < 400 else {"error_message": "report unavailable"}, status=self.report_status)
+            fulfill_json(route, self.report if self.report_status < 400 else {"error_message": "report unavailable"}, status=self.report_status)
             return
         if path == "/threads/thread-ui/timeline":
             fulfill_json(route, {"thread": {"thread_id": "thread-ui", "workspace_id": "ws-ui", "title": "北面调研报告", "brand_id": "brand-1", "status": "active", "active_job_id": None, "active_run_id": "run-ui", "created_at": "2026-07-21T00:00:00Z", "updated_at": "2026-07-21T00:00:00Z"}, "messages": [{"message_id": "artifact-ui", "role": "assistant", "text": "内容调研报告已生成。", "message_type": "artifact_result", "run_id": "run-ui", "artifact_refs": [], "created_at": "2026-07-21T00:00:00Z"}]})
@@ -575,10 +573,6 @@ class MockRuntime:
             self._append_decision(decision)
             fulfill_json(route, decision)
             return
-        if path == "/content-research/evidence-bundles/eb-ui":
-            fulfill_json(route, evidence_bundle_payload())
-            return
-
         fulfill_json(route, {"error_message": f"Unhandled mock route: {method} {path}"}, status=404)
 
     def _append_decision(self, decision: dict[str, Any]) -> None:

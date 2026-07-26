@@ -100,7 +100,7 @@ def test_creator_content_research_p0_browser_flow(
                         payload = response.json()
                     except Exception:
                         return
-                    if "/content-research/workflows/" in response.url and "/report" in response.url:
+                    if "/content-research/workflows/" in response.url and "/lite-report" in response.url:
                         report_payloads.append(payload)
                     if "/content-research/workflows/" in response.url and "/trace" in response.url:
                         trace_payloads.append(payload)

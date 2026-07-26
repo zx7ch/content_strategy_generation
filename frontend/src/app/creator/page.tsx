@@ -26,14 +26,14 @@ import {
   confirmContentResearchBrief,
   createContentResearchPresearch,
   endContentResearchWorkflow,
-  getContentResearchPublishedReport,
+  getContentResearchLiteReport,
   getContentResearchTrace,
   getCurrentXHSQRLogin,
   retryContentResearchFormalResearch,
   startXHSQRLogin,
   restoreContentResearchWorkflow,
   type ContentResearchFormalResearchResponse,
-  type ContentResearchPublishedReportResponse,
+  type ContentResearchLiteReportResponse,
   type ContentResearchPresearchResponse,
   type ContentResearchTrace,
   type ContentResearchWorkflowSummary,
@@ -51,7 +51,7 @@ interface ChatMessage {
   runId?: string | null;
   actionUrl?: string;
   actionLabel?: string;
-  report?: ContentResearchPublishedReportResponse;
+  report?: ContentResearchLiteReportResponse;
 }
 
 interface WorkflowTask {
@@ -75,9 +75,51 @@ interface ContentResearchRunState {
   trace: ContentResearchTrace | null;
   formalResearch: ContentResearchFormalResearchResponse | null;
   formalResearchStatus: "idle" | "collecting" | "completed" | "failed" | "invalid";
-  report: ContentResearchPublishedReportResponse | null;
+  report: ContentResearchLiteReportResponse | null;
   reportStatus: "idle" | "loading" | "ready" | "unavailable" | "failed";
   reportError: string | null;
+}
+
+type LitePublicationState = "complete_verified_report" | "partial_verified_report" | "evidence_only_report";
+
+interface LiteReportDisplay {
+  workflow_run_id: string;
+  publication_state: LitePublicationState;
+  artifact: Record<string, unknown>;
+  publication: Record<string, unknown>;
+  sections: Record<string, unknown>[];
+  citation_groups: Record<string, unknown>[];
+  citation_total: number;
+  citation_limit: number;
+  claim_cards: Record<string, unknown>[];
+  weak_signals: Record<string, unknown>[];
+  cross_direction_records: Record<string, unknown>[];
+  aggregate_claims: Record<string, unknown>[];
+  limitations_recovery: Record<string, unknown>[];
+  trace: Record<string, unknown>;
+}
+
+function liteReportDisplay(report: ContentResearchLiteReportResponse): LiteReportDisplay {
+  const state = stringField(report.publication, "state", "evidence_only_report");
+  const publicationState: LitePublicationState = state === "complete_verified_report" || state === "partial_verified_report"
+    ? state
+    : "evidence_only_report";
+  return {
+    workflow_run_id: report.workflow_run_id,
+    publication_state: publicationState,
+    artifact: { artifact_id: report.workflow_run_id },
+    publication: report.publication,
+    sections: [],
+    citation_groups: report.citations,
+    citation_total: report.citations.length,
+    citation_limit: report.citations.length,
+    claim_cards: report.sections.main_findings,
+    weak_signals: report.sections.weak_signals,
+    cross_direction_records: [],
+    aggregate_claims: [],
+    limitations_recovery: report.sections.limitations_scope,
+    trace: {},
+  };
 }
 
 const WELCOME_MESSAGE: ChatMessage = {
@@ -165,7 +207,7 @@ function contentResearchRunWithReport(
   summary: ContentResearchWorkflowSummary,
   trace: ContentResearchTrace | null,
   formalResearch: ContentResearchFormalResearchResponse | null,
-  report: ContentResearchPublishedReportResponse | null
+  report: ContentResearchLiteReportResponse | null
 ): ContentResearchRunState {
   return {
     workflowRunId,
@@ -851,7 +893,7 @@ function ContentResearchIntentCard({
   );
 }
 
-function reportStateLabel(state: ContentResearchPublishedReportResponse["publication_state"]) {
+function reportStateLabel(state: LitePublicationState) {
   if (state === "complete_verified_report") return "已完整核验";
   if (state === "partial_verified_report") return "部分内容已核验";
   return "仅展示已验证证据";
@@ -893,16 +935,16 @@ function reportHeaderTitle(sections: Record<string, unknown>[], evidenceOnly: bo
   return evidenceOnly ? "本次研究的已验证证据" : "本次内容调研结论";
 }
 
-function reportHeaderSubtitle(report: ContentResearchPublishedReportResponse, claims: Record<string, unknown>[]) {
+function reportHeaderSubtitle(report: LiteReportDisplay, claims: Record<string, unknown>[]) {
   const directionCount = new Set(claims.map((claim) => stringField(claim, "direction_id")).filter(Boolean)).size;
   const directionText = directionCount > 0 ? `覆盖 ${directionCount} 个研究方向` : "方向覆盖未公开";
   return `研究范围：${report.citation_total} 条冻结引用 · ${claims.length} 条受治理结论 · ${directionText}`;
 }
 
-function ContentResearchReportMessage({ report }: { report: ContentResearchPublishedReportResponse }) {
+function ContentResearchReportMessage({ report: liteReport }: { report: ContentResearchLiteReportResponse }) {
+  const report = liteReportDisplay(liteReport);
   const [selectedCitation, setSelectedCitation] = useState<Record<string, unknown> | null>(null);
   const [citations, setCitations] = useState<Record<string, unknown>[]>(() => report.citation_groups.filter((value): value is Record<string, unknown> => Boolean(value) && typeof value === "object" && !Array.isArray(value)));
-  const [loadingMore, setLoadingMore] = useState(false);
   const sections = report.sections.filter((value): value is Record<string, unknown> => Boolean(value) && typeof value === "object" && !Array.isArray(value));
   const claims = report.claim_cards.filter((value): value is Record<string, unknown> => Boolean(value) && typeof value === "object" && !Array.isArray(value));
   const aggregates = report.aggregate_claims.filter((value): value is Record<string, unknown> => Boolean(value) && typeof value === "object" && !Array.isArray(value));
@@ -920,28 +962,10 @@ function ContentResearchReportMessage({ report }: { report: ContentResearchPubli
   const omittedIds = Array.isArray(report.publication.omitted_section_ids) ? report.publication.omitted_section_ids.map(String) : [];
   const omittedSections = sections.filter((section) => omittedIds.includes(stringField(section, "section_id")));
   const nextAggregates = aggregates.filter((item) => stringField(item, "aggregate_type") === "action_hypothesis" || stringField(item, "request_origin") === "user_requested_next_steps");
-  const remainingCitations = Math.max(0, report.citation_total - citations.length);
-
   useEffect(() => {
-    setCitations(report.citation_groups.filter((value): value is Record<string, unknown> => Boolean(value) && typeof value === "object" && !Array.isArray(value)));
+    setCitations(liteReport.citations.filter((value): value is Record<string, unknown> => Boolean(value) && typeof value === "object" && !Array.isArray(value)));
     setSelectedCitation(null);
-  }, [report.artifact, report.citation_groups]);
-
-  async function loadMoreCitations() {
-    if (loadingMore || remainingCitations === 0) return;
-    setLoadingMore(true);
-    try {
-      const next = await getContentResearchPublishedReport(report.workflow_run_id, { citationOffset: citations.length, citationLimit: report.citation_limit });
-      setCitations((current) => {
-        const incoming = next.citation_groups
-          .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object" && !Array.isArray(item))
-          .filter((item) => !current.some((existing) => stringField(existing, "citation_group_id") === stringField(item, "citation_group_id")));
-        return [...current, ...incoming];
-      });
-    } finally {
-      setLoadingMore(false);
-    }
-  }
+  }, [liteReport.workflow_run_id, liteReport.citations]);
 
   const citationButton = (citation: Record<string, unknown>, index: number, variant: "inline" | "standalone" = "inline") => {
     const displayIndex = String(citation.display_index ?? index + 1);
@@ -974,7 +998,7 @@ function ContentResearchReportMessage({ report }: { report: ContentResearchPubli
         {weakSignals.length > 0 && <section aria-label="初步信号" className="border-t border-line pt-4"><h4 className="font-semibold">初步信号</h4>{weakSignals.map((item, index) => <details key={firstString(item, ["weak_signal_id", "id"], `weak-${index}`)} className="mt-2 border-l-4 border-slate-300 bg-slate-50 px-3 py-2 text-xs leading-5 text-quiet"><summary className="cursor-pointer">{firstString(item, ["statement", "reason", "summary"], "该信号尚不足以构成主要发现。")}</summary><p className="mt-2">未正式准入原因：{firstString(item, ["reason", "limitation", "threshold_state"], "证据范围或样本门槛尚不足。")}</p><p className="mt-1">恢复建议：{firstString(item, ["recovery_action", "next_action", "recovery"], "补充独立来源或样本后重新评估。")}</p></details>)}</section>}
         {(nextAggregates.length > 0 || limitations.length > 0) && <section className="border-t border-line pt-4"><h4 className="font-semibold">下一步建议</h4><div className="mt-2 space-y-2">{nextAggregates.map((item, index) => structuredCard(item, index, "aggregate"))}{limitations.map((item, index) => <details key={firstString(item, ["limitation_id", "id"], `limit-${index}`)} className="rounded-xl bg-slate-50 px-3 py-2 text-xs text-quiet"><summary className="cursor-pointer">{firstString(item, ["message", "reason", "summary"], "请结合当前证据范围使用本报告。")}</summary><p className="mt-2">恢复建议：{firstString(item, ["recovery_action", "next_action", "recovery"], "补充所缺样本后重新核验。")}</p></details>)}</div></section>}
         <section className="border-t border-line pt-4"><h4 className="font-semibold">研究范围与限制</h4><p className="mt-2 text-xs text-quiet">{limitations.length ? "限制与恢复建议已在“下一步建议”展开。" : "请在本次冻结样本、引用与审计范围内理解结论。"}</p></section>
-        <section className="border-t border-line pt-4"><h4 className="font-semibold">引用依据</h4><div className="mt-2 flex flex-wrap gap-2">{citations.filter((citation) => !attachedCitationIds.has(stringField(citation, "citation_group_id"))).map((citation, index) => citationButton(citation, index, "standalone"))}{remainingCitations > 0 && <button type="button" onClick={() => void loadMoreCitations()} disabled={loadingMore} className="rounded-lg border border-line bg-white px-2.5 py-1 text-xs hover:bg-slate-50 disabled:opacity-40">{loadingMore ? "加载中" : `加载其余 ${remainingCitations} 组引用`}</button>}{citations.length === 0 && <span className="text-xs text-quiet">本报告没有可展示的引用依据。</span>}</div></section>
+        <section className="border-t border-line pt-4"><h4 className="font-semibold">引用依据</h4><div className="mt-2 flex flex-wrap gap-2">{citations.filter((citation) => !attachedCitationIds.has(stringField(citation, "citation_group_id"))).map((citation, index) => citationButton(citation, index, "standalone"))}{citations.length === 0 && <span className="text-xs text-quiet">本报告没有可展示的引用依据。</span>}</div></section>
       </div>
       {selectedCitation && <aside className="border-t border-line bg-slate-50 px-5 py-4" aria-label="Content Research citation evidence"><div className="flex justify-between gap-3"><div><p className="font-semibold">引用 [{String(selectedCitation.display_index ?? "—")}]</p><p className="mt-2 text-xs leading-5 text-quiet">{firstString(objectField(selectedCitation, "preview_ref"), ["quote", "snippet"], "引用详情已冻结于此报告版本。")}</p></div><button type="button" onClick={() => setSelectedCitation(null)} aria-label="关闭引用依据">关闭</button></div>{Array.isArray(selectedCitation.evidence_refs) && selectedCitation.evidence_refs.length > 0 && <div className="mt-3 space-y-2 border-t border-line pt-3"><p className="text-xs font-semibold text-quiet">同组证据</p>{selectedCitation.evidence_refs.filter((ref): ref is Record<string, unknown> => Boolean(ref) && typeof ref === "object" && !Array.isArray(ref)).map((ref, index) => <div key={`${stringField(ref, "source_url")}-${index}`} className="rounded-lg bg-white px-3 py-2 text-xs text-quiet"><p>{firstString(ref, ["quote", "snippet", "title"], "已冻结证据")}</p><p className="mt-1">{[stringField(ref, "title"), stringField(ref, "source_type", stringField(ref, "source_kind")), stringField(ref, "captured_at"), stringField(ref, "field_path")].filter(Boolean).join(" · ") || "已冻结来源元数据"}</p>{stringField(ref, "source_url") && stringField(ref, "jump_state") !== "unavailable" ? <a className="mt-1 inline-flex underline" href={stringField(ref, "source_url")} target="_blank" rel="noopener noreferrer">打开原笔记</a> : <span className="mt-1 block">原笔记链接不可用</span>}</div>)}</div>}{!Array.isArray(selectedCitation.evidence_refs) || selectedCitation.evidence_refs.length === 0 ? <p className="mt-3 text-xs text-quiet">该冻结引用未提供可展示的证据明细。</p> : null}</aside>}
     </article>
@@ -997,28 +1021,6 @@ interface TraceTimelineStep {
 function objectField(source: Record<string, unknown> | undefined | null, key: string): Record<string, unknown> {
   const value = source?.[key];
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
-}
-
-function publishedReportTraceTimeline(report: ContentResearchPublishedReportResponse): TraceTimelineStep[] {
-  const trace = objectField(report as unknown as Record<string, unknown>, "trace");
-  const checkpointSummary = objectField(trace, "checkpoint_summary");
-  const stages = Array.isArray(checkpointSummary.stages) ? checkpointSummary.stages : [];
-  return stages.filter((stage): stage is Record<string, unknown> => Boolean(stage) && typeof stage === "object" && !Array.isArray(stage)).map((stage, index) => {
-    const duration = typeof stage.duration_ms === "number" ? `${(stage.duration_ms / 1000).toFixed(1)}s` : "耗时未知";
-    const stageName = stringField(stage, "stage_name", "执行阶段");
-    return {
-      id: `${stageName}-${stringField(stage, "input_fingerprint", String(index))}`,
-      number: index + 1,
-      stage: traceStepGroup(stageName),
-      title: traceStepTitle(stageName),
-      durationText: duration,
-      modelLabel: "仅展示安全 Trace 投影",
-      tokenText: "按需查看 usage",
-      actor: "内容调研",
-      output: `状态：${workflowStatusLabel(stringField(stage, "status", "unknown"))}\n重试：${String(stage.retry_count ?? 0)}\n输出引用：${Array.isArray(stage.output_refs) ? stage.output_refs.length : 0}`,
-      status: workflowStatusLabel(stringField(stage, "status", "unknown")),
-    };
-  });
 }
 
 function traceStepTitle(stepName: string) {
@@ -1057,16 +1059,7 @@ function ContentResearchTraceInspector({
   // A published report is the only U1 Trace source.  Live workflow progress
   // remains in its workflow card; it must not expose legacy observation/runtime
   // inputs as an audit trace before R4 has produced its safe projection.
-  const timeline = run.report ? publishedReportTraceTimeline(run.report) : [];
-  const reportFaithfulness = run.report ? objectField(objectField(run.report as unknown as Record<string, unknown>, "trace"), "faithfulness") : {};
-  const reportUsage = objectField(reportFaithfulness, "usage");
-  const reportTokenText = typeof reportUsage.total_tokens === "number" ? reportUsage.total_tokens.toLocaleString("en-US") : "未记录";
-  const reportCostUnknown = reportUsage.cost_unknown === true;
-  const reportCostText = reportCostUnknown
-    ? "成本未知"
-    : typeof reportUsage.cost_usd === "number"
-      ? `$${reportUsage.cost_usd}`
-      : "未记录";
+  const timeline: TraceTimelineStep[] = [];
   const displayTimeline = [...timeline].reverse();
   const providerFailure = [...(trace?.provider_operations ?? [])]
     .reverse()
@@ -1182,11 +1175,6 @@ function ContentResearchTraceInspector({
 
       <div className="border-b border-line px-4 py-3 text-xs text-quiet">
         <span className="truncate">当前进度：{statusText}</span>
-        {run.report && <div className="mt-3 grid grid-cols-3 gap-2" aria-label="安全 Trace 指标">
-          <div className="rounded-lg border border-line bg-white px-2 py-2 text-center"><strong className="block text-sm text-ink">{reportTokenText}</strong><span>累计 tokens</span></div>
-          <div className="rounded-lg border border-line bg-white px-2 py-2 text-center"><strong className="block text-sm text-ink">未公开</strong><span>LLM 调用</span></div>
-          <div className="rounded-lg border border-line bg-white px-2 py-2 text-center"><strong className="block text-sm text-ink">{reportCostText}</strong><span>成本</span></div>
-        </div>}
       </div>
 
       <div className="min-h-0 flex-1 overflow-y-auto px-3 py-3">
@@ -1279,7 +1267,7 @@ interface ContentResearchContextStage {
 }
 
 function contentResearchContextStatus(run: ContentResearchRunState): string {
-  if (run.report) return reportStateLabel(run.report.publication_state);
+  if (run.report) return reportStateLabel(liteReportDisplay(run.report).publication_state);
   if (run.formalResearchStatus === "invalid") return "所属对话已不存在";
   if (run.formalResearchStatus === "failed") return "专家调研启动失败";
   if (run.formalResearchStatus === "collecting") return "专家调研进行中";
@@ -1287,28 +1275,26 @@ function contentResearchContextStatus(run: ContentResearchRunState): string {
   return "等待启动";
 }
 
-function contentResearchContextStages(report: ContentResearchPublishedReportResponse): ContentResearchContextStage[] {
-  const tensions = report.cross_direction_records.length;
+function contentResearchContextStages(report: ContentResearchLiteReportResponse): ContentResearchContextStage[] {
+  const display = liteReportDisplay(report);
   return [
     {
       id: "scope",
       title: "范围与检索冻结",
-      detail: `${report.citation_total} 条冻结引用可追溯。`,
+      detail: `${display.citation_total} 条冻结引用可追溯。`,
       tone: "complete",
     },
     {
       id: "governance",
       title: "证据准入与归纳",
-      detail: `${report.claim_cards.length} 条受治理结论已进入报告。`,
+      detail: `${display.claim_cards.length} 条已准入发现已进入报告。`,
       tone: "complete",
     },
     {
       id: "publication",
       title: "报告发布与范围",
-      detail: tensions > 0
-        ? `${tensions} 组跨方向证据张力已保留，等待补采或治理。`
-        : `${reportStateLabel(report.publication_state)}；请结合报告中的范围与限制使用。`,
-      tone: tensions > 0 || report.publication_state !== "complete_verified_report" ? "warning" : "complete",
+      detail: `${reportStateLabel(display.publication_state)}；请结合报告中的范围与限制使用。`,
+      tone: display.publication_state !== "complete_verified_report" ? "warning" : "complete",
     },
   ];
 }
@@ -1355,10 +1341,10 @@ function ContentResearchContextSidebar({
       <h2 className="mb-3 text-sm font-semibold text-ink">本次研究摘要</h2>
       <section className="mb-4 rounded-xl border border-line bg-white p-4" aria-label="内容调研研究摘要">
         {report ? <ul className="space-y-2 text-xs leading-5 text-quiet">
-          <li>{report.citation_total} 条冻结引用</li>
-          <li>{report.claim_cards.length} 条受治理结论</li>
-          <li>{report.cross_direction_records.length} 组跨方向证据张力</li>
-          <li>{report.weak_signals.length} 条初步信号</li>
+          <li>{report.citations.length} 条冻结引用</li>
+          <li>{report.sections.main_findings.length} 条已准入发现</li>
+          <li>{report.run_direction_states.length} 个方向状态</li>
+          <li>{report.sections.weak_signals.length} 条初步信号</li>
         </ul> : <p className="text-xs leading-5 text-quiet">暂无已发布报告；此处不会显示未冻结的来源、结论或指标。</p>}
       </section>
 
@@ -1554,11 +1540,11 @@ export default function CreatorPage() {
     setMessages((current) => [...current, { ...message, id: createId("msg") }]);
   }
 
-  function appendPublishedReportMessage(report: ContentResearchPublishedReportResponse) {
-    const artifactId = stringField(report.artifact, "artifact_id", stringField(report.publication, "report_publication_id"));
-    setMessages((current) => current.some((message) => message.report && stringField(message.report.artifact, "artifact_id") === artifactId)
+  function appendLiteReportMessage(report: ContentResearchLiteReportResponse) {
+    const reportId = report.workflow_run_id;
+    setMessages((current) => current.some((message) => message.report?.workflow_run_id === reportId)
       ? current
-      : [...current, { id: `report-${artifactId}`, role: "assistant", text: "", messageType: "artifact_result", report }]);
+      : [...current, { id: `report-${reportId}`, role: "assistant", text: "", messageType: "artifact_result", report }]);
   }
 
   function applySnapshot(snapshot: WorkflowRunSnapshot | null | undefined, threadId: string) {
@@ -1602,15 +1588,15 @@ export default function CreatorPage() {
     return trace;
   }
 
-  async function refreshContentResearchReport(workflowRunId: string): Promise<ContentResearchPublishedReportResponse | null> {
+  async function refreshContentResearchReport(workflowRunId: string): Promise<ContentResearchLiteReportResponse | null> {
     setContentResearchRun((current) =>
       current && current.workflowRunId === workflowRunId
         ? { ...current, reportStatus: "loading", reportError: null }
         : current
     );
     try {
-      const report = await getContentResearchPublishedReport(workflowRunId);
-      appendPublishedReportMessage(report);
+      const report = await getContentResearchLiteReport(workflowRunId);
+      appendLiteReportMessage(report);
       setContentResearchRun((current) =>
         current && current.workflowRunId === workflowRunId
           ? {
@@ -1697,11 +1683,7 @@ export default function CreatorPage() {
         // transaction is necessarily observable to a separate read
         // connection. Retry that read briefly rather than requiring a manual
         // refresh after a valid completed run.
-        let report: ContentResearchPublishedReportResponse | null = null;
-        for (let attempt = 0; report === null && attempt < 10; attempt += 1) {
-          report = await refreshContentResearchReport(workflowRunId);
-          if (report === null) await new Promise<void>((resolve) => window.setTimeout(resolve, 1000));
-        }
+        await refreshContentResearchReport(workflowRunId);
         setContentResearchRun((current) =>
           current && current.workflowRunId === workflowRunId
             ? { ...current, formalResearchStatus: "completed" }
@@ -1807,20 +1789,20 @@ export default function CreatorPage() {
       // Discard stale response if user already switched to another thread
       if (loadingThreadRef.current !== threadId) return;
       let restoredRunId: string | null = null;
-      let latestReport: ContentResearchPublishedReportResponse | null = null;
+      let latestReport: ContentResearchLiteReportResponse | null = null;
       let latestFailure: { messageId: string; workflowRunId: string; error: string } | undefined;
       if (history.length > 0) {
         const timelineMessages = history.map(chatMessageFromRecord);
         const reports = await Promise.all(history.map(async (message) => {
           if (message.message_type !== "artifact_result" || !message.run_id) return null;
           try {
-            return { messageId: message.message_id, report: await getContentResearchPublishedReport(message.run_id) };
+            return { messageId: message.message_id, report: await getContentResearchLiteReport(message.run_id) };
           } catch (error) {
             return { messageId: message.message_id, workflowRunId: message.run_id, error: error instanceof Error ? error.message : "报告读取失败" };
           }
         }));
         if (loadingThreadRef.current !== threadId) return;
-        const reportResults = reports.filter((value): value is { messageId: string; report: ContentResearchPublishedReportResponse } => value !== null && "report" in value);
+        const reportResults = reports.filter((value): value is { messageId: string; report: ContentResearchLiteReportResponse } => value !== null && "report" in value);
         const reportByMessageId = new Map(reportResults.map((value) => [value.messageId, value.report]));
         const reportFailures = reports.filter((value): value is { messageId: string; workflowRunId: string; error: string } => value !== null && "error" in value);
         setMessages([

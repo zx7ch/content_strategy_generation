@@ -95,7 +95,7 @@ def test_creator_browser_restores_published_report_from_timeline_artifact(
     )
     try:
         with urlopen(Request(
-            f"{stack['backend_url']}/content-research/workflows/{workflow_run_id}/report",
+            f"{stack['backend_url']}/content-research/workflows/{workflow_run_id}/lite-report",
             headers={"X-Workspace-Id": "00000000-0000-0000-0000-000000000001", "X-User-Id": "operator"},
         )) as response:
             assert response.status == 200

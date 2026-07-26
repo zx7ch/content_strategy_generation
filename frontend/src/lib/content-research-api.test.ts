@@ -7,8 +7,7 @@ import {
   createContentResearchPresearch,
   endContentResearchWorkflow,
   getContentResearchDecisions,
-  getContentResearchEvidenceBundle,
-  getContentResearchPublishedReport,
+  getContentResearchLiteReport,
   getContentResearchTrace,
   getContentResearchWorkflow,
   retryContentResearchFormalResearch,
@@ -118,40 +117,25 @@ test("formal research dispatch preserves failed specialist state", async () => {
   assert.equal(result.failed_tasks[0].error, "auth_required");
 });
 
-test("getContentResearchPublishedReport fetches only the R4 materialized report contract", async () => {
+test("getContentResearchLiteReport fetches the Lite report contract", async () => {
   let requestUrl = "";
   globalThis.fetch = (async (input) => {
     requestUrl = String(input);
     return jsonResponse({
       schema_version: "content_research_api_v1",
       workflow_run_id: "run_1",
-      workflow_terminal_state: "succeeded",
-      publication_state: "partial_verified_report",
-      artifact: { artifact_id: "artifact_1" }, publication: {}, sections: [], citation_groups: [],
-      citation_total: 0, citation_offset: 0, citation_limit: 50, claim_cards: [], weak_signals: [],
-      cross_direction_records: [], aggregate_claims: [], limitations_recovery: [], trace: {},
+      workflow_execution_state: "succeeded",
+      publication: { state: "partial_verified_report" },
+      sections: { main_findings: [], weak_signals: [], limitations_scope: [] },
+      status_strip: {}, citations: [], run_direction_states: [], recovery_projection: null,
     });
   }) as typeof fetch;
 
-  const report = await getContentResearchPublishedReport("run_1", { citationOffset: 10, citationLimit: 5 });
+  const report = await getContentResearchLiteReport("run_1", { citationGroupIds: ["cg_1", "cg_2"] });
 
-  assert.ok(requestUrl.endsWith("/content-research/workflows/run_1/report?citation_offset=10&citation_limit=5"));
-  assert.equal(report.publication_state, "partial_verified_report");
-  assert.equal(report.workflow_terminal_state, "succeeded");
-});
-
-test("getContentResearchEvidenceBundle fetches expanded bundle", async () => {
-  let requestUrl = "";
-  globalThis.fetch = (async (input) => {
-    requestUrl = String(input);
-    return jsonResponse(evidenceBundlePayload());
-  }) as typeof fetch;
-
-  const result = await getContentResearchEvidenceBundle("eb_1");
-
-  assert.ok(requestUrl.endsWith("/content-research/evidence-bundles/eb_1"));
-  assert.equal(result.bundle_id, "eb_1");
-  assert.equal(result.source_links.length, 1);
+  assert.ok(requestUrl.endsWith("/content-research/workflows/run_1/lite-report?citation_group_ids=cg_1&citation_group_ids=cg_2"));
+  assert.equal(report.publication.state, "partial_verified_report");
+  assert.equal(report.workflow_execution_state, "succeeded");
 });
 
 test("submitContentResearchBrandDecision posts selected decision", async () => {
@@ -322,7 +306,7 @@ test("content research helpers throw readable non-ok errors", async () => {
 
   await assert.rejects(() => getContentResearchWorkflow("run_missing"), /Content research workflow not found/);
   await assert.rejects(() => getContentResearchTrace("run_missing"), /Content research workflow not found/);
-  await assert.rejects(() => getContentResearchEvidenceBundle("eb_missing"), /Content research workflow not found/);
+  await assert.rejects(() => getContentResearchLiteReport("run_missing"), /Content research workflow not found/);
   await assert.rejects(() => getContentResearchDecisions("run_missing"), /Content research workflow not found/);
   await assert.rejects(
     () =>

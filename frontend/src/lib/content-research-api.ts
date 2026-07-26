@@ -174,61 +174,24 @@ export async function getXHSQRLogin(attemptId: string): Promise<XHSQRLoginRespon
   return contentResearchFetch(`/content-research/providers/xiaohongshu/login/qr/${encodeURIComponent(attemptId)}`);
 }
 
-/** R4's only formal report contract; UI rendering is owned by U1. */
-export interface ContentResearchPublishedReportResponse {
+/** Narrow public projection from the immutable report publication. */
+export interface ContentResearchLiteReportResponse {
   schema_version: string;
   workflow_run_id: string;
-  workflow_terminal_state: string;
-  publication_state: "complete_verified_report" | "partial_verified_report" | "evidence_only_report";
-  artifact: JsonObject;
-  publication: JsonObject;
-  sections: JsonObject[];
-  citation_groups: JsonObject[];
-  citation_total: number;
-  citation_offset: number;
-  citation_limit: number;
-  claim_cards: JsonObject[];
-  weak_signals: JsonObject[];
-  cross_direction_records: JsonObject[];
-  aggregate_claims: JsonObject[];
-  limitations_recovery: JsonObject[];
-  trace: JsonObject;
-}
-
-export interface ContentResearchEvidenceBundleView {
-  schema_version: string;
-  bundle_id: string;
-  workflow_run_id: string;
-  research_brief_id?: string | null;
-  research_plan_id?: string | null;
-  research_direction_id?: string | null;
-  status: string;
-  bundle_type: string;
-  bundle_version: string;
-  summary: string;
-  coverage: JsonObject;
-  retrieval_metrics: JsonObject;
-  faithfulness_metrics: JsonObject;
-  cross_source_metrics: JsonObject;
-  contradiction_summary: JsonObject;
-  citation_coverage: JsonObject;
-  unsupported_claim_count: number;
-  missing_evidence: JsonObject[];
-  priority_policy_id?: string | null;
-  evidence_boundary_policy_id?: string | null;
-  decision_card: JsonObject;
-  priority: JsonObject;
-  evidence_state: string;
-  evidence_grade: string;
-  claim_scope: JsonObject;
-  next_action: JsonObject;
-  items: JsonObject[];
-  evidence_by_role: Record<string, JsonObject[]>;
-  lineage_by_evidence_id: Record<string, JsonObject[]>;
-  source_links: JsonObject[];
-  metadata: JsonObject;
-  created_at: string;
-  updated_at: string;
+  workflow_execution_state: string;
+  subject?: string | null;
+  frozen_scope: JsonObject;
+  collected_at?: string | null;
+  publication: JsonObject & { state?: string | null };
+  sections: {
+    main_findings: JsonObject[];
+    weak_signals: JsonObject[];
+    limitations_scope: JsonObject[];
+  };
+  status_strip: JsonObject;
+  citations: JsonObject[];
+  run_direction_states: JsonObject[];
+  recovery_projection?: JsonObject | null;
 }
 
 export interface ContentResearchHumanDecisionRequest {
@@ -315,21 +278,18 @@ export async function getContentResearchTrace(workflowRunId: string): Promise<Co
   return contentResearchFetch(`/content-research/workflows/${encodeURIComponent(workflowRunId)}/trace`);
 }
 
-export async function getContentResearchPublishedReport(
+export async function getContentResearchLiteReport(
   workflowRunId: string,
-  options: { researchPlanId?: string; publicationId?: string; citationOffset?: number; citationLimit?: number } = {}
-): Promise<ContentResearchPublishedReportResponse> {
+  options: { researchPlanId?: string; publicationId?: string; citationGroupIds?: string[] } = {}
+): Promise<ContentResearchLiteReportResponse> {
   const query = new URLSearchParams();
   if (options.researchPlanId) query.set("research_plan_id", options.researchPlanId);
   if (options.publicationId) query.set("publication_id", options.publicationId);
-  if (options.citationOffset !== undefined) query.set("citation_offset", String(options.citationOffset));
-  if (options.citationLimit !== undefined) query.set("citation_limit", String(options.citationLimit));
+  for (const citationGroupId of options.citationGroupIds ?? []) {
+    query.append("citation_group_ids", citationGroupId);
+  }
   const suffix = query.size ? `?${query.toString()}` : "";
-  return contentResearchFetch(`/content-research/workflows/${encodeURIComponent(workflowRunId)}/report${suffix}`);
-}
-
-export async function getContentResearchEvidenceBundle(bundleId: string): Promise<ContentResearchEvidenceBundleView> {
-  return contentResearchFetch(`/content-research/evidence-bundles/${encodeURIComponent(bundleId)}`);
+  return contentResearchFetch(`/content-research/workflows/${encodeURIComponent(workflowRunId)}/lite-report${suffix}`);
 }
 
 export async function submitContentResearchBrandDecision(

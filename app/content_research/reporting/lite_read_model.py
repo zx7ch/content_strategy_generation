@@ -47,10 +47,17 @@ class LiteReportReader:
                 workflow_run_id=workflow_run_id,
                 research_plan_id=research_plan_id,
                 publication_id=publication_id,
-                # Lite filtering validates against the complete immutable publication,
-                # rather than a pagination window of it.
-                citation_limit=2**31 - 1,
             )
+            if citation_group_ids:
+                report = {
+                    **report,
+                    "citation_groups": await self._published.citation_groups(
+                        workflow_run_id=workflow_run_id,
+                        research_plan_id=research_plan_id,
+                        publication_id=publication_id,
+                        citation_group_ids=set(citation_group_ids),
+                    ),
+                }
         except PublishedReportNotFoundError:
             if citation_group_ids is not None:
                 raise
@@ -69,7 +76,6 @@ class LiteReportReader:
         citations = _select_citations(
             _lite_citations(report.get("citation_groups")),
             citation_group_ids,
-            publication_citation_group_ids=_citation_group_ids(report.get("citation_groups")),
         )
         citations_by_claim = _citations_by_claim(citations)
         direction_states = _direction_states(report)
@@ -272,30 +278,11 @@ def _lite_citations(groups: object) -> list[dict[str, Any]]:
 def _select_citations(
     citations: list[dict[str, Any]],
     citation_group_ids: list[str] | None,
-    *,
-    publication_citation_group_ids: set[str],
 ) -> list[dict[str, Any]]:
     if citation_group_ids is None:
         return citations
     requested = set(citation_group_ids)
-    missing = requested - publication_citation_group_ids
-    if missing:
-        raise PublishedReportNotFoundError(
-            "requested citation groups are absent from the publication: "
-            + ", ".join(sorted(missing))
-        )
     return [citation for citation in citations if citation.get("citation_group_id") in requested]
-
-
-def _citation_group_ids(groups: object) -> set[str]:
-    if not isinstance(groups, list):
-        return set()
-    return {
-        group["citation_group_id"]
-        for group in groups
-        if isinstance(group, dict)
-        if isinstance(group.get("citation_group_id"), str)
-    }
 
 
 def _citation_ref(ref: dict[str, Any]) -> dict[str, Any]:

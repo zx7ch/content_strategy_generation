@@ -10,7 +10,6 @@ import pytest
 
 from app.api.routes.router import app
 from app.content_research.presearch.service import PresearchService
-from app.content_research.reporting.composer import ResearchReportComposer
 from app.content_research.service import ContentResearchService, WorkflowRunManagerRuntime
 from app.content_research.sources import SourceAdapterRegistry
 from app.content_research.sources.base import ProviderCapability, SourceOperationResult
@@ -185,25 +184,14 @@ async def test_formal_workflow_public_api_e2e_is_packet_only_safe_and_replayable
     assert {item["direction_id"] for item in summary["subagent_tasks"]} == set(ALL_DIRECTIONS)
     assert {item["status"] for item in summary["subagent_tasks"]} <= {"completed", "partial_completed"}
 
-    report = await client.get(f"/content-research/workflows/{workflow['workflow_run_id']}/report")
+    report = await client.get(f"/content-research/workflows/{workflow['workflow_run_id']}/lite-report")
     assert report.status_code == 200, report.text
     report_payload = report.json()
-    assert report_payload["publication_state"] in {"partial_verified_report", "evidence_only_report"}
-    assert all("evidence_bundle" not in card for card in report_payload["claim_cards"])
-    assert all("claim_candidate_id" in signal for signal in report_payload["weak_signals"])
+    assert report_payload["publication"]["state"] in {"partial_verified_report", "evidence_only_report"}
     assert all(
-        ref["quote"] and ref["field_path"] and isinstance(ref["text_start"], int)
-        and isinstance(ref["text_end"], int) and ref["source_text_hash"] and ref["source_url"]
-        for group in report_payload["citation_groups"] for ref in group["evidence_refs"]
+        ref["quote"] and ref["field_path"] and ref["source_text_hash"] and ref["source_url"]
+        for group in report_payload["citations"] for ref in group["evidence_refs"]
     )
-    persisted_snapshot = next(
-        item
-        for item in app.state.content_research_service._store.list_result_snapshots_for_workflow(workflow["workflow_run_id"])
-        if item.id == report_payload["publication"]["governed_snapshot_id"]
-    )
-    report_draft = ResearchReportComposer().compose(persisted_snapshot)
-    assert report_draft.sections[0].citation_anchors
-    assert report_draft.sections[0].citation_anchors[0].citation_group_id == report_payload["citation_groups"][0]["citation_group_id"]
 
     governance = await client.get(f"/content-research/workflows/{workflow['workflow_run_id']}/governance")
     assert governance.status_code == 200, governance.text
@@ -223,8 +211,8 @@ async def test_formal_workflow_public_api_e2e_is_packet_only_safe_and_replayable
     )
     assert replay.status_code == 200, replay.text
     assert adapter.calls == calls_before_replay
-    rerun = (await client.get(f"/content-research/workflows/{workflow['workflow_run_id']}/report")).json()
-    assert rerun["citation_groups"] == report_payload["citation_groups"]
+    rerun = (await client.get(f"/content-research/workflows/{workflow['workflow_run_id']}/lite-report")).json()
+    assert rerun["citations"] == report_payload["citations"]
 
 
 @pytest.mark.asyncio
@@ -287,9 +275,9 @@ async def test_auth_required_retry_requeues_the_same_run_once_and_publishes_once
     else:
         pytest.fail("same-run auth retry did not publish")
     assert len(reports) == 1
-    report = await client.get(f"/content-research/workflows/{workflow['workflow_run_id']}/report")
+    report = await client.get(f"/content-research/workflows/{workflow['workflow_run_id']}/lite-report")
     assert report.status_code == 200, report.text
-    assert report.json()["citation_total"] > 0
+    assert report.json()["citations"]
     await thread_store.close()
 
 
@@ -333,22 +321,22 @@ async def test_single_direction_workflow_publishes_a_cited_report_with_frozen_sc
         await asyncio.sleep(0.01)
     else:
         pytest.fail("single-direction formal research did not publish")
-    report = await client.get(f"/content-research/workflows/{workflow['workflow_run_id']}/report")
+    report = await client.get(f"/content-research/workflows/{workflow['workflow_run_id']}/lite-report")
     await thread_store.close()
 
     assert report.status_code == 200, report.text
     payload = report.json()
-    assert payload["release"] == {
+    assert payload["frozen_scope"] == {
         "direction_set_version": "formal_v1",
         "direction_ids": ["product_marketing"],
     }
     assert payload["run_direction_states"] == [{
         "direction": "product_marketing",
         "state": "formal_directional_result",
-        "reason_codes": [],
-        "recovery_actions": [],
+        "reason_code": None,
+        "recovery_action": None,
     }]
-    assert payload["citation_total"] > 0
+    assert payload["citations"]
 
 
 @pytest.mark.asyncio
