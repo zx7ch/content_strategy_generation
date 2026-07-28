@@ -59,9 +59,71 @@ async def test_lite_reader_projects_each_formal_publication_without_writing(
         thread = await threads.create_thread(title="lite")
         async with WorkflowRunManager(db_path) as manager:
             run = await manager.start_run(thread_id=thread["id"], user_id="user")
-        snapshot = replace(_snapshot(), workflow_run_id=run.run_id)
+        base_snapshot = _snapshot()
+        governed = base_snapshot.metadata["governed_snapshot"]
+        citation_group = governed["citation_groups"][0]
+        snapshot = replace(
+            base_snapshot,
+            workflow_run_id=run.run_id,
+            metadata={
+                **base_snapshot.metadata,
+                "governed_snapshot": {
+                    **governed,
+                    "policy_scope": {
+                        **governed["policy_scope"],
+                        "direction_set_version": "direction_set_v1",
+                        "direction_ids": ["product_marketing"],
+                    },
+                    "direction_results": [
+                        {
+                            "direction_id": "product_marketing",
+                            "state": "formal_directional_result",
+                            "limitations": [],
+                            "recovery_actions": [],
+                        }
+                    ],
+                    "citation_groups": [
+                        {
+                            **citation_group,
+                            "evidence_refs": [
+                                {
+                                    **citation_group["evidence_refs"][0],
+                                    "source_collected_at": "2026-07-21T00:00:00Z",
+                                },
+                                {
+                                    "field_path": "title",
+                                    "quote": "missing",
+                                    "text_start": 0,
+                                    "text_end": 7,
+                                    "source_text_hash": "b" * 64,
+                                    "source_url": None,
+                                    "source_collected_at": "2026-07-21T00:01:00Z",
+                                },
+                                {
+                                    "field_path": "title",
+                                    "quote": "locked",
+                                    "text_start": 0,
+                                    "text_end": 6,
+                                    "source_text_hash": "c" * 64,
+                                    "source_url": "https://example.test/locked",
+                                    "source_collected_at": "2026-07-21T00:02:00Z",
+                                    "navigation_state": "navigation_unavailable",
+                                    "navigation_reason": "provider_auth_required",
+                                },
+                            ],
+                        }
+                    ],
+                },
+            },
+        )
         draft = ResearchReportComposer().compose(snapshot)
         decision = replace(_decision(draft), workflow_run_id=run.run_id)
+        if publication_state == "evidence_only_report":
+            decision = replace(
+                decision,
+                audit_state="failed",
+                reason_codes=("insufficient_admitted_evidence",),
+            )
         publication_changes = {
             "workflow_run_id": run.run_id,
             "publication_state": publication_state,
@@ -89,8 +151,16 @@ async def test_lite_reader_projects_each_formal_publication_without_writing(
         assert first == second
         assert first["publication"]["state"] == publication_state
         assert expected_status_strip in first["status_strip"]
-        if publication_state != "evidence_only_report":
-            assert first["citations"][0]["evidence_refs"][0]["navigation_state"] == "available"
+        assert [
+            item["navigation_state"]
+            for item in first["citations"][0]["evidence_refs"]
+        ] == ["available", "missing_source_url", "navigation_unavailable"]
+        if publication_state == "evidence_only_report":
+            assert first["publication"]["publication_reason"] == (
+                "insufficient_admitted_evidence"
+            )
+            assert first["sections"]["main_findings"] == []
+            assert first["sections"]["weak_signals"] == []
         assert first["recovery_projection"] is None
         async with WorkflowStore(db_path) as workflow_store:
             artifacts = await workflow_store.list_artifacts(run.run_id)

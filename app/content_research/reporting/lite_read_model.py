@@ -73,23 +73,55 @@ class LiteReportReader:
         publication_state = str(report.get("publication_state") or "")
         if publication_state not in _PUBLICATION_STATES:
             raise PublishedReportNotFoundError("published report has unsupported publication state")
+        requested_directions = set(_frozen_scope(report)["direction_ids"])
+        claim_cards = [
+            card
+            for card in report.get("claim_cards") or []
+            if isinstance(card, dict)
+            and (
+                not requested_directions
+                or card.get("direction_id") in requested_directions
+            )
+        ]
+        weak_signal_records = [
+            signal
+            for signal in report.get("weak_signals") or []
+            if isinstance(signal, dict)
+            and (
+                not requested_directions
+                or signal.get("direction_id") in requested_directions
+            )
+        ]
+        excluded_claim_ids = {
+            str(item["claim_candidate_id"])
+            for item in [
+                *(report.get("claim_cards") or []),
+                *(report.get("weak_signals") or []),
+            ]
+            if isinstance(item, dict)
+            and requested_directions
+            and item.get("direction_id") not in requested_directions
+            and item.get("claim_candidate_id")
+        }
         citations = _select_citations(
-            _lite_citations(report.get("citation_groups")),
+            [
+                citation
+                for citation in _lite_citations(report.get("citation_groups"))
+                if citation.get("claim_candidate_id") not in excluded_claim_ids
+            ],
             citation_group_ids,
         )
         citations_by_claim = _citations_by_claim(citations)
         direction_states = _direction_states(report)
         findings = [
             _finding(card, citations_by_claim)
-            for card in report.get("claim_cards") or []
-            if isinstance(card, dict)
-            and str(card.get("admission_state") or "admitted") in {"admitted", "accepted"}
+            for card in claim_cards
+            if str(card.get("admission_state") or "admitted") in {"admitted", "accepted"}
             and _allowed_claim(card, citations_by_claim)
         ]
         weak_signals = [
             item
-            for signal in report.get("weak_signals") or []
-            if isinstance(signal, dict)
+            for signal in weak_signal_records
             for item in [_weak_signal(signal, citations_by_claim)]
             if item is not None
         ]
@@ -102,7 +134,11 @@ class LiteReportReader:
             "subject": _subject(self._store, report["workflow_run_id"]),
             "frozen_scope": _frozen_scope(report),
             "collected_at": _collected_at(citations),
-            "publication": {"state": publication_state, **dict(report.get("publication") or {})},
+            "publication": {
+                "state": publication_state,
+                **dict(report.get("publication") or {}),
+                "publication_reason": _publication_reason(report),
+            },
             "sections": {
                 "main_findings": [] if is_evidence_only else finding_cards,
                 "weak_signals": [] if is_evidence_only else weak_signals,
@@ -371,6 +407,19 @@ def _collected_at(citations: list[dict[str, Any]]) -> str | None:
         ),
         None,
     )
+
+
+def _publication_reason(report: dict[str, Any]) -> str | None:
+    publication = report.get("publication")
+    if not isinstance(publication, dict):
+        return None
+    reason_codes = publication.get("reason_codes")
+    if isinstance(reason_codes, list):
+        reason = next((str(item) for item in reason_codes if item), None)
+        if reason:
+            return reason
+    recovery_state = publication.get("audit_recovery_state")
+    return str(recovery_state) if recovery_state else None
 
 
 def _has_persisted_failure(checkpoints: list[StageCheckpointRecord]) -> bool:

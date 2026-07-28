@@ -16,6 +16,7 @@ export interface ContentResearchPresearchResponse {
   subject_confirmation: string;
   competitor_tags: string[];
   research_directions: string[];
+  direction_catalog: string[];
   custom_research_question: string;
   custom_competitor_input?: string;
   timeout_status: string;
@@ -67,45 +68,6 @@ export interface ContentResearchWorkflowSummary {
   runtime_child_tasks: JsonObject[];
 }
 
-export interface ContentResearchTrace {
-  workflow_run_id: string;
-  thread_id?: string | null;
-  current_stage?: string | null;
-  run_status?: string | null;
-  recoverable: boolean;
-  duration_ms: number;
-  error_count: number;
-  retry_count: number;
-  traces: JsonObject[];
-  observation_events: JsonObject[];
-  workflow_events: JsonObject[];
-  runtime_steps: JsonObject[];
-  runtime_child_tasks: JsonObject[];
-  usage_summary: {
-    total_calls?: number;
-    prompt_tokens?: number;
-    completion_tokens?: number;
-    total_tokens?: number;
-    total_cost?: number;
-    currency?: string;
-    latency_ms?: number;
-    [key: string]: unknown;
-  };
-  usage_steps: JsonObject[];
-  usage_events: JsonObject[];
-  provider_operations: Array<{
-    operation_fingerprint: string;
-    operation?: string | null;
-    status: string;
-    started_at?: string | null;
-    finished_at?: string | null;
-    failure_code?: string | null;
-    failure_reason?: string | null;
-    retryable: boolean;
-    recovery_action?: string | null;
-  }>;
-}
-
 export interface ContentResearchSourceCollectionRequest {
   query?: string | null;
   source_kind?: string;
@@ -139,7 +101,7 @@ export interface ContentResearchFormalResearchResponse {
 
 export interface ContentResearchWorkflowActionRequest {
   schema_version?: string;
-  action: "confirm_brief" | "start_formal_research" | "retry_formal_research" | "end_content_research";
+  action: "confirm_brief" | "start_formal_research" | "resume_formal_research" | "end_content_research";
   payload?: JsonObject;
 }
 
@@ -274,10 +236,6 @@ export async function getContentResearchWorkflow(workflowRunId: string): Promise
   return contentResearchFetch(`/content-research/workflows/${encodeURIComponent(workflowRunId)}`);
 }
 
-export async function getContentResearchTrace(workflowRunId: string): Promise<ContentResearchTrace> {
-  return contentResearchFetch(`/content-research/workflows/${encodeURIComponent(workflowRunId)}/trace`);
-}
-
 export async function getContentResearchLiteReport(
   workflowRunId: string,
   options: { researchPlanId?: string; publicationId?: string; citationGroupIds?: string[] } = {}
@@ -329,15 +287,17 @@ export async function startContentResearchFormalResearch(
   return response.result;
 }
 
-export async function retryContentResearchFormalResearch(
-  workflowRunId: string,
-  payload: ContentResearchSourceCollectionRequest
-): Promise<ContentResearchFormalResearchResponse> {
-  const response = await runContentResearchWorkflowAction<ContentResearchFormalResearchResponse>(workflowRunId, {
-    action: "retry_formal_research",
-    payload: payload as unknown as JsonObject,
+export async function resumeContentResearchFormalResearch(
+  workflowRunId: string
+): Promise<ContentResearchWorkflowActionResponse<{
+  workflow_run_id: string;
+  status: string;
+  recoverable: boolean;
+}>> {
+  return runContentResearchWorkflowAction(workflowRunId, {
+    action: "resume_formal_research",
+    payload: {},
   });
-  return response.result;
 }
 
 export async function endContentResearchWorkflow(workflowRunId: string): Promise<ContentResearchWorkflowActionResponse> {
@@ -365,17 +325,6 @@ export async function runContentResearchWorkflowAction<T = JsonObject>(
     method: "POST",
     body: payload,
   });
-}
-
-export async function restoreContentResearchWorkflow(workflowRunId: string): Promise<{
-  workflow: ContentResearchWorkflowSummary;
-  trace: ContentResearchTrace;
-}> {
-  const [workflow, trace] = await Promise.all([
-    getContentResearchWorkflow(workflowRunId),
-    getContentResearchTrace(workflowRunId),
-  ]);
-  return { workflow, trace };
 }
 
 async function contentResearchFetch<T>(

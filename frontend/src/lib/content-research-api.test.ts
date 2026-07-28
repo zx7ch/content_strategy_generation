@@ -8,9 +8,8 @@ import {
   endContentResearchWorkflow,
   getContentResearchDecisions,
   getContentResearchLiteReport,
-  getContentResearchTrace,
   getContentResearchWorkflow,
-  retryContentResearchFormalResearch,
+  resumeContentResearchFormalResearch,
   submitContentResearchBrandDecision,
   submitContentResearchContentDecision,
 } from "./content-research-api.ts";
@@ -29,6 +28,7 @@ test("createContentResearchPresearch posts seed to real P0 endpoint", async () =
       subject_confirmation: "徒步短裤",
       competitor_tags: ["迪卡侬"],
       research_directions: ["产品营销"],
+      direction_catalog: ["product_marketing", "competitor_discovery", "content_performance"],
       custom_research_question: "",
       custom_competitor_input: "",
       timeout_status: "none",
@@ -45,6 +45,11 @@ test("createContentResearchPresearch posts seed to real P0 endpoint", async () =
   assert.ok(requestUrl.endsWith("/content-research/presearch"));
   assert.match(requestBody, /"seed_text":"徒步短裤"/);
   assert.equal(result.workflow_run_id, "run_1");
+  assert.deepEqual(result.direction_catalog, [
+    "product_marketing",
+    "competitor_discovery",
+    "content_performance",
+  ]);
 });
 
 test("confirmContentResearchBrief posts selected directions", async () => {
@@ -240,25 +245,19 @@ test("formal research preserves completed and failed specialist states distinctl
   assert.equal(failed.failed_tasks[0].error, "rate_limited");
 });
 
-test("retryContentResearchFormalResearch sends retry workflow action", async () => {
+test("resumeContentResearchFormalResearch sends the recovery continuation action", async () => {
   let requestBody = "";
   globalThis.fetch = (async (_input, init) => {
     requestBody = String(init?.body ?? "");
     return jsonResponse({
       schema_version: "content_research_workflow_action_response_v1",
       workflow_run_id: "run_1",
-      action: "retry_formal_research",
-      status: "completed",
+      action: "resume_formal_research",
+      status: "running",
       result: {
         workflow_run_id: "run_1",
-        provider: "xiaohongshu",
-        source_kind: "search_result",
-        status: "completed",
-        task_count: 2,
-        completed_task_count: 2,
-        partial_completed_task_count: 0,
-        failed_tasks: [],
-        limit_per_specialist: 50,
+        status: "running",
+        recoverable: true,
       },
       execution_mode: "local",
       remote_run_id: null,
@@ -267,10 +266,10 @@ test("retryContentResearchFormalResearch sends retry workflow action", async () 
     });
   }) as typeof fetch;
 
-  const result = await retryContentResearchFormalResearch("run_1", {});
+  const result = await resumeContentResearchFormalResearch("run_1");
 
-  assert.match(requestBody, /"action":"retry_formal_research"/);
-  assert.equal(result.status, "completed");
+  assert.match(requestBody, /"action":"resume_formal_research"/);
+  assert.equal(result.status, "running");
 });
 
 test("endContentResearchWorkflow sends end workflow action", async () => {
@@ -305,7 +304,6 @@ test("content research helpers throw readable non-ok errors", async () => {
     jsonResponse({ error_message: "Content research workflow not found" }, 404)) as typeof fetch;
 
   await assert.rejects(() => getContentResearchWorkflow("run_missing"), /Content research workflow not found/);
-  await assert.rejects(() => getContentResearchTrace("run_missing"), /Content research workflow not found/);
   await assert.rejects(() => getContentResearchLiteReport("run_missing"), /Content research workflow not found/);
   await assert.rejects(() => getContentResearchDecisions("run_missing"), /Content research workflow not found/);
   await assert.rejects(
@@ -342,122 +340,6 @@ function workflowPayload() {
     runtime_run: { run_id: "run_1", current_step: "formal_research", status: "running" },
     runtime_steps: [],
     runtime_child_tasks: [],
-  };
-}
-
-function tracePayload() {
-  return {
-    workflow_run_id: "run_1",
-    thread_id: "thread_1",
-    current_stage: "formal_research",
-    run_status: "running",
-    recoverable: true,
-    duration_ms: 10,
-    error_count: 0,
-    retry_count: 0,
-    traces: [],
-    observation_events: [],
-    workflow_events: [],
-    runtime_steps: [],
-    runtime_child_tasks: [],
-    usage_summary: { total_tokens: 0 },
-    usage_steps: [],
-    usage_events: [],
-  };
-}
-
-function resultsPayload() {
-  return {
-    schema_version: "content_research_api_v1",
-    snapshot_id: "rrs_1",
-    workflow_run_id: "run_1",
-    research_brief_id: "rb_1",
-    research_plan_id: "rp_1",
-    snapshot_version: "1",
-    result_type: "topic_research",
-    status: "ready",
-    title: "调研结果",
-    executive_summary: "通勤场景值得优先研究。",
-    items: [
-      {
-        result_item_id: "ri_1",
-        claim: "通勤场景值得优先研究。",
-        summary: "通勤场景值得优先研究。",
-        evidence_bundle_id: "eb_1",
-        evidence_bundle_ids: ["eb_1"],
-        support_level: "medium",
-        claim_status: "supported",
-        priority: { label: "high_priority", rank: 1 },
-        priority_label: "high_priority",
-        evidence_state: "partially_supported",
-        evidence_grade: "B",
-        claim_scope: { allowed: ["Use as a bounded research signal."] },
-        next_action: { type: "content_experiment" },
-        decision_card: {},
-        risk_flags: [],
-        missing_evidence: [],
-        source_count: 2,
-      },
-    ],
-    findings: [],
-    recommendations: [],
-    evidence_bundle_ids: ["eb_1"],
-    claim_count: 1,
-    supported_claim_count: 1,
-    unsupported_claim_count: 0,
-    citation_coverage_score: 0.8,
-    faithfulness_score: 0.76,
-    answer_relevancy_score: 0.72,
-    derivation_completeness_score: 1,
-    evidence_boundary_calibration_score: 1,
-    decision_summary: {},
-    decision_cards: [],
-    priority_summary: {},
-    evidence_boundary_summary: {},
-    limitations: [],
-    abstentions: [],
-    metadata: {},
-    created_at: "2026-07-06T00:00:00+08:00",
-  };
-}
-
-function evidenceBundlePayload() {
-  return {
-    schema_version: "content_research_api_v1",
-    bundle_id: "eb_1",
-    workflow_run_id: "run_1",
-    research_brief_id: "rb_1",
-    research_plan_id: "rp_1",
-    research_direction_id: "rd_1",
-    status: "ready",
-    bundle_type: "research_direction",
-    bundle_version: "v1",
-    summary: "通勤场景证据包",
-    coverage: { source_count: 2 },
-    retrieval_metrics: {},
-    faithfulness_metrics: {},
-    cross_source_metrics: {},
-    contradiction_summary: {},
-    citation_coverage: {},
-    unsupported_claim_count: 0,
-    missing_evidence: [],
-    priority_policy_id: "pp_content_research_default_v1",
-    evidence_boundary_policy_id: "ebp_content_research_default_v1",
-    decision_card: {},
-    priority: { label: "high_priority" },
-    evidence_state: "partially_supported",
-    evidence_grade: "B",
-    claim_scope: { allowed: ["Use as a bounded research signal."] },
-    next_action: { type: "content_experiment" },
-    items: [],
-    evidence_by_role: {
-      supporting_fact: [{ id: "ev_1", title: "通勤背包测评" }],
-    },
-    lineage_by_evidence_id: { ev_1: [{ transformation_type: "captured" }] },
-    source_links: [{ evidence_id: "ev_1", source_url: "https://example.com/note" }],
-    metadata: {},
-    created_at: "2026-07-06T00:00:00+08:00",
-    updated_at: "2026-07-06T00:00:00+08:00",
   };
 }
 
