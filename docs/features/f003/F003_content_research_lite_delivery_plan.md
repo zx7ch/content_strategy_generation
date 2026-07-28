@@ -356,3 +356,16 @@ Lite 的证据字段只允许 `content_text` 与 `title`（投影过滤）。评
 | Gate 0（v2 重新冻结） | CLEAN | 2026-07-22 | `template_only`、`direction_set_v1`、三档报告/非报告恢复呈现和 citation 跳转合同已同步到正式 R1/R3/R4 与 mock v5；产品确认四档预览视觉归属符合预期。Gate 1 必须原子实现共享 policy/Composer/audit/read model；现有 Lite-local seam 不得继续扩展。 |
 | Gate 1：共享 template publication runtime | CLEAN | 2026-07-22 | 已完成 F003-LITE-G1-V2：共享 policy 冻结 `direction_set_version`、`direction_ids`、`report_compose_mode`；Composer/faithfulness 保持 `template_only` 的结构化章节与 semantic `not_applicable`；Lite 窄投影改为仅输出共享 publication state、冻结 scope、逐方向状态、三态 citation navigation 与非报告 `recovery_projection`，不再暴露 `complete_lite` 等 Lite-local 状态。三档发布、恢复不产生 artifact、replay 及 `/lite-report` API E2E 回归共 48 项通过。Creator UI 未在 Gate 1 露出，浏览器验收留待 Gate 2/4。 |
 | Gate 2：Product Marketing 真实垂直切片 | CLEAN | 2026-07-26 | 已完成真实 Creator Product Marketing 成功与 auth recovery 验收：受控 auth failure 不发布报告或 timeline artifact；显式 QR 认证后，同一 run 恢复完成真实 discover/detail、admission 和 `complete_verified_report`，保留 8 个冻结 citation group，并且只 materialize 一份报告/一条 artifact。失败阶段已 supersede、恢复后的 provider operation 有 completed checkpoint；成功 run 的显式重试不重放，已发布报告刷新后保持同一版本。完整证据与非阻塞遗留项见 [Gate 2 最终验收记录](../../bugfix/20260726_f003_gate2_final_acceptance.md)。 |
+
+### 2026-07-28 Task 2 v2 review repair
+
+- 根因修复：已有 publication 的 lineage/artifact 损坏不再进入 `publication: none` recovery；空 `direction_ids` 不再作为 wildcard；Creator 不再显示历史 Trace 重试文案；workflow restore 的非 404 错误保持可见且不删除 thread-scoped saved run；同一 run 的 recovery card 会被唯一 published report 原位替换。
+- 测试层级修复：本地 uvicorn + Next.js + SQLite + Playwright 套件从 `tests/acceptance` 迁至 `tests/e2e`。每个场景使用独立临时 SQLite/Chroma 存储，外部 LLM、source adapter 及 500 restore 分支使用显式 deterministic test fakes；不使用 `page.route`。staging/pre-release acceptance 仍保留给后续 Task 4，本次未启动 Task 3/4。
+- RED 证据：新增测试分别复现空 scope 泄露、损坏 publication 被误投影为 recovery、历史 Trace 文案残留、restore 500 被吞并清除 saved run、以及浏览器端损坏 publication 返回 recovery；隔离后的 recovery replacement 回归保持通过。
+- GREEN 证据：
+  - `pytest -q tests/integration/test_content_research_lite_read_model.py tests/e2e/test_content_research_report_publication_timeline_api.py`：`9 passed`
+  - `pytest -q tests/e2e/test_content_research_creator_browser.py`：`8 passed`
+  - `npm test`：`27 passed`
+  - `npx tsc --noEmit`：通过
+  - `npm run lint`：通过，保留 4 条既有 React Hook warning
+  - `npm run build`：通过，保留同一组既有 React Hook warning

@@ -5,7 +5,10 @@ from __future__ import annotations
 from typing import Any
 
 from app.content_research.contracts import DIRECTION_CATALOG_V1
-from app.content_research.persistence_models import StageCheckpointRecord
+from app.content_research.persistence_models import (
+    ReportPublicationRecord,
+    StageCheckpointRecord,
+)
 from app.content_research.reporting.read_model import (
     PublishedReportNotFoundError,
     PublishedReportReader,
@@ -20,6 +23,10 @@ _PUBLICATION_STATES = {
     "evidence_only_report",
 }
 _RECOVERABLE_RUN_STATES = {"failed", "paused"}
+
+
+class ExistingPublicationUnreadableError(RuntimeError):
+    """Raised when a committed publication exists but cannot be projected safely."""
 
 
 class LiteReportReader:
@@ -58,9 +65,17 @@ class LiteReportReader:
                         citation_group_ids=set(citation_group_ids),
                     ),
                 }
-        except PublishedReportNotFoundError:
+        except PublishedReportNotFoundError as exc:
             if citation_group_ids is not None:
                 raise
+            if self._has_publication(
+                workflow_run_id=workflow_run_id,
+                research_plan_id=research_plan_id,
+                publication_id=publication_id,
+            ):
+                raise ExistingPublicationUnreadableError(
+                    "existing publication is unreadable"
+                ) from exc
             return await self._recoverable_projection(workflow_run_id)
         return self._published_projection(report, citation_group_ids=citation_group_ids)
 
@@ -74,24 +89,12 @@ class LiteReportReader:
         if publication_state not in _PUBLICATION_STATES:
             raise PublishedReportNotFoundError("published report has unsupported publication state")
         requested_directions = set(_frozen_scope(report)["direction_ids"])
-        claim_cards = [
-            card
-            for card in report.get("claim_cards") or []
-            if isinstance(card, dict)
-            and (
-                not requested_directions
-                or card.get("direction_id") in requested_directions
-            )
-        ]
-        weak_signal_records = [
-            signal
-            for signal in report.get("weak_signals") or []
-            if isinstance(signal, dict)
-            and (
-                not requested_directions
-                or signal.get("direction_id") in requested_directions
-            )
-        ]
+        claim_cards = _records_in_directions(
+            report.get("claim_cards"), requested_directions
+        )
+        weak_signal_records = _records_in_directions(
+            report.get("weak_signals"), requested_directions
+        )
         excluded_claim_ids = {
             str(item["claim_candidate_id"])
             for item in [
@@ -99,17 +102,20 @@ class LiteReportReader:
                 *(report.get("weak_signals") or []),
             ]
             if isinstance(item, dict)
-            and requested_directions
             and item.get("direction_id") not in requested_directions
             and item.get("claim_candidate_id")
         }
-        citations = _select_citations(
-            [
-                citation
-                for citation in _lite_citations(report.get("citation_groups"))
-                if citation.get("claim_candidate_id") not in excluded_claim_ids
-            ],
-            citation_group_ids,
+        citations = (
+            _select_citations(
+                [
+                    citation
+                    for citation in _lite_citations(report.get("citation_groups"))
+                    if citation.get("claim_candidate_id") not in excluded_claim_ids
+                ],
+                citation_group_ids,
+            )
+            if requested_directions
+            else []
         )
         citations_by_claim = _citations_by_claim(citations)
         direction_states = _direction_states(report)
@@ -207,6 +213,20 @@ class LiteReportReader:
             if item.workflow_run_id == workflow_run_id
         ]
 
+    def _has_publication(
+        self,
+        *,
+        workflow_run_id: str,
+        research_plan_id: str | None,
+        publication_id: str | None,
+    ) -> bool:
+        return any(
+            item.workflow_run_id == workflow_run_id
+            and (research_plan_id is None or item.research_plan_id == research_plan_id)
+            and (publication_id is None or item.id == publication_id)
+            for item in self._store.list_typed_records(ReportPublicationRecord)
+        )
+
 
 def _frozen_scope(report: dict[str, Any]) -> dict[str, Any]:
     release = report.get("release") if isinstance(report.get("release"), dict) else {}
@@ -226,6 +246,16 @@ def _policy_scope(policy: dict[str, Any]) -> dict[str, Any]:
         ),
         "report_compose_mode": policy.get("report_compose_mode") or "prose",
     }
+
+
+def _records_in_directions(
+    records: object, direction_ids: set[str]
+) -> list[dict[str, Any]]:
+    return [
+        item
+        for item in (records if isinstance(records, list) else [])
+        if isinstance(item, dict) and item.get("direction_id") in direction_ids
+    ]
 
 
 def _direction_states(report: dict[str, Any]) -> list[dict[str, Any]]:

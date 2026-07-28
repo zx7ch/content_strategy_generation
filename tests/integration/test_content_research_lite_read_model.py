@@ -1,4 +1,6 @@
 from dataclasses import replace
+import json
+import sqlite3
 
 import pytest
 
@@ -37,6 +39,63 @@ def test_lite_direction_states_normalize_requested_not_started_to_unavailable():
         "reason_code": "collection_result_unavailable",
         "recovery_action": None,
     }
+
+
+def test_lite_projection_with_empty_requested_scope_exposes_no_directional_data(tmp_path):
+    db_path = str(tmp_path / "empty-scope.db")
+    reader = LiteReportReader(SQLiteContentResearchStore(db_path), db_path)
+    report = {
+        "workflow_run_id": "run_empty_scope",
+        "workflow_terminal_state": "succeeded",
+        "publication_state": "complete_verified_report",
+        "publication": {"compose_mode": "template_only"},
+        "release": {
+            "direction_set_version": "direction_set_v1",
+            "direction_ids": [],
+        },
+        "claim_cards": [
+            {
+                "claim_candidate_id": "claim_product",
+                "direction_id": "product_marketing",
+                "admission_state": "admitted",
+                "statement": "must remain hidden",
+                "claim_type": "finding",
+                "scope": "one sample",
+            }
+        ],
+        "weak_signals": [
+            {
+                "claim_candidate_id": "weak_product",
+                "direction_id": "product_marketing",
+                "statement": "must also remain hidden",
+            }
+        ],
+        "citation_groups": [
+            {
+                "citation_group_id": "cg_product",
+                "display_index": 1,
+                "claim_candidate_id": "claim_product",
+                "evidence_refs": [
+                    {
+                        "field_path": "content_text",
+                        "quote": "private directional evidence",
+                        "source_url": "https://example.test/private",
+                    }
+                ],
+            }
+        ],
+        "run_direction_states": [
+            {"direction": "product_marketing", "state": "completed"}
+        ],
+        "limitations_recovery": [],
+    }
+
+    payload = reader._published_projection(report, citation_group_ids=None)
+
+    assert payload["sections"]["main_findings"] == []
+    assert payload["sections"]["weak_signals"] == []
+    assert payload["citations"] == []
+    assert payload["status_strip"]["admitted_finding_count"] == 0
 
 
 @pytest.mark.asyncio
@@ -239,3 +298,74 @@ async def test_lite_reader_returns_non_report_recovery_projection_without_artifa
             assert await workflow_store.list_artifacts(run.run_id) == []
     finally:
         await threads.close()
+
+
+@pytest.mark.asyncio
+async def test_lite_reader_never_turns_an_existing_corrupt_publication_into_recovery(
+    tmp_path,
+):
+    db_path = str(tmp_path / "corrupt-publication.db")
+    store = SQLiteContentResearchStore(db_path)
+    async with ThreadStore(db_path) as threads:
+        thread = await threads.create_thread(title="corrupt publication")
+    async with WorkflowRunManager(db_path) as manager:
+        run = await manager.start_run(thread_id=thread["id"], user_id="user")
+    store.save_brief(
+        ResearchBriefRecord(
+            id="brief_corrupt",
+            workflow_run_id=run.run_id,
+            thread_id=thread["id"],
+            schema_version="content_research_brief_v1",
+            status="ready",
+            payload={
+                "schema_version": "content_research_brief_payload_v1",
+                "confirmed_subject": "损坏报告",
+            },
+        )
+    )
+    base_snapshot = _snapshot()
+    snapshot = replace(base_snapshot, workflow_run_id=run.run_id)
+    draft = ResearchReportComposer().compose(snapshot)
+    decision = replace(_decision(draft), workflow_run_id=run.run_id)
+    publication = replace(
+        _publication(draft, decision),
+        workflow_run_id=run.run_id,
+    )
+    store.save_result_snapshot(snapshot)
+    store.save_report_draft(draft.to_record())
+    store.save_report_faithfulness_decision(decision.to_record())
+    store.save_report_publication(publication.to_record())
+    async with WorkflowRunManager(db_path) as manager:
+        await manager.complete_run(run.run_id)
+    await ReportPublicationMaterializer(store, db_path).materialize(publication.id)
+    store.save_stage_checkpoint(
+        StageCheckpointRecord(
+            "checkpoint_corrupt",
+            "content_research_stage_checkpoint_v1",
+            {"reason_code": "auth_expired"},
+            workflow_run_id=run.run_id,
+            subagent_task_id="task_corrupt",
+            stage_name="collect",
+            input_fingerprint="corrupt-operation",
+            status="failed",
+        )
+    )
+    with sqlite3.connect(db_path) as connection:
+        row = connection.execute(
+            "SELECT artifact_id, payload_json FROM workflow_artifacts WHERE run_id = ?",
+            (run.run_id,),
+        ).fetchone()
+        assert row is not None
+        payload = json.loads(row[1])
+        payload.pop("sections")
+        connection.execute(
+            "UPDATE workflow_artifacts SET payload_json = ? WHERE artifact_id = ?",
+            (json.dumps(payload), row[0]),
+        )
+        connection.execute(
+            "UPDATE workflow_runs SET status = 'paused' WHERE run_id = ?",
+            (run.run_id,),
+        )
+
+    with pytest.raises(RuntimeError, match="existing publication is unreadable"):
+        await LiteReportReader(store, db_path).read(workflow_run_id=run.run_id)

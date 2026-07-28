@@ -50,12 +50,20 @@ async def test_creator_timeline_api_exposes_one_materialized_report_result_and_r
         ]
         snapshot = replace(
             _governed_snapshot(),
-            workflow_run_id=run.run_id,
-            metadata={
-                "governed_snapshot": {**governed, "citation_groups": frozen_citations},
-                "governed_input_fingerprint": "timeline_frozen_citations",
-            },
-        )
+                workflow_run_id=run.run_id,
+                metadata={
+                    "governed_snapshot": {
+                        **governed,
+                        "policy_scope": {
+                            **governed["policy_scope"],
+                            "direction_set_version": "direction_set_v1",
+                            "direction_ids": ["product_marketing"],
+                        },
+                        "citation_groups": frozen_citations,
+                    },
+                    "governed_input_fingerprint": "timeline_frozen_citations",
+                },
+            )
         draft = ResearchReportComposer().compose(snapshot)
         decision = replace(_decision(draft), workflow_run_id=run.run_id)
         publication = replace(_publication(draft, decision), workflow_run_id=run.run_id)

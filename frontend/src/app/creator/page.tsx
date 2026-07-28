@@ -112,6 +112,11 @@ function contentResearchRunForThread(threadId: string): string | null {
   return contentResearchRunsByThread()[threadId] ?? null;
 }
 
+function contentResearchThreadForRun(workflowRunId: string): string | null {
+  return Object.entries(contentResearchRunsByThread())
+    .find(([, savedRunId]) => savedRunId === workflowRunId)?.[0] ?? null;
+}
+
 function saveContentResearchRunForThread(threadId: string, workflowRunId: string) {
   const runs = contentResearchRunsByThread();
   runs[threadId] = workflowRunId;
@@ -212,7 +217,7 @@ function displayChatText(text: string | null | undefined) {
   // report must still render its explicit error state instead of crashing.
   return (text ?? "").replace(
     /(小红书采集未完成：)(auth_required|rate_limited|transient_error|permanent_error|parser_error|unknown)(。可在「查看调研过程」中重试。)/,
-    (_match, prefix, reason, suffix) => `${prefix}${sourceFailureReasonText(reason)}${suffix}`
+    (_match, prefix, reason) => `${prefix}${sourceFailureReasonText(reason)}。`
   ).replace(
     /返回 (\d+) 条 search_result_minimal 素材/g,
     "已采集 $1 条公开内容"
@@ -837,6 +842,13 @@ function recordList(value: unknown): Record<string, unknown>[] {
     : [];
 }
 
+function selectRequestedDirectionStates(report: ContentResearchLiteReportResponse) {
+  const requestedDirectionIds = new Set(arrayField(report.frozen_scope, "direction_ids"));
+  return recordList(report.run_direction_states).filter((item) =>
+    requestedDirectionIds.has(stringField(item, "direction"))
+  );
+}
+
 function numberField(source: Record<string, unknown>, key: string) {
   const value = source[key];
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
@@ -908,12 +920,9 @@ function ContentResearchReportMessage({
   const observations = evidenceOnly ? [] : allCards.filter((item) => stringField(item, "card_kind") === "observation");
   const leads = evidenceOnly ? [] : recordList(report.sections.weak_signals);
   const limitations = recordList(report.sections.limitations_scope);
-  const requestedDirections = new Set(arrayField(report.frozen_scope, "direction_ids"));
   const directionStates = evidenceOnly
     ? []
-    : recordList(report.run_direction_states).filter((item) =>
-        requestedDirections.has(stringField(item, "direction"))
-      );
+    : selectRequestedDirectionStates(report);
   const statusStrip = report.status_strip;
   const citationsById = new Map(citations.map((citation) => [stringField(citation, "citation_group_id"), citation]));
   const statusText = evidenceOnly
@@ -1162,14 +1171,7 @@ function ContentResearchContextSidebar({
   const published = report ? litePublicationState(report) !== null : false;
   const evidenceOnly = report ? litePublicationState(report) === "evidence_only_report" : false;
   const stages = report && !evidenceOnly ? contentResearchContextStages(report) : [];
-  const requestedDirections = report
-    ? new Set(arrayField(report.frozen_scope, "direction_ids"))
-    : new Set<string>();
-  const requestedDirectionCount = report
-    ? recordList(report.run_direction_states).filter((item) =>
-        requestedDirections.has(stringField(item, "direction"))
-      ).length
-    : 0;
+  const requestedDirectionCount = report ? selectRequestedDirectionStates(report).length : 0;
 
   return (
     <aside className="hidden w-[300px] shrink-0 overflow-y-auto border-l border-line bg-slate-50 p-4 lg:block" aria-label="内容调研上下文">
@@ -1263,15 +1265,22 @@ export default function CreatorPage() {
     async function loadInitialThread() {
       const workflowRunId = new URLSearchParams(window.location.search).get("contentResearchRunId")?.trim() || null;
       let restoredThreadId: string | null = null;
+      let workflowRestoreError: string | null = null;
       if (workflowRunId) {
         try {
           const workflow = await getContentResearchWorkflow(workflowRunId);
           if (cancelled) return;
           restoredThreadId = workflow.brief.thread_id;
           saveContentResearchRunForThread(restoredThreadId, workflowRunId);
-        } catch {
-          // A broken direct link must not reuse an unrelated thread's run.
-          restoredThreadId = "__content_research_run_not_found__";
+        } catch (error) {
+          if (isExpectedLiteReportAbsence(error)) {
+            // A broken direct link must not reuse an unrelated thread's run.
+            restoredThreadId = "__content_research_run_not_found__";
+          } else {
+            workflowRestoreError = error instanceof Error ? error.message : "运行读取失败";
+            restoredThreadId = contentResearchThreadForRun(workflowRunId)
+              ?? "__content_research_run_restore_failed__";
+          }
         }
       }
 
@@ -1289,7 +1298,9 @@ export default function CreatorPage() {
             setActiveThreadId(null);
             setMessages([
               WELCOME_MESSAGE,
-              { id: "content-research-run-thread-unavailable", role: "system", text: "该内容调研所属对话不可访问，未切换到其他对话。" },
+              workflowRestoreError
+                ? { id: "content-research-run-restore-failed", role: "system", text: `内容调研运行暂不可读取：${workflowRestoreError}` }
+                : { id: "content-research-run-thread-unavailable", role: "system", text: "该内容调研所属对话不可访问，未切换到其他对话。" },
             ]);
           }
           return;
@@ -1714,8 +1725,13 @@ export default function CreatorPage() {
           } else {
             setContentResearchRun(restoredRun);
           }
-        } catch {
-          removeContentResearchRunForThread(threadId);
+        } catch (error) {
+          if (isExpectedLiteReportAbsence(error)) {
+            removeContentResearchRunForThread(threadId);
+          } else {
+            const detail = error instanceof Error ? error.message : "运行读取失败";
+            appendMessage({ role: "system", text: `内容调研运行暂不可读取：${detail}` });
+          }
           // The Timeline report remains visible even if an old workflow summary is unavailable.
         }
       }

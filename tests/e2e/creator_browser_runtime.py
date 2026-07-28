@@ -1,0 +1,118 @@
+"""Production app wiring with deterministic external providers for browser E2E."""
+
+from __future__ import annotations
+
+import json
+import os
+from contextlib import asynccontextmanager
+
+import app.main as production
+from app.content_research.presearch.service import PresearchService
+from app.content_research.sources import SourceAdapterRegistry
+from app.content_research.sources.base import ProviderCapability, SourceOperationResult
+from app.services.llm.types import LLMResponse, TokenUsage
+
+
+class DeterministicPresearchLLM:
+    async def generate(self, _request):
+        return LLMResponse(
+            content=json.dumps(
+                {
+                    "subject_confirmation": "夏季通勤短裤",
+                    "competitor_tags": ["迪卡侬"],
+                    "research_directions": [
+                        "product_marketing",
+                        "competitor_discovery",
+                        "content_performance",
+                    ],
+                    "custom_research_question": "",
+                    "custom_competitor_input": "",
+                },
+                ensure_ascii=False,
+            ),
+            provider="deterministic-e2e",
+            model="deterministic-e2e",
+            usage=TokenUsage(total_tokens=1),
+            latency_ms=1,
+        )
+
+
+class DeterministicAuthRequiredSource:
+    """A local fake that cannot make network calls and always pauses safely."""
+
+    def capabilities(self):
+        return (
+            ProviderCapability(
+                "discover_candidates",
+                "supported",
+                ("title", "author", "metrics"),
+            ),
+            ProviderCapability(
+                "collect_note_detail",
+                "supported",
+                ("title", "content_text", "author", "metrics"),
+            ),
+            ProviderCapability(
+                "collect_comments",
+                "supported",
+                ("comment_text", "author", "parent_note_id"),
+            ),
+        )
+
+    async def discover_candidates(self, _request):
+        return SourceOperationResult(
+            provider="xiaohongshu",
+            operation="discover_candidates",
+            source_kind="search_result_minimal",
+            status="failed",
+            items=[],
+            failure_reason="auth_required",
+            retryable=False,
+            completeness="unavailable",
+        )
+
+    async def collect_note_detail(self, _request):  # pragma: no cover - guarded by discover
+        raise AssertionError("detail collection must not follow auth-required discovery")
+
+    async def collect_comments(self, _request):  # pragma: no cover - guarded by discover
+        raise AssertionError("comment collection must not follow auth-required discovery")
+
+
+class DeterministicWorkflowRestoreFailure:
+    def __init__(self, delegate) -> None:
+        self._delegate = delegate
+
+    def __getattr__(self, name):
+        return getattr(self._delegate, name)
+
+    async def get_runtime_snapshot(self, _workflow_run_id: str) -> dict:
+        raise RuntimeError("deterministic workflow restore failure")
+
+
+_production_lifespan = production.app.router.lifespan_context
+
+
+@asynccontextmanager
+async def deterministic_lifespan(application):
+    production.schedule_embedding_prewarm = lambda: None
+    async with _production_lifespan(application):
+        service = application.state.content_research_service
+        registry = SourceAdapterRegistry(
+            {"xiaohongshu": DeterministicAuthRequiredSource()}
+        )
+        service._presearch = PresearchService(
+            DeterministicPresearchLLM(),
+            first_feedback_timeout_seconds=0.05,
+            hard_cutoff_seconds=0.1,
+        )
+        service._source_registry = registry
+        service._task_router._source_registry = registry
+        if os.getenv("CREATOR_E2E_FAIL_WORKFLOW_RESTORE") == "1":
+            service._workflow_runtime = DeterministicWorkflowRestoreFailure(
+                service._workflow_runtime
+            )
+        yield
+
+
+app = production.app
+app.router.lifespan_context = deterministic_lifespan

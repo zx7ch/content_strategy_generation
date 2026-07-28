@@ -1,4 +1,4 @@
-"""Real-browser acceptance for the Lite-only Creator vertical slice."""
+"""Deterministic local-browser E2E for the Lite-only Creator vertical slice."""
 
 from __future__ import annotations
 
@@ -29,10 +29,10 @@ from app.content_research.reporting.publication_materializer import (
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
 from app.memory.thread_store import ThreadStore
 from app.services.workflow_run_manager import WorkflowRunManager
-from tests.acceptance.test_v2_phase1_console_walkthrough import (
-    _chrome_executable,
-    _reserve_port,
-    _run_process,
+from tests.e2e.browser_process import (
+    chrome_executable,
+    reserve_port,
+    run_process,
 )
 from tests.integration.test_content_research_report_store import (
     _decision,
@@ -49,15 +49,14 @@ USER_HEADERS = {
 }
 
 
-@pytest.fixture(scope="module")
-def real_creator_stack(tmp_path_factory):
+@pytest.fixture()
+def real_creator_stack(tmp_path, request):
     repo_root = Path(__file__).resolve().parents[2]
     frontend_root = repo_root / "frontend"
-    root = tmp_path_factory.mktemp("content_research_lite_browser")
-    db_path = root / "creator-lite.db"
-    chroma_dir = root / "chroma"
-    backend_port = _reserve_port()
-    frontend_port = _reserve_port()
+    db_path = tmp_path / "creator-lite.db"
+    chroma_dir = tmp_path / "chroma"
+    backend_port = reserve_port()
+    frontend_port = reserve_port()
     backend_url = f"http://127.0.0.1:{backend_port}"
     frontend_url = f"http://127.0.0.1:{frontend_port}"
     backend_env = {
@@ -71,6 +70,11 @@ def real_creator_stack(tmp_path_factory):
             f"http://localhost:3000,http://127.0.0.1:3000,{frontend_url}"
         ),
         "PYTHONPATH": str(repo_root),
+        "CREATOR_E2E_FAIL_WORKFLOW_RESTORE": (
+            "1"
+            if getattr(request, "param", {}).get("fail_workflow_restore")
+            else "0"
+        ),
     }
     frontend_env = {
         **os.environ,
@@ -78,12 +82,12 @@ def real_creator_stack(tmp_path_factory):
         "XHS_API_BASE_URL": backend_url,
         "NEXT_TELEMETRY_DISABLED": "1",
     }
-    with _run_process(
+    with run_process(
         cmd=[
             "python3",
             "-m",
             "uvicorn",
-            "app.main:app",
+            "tests.e2e.creator_browser_runtime:app",
             "--host",
             "127.0.0.1",
             "--port",
@@ -97,7 +101,7 @@ def real_creator_stack(tmp_path_factory):
         ready_timeout=30,
         name="backend",
     ):
-        with _run_process(
+        with run_process(
             cmd=[
                 "npm",
                 "run",
@@ -126,7 +130,7 @@ def browser_page(real_creator_stack):
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(
             headless=True,
-            executable_path=_chrome_executable(),
+            executable_path=chrome_executable(),
         )
         page = browser.new_page(viewport={"width": 1440, "height": 960})
         yield page, real_creator_stack
@@ -356,6 +360,80 @@ def test_creator_replaces_recovery_with_publication_after_resume(browser_page):
     expect(report).to_be_visible(timeout=20000)
     expect(report.get_by_text("已完整核验", exact=True)).to_be_visible()
     expect(recovery).to_have_count(0)
+    expect(
+        page.locator('article[aria-label="Content Research published report"]')
+    ).to_have_count(1)
+
+
+def test_creator_removes_historical_trace_retry_copy(browser_page):
+    page, stack = browser_page
+    brand_id = default_brand_id(stack["backend_url"])
+    run_async_in_thread(
+        seed_historical_message(
+            stack["db_path"],
+            brand_id=brand_id,
+            text="小红书采集未完成：auth_required。可在「查看调研过程」中重试。",
+        )
+    )
+
+    page.goto(stack["frontend_url"] + "/creator", wait_until="domcontentloaded")
+
+    expect(
+        page.get_by_text(
+            "小红书采集未完成：需要登录小红书网页端。",
+            exact=True,
+        )
+    ).to_be_visible(timeout=20000)
+    expect(page.get_by_text(re.compile("查看调研过程"))).to_have_count(0)
+    expect(page.get_by_text(re.compile("重试"))).to_have_count(0)
+
+
+@pytest.mark.parametrize(
+    "real_creator_stack",
+    [{"fail_workflow_restore": True}],
+    indirect=True,
+)
+def test_creator_keeps_saved_run_and_surfaces_workflow_restore_500(browser_page):
+    page, stack = browser_page
+    brand_id = default_brand_id(stack["backend_url"])
+    seeded = run_async_in_thread(
+        seed_recovery(
+            stack["db_path"],
+            brand_id=brand_id,
+            title="恢复失败仍保留入口",
+        )
+    )
+    storage_key = "xhs-growth-agent:content-research-active-runs-by-thread"
+    page.add_init_script(
+        "window.localStorage.clear();"
+        f"window.localStorage.setItem({json.dumps(storage_key)}, "
+        f"{json.dumps(json.dumps({seeded['thread_id']: seeded['run_id']}))});"
+    )
+    try:
+        urlopen(
+            Request(
+                f"{stack['backend_url']}/content-research/workflows/{seeded['run_id']}",
+                headers=USER_HEADERS,
+            )
+        )
+    except HTTPError as error:
+        direct_status = error.code
+        direct_body = error.read().decode("utf-8")
+    else:
+        raise AssertionError("corrupt workflow unexpectedly restored")
+    assert direct_status == 500, direct_body
+    page.goto(stack["frontend_url"] + "/creator", wait_until="domcontentloaded")
+
+    expect(
+        page.get_by_text(re.compile("deterministic workflow restore failure")).first
+    ).to_be_visible(
+        timeout=20000
+    )
+    saved = page.evaluate(
+        "(key) => JSON.parse(window.localStorage.getItem(key) || '{}')",
+        storage_key,
+    )
+    assert saved == {seeded["thread_id"]: seeded["run_id"]}
 
 
 def test_creator_surfaces_non_not_found_lite_report_error(browser_page):
@@ -392,9 +470,7 @@ def test_creator_surfaces_non_not_found_lite_report_error(browser_page):
         ).fetchone()
         assert row is not None
         artifact_payload = json.loads(row[1])
-        artifact_payload["citation_groups"][0]["evidence_refs"][0]["field_path"] = [
-            "content_text"
-        ]
+        artifact_payload.pop("sections")
         connection.execute(
             """
             UPDATE workflow_artifacts
@@ -403,6 +479,22 @@ def test_creator_surfaces_non_not_found_lite_report_error(browser_page):
             """,
             (json.dumps(artifact_payload), row[0]),
         )
+        connection.execute(
+            "UPDATE workflow_runs SET status = 'paused' WHERE run_id = ?",
+            (seeded["run_id"],),
+        )
+    SQLiteContentResearchStore(stack["db_path"]).save_stage_checkpoint(
+        StageCheckpointRecord(
+            id=f"checkpoint_corrupt_{seeded['run_id']}",
+            schema_version="content_research_stage_checkpoint_v1",
+            payload={"reason_code": "auth_expired"},
+            workflow_run_id=seeded["run_id"],
+            subagent_task_id=f"task_corrupt_{seeded['run_id']}",
+            stage_name="operation",
+            input_fingerprint="corrupt-existing-publication",
+            status="failed",
+        )
+    )
 
     try:
         urlopen(
@@ -578,6 +670,26 @@ async def seed_recovery(
         "thread_id": thread["id"],
         "brief_id": brief.id,
     }
+
+
+async def seed_historical_message(
+    db_path: str,
+    *,
+    brand_id: str,
+    text: str,
+) -> str:
+    async with ThreadStore(db_path) as thread_store:
+        thread = await thread_store.create_thread(
+            title="历史采集失败",
+            workspace_id=WORKSPACE_ID,
+            brand_id=brand_id,
+        )
+        await thread_store.append_message(
+            thread_id=thread["id"],
+            role="assistant",
+            text=text,
+        )
+    return str(thread["id"])
 
 
 async def publish_existing_recovery_run(
