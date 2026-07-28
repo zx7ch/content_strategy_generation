@@ -4,11 +4,17 @@ from app.content_research.reporting.lite_read_model import (
     _lite_citations,
     _weak_signal,
 )
-from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
 
 
-def test_lite_projection_with_empty_requested_scope_exposes_no_directional_data(tmp_path):
-    reader = LiteReportReader(SQLiteContentResearchStore(str(tmp_path / "empty-scope.db")), str(tmp_path / "empty-scope.db"))
+class _StoreWithoutBrief:
+    """Smallest store seam needed by the published projection under test."""
+
+    def get_brief_by_workflow(self, workflow_run_id: str):
+        return None
+
+
+def test_lite_projection_with_empty_requested_scope_exposes_no_directional_data():
+    reader = LiteReportReader(_StoreWithoutBrief(), ":memory:")
     report = {
         "workflow_run_id": "run_empty_scope",
         "workflow_terminal_state": "succeeded",
