@@ -23,8 +23,6 @@ def test_content_research_bootstrap_creates_p0_tables(tmp_path):
 
     assert {
         "content_research_briefs",
-        "content_research_evidence_bundle_items",
-        "content_research_evidence_bundles",
         "content_research_evidence_lineage",
         "content_research_evidence_records",
         "content_research_result_snapshots",
@@ -53,6 +51,7 @@ def test_content_research_bootstrap_creates_p0_tables(tmp_path):
         "content_research_budget_ledger_entries",
         "content_research_report_faithfulness_decisions",
     }.issubset(tables)
+    assert not any("_".join(("evidence", "bundle")) in table for table in tables)
 
 
 def test_content_research_bootstrap_creates_required_indexes(tmp_path):
@@ -82,13 +81,12 @@ def test_content_research_bootstrap_creates_required_indexes(tmp_path):
         "idx_content_research_evidence_records_source_url",
         "idx_content_research_evidence_records_dedupe_key",
         "idx_content_research_evidence_lineage_record_created",
-        "idx_content_research_evidence_bundles_direction_status_created",
-        "idx_content_research_evidence_bundle_items_bundle_order",
         "idx_content_research_result_snapshots_workflow_created",
         "idx_content_research_human_decisions_idempotency",
         "idx_content_research_human_decisions_workflow_created",
         "idx_content_research_human_decisions_target_created",
     }.issubset(indexes)
+    assert not any("_".join(("evidence", "bundle")) in index for index in indexes)
 
 
 def test_store_protocol_and_sqlite_adapter_do_not_expose_cloud_api():

@@ -43,7 +43,6 @@ from app.content_research.api_schemas import (
 )
 from app.content_research.async_dispatch import AsyncFormalResearchDispatchRepository
 from app.content_research.contracts import DIRECTION_CATALOG_V1, build_default_snapshot
-from app.content_research.decision_policy import DecisionPolicyService
 from app.content_research.decisions import ResearchDecisionService
 from app.content_research.evidence import EvidenceService
 from app.content_research.evidence.governance_reader import (
@@ -378,7 +377,6 @@ class ContentResearchService:
             store=store, workflow_runtime=workflow_runtime
         )
         self._decision_advancement_service = DecisionAdvancementService(store=store)
-        self._decision_policy_service = DecisionPolicyService(store)
         self._cross_direction_governance = CrossDirectionGovernanceService(store)
         self._report_execution = ReportExecutionService(store)
         self._dispatch = AsyncFormalResearchDispatchRepository(store._db_path)

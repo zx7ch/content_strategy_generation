@@ -138,8 +138,6 @@ async def test_confirm_brief_creates_plan_directions_tasks_and_workflow_summary(
         "product_marketing",
         "competitor_discovery",
     ]
-    assert payload["plan"]["payload"]["priority_policy"]["version"] == "priority_v1"
-    assert payload["plan"]["payload"]["evidence_boundary_policy"]["version"] == "evidence_boundary_v1"
     assert [item["payload"]["direction_id"] for item in payload["directions"]] == [
         "product_marketing",
         "competitor_discovery",

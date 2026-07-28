@@ -177,54 +177,6 @@ def _bootstrap_legacy_content_research_schema(db_path: str) -> None:
             CREATE INDEX IF NOT EXISTS idx_content_research_evidence_lineage_record_created
                 ON content_research_evidence_lineage(evidence_record_id, created_at);
 
-            CREATE TABLE IF NOT EXISTS content_research_evidence_bundles (
-                id TEXT PRIMARY KEY,
-                workflow_run_id TEXT NOT NULL,
-                research_brief_id TEXT,
-                research_plan_id TEXT,
-                research_direction_id TEXT,
-                schema_version TEXT NOT NULL,
-                status TEXT NOT NULL,
-                bundle_type TEXT NOT NULL,
-                bundle_version TEXT NOT NULL,
-                summary TEXT NOT NULL,
-                coverage_json TEXT NOT NULL DEFAULT '{}',
-                retrieval_metrics_json TEXT NOT NULL DEFAULT '{}',
-                faithfulness_metrics_json TEXT NOT NULL DEFAULT '{}',
-                cross_source_metrics_json TEXT NOT NULL DEFAULT '{}',
-                contradiction_summary_json TEXT NOT NULL DEFAULT '{}',
-                citation_coverage_json TEXT NOT NULL DEFAULT '{}',
-                unsupported_claim_count INTEGER NOT NULL DEFAULT 0,
-                missing_evidence_json TEXT NOT NULL DEFAULT '[]',
-                priority_policy_id TEXT,
-                evidence_boundary_policy_id TEXT,
-                decision_card_json TEXT NOT NULL DEFAULT '{}',
-                priority_json TEXT NOT NULL DEFAULT '{}',
-                evidence_state TEXT NOT NULL DEFAULT 'signal',
-                evidence_grade TEXT NOT NULL DEFAULT 'C',
-                claim_scope_json TEXT NOT NULL DEFAULT '{}',
-                next_action_json TEXT NOT NULL DEFAULT '{}',
-                metadata_json TEXT NOT NULL DEFAULT '{}',
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_content_research_evidence_bundles_direction_status_created
-                ON content_research_evidence_bundles(research_direction_id, status, created_at);
-
-            CREATE TABLE IF NOT EXISTS content_research_evidence_bundle_items (
-                id TEXT PRIMARY KEY,
-                bundle_id TEXT NOT NULL,
-                evidence_record_id TEXT,
-                role TEXT NOT NULL,
-                sort_order INTEGER NOT NULL,
-                schema_version TEXT NOT NULL,
-                payload_json TEXT NOT NULL DEFAULT '{}',
-                metadata_json TEXT NOT NULL DEFAULT '{}',
-                created_at TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_content_research_evidence_bundle_items_bundle_order
-                ON content_research_evidence_bundle_items(bundle_id, sort_order);
-
             CREATE TABLE IF NOT EXISTS content_research_result_snapshots (
                 id TEXT PRIMARY KEY,
                 workflow_run_id TEXT NOT NULL,
@@ -238,7 +190,6 @@ def _bootstrap_legacy_content_research_schema(db_path: str) -> None:
                 executive_summary TEXT NOT NULL,
                 findings_json TEXT NOT NULL DEFAULT '[]',
                 recommendations_json TEXT NOT NULL DEFAULT '[]',
-                evidence_bundle_ids_json TEXT NOT NULL DEFAULT '[]',
                 claim_count INTEGER NOT NULL DEFAULT 0,
                 supported_claim_count INTEGER NOT NULL DEFAULT 0,
                 unsupported_claim_count INTEGER NOT NULL DEFAULT 0,

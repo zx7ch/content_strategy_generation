@@ -153,13 +153,10 @@ def test_result_snapshot_is_immutable_by_id(store):
                 "result_item_id": "ri_1",
                 "claim": "Supported claim",
                 "summary": "Supported claim",
-                "evidence_bundle_id": "eb_1",
-                "evidence_bundle_ids": ["eb_1"],
                 "support_level": "medium",
                 "claim_status": "supported",
             }
         ],
-        evidence_bundle_ids=["eb_1"],
         claim_count=1,
         supported_claim_count=1,
     )

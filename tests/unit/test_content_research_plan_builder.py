@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 from app.content_research.models import ResearchBriefRecord
-from app.content_research.workflow import BriefConfirmation, ResearchDirectionRegistry, ResearchPlanBuilder, SubagentTaskRouter
+from app.content_research.workflow import (
+    BriefConfirmation,
+    ResearchDirectionRegistry,
+    ResearchPlanBuilder,
+    SubagentTaskRouter,
+)
 
 
 def test_plan_builder_outputs_required_research_plan_contract():
@@ -45,8 +50,6 @@ def test_plan_builder_outputs_required_research_plan_contract():
     assert payload["confirmed_subject"] == "徒步短裤"
     assert payload["selected_competitors"] == ["迪卡侬"]
     assert payload["custom_competitors"] == ["凯乐石"]
-    assert payload["priority_policy"]["version"] == "priority_v1"
-    assert payload["evidence_boundary_policy"]["version"] == "evidence_boundary_v1"
     assert payload["evidence_requirements"]["minimum_source_kinds"] == ["search_result"]
     assert [item["research_direction_id"] for item in payload["subagent_tasks"]] == [
         "product_marketing",

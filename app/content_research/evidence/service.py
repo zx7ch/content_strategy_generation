@@ -7,11 +7,8 @@ import json
 from typing import TYPE_CHECKING, Any
 
 from app.content_research.evidence.models import (
-    EvidenceBundleItemRecord,
-    EvidenceBundleRecord,
     EvidenceLineageRecord,
     EvidenceRecord,
-    ExpandedEvidenceBundle,
 )
 from app.content_research.models import utcnow
 
@@ -293,67 +290,6 @@ class EvidenceService:
         except ValueError as exc:
             if not any(item.id == lineage.id for item in self._store.list_evidence_lineage(lineage.evidence_record_id)):
                 raise exc
-
-
-class EvidenceBundleService:
-    def __init__(self, store: ContentResearchStore) -> None:
-        self._store = store
-
-    def create_bundle(
-        self,
-        bundle: EvidenceBundleRecord,
-        items: list[EvidenceBundleItemRecord],
-    ) -> EvidenceBundleRecord:
-        saved = self._store.save_evidence_bundle(bundle)
-        for item in sorted(items, key=lambda candidate: candidate.sort_order):
-            if item.role != "missing_evidence" and item.evidence_record_id:
-                if self._store.get_evidence_record(item.evidence_record_id) is None:
-                    raise ValueError(f"Evidence record not found for bundle item: {item.evidence_record_id}")
-            if item.role != "missing_evidence" and not item.evidence_record_id:
-                raise ValueError("Non-missing bundle items require evidence_record_id")
-            self._store.add_evidence_bundle_item(item)
-        return saved
-
-    def expand_bundle(self, bundle_id: str) -> ExpandedEvidenceBundle | None:
-        bundle = self._store.get_evidence_bundle(bundle_id)
-        if bundle is None:
-            return None
-
-        items = self._store.list_evidence_bundle_items(bundle_id)
-        evidence_by_role: dict[str, list[EvidenceRecord]] = {}
-        lineage_by_evidence_id: dict[str, list[EvidenceLineageRecord]] = {}
-        source_links: list[dict[str, str]] = []
-        missing_evidence = list(bundle.missing_evidence)
-
-        for item in items:
-            if item.role == "missing_evidence":
-                missing_evidence.append(item.payload)
-                continue
-            if not item.evidence_record_id:
-                continue
-            record = self._store.get_evidence_record(item.evidence_record_id)
-            if record is None:
-                continue
-            evidence_by_role.setdefault(item.role, []).append(record)
-            lineage_by_evidence_id[record.id] = self._store.list_evidence_lineage(record.id)
-            if record.source_url or record.source_id:
-                source_links.append(
-                    {
-                        "evidence_id": record.id,
-                        "source_url": record.source_url,
-                        "source_id": record.source_id,
-                        "source_platform": record.source_platform,
-                    }
-                )
-
-        return ExpandedEvidenceBundle(
-            bundle=bundle,
-            items=items,
-            evidence_by_role=evidence_by_role,
-            lineage_by_evidence_id=lineage_by_evidence_id,
-            source_links=source_links,
-            missing_evidence=missing_evidence,
-        )
 
 
 def _prefixed_id(prefix: str, stable_key: str, payload: dict[str, Any]) -> str:

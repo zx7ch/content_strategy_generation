@@ -2,7 +2,6 @@ from dataclasses import replace
 
 import pytest
 
-from app.content_research.persistence_models import ReportDraftRecord
 from app.content_research.reporting.contracts import (
     CitationAnchor,
     ReportDraft,
@@ -159,14 +158,3 @@ def test_partial_and_evidence_only_contracts_preserve_their_respective_boundarie
 
     assert partial.omitted_section_ids == ("sec_main_findings",)
     assert evidence_only.has_free_prose is False
-
-
-@pytest.mark.parametrize("legacy_key", ["evidence_bundle_ids", "items", "recommendations"])
-def test_report_persistence_payload_rejects_legacy_bundle_result_relations(legacy_key: str):
-    with pytest.raises(ValueError, match="legacy bundle/result"):
-        ReportDraftRecord(
-            id="rpd_legacy", schema_version="report_v1", payload={legacy_key: []},
-            workflow_run_id="run_1", research_plan_id="rp_1", governed_snapshot_id="rrs_1",
-            governed_snapshot_version="1", input_fingerprint="fingerprint", policy_version="policy_v1",
-            algorithm_version="report_v1",
-        )

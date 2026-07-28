@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from app.content_research.evidence.models import EvidenceBundleRecord, EvidenceRecord
+from app.content_research.evidence.models import EvidenceRecord
 from app.content_research.models import SubagentTaskRecord
 from app.content_research.sources import SourceAdapterRegistry
 from app.content_research.sources.base import SourceOperationResult
@@ -39,7 +39,6 @@ class SubagentExecutionResult:
     findings: list[SubagentFinding]
     evidence_records: list[EvidenceRecord]
     missing_evidence: list[dict[str, Any]]
-    evidence_bundle: EvidenceBundleRecord | None = None
     failure_reason: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 

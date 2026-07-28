@@ -93,7 +93,6 @@ async def test_formal_completion_without_a_live_creator_run_reports_not_publishe
         "content_research_directional_packet",
         "content_research_direction_result",
     }
-    assert all(item["type"] != "content_research_evidence_bundle" for item in completion["artifact_refs"])
     assert completion["task_outcomes"][0]["status"] == "partial_completed"
     event = runtime.events[0]
     assert event["event_type"] == "formal_research_governed_completed"

@@ -114,7 +114,6 @@ class ResearchResultSnapshotRecord:
     research_plan_id: str | None = None
     findings: list[dict[str, Any]] = field(default_factory=list)
     recommendations: list[dict[str, Any]] = field(default_factory=list)
-    evidence_bundle_ids: list[str] = field(default_factory=list)
     claim_count: int = 0
     supported_claim_count: int = 0
     unsupported_claim_count: int = 0

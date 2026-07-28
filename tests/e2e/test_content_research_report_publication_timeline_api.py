@@ -125,7 +125,6 @@ async def test_creator_timeline_api_exposes_one_materialized_report_result_and_r
                 f"/content-research/workflows/{run.run_id}/lite-report?publication_id=publication_missing"
             )
             report_response = await client.get(f"/content-research/workflows/{run.run_id}/report")
-            evidence_bundle_response = await client.get("/content-research/evidence-bundles/eb_1")
             legacy_response = await client.get(f"/content-research/workflows/{run.run_id}/results")
         assert response.status_code == 200
         results = [
@@ -145,7 +144,6 @@ async def test_creator_timeline_api_exposes_one_materialized_report_result_and_r
         assert lite_response.status_code == 200, lite_response.text
         assert unavailable_citation_response.status_code == 404
         assert selector_mismatch_response.status_code == 404
-        assert evidence_bundle_response.status_code == 404
         assert legacy_response.status_code == 404
         lite = lite_response.json()
         assert lite["publication"]["state"] == "complete_verified_report"

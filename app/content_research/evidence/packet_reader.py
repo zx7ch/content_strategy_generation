@@ -22,7 +22,7 @@ class DirectionPacketReadModel:
 class PacketEvidenceReader:
     """The only packet read seam for a workflow direction.
 
-    It deliberately has no EvidenceBundle dependency. Claim admission and
+    It deliberately has no aggregate persistence dependency. Claim admission and
     result building consume this model in later Foundation tasks.
     """
 

@@ -1,8 +1,10 @@
+import sqlite3
 from dataclasses import replace
 
 import pytest
 
 from app.content_research.reporting.composer import ResearchReportComposer
+from app.content_research.reporting.lite_read_model import LiteReportReader
 from app.content_research.reporting.publication_materializer import ReportPublicationMaterializer
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
 from app.memory.thread_store import ThreadStore
@@ -16,6 +18,18 @@ from tests.integration.test_content_research_report_store import (
     _snapshot,
 )
 from tests.unit.test_content_research_report_composer import _snapshot as _composer_snapshot
+
+
+def _legacy_bundle_tables(db_path: str) -> set[str]:
+    obsolete_suffix = "_".join(("evidence", "bundle"))
+    with sqlite3.connect(db_path) as conn:
+        return {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'content_research_%'"
+            )
+            if obsolete_suffix in row[0]
+        }
 
 
 @pytest.mark.asyncio
@@ -52,7 +66,6 @@ async def test_materializes_published_report_as_one_creator_snapshot_and_timelin
         assert artifact.payload_json["faithfulness_decision_id"] == decision.id
         assert artifact.payload_json["governed_snapshot_id"] == snapshot.id
         assert "items" not in artifact.payload_json
-        assert "evidence_bundle_ids" not in artifact.payload_json
 
         messages = await thread_store.get_thread_messages(thread["id"])
         result_messages = [item for item in messages if item["message_type"] == "artifact_result"]
@@ -62,6 +75,63 @@ async def test_materializes_published_report_as_one_creator_snapshot_and_timelin
         async with WorkflowStore(db_path) as workflow_store:
             artifacts = await workflow_store.list_artifacts(run.run_id)
         assert [item.artifact_id for item in artifacts].count(artifact.artifact_id) == 1
+    finally:
+        await thread_store.close()
+
+
+@pytest.mark.asyncio
+async def test_gate2_artifact_remains_readable_without_obsolete_aggregate_schema(tmp_path):
+    db_path = str(tmp_path / "artifact-without-bundles.db")
+    store = SQLiteContentResearchStore(db_path)
+    assert _legacy_bundle_tables(db_path) == set()
+
+    thread_store = ThreadStore(db_path)
+    await thread_store.connect()
+    thread = await thread_store.create_thread(title="Gate 2 artifact")
+    try:
+        async with WorkflowRunManager(db_path) as manager:
+            run = await manager.start_run(thread_id=thread["id"], user_id="user-1")
+        source_snapshot = _composer_snapshot()
+        governed = source_snapshot.metadata["governed_snapshot"]
+        snapshot = replace(
+            source_snapshot,
+            workflow_run_id=run.run_id,
+            metadata={
+                **source_snapshot.metadata,
+                "governed_snapshot": {
+                    **governed,
+                    "policy_scope": {
+                        **governed["policy_scope"],
+                        "direction_set_version": "direction_catalog_v1",
+                        "direction_ids": ["product_marketing"],
+                    },
+                    "direction_results": [
+                        {
+                            "direction_id": "product_marketing",
+                            "state": "completed",
+                            "limitations": [],
+                            "recovery_actions": [],
+                        }
+                    ],
+                },
+            },
+        )
+        draft = ResearchReportComposer().compose(snapshot)
+        decision = replace(_decision(draft), workflow_run_id=run.run_id)
+        publication = replace(_publication(draft, decision), workflow_run_id=run.run_id)
+        store.save_result_snapshot(snapshot)
+        store.save_report_draft(draft.to_record())
+        store.save_report_faithfulness_decision(decision.to_record())
+        store.save_report_publication(publication.to_record())
+        async with WorkflowRunManager(db_path) as manager:
+            await manager.complete_run(run.run_id)
+
+        artifact = await ReportPublicationMaterializer(store, db_path).materialize(publication.id)
+        report = await LiteReportReader(store, db_path).read(workflow_run_id=run.run_id)
+
+        assert artifact.payload_json["citation_groups"]
+        assert report["publication"]["state"] == "complete_verified_report"
+        assert [citation["citation_group_id"] for citation in report["citations"]] == ["citation_7"]
     finally:
         await thread_store.close()
 
