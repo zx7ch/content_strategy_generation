@@ -153,12 +153,12 @@ function contentResearchStartFailure(detail: string): {
   if (/Creator thread (is required|no longer exists)/i.test(detail)) {
     return {
       status: "invalid",
-      message: "本轮调研所属的 Creator 对话已不存在，无法重试。请在有效对话中重新发起一轮内容调研。",
+      message: "本轮调研所属的 Creator 对话已不存在，无法继续。请在有效对话中重新发起一轮内容调研。",
     };
   }
   return {
     status: "failed",
-    message: `专家调研启动失败：${detail}。请检查来源登录态、采集服务和运行配置后重试。`,
+    message: `专家调研启动失败：${detail}。请检查来源登录态、采集服务和运行配置后继续。`,
   };
 }
 
@@ -190,8 +190,8 @@ function contentResearchRunWithReport(
 
 function sourceFailureReasonText(reason: string | null | undefined) {
   if (reason === "auth_required") return "需要登录小红书网页端";
-  if (reason === "rate_limited") return "当前访问过于频繁，请稍后重试";
-  if (reason) return "采集服务暂时不可用，请稍后重试";
+  if (reason === "rate_limited") return "当前访问过于频繁，请稍后再继续";
+  if (reason) return "采集服务暂时不可用，请检查服务状态后继续";
   return "无";
 }
 
@@ -216,7 +216,7 @@ function displayChatText(text: string | null | undefined) {
   // Timeline records from an older runtime can lack free text; an unavailable
   // report must still render its explicit error state instead of crashing.
   return (text ?? "").replace(
-    /(小红书采集未完成：)(auth_required|rate_limited|transient_error|permanent_error|parser_error|unknown)(。可在「查看调研过程」中重试。)/,
+    /(小红书采集未完成：)([a-z_]+)(。可在「查看调研过程」中重试。)/,
     (_match, prefix, reason) => `${prefix}${sourceFailureReasonText(reason)}。`
   ).replace(
     /返回 (\d+) 条 search_result_minimal 素材/g,
@@ -1376,7 +1376,7 @@ export default function CreatorPage() {
             });
           })
           .catch(() => {
-            appendMessage({ role: "assistant", text: "任务完成，但读取结果失败，请刷新页面重试。" });
+            appendMessage({ role: "assistant", text: "任务完成，但读取结果失败，请刷新页面后继续查看。" });
           });
       },
       onFailed: () => {

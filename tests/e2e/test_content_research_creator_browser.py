@@ -29,7 +29,7 @@ from app.content_research.reporting.publication_materializer import (
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
 from app.memory.thread_store import ThreadStore
 from app.services.workflow_run_manager import WorkflowRunManager
-from tests.e2e.browser_process import (
+from tests.browser_process import (
     chrome_executable,
     reserve_port,
     run_process,
@@ -206,7 +206,7 @@ def test_creator_complete_report_uses_lite_and_handles_all_navigation_states(
     page.on("request", lambda request: requested_urls.append(request.url))
 
     open_creator_with_restored_run(page, stack["frontend_url"], seeded["run_id"])
-    report = page.locator('article[aria-label="Content Research published report"]')
+    report = published_report(page)
     expect(report).to_be_visible(timeout=20000)
     expect(report.get_by_text("已完整核验", exact=True)).to_be_visible()
     report.get_by_role("button", name="打开引用 7").first.click()
@@ -265,7 +265,7 @@ def test_creator_partial_report_shows_requested_unavailable_direction_only(
     )
 
     open_creator_with_restored_run(page, stack["frontend_url"], seeded["run_id"])
-    report = page.locator('article[aria-label="Content Research published report"]')
+    report = published_report(page)
     expect(report).to_be_visible(timeout=20000)
     direction_section = report.locator('section[aria-label="方向状态"]')
     expect(direction_section.get_by_text(re.compile("竞品发现.*unavailable"))).to_be_visible()
@@ -304,7 +304,7 @@ def test_creator_evidence_only_report_shows_saved_evidence_and_reason_only(
     )
 
     open_creator_with_restored_run(page, stack["frontend_url"], seeded["run_id"])
-    report = page.locator('article[aria-label="Content Research published report"]')
+    report = published_report(page)
     expect(report).to_be_visible(timeout=20000)
     expect(report.get_by_text("1 条已保存依据", exact=True)).to_be_visible()
     expect(
@@ -336,7 +336,7 @@ def test_creator_replaces_recovery_with_publication_after_resume(browser_page):
     open_creator_with_restored_run(page, stack["frontend_url"], seeded["run_id"])
     recovery = page.locator('section[aria-label="Content Research recovery status"]')
     expect(recovery).to_be_visible(timeout=20000)
-    expect(page.locator('article[aria-label="Content Research published report"]')).to_have_count(0)
+    expect(published_report(page)).to_have_count(0)
 
     with page.expect_response(
         lambda response: response.url.endswith("/actions"),
@@ -356,23 +356,35 @@ def test_creator_replaces_recovery_with_publication_after_resume(browser_page):
         )
     )
 
-    report = page.locator('article[aria-label="Content Research published report"]')
+    report = published_report(page)
     expect(report).to_be_visible(timeout=20000)
     expect(report.get_by_text("已完整核验", exact=True)).to_be_visible()
     expect(recovery).to_have_count(0)
-    expect(
-        page.locator('article[aria-label="Content Research published report"]')
-    ).to_have_count(1)
+    expect(published_report(page)).to_have_count(1)
 
 
-def test_creator_removes_historical_trace_retry_copy(browser_page):
+@pytest.mark.parametrize(
+    ("reason", "expected_reason"),
+    [
+        ("auth_required", "需要登录小红书网页端"),
+        ("rate_limited", "当前访问过于频繁，请稍后再继续"),
+        ("transient_error", "采集服务暂时不可用，请检查服务状态后继续"),
+        ("permanent_error", "采集服务暂时不可用，请检查服务状态后继续"),
+        ("parser_error", "采集服务暂时不可用，请检查服务状态后继续"),
+        ("unknown", "采集服务暂时不可用，请检查服务状态后继续"),
+        ("unavailable", "采集服务暂时不可用，请检查服务状态后继续"),
+    ],
+)
+def test_creator_removes_historical_trace_retry_copy_for_every_source_failure_reason(
+    browser_page, reason, expected_reason
+):
     page, stack = browser_page
     brand_id = default_brand_id(stack["backend_url"])
     run_async_in_thread(
         seed_historical_message(
             stack["db_path"],
             brand_id=brand_id,
-            text="小红书采集未完成：auth_required。可在「查看调研过程」中重试。",
+            text=f"小红书采集未完成：{reason}。可在「查看调研过程」中重试。",
         )
     )
 
@@ -380,7 +392,7 @@ def test_creator_removes_historical_trace_retry_copy(browser_page):
 
     expect(
         page.get_by_text(
-            "小红书采集未完成：需要登录小红书网页端。",
+            f"小红书采集未完成：{expected_reason}。",
             exact=True,
         )
     ).to_be_visible(timeout=20000)
@@ -534,6 +546,10 @@ def open_creator_with_restored_run(
         wait_until="domcontentloaded",
     )
     page.get_by_role("button", name=re.compile("内容调研")).wait_for(timeout=15000)
+
+
+def published_report(page: Page):
+    return page.locator('article[aria-label="Content Research published report"]')
 
 
 def default_brand_id(backend_url: str) -> str:

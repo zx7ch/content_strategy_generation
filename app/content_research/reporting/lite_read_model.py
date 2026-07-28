@@ -68,11 +68,12 @@ class LiteReportReader:
         except PublishedReportNotFoundError as exc:
             if citation_group_ids is not None:
                 raise
-            if self._has_publication(
-                workflow_run_id=workflow_run_id,
-                research_plan_id=research_plan_id,
-                publication_id=publication_id,
-            ):
+            if self._has_publication(workflow_run_id=workflow_run_id):
+                if research_plan_id is not None or publication_id is not None:
+                    # A caller asked for a specific frozen publication and it
+                    # did not resolve.  Keep that ordinary not-found result;
+                    # it must never masquerade as a recoverable run.
+                    raise
                 raise ExistingPublicationUnreadableError(
                     "existing publication is unreadable"
                 ) from exc
@@ -217,13 +218,9 @@ class LiteReportReader:
         self,
         *,
         workflow_run_id: str,
-        research_plan_id: str | None,
-        publication_id: str | None,
     ) -> bool:
         return any(
             item.workflow_run_id == workflow_run_id
-            and (research_plan_id is None or item.research_plan_id == research_plan_id)
-            and (publication_id is None or item.id == publication_id)
             for item in self._store.list_typed_records(ReportPublicationRecord)
         )
 

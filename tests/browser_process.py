@@ -1,14 +1,14 @@
-"""Process and browser discovery helpers for local deterministic E2E tests."""
+"""Process and browser discovery helpers for browser-driven test suites."""
 
 from __future__ import annotations
 
-from contextlib import contextmanager
 import os
-from pathlib import Path
 import signal
 import socket
 import subprocess
 import time
+from contextlib import contextmanager
+from pathlib import Path
 from typing import Iterator
 
 import httpx
@@ -32,7 +32,7 @@ def chrome_executable() -> str:
     for candidate in candidates:
         if candidate and Path(candidate).exists():
             return candidate
-    pytest.skip("Chrome executable unavailable for local browser E2E")
+    pytest.skip("Chrome executable unavailable for browser-driven test")
 
 
 @contextmanager
@@ -69,13 +69,17 @@ def run_process(
                 pass
             time.sleep(0.1)
         else:  # pragma: no cover - startup failure
-            process.terminate()
-            try:
-                stdout, _ = process.communicate(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                stdout, _ = process.communicate(timeout=5)
-            output.append(stdout)
+            if process.stdout is not None:
+                # `read()` waits for EOF, but the process is still alive here.
+                # Terminate it before collecting diagnostics so a failed
+                # readiness probe cannot hang the browser test harness.
+                process.terminate()
+                try:
+                    stdout, _ = process.communicate(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    stdout, _ = process.communicate(timeout=5)
+                output.append(stdout)
             raise AssertionError(f"{name} did not start in time:\n{''.join(output)}")
         yield
     finally:

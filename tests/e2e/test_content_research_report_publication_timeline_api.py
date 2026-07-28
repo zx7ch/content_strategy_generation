@@ -1,3 +1,4 @@
+import sqlite3
 from dataclasses import replace
 
 import httpx
@@ -35,6 +36,19 @@ async def test_creator_timeline_api_exposes_one_materialized_report_result_and_r
         thread = await thread_store.create_thread(title="调研报告")
         async with WorkflowRunManager(db_path) as manager:
             run = await manager.start_run(thread_id=thread["id"], user_id="user-1")
+        store.save_brief(
+            ResearchBriefRecord(
+                id="brief_existing_publication_selector_mismatch",
+                workflow_run_id=run.run_id,
+                thread_id=thread["id"],
+                schema_version="content_research_brief_v1",
+                status="ready",
+                payload={
+                    "schema_version": "content_research_brief_payload_v1",
+                    "confirmed_subject": "已有报告不应进入恢复",
+                },
+            )
+        )
         governed = _governed_snapshot().metadata["governed_snapshot"]
         frozen_citations = [
             {
@@ -77,6 +91,26 @@ async def test_creator_timeline_api_exposes_one_materialized_report_result_and_r
         materializer = ReportPublicationMaterializer(store, db_path)
         artifact = await materializer.materialize(publication.id)
         await materializer.materialize(publication.id)
+        # A failed/paused run normally qualifies for recovery.  A committed
+        # publication must still block recovery when a caller provides a
+        # selector that does not resolve to it.
+        with sqlite3.connect(db_path) as connection:
+            connection.execute(
+                "UPDATE workflow_runs SET status = 'paused' WHERE run_id = ?",
+                (run.run_id,),
+            )
+        store.save_stage_checkpoint(
+            StageCheckpointRecord(
+                id="checkpoint_existing_publication_selector_mismatch",
+                schema_version="content_research_stage_checkpoint_v1",
+                payload={"reason_code": "auth_expired"},
+                workflow_run_id=run.run_id,
+                subagent_task_id="task_existing_publication_selector_mismatch",
+                stage_name="collect",
+                input_fingerprint="existing-publication-selector-mismatch",
+                status="failed",
+            )
+        )
 
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
@@ -86,6 +120,9 @@ async def test_creator_timeline_api_exposes_one_materialized_report_result_and_r
             )
             unavailable_citation_response = await client.get(
                 f"/content-research/workflows/{run.run_id}/lite-report?citation_group_ids=cg_missing"
+            )
+            selector_mismatch_response = await client.get(
+                f"/content-research/workflows/{run.run_id}/lite-report?publication_id=publication_missing"
             )
             report_response = await client.get(f"/content-research/workflows/{run.run_id}/report")
             evidence_bundle_response = await client.get("/content-research/evidence-bundles/eb_1")
@@ -107,6 +144,7 @@ async def test_creator_timeline_api_exposes_one_materialized_report_result_and_r
         assert report_response.status_code == 404, report_response.text
         assert lite_response.status_code == 200, lite_response.text
         assert unavailable_citation_response.status_code == 404
+        assert selector_mismatch_response.status_code == 404
         assert evidence_bundle_response.status_code == 404
         assert legacy_response.status_code == 404
         lite = lite_response.json()
