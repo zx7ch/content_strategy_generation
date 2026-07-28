@@ -6,6 +6,7 @@ import sqlite3
 from app.content_research.bootstrap import bootstrap_content_research_schema
 from app.content_research.stores import base
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
+from tests.content_research_test_constants import LEGACY_EVIDENCE_BUNDLE_FRAGMENT
 
 
 def test_content_research_bootstrap_creates_p0_tables(tmp_path):
@@ -51,7 +52,7 @@ def test_content_research_bootstrap_creates_p0_tables(tmp_path):
         "content_research_budget_ledger_entries",
         "content_research_report_faithfulness_decisions",
     }.issubset(tables)
-    assert not any("_".join(("evidence", "bundle")) in table for table in tables)
+    assert not any(LEGACY_EVIDENCE_BUNDLE_FRAGMENT in table for table in tables)
 
 
 def test_content_research_bootstrap_creates_required_indexes(tmp_path):
@@ -86,7 +87,7 @@ def test_content_research_bootstrap_creates_required_indexes(tmp_path):
         "idx_content_research_human_decisions_workflow_created",
         "idx_content_research_human_decisions_target_created",
     }.issubset(indexes)
-    assert not any("_".join(("evidence", "bundle")) in index for index in indexes)
+    assert not any(LEGACY_EVIDENCE_BUNDLE_FRAGMENT in index for index in indexes)
 
 
 def test_store_protocol_and_sqlite_adapter_do_not_expose_cloud_api():

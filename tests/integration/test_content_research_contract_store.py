@@ -20,6 +20,7 @@ from app.content_research.persistence_models import (
     WeakSignalRecord,
 )
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
+from tests.content_research_test_constants import LEGACY_EVIDENCE_BUNDLE_FRAGMENT
 
 
 def test_snapshot_round_trip_is_append_only_and_migrations_are_idempotent(tmp_path):
@@ -50,7 +51,7 @@ def test_snapshot_round_trip_is_append_only_and_migrations_are_idempotent(tmp_pa
 def test_legacy_database_upgrades_without_losing_legacy_rows(tmp_path):
     db_path = str(tmp_path / "legacy.db")
     _bootstrap_legacy_content_research_schema(db_path)
-    obsolete_suffix = "_".join(("evidence", "bundle"))
+    obsolete_suffix = LEGACY_EVIDENCE_BUNDLE_FRAGMENT
     with sqlite3.connect(db_path) as conn:
         conn.execute("INSERT INTO content_research_briefs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", ("rb_legacy", "run_legacy", "thread", "v1", "ready", "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00", '{"schema_version":"v1"}', "{}"))
         conn.execute(f"CREATE TABLE content_research_{obsolete_suffix}s (id TEXT PRIMARY KEY)")
