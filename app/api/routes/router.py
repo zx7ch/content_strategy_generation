@@ -820,6 +820,16 @@ def _get_content_research_service(request: Request) -> ContentResearchService:
     )
 
 
+def _require_f003_lite_preview() -> None:
+    if settings.F003_LITE_PREVIEW_ENABLED:
+        return
+    raise APIError(
+        status_code=403,
+        error_code="F003_LITE_PREVIEW_DISABLED",
+        error_message="F003 Lite internal preview is disabled",
+    )
+
+
 def _content_research_error(exc: Exception) -> APIError:
     if isinstance(exc, ContentResearchNotFoundError):
         return APIError(
@@ -880,6 +890,7 @@ async def create_content_research_presearch(
     request: Request,
     x_user_id: str = Header(default=DEFAULT_USER_ID, alias="X-User-Id"),
 ) -> ContentResearchPresearchResponse:
+    _require_f003_lite_preview()
     service = _get_content_research_service(request)
     try:
         return await service.submit_presearch(
@@ -942,6 +953,7 @@ async def confirm_content_research_brief(
     payload: ContentResearchBriefConfirmRequest,
     request: Request,
 ) -> ContentResearchWorkflowSummaryResponse:
+    _require_f003_lite_preview()
     service = _get_content_research_service(request)
     try:
         return await service.confirm_brief(brief_id=brief_id, confirmation_request=payload)
@@ -958,6 +970,7 @@ async def create_content_research_workflow_from_brief(
     request: Request,
     brief_id: str = Query(...),
 ) -> ContentResearchWorkflowSummaryResponse:
+    _require_f003_lite_preview()
     service = _get_content_research_service(request)
     try:
         return await service.confirm_brief(brief_id=brief_id, confirmation_request=payload)
@@ -1108,6 +1121,8 @@ async def run_content_research_workflow_action(
     payload: ContentResearchWorkflowActionRequest,
     request: Request,
 ) -> ContentResearchWorkflowActionResponse:
+    if payload.action.strip() == "confirm_brief":
+        _require_f003_lite_preview()
     service = _get_content_research_service(request)
     try:
         return await service.run_workflow_action(workflow_run_id=workflow_run_id, request=payload)

@@ -7,6 +7,7 @@ import httpx
 import pytest
 
 from app.api.routes.router import app
+from app.config import settings
 from app.content_research.presearch.service import PresearchService
 from app.content_research.service import ContentResearchService
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
@@ -246,3 +247,48 @@ async def test_create_workflow_alias_confirms_brief(client):
 
     assert response.status_code == 200
     assert response.json()["plan"]["payload"]["selected_directions"] == ["product_marketing"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "confirmation_endpoint",
+    ["brief", "workflow_alias", "workflow_action"],
+)
+async def test_preview_off_rejects_every_confirmation_entry_before_persisting_plan(
+    client,
+    monkeypatch: pytest.MonkeyPatch,
+    confirmation_endpoint: str,
+):
+    presearch = await _create_presearch(client)
+    service = app.state.content_research_service
+    brief_before = service._store.get_brief(presearch["brief_id"])
+    assert brief_before is not None
+    assert service._store.list_plans_for_brief(presearch["brief_id"]) == []
+    monkeypatch.setattr(settings, "F003_LITE_PREVIEW_ENABLED", False)
+    confirmation = {
+        "confirmed_subject": "徒步短裤",
+        "subject_type": "category",
+        "selected_directions": ["product_marketing"],
+    }
+
+    if confirmation_endpoint == "brief":
+        response = await client.post(
+            f"/content-research/briefs/{presearch['brief_id']}/confirm",
+            json=confirmation,
+        )
+    elif confirmation_endpoint == "workflow_alias":
+        response = await client.post(
+            "/content-research/workflows",
+            params={"brief_id": presearch["brief_id"]},
+            json=confirmation,
+        )
+    else:
+        response = await client.post(
+            f"/content-research/workflows/{presearch['workflow_run_id']}/actions",
+            json={"action": "confirm_brief", "payload": confirmation},
+        )
+
+    assert response.status_code == 403
+    assert response.json()["error_code"] == "F003_LITE_PREVIEW_DISABLED"
+    assert service._store.get_brief(presearch["brief_id"]) == brief_before
+    assert service._store.list_plans_for_brief(presearch["brief_id"]) == []

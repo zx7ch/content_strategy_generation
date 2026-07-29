@@ -59,8 +59,12 @@ def real_creator_stack(tmp_path, request):
     frontend_port = reserve_port()
     backend_url = f"http://127.0.0.1:{backend_port}"
     frontend_url = f"http://127.0.0.1:{frontend_port}"
+    parameters = getattr(request, "param", {})
+    preview_enabled = parameters.get("preview_enabled", True)
+    preview_value = "true" if preview_enabled else "false"
     backend_env = {
         **os.environ,
+        "F003_LITE_PREVIEW_ENABLED": preview_value,
         "SQLITE_DB_PATH": str(db_path),
         "CREATOR_THREADS_DB_PATH": str(db_path),
         "CHROMA_PERSIST_DIR": str(chroma_dir),
@@ -72,12 +76,13 @@ def real_creator_stack(tmp_path, request):
         "PYTHONPATH": str(repo_root),
         "CREATOR_E2E_FAIL_WORKFLOW_RESTORE": (
             "1"
-            if getattr(request, "param", {}).get("fail_workflow_restore")
+            if parameters.get("fail_workflow_restore")
             else "0"
         ),
     }
     frontend_env = {
         **os.environ,
+        "F003_LITE_PREVIEW_ENABLED": preview_value,
         "NEXT_PUBLIC_XHS_API_BASE_URL": backend_url,
         "XHS_API_BASE_URL": backend_url,
         "NEXT_TELEMETRY_DISABLED": "1",
@@ -137,13 +142,31 @@ def browser_page(real_creator_stack):
         browser.close()
 
 
-def test_creator_brief_uses_fixed_catalog_and_submits_selected_subset(browser_page):
+@pytest.mark.parametrize(
+    "selected_direction_ids",
+    [
+        ("product_marketing",),
+        ("product_marketing", "content_performance"),
+        tuple(DIRECTION_CATALOG_V1),
+    ],
+    ids=["single", "double", "all"],
+)
+def test_creator_brief_uses_fixed_catalog_and_submits_selected_subset(
+    browser_page,
+    selected_direction_ids,
+):
     page, stack = browser_page
     presearch_payloads: list[dict] = []
+    confirmation_responses: list[int] = []
 
     def record_presearch(response) -> None:
         if response.url.endswith("/content-research/presearch") and response.status == 201:
             presearch_payloads.append(response.json())
+        if (
+            response.url.endswith("/actions")
+            and '"action":"confirm_brief"' in (response.request.post_data or "")
+        ):
+            confirmation_responses.append(response.status)
 
     page.on("response", record_presearch)
     page.goto(stack["frontend_url"] + "/creator", wait_until="domcontentloaded")
@@ -161,23 +184,64 @@ def test_creator_brief_uses_fixed_catalog_and_submits_selected_subset(browser_pa
         expect(page.get_by_role("button", name=retired_label, exact=True)).to_have_count(0)
 
     page.get_by_role("button", name="准确，继续").click()
-    page.get_by_role("button", name="产品营销", exact=True).click()
-    page.get_by_role("button", name="内容表现", exact=True).click()
+    direction_labels = {
+        "product_marketing": "产品营销",
+        "competitor_discovery": "竞品发现",
+        "content_performance": "内容表现",
+    }
+    for direction_id in selected_direction_ids:
+        page.get_by_role(
+            "button",
+            name=direction_labels[direction_id],
+            exact=True,
+        ).click()
+    confirm_button = page.get_by_role(
+        "button",
+        name=re.compile("确认并开始调研"),
+    )
     with page.expect_response(
         lambda response: response.url.endswith("/actions")
         and '"action":"confirm_brief"' in (response.request.post_data or ""),
         timeout=15000,
     ) as response_info:
-        page.get_by_role("button", name=re.compile("确认并开始调研")).click()
+        if selected_direction_ids == tuple(DIRECTION_CATALOG_V1):
+            confirm_button.evaluate("(button) => { button.click(); button.click(); }")
+        else:
+            confirm_button.click()
     response = response_info.value
 
     assert response.status == 200
     assert presearch_payloads[-1]["direction_catalog"] == list(DIRECTION_CATALOG_V1)
     request_payload = response.request.post_data_json
-    assert request_payload["payload"]["selected_directions"] == [
-        "product_marketing",
-        "content_performance",
-    ]
+    assert request_payload["payload"]["selected_directions"] == list(
+        selected_direction_ids
+    )
+    if selected_direction_ids == tuple(DIRECTION_CATALOG_V1):
+        page.wait_for_timeout(500)
+        assert confirmation_responses == [200]
+        with sqlite3.connect(stack["db_path"]) as connection:
+            plan_count = connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM content_research_plans
+                WHERE workflow_run_id = ?
+                """,
+                (response.json()["workflow_run_id"],),
+            ).fetchone()[0]
+        assert plan_count == 1
+
+
+@pytest.mark.parametrize(
+    "real_creator_stack",
+    [{"preview_enabled": False}],
+    indirect=True,
+)
+def test_creator_hides_lite_entry_when_preview_is_disabled(browser_page):
+    page, stack = browser_page
+
+    page.goto(stack["frontend_url"] + "/creator", wait_until="domcontentloaded")
+
+    expect(page.get_by_role("button", name=re.compile("内容调研"))).to_have_count(0)
 
 
 def test_creator_complete_report_uses_lite_and_handles_all_navigation_states(
@@ -335,6 +399,10 @@ def test_creator_replaces_recovery_with_publication_after_resume(browser_page):
 
     open_creator_with_restored_run(page, stack["frontend_url"], seeded["run_id"])
     recovery = page.locator('section[aria-label="Content Research recovery status"]')
+    expect(recovery).to_be_visible(timeout=20000)
+    expect(published_report(page)).to_have_count(0)
+    page.set_viewport_size({"width": 390, "height": 844})
+    page.reload(wait_until="domcontentloaded")
     expect(recovery).to_be_visible(timeout=20000)
     expect(published_report(page)).to_have_count(0)
 

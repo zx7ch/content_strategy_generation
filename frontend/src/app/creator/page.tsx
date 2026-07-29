@@ -77,6 +77,9 @@ interface ContentResearchRunState {
 
 type LitePublicationState = "complete_verified_report" | "partial_verified_report" | "evidence_only_report";
 
+const F003_LITE_PREVIEW_ENABLED =
+  process.env.F003_LITE_PREVIEW_ENABLED === "true";
+
 function litePublicationState(report: ContentResearchLiteReportResponse): LitePublicationState | null {
   const state = stringField(report.publication, "state");
   return state === "complete_verified_report" || state === "partial_verified_report" || state === "evidence_only_report"
@@ -2362,19 +2365,21 @@ export default function CreatorPage() {
                   +
                 </button>
                 <span className="h-6 w-px shrink-0 bg-line" />
-                <button
-                  type="button"
-                  onClick={() => setContentResearchMode((current) => !current)}
-                  className={[
-                    "inline-flex h-9 shrink-0 items-center gap-2 rounded-full border px-3 text-sm font-medium transition",
-                    contentResearchMode
-                      ? "border-ink bg-slate-100 text-ink"
-                      : "border-transparent text-ink hover:bg-slate-100",
-                  ].join(" ")}
-                >
-                  <span className="text-base">⌕</span>
-                  内容调研
-                </button>
+                {F003_LITE_PREVIEW_ENABLED && (
+                  <button
+                    type="button"
+                    onClick={() => setContentResearchMode((current) => !current)}
+                    className={[
+                      "inline-flex h-9 shrink-0 items-center gap-2 rounded-full border px-3 text-sm font-medium transition",
+                      contentResearchMode
+                        ? "border-ink bg-slate-100 text-ink"
+                        : "border-transparent text-ink hover:bg-slate-100",
+                    ].join(" ")}
+                  >
+                    <span className="text-base">⌕</span>
+                    内容调研
+                  </button>
+                )}
               </div>
               <button
                 type="button"
