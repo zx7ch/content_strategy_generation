@@ -127,6 +127,43 @@ class PublishedReportReader:
             "trace": _trace_projection(self._store, publication, decision),
         }
 
+    async def citation_groups(
+        self,
+        *,
+        workflow_run_id: str,
+        research_plan_id: str | None = None,
+        publication_id: str | None = None,
+        citation_group_ids: set[str],
+    ) -> list[dict[str, Any]]:
+        """Return requested immutable artifact citations after publication-scoped validation."""
+        publication = self._publication(
+            workflow_run_id=workflow_run_id,
+            research_plan_id=research_plan_id,
+            publication_id=publication_id,
+        )
+        decision = self._record(
+            ReportFaithfulnessDecisionRecord, publication.faithfulness_decision_id, "audit"
+        )
+        snapshot = self._snapshot(publication)
+        self._validate_lineage(publication, decision, snapshot)
+        artifact, _ = await self._artifact(publication)
+        payload = artifact.payload_json
+        groups = payload.get("citation_groups") if isinstance(payload, dict) else None
+        if not isinstance(groups, list):
+            raise PublishedReportNotFoundError("published report artifact is malformed")
+        by_id = {
+            str(group["citation_group_id"]): group
+            for group in groups
+            if isinstance(group, dict) and isinstance(group.get("citation_group_id"), str)
+        }
+        missing = citation_group_ids - set(by_id)
+        if missing:
+            raise PublishedReportNotFoundError(
+                "requested citation groups are absent from the publication: "
+                + ", ".join(sorted(missing))
+            )
+        return [_citation_group(dict(group)) for group in groups if isinstance(group, dict) and group.get("citation_group_id") in citation_group_ids]
+
     def _publication(
         self, *, workflow_run_id: str, research_plan_id: str | None, publication_id: str | None
     ) -> ReportPublicationRecord:

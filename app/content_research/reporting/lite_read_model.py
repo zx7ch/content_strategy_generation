@@ -4,7 +4,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.content_research.persistence_models import StageCheckpointRecord
+from app.content_research.contracts import DIRECTION_CATALOG_V1
+from app.content_research.persistence_models import (
+    ReportPublicationRecord,
+    StageCheckpointRecord,
+)
 from app.content_research.reporting.read_model import (
     PublishedReportNotFoundError,
     PublishedReportReader,
@@ -13,17 +17,16 @@ from app.content_research.stores.base import ContentResearchStore
 from app.memory.workflow_store import WorkflowStore
 
 _LITE_FIELDS = {"content_text", "title"}
-_DIRECTION_SET_V1 = (
-    "product_marketing",
-    "competitor_discovery",
-    "content_performance",
-)
 _PUBLICATION_STATES = {
     "complete_verified_report",
     "partial_verified_report",
     "evidence_only_report",
 }
 _RECOVERABLE_RUN_STATES = {"failed", "paused"}
+
+
+class ExistingPublicationUnreadableError(RuntimeError):
+    """Raised when a committed publication exists but cannot be projected safely."""
 
 
 class LiteReportReader:
@@ -44,6 +47,7 @@ class LiteReportReader:
         workflow_run_id: str,
         research_plan_id: str | None = None,
         publication_id: str | None = None,
+        citation_group_ids: list[str] | None = None,
     ) -> dict[str, Any]:
         try:
             report = await self._published.read(
@@ -51,28 +55,80 @@ class LiteReportReader:
                 research_plan_id=research_plan_id,
                 publication_id=publication_id,
             )
-        except PublishedReportNotFoundError:
+            if citation_group_ids:
+                report = {
+                    **report,
+                    "citation_groups": await self._published.citation_groups(
+                        workflow_run_id=workflow_run_id,
+                        research_plan_id=research_plan_id,
+                        publication_id=publication_id,
+                        citation_group_ids=set(citation_group_ids),
+                    ),
+                }
+        except PublishedReportNotFoundError as exc:
+            if citation_group_ids is not None:
+                raise
+            if self._has_publication(workflow_run_id=workflow_run_id):
+                if research_plan_id is not None or publication_id is not None:
+                    # A caller asked for a specific frozen publication and it
+                    # did not resolve.  Keep that ordinary not-found result;
+                    # it must never masquerade as a recoverable run.
+                    raise
+                raise ExistingPublicationUnreadableError(
+                    "existing publication is unreadable"
+                ) from exc
             return await self._recoverable_projection(workflow_run_id)
-        return self._published_projection(report)
+        return self._published_projection(report, citation_group_ids=citation_group_ids)
 
-    def _published_projection(self, report: dict[str, Any]) -> dict[str, Any]:
+    def _published_projection(
+        self,
+        report: dict[str, Any],
+        *,
+        citation_group_ids: list[str] | None,
+    ) -> dict[str, Any]:
         publication_state = str(report.get("publication_state") or "")
         if publication_state not in _PUBLICATION_STATES:
             raise PublishedReportNotFoundError("published report has unsupported publication state")
-        citations = _lite_citations(report.get("citation_groups"))
+        requested_directions = set(_frozen_scope(report)["direction_ids"])
+        claim_cards = _records_in_directions(
+            report.get("claim_cards"), requested_directions
+        )
+        weak_signal_records = _records_in_directions(
+            report.get("weak_signals"), requested_directions
+        )
+        excluded_claim_ids = {
+            str(item["claim_candidate_id"])
+            for item in [
+                *(report.get("claim_cards") or []),
+                *(report.get("weak_signals") or []),
+            ]
+            if isinstance(item, dict)
+            and item.get("direction_id") not in requested_directions
+            and item.get("claim_candidate_id")
+        }
+        citations = (
+            _select_citations(
+                [
+                    citation
+                    for citation in _lite_citations(report.get("citation_groups"))
+                    if citation.get("claim_candidate_id") not in excluded_claim_ids
+                ],
+                citation_group_ids,
+            )
+            if requested_directions
+            else []
+        )
         citations_by_claim = _citations_by_claim(citations)
         direction_states = _direction_states(report)
         findings = [
             _finding(card, citations_by_claim)
-            for card in report.get("claim_cards") or []
-            if isinstance(card, dict)
-            and str(card.get("admission_state") or "admitted") in {"admitted", "accepted"}
+            for card in claim_cards
+            if str(card.get("admission_state") or "admitted") in {"admitted", "accepted"}
             and _allowed_claim(card, citations_by_claim)
         ]
         weak_signals = [
             item
-            for signal in report.get("weak_signals") or []
-            if isinstance(signal, dict)
+            for signal in weak_signal_records
             for item in [_weak_signal(signal, citations_by_claim)]
             if item is not None
         ]
@@ -85,7 +141,11 @@ class LiteReportReader:
             "subject": _subject(self._store, report["workflow_run_id"]),
             "frozen_scope": _frozen_scope(report),
             "collected_at": _collected_at(citations),
-            "publication": {"state": publication_state, **dict(report.get("publication") or {})},
+            "publication": {
+                "state": publication_state,
+                **dict(report.get("publication") or {}),
+                "publication_reason": _publication_reason(report),
+            },
             "sections": {
                 "main_findings": [] if is_evidence_only else finding_cards,
                 "weak_signals": [] if is_evidence_only else weak_signals,
@@ -154,6 +214,16 @@ class LiteReportReader:
             if item.workflow_run_id == workflow_run_id
         ]
 
+    def _has_publication(
+        self,
+        *,
+        workflow_run_id: str,
+    ) -> bool:
+        return any(
+            item.workflow_run_id == workflow_run_id
+            for item in self._store.list_typed_records(ReportPublicationRecord)
+        )
+
 
 def _frozen_scope(report: dict[str, Any]) -> dict[str, Any]:
     release = report.get("release") if isinstance(report.get("release"), dict) else {}
@@ -168,9 +238,21 @@ def _frozen_scope(report: dict[str, Any]) -> dict[str, Any]:
 def _policy_scope(policy: dict[str, Any]) -> dict[str, Any]:
     return {
         "direction_set_version": policy.get("direction_set_version"),
-        "direction_ids": list(policy.get("direction_ids") or []),
+        "direction_ids": list(
+            policy.get("requested_direction_ids") or policy.get("direction_ids") or []
+        ),
         "report_compose_mode": policy.get("report_compose_mode") or "prose",
     }
+
+
+def _records_in_directions(
+    records: object, direction_ids: set[str]
+) -> list[dict[str, Any]]:
+    return [
+        item
+        for item in (records if isinstance(records, list) else [])
+        if isinstance(item, dict) and item.get("direction_id") in direction_ids
+    ]
 
 
 def _direction_states(report: dict[str, Any]) -> list[dict[str, Any]]:
@@ -181,30 +263,52 @@ def _direction_states(report: dict[str, Any]) -> list[dict[str, Any]]:
     )
     scope = _frozen_scope(report)
     by_direction = {item.get("direction"): item for item in states if isinstance(item, dict)}
+    requested_direction_ids = set(scope["direction_ids"])
     return [
-        {
-            "direction": direction_id,
-            "state": (by_direction.get(direction_id) or {}).get("state", "unavailable"),
-            "reason_code": _single_reason(
-                (by_direction.get(direction_id) or {}).get("reason_codes")
-            ),
-            "recovery_action": _single_reason(
-                (by_direction.get(direction_id) or {}).get("recovery_actions")
-            ),
-        }
-        for direction_id in scope["direction_ids"]
+        _direction_state_view(
+            direction_id,
+            by_direction.get(direction_id),
+            requested=direction_id in requested_direction_ids,
+        )
+        for direction_id in DIRECTION_CATALOG_V1
     ]
 
 
-def _unavailable_direction_states(policy: dict[str, Any]) -> list[dict[str, Any]]:
-    return [
-        {
+def _direction_state_view(
+    direction_id: str, result: dict[str, Any] | None, *, requested: bool
+) -> dict[str, Any]:
+    if not requested:
+        return {
             "direction": direction_id,
-            "state": "unavailable",
+            "state": "not_requested",
             "reason_code": None,
             "recovery_action": None,
         }
-        for direction_id in _policy_scope(policy)["direction_ids"]
+    state = str((result or {}).get("state") or "")
+    if state in {"", "not_started", "not_requested"}:
+        return {
+            "direction": direction_id,
+            "state": "unavailable",
+            "reason_code": "collection_result_unavailable",
+            "recovery_action": None,
+        }
+    return {
+        "direction": direction_id,
+        "state": state,
+        "reason_code": _single_reason((result or {}).get("reason_codes")),
+        "recovery_action": _single_reason((result or {}).get("recovery_actions")),
+    }
+
+
+def _unavailable_direction_states(policy: dict[str, Any]) -> list[dict[str, Any]]:
+    requested_direction_ids = set(_policy_scope(policy)["direction_ids"])
+    return [
+        _direction_state_view(
+            direction_id,
+            None,
+            requested=direction_id in requested_direction_ids,
+        )
+        for direction_id in DIRECTION_CATALOG_V1
     ]
 
 
@@ -232,6 +336,16 @@ def _lite_citations(groups: object) -> list[dict[str, Any]]:
                 }
             )
     return result
+
+
+def _select_citations(
+    citations: list[dict[str, Any]],
+    citation_group_ids: list[str] | None,
+) -> list[dict[str, Any]]:
+    if citation_group_ids is None:
+        return citations
+    requested = set(citation_group_ids)
+    return [citation for citation in citations if citation.get("citation_group_id") in requested]
 
 
 def _citation_ref(ref: dict[str, Any]) -> dict[str, Any]:
@@ -320,6 +434,19 @@ def _collected_at(citations: list[dict[str, Any]]) -> str | None:
         ),
         None,
     )
+
+
+def _publication_reason(report: dict[str, Any]) -> str | None:
+    publication = report.get("publication")
+    if not isinstance(publication, dict):
+        return None
+    reason_codes = publication.get("reason_codes")
+    if isinstance(reason_codes, list):
+        reason = next((str(item) for item in reason_codes if item), None)
+        if reason:
+            return reason
+    recovery_state = publication.get("audit_recovery_state")
+    return str(recovery_state) if recovery_state else None
 
 
 def _has_persisted_failure(checkpoints: list[StageCheckpointRecord]) -> bool:

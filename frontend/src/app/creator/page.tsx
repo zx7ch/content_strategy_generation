@@ -26,16 +26,12 @@ import {
   confirmContentResearchBrief,
   createContentResearchPresearch,
   endContentResearchWorkflow,
-  getContentResearchPublishedReport,
-  getContentResearchTrace,
-  getCurrentXHSQRLogin,
-  retryContentResearchFormalResearch,
-  startXHSQRLogin,
-  restoreContentResearchWorkflow,
+  getContentResearchLiteReport,
+  getContentResearchWorkflow,
+  resumeContentResearchFormalResearch,
   type ContentResearchFormalResearchResponse,
-  type ContentResearchPublishedReportResponse,
+  type ContentResearchLiteReportResponse,
   type ContentResearchPresearchResponse,
-  type ContentResearchTrace,
   type ContentResearchWorkflowSummary,
 } from "@/lib/content-research-api";
 
@@ -51,7 +47,7 @@ interface ChatMessage {
   runId?: string | null;
   actionUrl?: string;
   actionLabel?: string;
-  report?: ContentResearchPublishedReportResponse;
+  report?: ContentResearchLiteReportResponse;
 }
 
 interface WorkflowTask {
@@ -72,12 +68,27 @@ interface ContentResearchIntentState {
 interface ContentResearchRunState {
   workflowRunId: string;
   summary: ContentResearchWorkflowSummary;
-  trace: ContentResearchTrace | null;
   formalResearch: ContentResearchFormalResearchResponse | null;
   formalResearchStatus: "idle" | "collecting" | "completed" | "failed" | "invalid";
-  report: ContentResearchPublishedReportResponse | null;
+  report: ContentResearchLiteReportResponse | null;
   reportStatus: "idle" | "loading" | "ready" | "unavailable" | "failed";
   reportError: string | null;
+}
+
+type LitePublicationState = "complete_verified_report" | "partial_verified_report" | "evidence_only_report";
+
+const F003_LITE_PREVIEW_ENABLED =
+  process.env.F003_LITE_PREVIEW_ENABLED === "true";
+
+function litePublicationState(report: ContentResearchLiteReportResponse): LitePublicationState | null {
+  const state = stringField(report.publication, "state");
+  return state === "complete_verified_report" || state === "partial_verified_report" || state === "evidence_only_report"
+    ? state
+    : null;
+}
+
+function isExpectedLiteReportAbsence(error: unknown) {
+  return error instanceof Error && /not found|404/i.test(error.message);
 }
 
 const WELCOME_MESSAGE: ChatMessage = {
@@ -104,6 +115,11 @@ function contentResearchRunForThread(threadId: string): string | null {
   return contentResearchRunsByThread()[threadId] ?? null;
 }
 
+function contentResearchThreadForRun(workflowRunId: string): string | null {
+  return Object.entries(contentResearchRunsByThread())
+    .find(([, savedRunId]) => savedRunId === workflowRunId)?.[0] ?? null;
+}
+
 function saveContentResearchRunForThread(threadId: string, workflowRunId: string) {
   const runs = contentResearchRunsByThread();
   runs[threadId] = workflowRunId;
@@ -128,8 +144,6 @@ function createId(prefix: string) {
 function formalResearchStatus(result: ContentResearchFormalResearchResponse | null): ContentResearchRunState["formalResearchStatus"] {
   if (!result) return "idle";
   if (result.status === "failed") return "failed";
-  // The action acknowledges durable dispatch; it is not a completion signal.
-  // Treat queued/running work as live until the persisted Trace is terminal.
   return ["completed", "partial_completed", "succeeded"].includes(result.status)
     ? "completed"
     : "collecting";
@@ -142,12 +156,12 @@ function contentResearchStartFailure(detail: string): {
   if (/Creator thread (is required|no longer exists)/i.test(detail)) {
     return {
       status: "invalid",
-      message: "本轮调研所属的 Creator 对话已不存在，无法重试。请在有效对话中重新发起一轮内容调研。",
+      message: "本轮调研所属的 Creator 对话已不存在，无法继续。请在有效对话中重新发起一轮内容调研。",
     };
   }
   return {
     status: "failed",
-    message: `专家调研启动失败：${detail}。请检查来源登录态、采集服务和运行配置后重试。`,
+    message: `专家调研启动失败：${detail}。请检查来源登录态、采集服务和运行配置后继续。`,
   };
 }
 
@@ -163,14 +177,12 @@ function isUncertainContentResearchDispatchFailure(detail: string) {
 function contentResearchRunWithReport(
   workflowRunId: string,
   summary: ContentResearchWorkflowSummary,
-  trace: ContentResearchTrace | null,
   formalResearch: ContentResearchFormalResearchResponse | null,
-  report: ContentResearchPublishedReportResponse | null
+  report: ContentResearchLiteReportResponse | null
 ): ContentResearchRunState {
   return {
     workflowRunId,
     summary,
-    trace,
     formalResearch,
     formalResearchStatus: formalResearchStatus(formalResearch),
     report,
@@ -181,8 +193,8 @@ function contentResearchRunWithReport(
 
 function sourceFailureReasonText(reason: string | null | undefined) {
   if (reason === "auth_required") return "需要登录小红书网页端";
-  if (reason === "rate_limited") return "当前访问过于频繁，请稍后重试";
-  if (reason) return "采集服务暂时不可用，请稍后重试";
+  if (reason === "rate_limited") return "当前访问过于频繁，请稍后再继续";
+  if (reason) return "采集服务暂时不可用，请检查服务状态后继续";
   return "无";
 }
 
@@ -207,8 +219,8 @@ function displayChatText(text: string | null | undefined) {
   // Timeline records from an older runtime can lack free text; an unavailable
   // report must still render its explicit error state instead of crashing.
   return (text ?? "").replace(
-    /(小红书采集未完成：)(auth_required|rate_limited|transient_error|permanent_error|parser_error|unknown)(。可在「查看调研过程」中重试。)/,
-    (_match, prefix, reason, suffix) => `${prefix}${sourceFailureReasonText(reason)}${suffix}`
+    /(小红书采集未完成：)([a-z_]+)(。可在「查看调研过程」中重试。)/,
+    (_match, prefix, reason) => `${prefix}${sourceFailureReasonText(reason)}。`
   ).replace(
     /返回 (\d+) 条 search_result_minimal 素材/g,
     "已采集 $1 条公开内容"
@@ -632,46 +644,14 @@ function splitInlineList(value: string) {
     .filter(Boolean);
 }
 
-const P0_EXECUTABLE_DIRECTIONS = [
+const LITE_DIRECTION_CATALOG = [
   { id: "product_marketing", label: "产品营销" },
-  { id: "competitor_discovery", label: "竞品品牌" },
-  { id: "ugc_community", label: "UGC 社群互动" },
-  { id: "comment_insight", label: "用户评论痛点" },
-  { id: "brand_activity", label: "品牌活动" },
-  { id: "keyword_growth", label: "高增长关键词" },
-  { id: "content_performance", label: "小红书内容表现" },
+  { id: "competitor_discovery", label: "竞品发现" },
+  { id: "content_performance", label: "内容表现" },
 ] as const;
 
-const DIRECTION_ALIASES: Record<string, string> = {
-  产品营销: "product_marketing",
-  产品卖点表达: "product_marketing",
-  竞品品牌: "competitor_discovery",
-  UGC社群互动: "ugc_community",
-  "UGC 社群互动": "ugc_community",
-  用户评论痛点: "comment_insight",
-  品牌活动: "brand_activity",
-  高增长关键词: "keyword_growth",
-  小红书内容表现: "content_performance",
-  小红书爆文内容: "content_performance",
-};
-
-function normalizeP0Direction(value: string): string | null {
-  const trimmed = value.trim();
-  if (!trimmed) return null;
-  if (P0_EXECUTABLE_DIRECTIONS.some((item) => item.id === trimmed)) return trimmed;
-  return DIRECTION_ALIASES[trimmed] ?? null;
-}
-
-function p0DirectionLabel(value: string) {
-  return P0_EXECUTABLE_DIRECTIONS.find((item) => item.id === value)?.label ?? value;
-}
-
-function p0ExecutableDirections(rawDirections: string[]) {
-  const normalized = rawDirections
-    .map(normalizeP0Direction)
-    .filter((item): item is string => item !== null);
-  const unique = [...new Set(normalized)];
-  return unique.length ? unique : ["product_marketing", "competitor_discovery", "comment_insight"];
+function liteDirectionLabel(value: string) {
+  return LITE_DIRECTION_CATALOG.find((item) => item.id === value)?.label ?? value;
 }
 
 function ContentResearchIntentCard({
@@ -687,7 +667,9 @@ function ContentResearchIntentCard({
   const subject = subjectInput.trim() || "本轮调研";
   const presearchConclusion = intent.presearch.subject_confirmation.trim();
   const initialCompetitors = intent.presearch.competitor_tags.length ? intent.presearch.competitor_tags : ["待补充竞品"];
-  const visibleDirections = P0_EXECUTABLE_DIRECTIONS.map((item) => item.id);
+  const visibleDirections = LITE_DIRECTION_CATALOG
+    .filter((item) => intent.presearch.direction_catalog.includes(item.id))
+    .map((item) => item.id);
   const [subjectConfirmed, setSubjectConfirmed] = useState<"yes" | "mostly" | "no" | null>(null);
   const [selectedCompetitors, setSelectedCompetitors] = useState<string[]>([]);
   const [selectedDirections, setSelectedDirections] = useState<string[]>([]);
@@ -825,7 +807,7 @@ function ContentResearchIntentCard({
                   selectedDirections.includes(direction) ? "bg-[#789180] text-white" : "bg-[#e8efe9] text-[#51665a] hover:bg-[#dfe8e1]",
                 ].join(" ")}
               >
-                {p0DirectionLabel(direction)}
+                {liteDirectionLabel(direction)}
               </button>
             ))}
           </div>
@@ -851,423 +833,288 @@ function ContentResearchIntentCard({
   );
 }
 
-function reportStateLabel(state: ContentResearchPublishedReportResponse["publication_state"]) {
+function reportStateLabel(state: LitePublicationState) {
   if (state === "complete_verified_report") return "已完整核验";
   if (state === "partial_verified_report") return "部分内容已核验";
   return "仅展示已验证证据";
 }
 
-function reportSectionTitle(section: Record<string, unknown>) {
-  const kind = stringField(section, "section_kind", "section_id");
-  const labels: Record<string, string> = {
-    core_conclusions: "核心结论",
-    main_findings: "主要发现",
-    cross_direction_tensions: "跨方向张力",
-    weak_signals: "初步信号",
-    next_steps: "下一步建议",
-    limitations_scope: "研究范围与限制",
-  };
-  return labels[kind] || stringField(section, "title", kind || "研究内容");
-}
-
-function reportSectionText(section: Record<string, unknown>) {
-  return firstString(section, ["text", "body", "content", "prose", "summary"]);
-}
-
-function sectionCitationIds(section: Record<string, unknown>) {
-  const anchorIds = Array.isArray(section.citation_anchors)
-    ? section.citation_anchors
-      .filter((anchor): anchor is Record<string, unknown> => Boolean(anchor) && typeof anchor === "object" && !Array.isArray(anchor))
-      .map((anchor) => stringField(anchor, "citation_group_id"))
+function recordList(value: unknown): Record<string, unknown>[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object" && !Array.isArray(item))
     : [];
-  const declaredIds = Array.isArray(section.citation_group_ids)
-    ? section.citation_group_ids.map(String).filter(Boolean)
-    : [];
-  return [...new Set([...anchorIds, ...declaredIds])];
 }
 
-function reportHeaderTitle(sections: Record<string, unknown>[], evidenceOnly: boolean) {
-  const coreConclusion = sections.find((section) => stringField(section, "section_kind") === "core_conclusions");
-  const conclusion = coreConclusion ? reportSectionText(coreConclusion) : "";
-  if (!evidenceOnly && conclusion) return conclusion;
-  return evidenceOnly ? "本次研究的已验证证据" : "本次内容调研结论";
+function selectRequestedDirectionStates(report: ContentResearchLiteReportResponse) {
+  const requestedDirectionIds = new Set(arrayField(report.frozen_scope, "direction_ids"));
+  return recordList(report.run_direction_states).filter((item) =>
+    requestedDirectionIds.has(stringField(item, "direction"))
+  );
 }
 
-function reportHeaderSubtitle(report: ContentResearchPublishedReportResponse, claims: Record<string, unknown>[]) {
-  const directionCount = new Set(claims.map((claim) => stringField(claim, "direction_id")).filter(Boolean)).size;
-  const directionText = directionCount > 0 ? `覆盖 ${directionCount} 个研究方向` : "方向覆盖未公开";
-  return `研究范围：${report.citation_total} 条冻结引用 · ${claims.length} 条受治理结论 · ${directionText}`;
+function numberField(source: Record<string, unknown>, key: string) {
+  const value = source[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
 }
 
-function ContentResearchReportMessage({ report }: { report: ContentResearchPublishedReportResponse }) {
+function liteCollectedDate(value: string | null | undefined) {
+  return value ? `截至 ${value.slice(0, 10)}` : "采集时间未公开";
+}
+
+function recoveryReasonLabel(reason: string) {
+  if (reason === "auth_expired" || reason === "auth_required") return "登录状态已失效";
+  if (reason === "rate_limited") return "来源访问频率受限";
+  return "调研暂时中断";
+}
+
+function ContentResearchReportMessage({
+  report,
+  onRecover,
+}: {
+  report: ContentResearchLiteReportResponse;
+  onRecover?: () => void;
+}) {
   const [selectedCitation, setSelectedCitation] = useState<Record<string, unknown> | null>(null);
-  const [citations, setCitations] = useState<Record<string, unknown>[]>(() => report.citation_groups.filter((value): value is Record<string, unknown> => Boolean(value) && typeof value === "object" && !Array.isArray(value)));
-  const [loadingMore, setLoadingMore] = useState(false);
-  const sections = report.sections.filter((value): value is Record<string, unknown> => Boolean(value) && typeof value === "object" && !Array.isArray(value));
-  const claims = report.claim_cards.filter((value): value is Record<string, unknown> => Boolean(value) && typeof value === "object" && !Array.isArray(value));
-  const aggregates = report.aggregate_claims.filter((value): value is Record<string, unknown> => Boolean(value) && typeof value === "object" && !Array.isArray(value));
-  const tensions = report.cross_direction_records.filter((value): value is Record<string, unknown> => Boolean(value) && typeof value === "object" && !Array.isArray(value));
-  const weakSignals = report.weak_signals.filter((value): value is Record<string, unknown> => Boolean(value) && typeof value === "object" && !Array.isArray(value));
-  const limitations = report.limitations_recovery.filter((value): value is Record<string, unknown> => Boolean(value) && typeof value === "object" && !Array.isArray(value));
-  const coreSection = sections.find((section) => stringField(section, "section_kind") === "core_conclusions");
-  const bodySections = sections.filter((section) => stringField(section, "section_kind") !== "core_conclusions");
-  const citationsById = new Map(citations.map((citation) => [stringField(citation, "citation_group_id"), citation]));
-  const attachedCitationIds = new Set(sections.flatMap(sectionCitationIds));
-  const evidenceOnly = report.publication_state === "evidence_only_report";
-  const partial = report.publication_state === "partial_verified_report";
-  const headerTitle = reportHeaderTitle(sections, evidenceOnly);
-  const headerSubtitle = reportHeaderSubtitle(report, claims);
-  const omittedIds = Array.isArray(report.publication.omitted_section_ids) ? report.publication.omitted_section_ids.map(String) : [];
-  const omittedSections = sections.filter((section) => omittedIds.includes(stringField(section, "section_id")));
-  const nextAggregates = aggregates.filter((item) => stringField(item, "aggregate_type") === "action_hypothesis" || stringField(item, "request_origin") === "user_requested_next_steps");
-  const remainingCitations = Math.max(0, report.citation_total - citations.length);
+  const publicationState = litePublicationState(report);
+  const recovery = report.recovery_projection && typeof report.recovery_projection === "object"
+    ? report.recovery_projection
+    : null;
+  const publicationIsNone = report.publication.state === null;
 
   useEffect(() => {
-    setCitations(report.citation_groups.filter((value): value is Record<string, unknown> => Boolean(value) && typeof value === "object" && !Array.isArray(value)));
     setSelectedCitation(null);
-  }, [report.artifact, report.citation_groups]);
+  }, [report.workflow_run_id, report.citations]);
 
-  async function loadMoreCitations() {
-    if (loadingMore || remainingCitations === 0) return;
-    setLoadingMore(true);
-    try {
-      const next = await getContentResearchPublishedReport(report.workflow_run_id, { citationOffset: citations.length, citationLimit: report.citation_limit });
-      setCitations((current) => {
-        const incoming = next.citation_groups
-          .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object" && !Array.isArray(item))
-          .filter((item) => !current.some((existing) => stringField(existing, "citation_group_id") === stringField(item, "citation_group_id")));
-        return [...current, ...incoming];
-      });
-    } finally {
-      setLoadingMore(false);
-    }
+  if (!publicationState) {
+    if (!publicationIsNone || !recovery) return null;
+    const completedStages = arrayField(recovery, "completed_stages");
+    const actionable = stringField(recovery, "actionability") === "available";
+    return (
+      <section
+        className="w-full max-w-[92%] rounded-2xl border border-amber-200 bg-amber-50 px-5 py-4 text-sm text-ink shadow-sm"
+        aria-label="Content Research recovery status"
+      >
+        <p className="text-[10px] font-semibold tracking-wider text-amber-700">研究运行</p>
+        <h3 className="mt-1 text-lg font-semibold">调研可继续</h3>
+        <p className="mt-2 text-sm text-amber-900">{recoveryReasonLabel(stringField(recovery, "reason_code"))}</p>
+        <p className="mt-2 text-xs text-quiet">
+          {completedStages.length ? `已保存阶段：${completedStages.join("、")}` : "尚无已完成阶段。"}
+        </p>
+        {actionable && stringField(recovery, "next_action") === "resume_run" && (
+          <button
+            type="button"
+            onClick={onRecover}
+            className="mt-4 rounded-lg bg-ink px-3 py-2 text-xs font-medium text-white"
+          >
+            {["auth_expired", "auth_required"].includes(stringField(recovery, "reason_code"))
+              ? "更新登录后继续"
+              : "继续调研"}
+          </button>
+        )}
+      </section>
+    );
   }
 
-  const citationButton = (citation: Record<string, unknown>, index: number, variant: "inline" | "standalone" = "inline") => {
+  const evidenceOnly = publicationState === "evidence_only_report";
+  const partial = publicationState === "partial_verified_report";
+  const citations = recordList(report.citations);
+  const allCards = recordList(report.sections.main_findings);
+  const findings = evidenceOnly ? [] : allCards.filter((item) => stringField(item, "card_kind") !== "observation");
+  const observations = evidenceOnly ? [] : allCards.filter((item) => stringField(item, "card_kind") === "observation");
+  const leads = evidenceOnly ? [] : recordList(report.sections.weak_signals);
+  const limitations = recordList(report.sections.limitations_scope);
+  const directionStates = evidenceOnly
+    ? []
+    : selectRequestedDirectionStates(report);
+  const statusStrip = report.status_strip;
+  const citationsById = new Map(citations.map((citation) => [stringField(citation, "citation_group_id"), citation]));
+  const statusText = evidenceOnly
+    ? `${numberField(statusStrip, "saved_evidence_count")} 条已保存依据`
+    : `${numberField(statusStrip, "completed_direction_count")} 个方向完成 · ${numberField(statusStrip, "admitted_finding_count")} 条已验证发现 · ${numberField(statusStrip, "observation_count")} 条样本观察 · ${numberField(statusStrip, "lead_count")} 条线索`;
+
+  const citationButton = (citation: Record<string, unknown>, index: number) => {
     const displayIndex = String(citation.display_index ?? index + 1);
     return (
       <button
         key={stringField(citation, "citation_group_id", String(index))}
         type="button"
-        className={variant === "inline"
-          ? "ml-1 inline rounded text-xs font-medium text-[#4f6f5f] underline underline-offset-2"
-          : "rounded-lg border border-line bg-white px-2.5 py-1 text-xs hover:bg-slate-50"}
+        className="rounded-lg border border-line bg-white px-2.5 py-1 text-xs hover:bg-slate-50"
         onClick={() => setSelectedCitation(citation)}
         aria-label={`打开引用 ${displayIndex}`}
       >
-        [{displayIndex}]{variant === "standalone" ? " 查看依据" : ""}
+        [{displayIndex}] 查看依据
       </button>
     );
   };
-  const structuredCard = (item: Record<string, unknown>, index: number, kind: "claim" | "aggregate") => <details key={firstString(item, [kind === "claim" ? "claim_candidate_id" : "aggregate_claim_id", "id"], `${kind}-${index}`)} aria-label={kind === "claim" ? "主要发现卡" : "行动建议卡"} className={kind === "claim" ? "rounded-xl border border-line bg-white px-3 py-3" : "rounded-xl bg-slate-100 px-3 py-3"}><summary className="cursor-pointer font-medium">{firstString(item, ["statement", "title", "summary"], kind === "claim" ? "已验证观察" : "综合观察")}</summary><dl className="mt-3 grid gap-2 text-xs text-quiet"><div><dt className="font-medium text-ink">对象类型</dt><dd>{kind === "claim" ? "已准入方向 claim" : stringField(item, "aggregate_type", "综合 claim")}</dd></div>{firstString(item, ["direction_id", "scope", "claim_type"]) && <div><dt className="font-medium text-ink">范围</dt><dd>{firstString(item, ["direction_id", "scope", "claim_type"])}</dd></div>}{firstString(item, ["derivation_method", "request_origin", "admission_state"]) && <div><dt className="font-medium text-ink">依据状态</dt><dd>{firstString(item, ["derivation_method", "request_origin", "admission_state"])}</dd></div>}{item.hypothesis_only === true && <div><dt className="font-medium text-ink">标记</dt><dd>待验证行动假设，非已验证事实。</dd></div>}</dl></details>;
 
-  return <div className="flex justify-start" data-report-publication-id={stringField(report.publication, "report_publication_id")}>
-    <article className="w-full max-w-[92%] overflow-hidden rounded-2xl border border-line bg-white text-sm text-ink shadow-sm" aria-label="Content Research published report">
-      <header className="border-b border-line bg-[#fbfcfb] px-5 py-4" aria-label="Content Research report header"><p className="text-[10px] font-semibold tracking-wider text-[#4f6f5f]">研究结论</p><div className="mt-1 flex flex-wrap items-start justify-between gap-3"><div><h3 className="text-lg font-semibold leading-7">{headerTitle}</h3><p className="mt-1 text-xs text-quiet">{headerSubtitle}</p><p className="mt-1 text-xs text-quiet">发布日期未公开</p></div><span className="rounded-full bg-[#fff4df] px-2.5 py-1 text-xs font-medium text-[#a16207]">{reportStateLabel(report.publication_state)}</span></div></header>
-      <div className="space-y-5 px-5 py-5">
-        {partial && <section className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900" aria-label="部分报告审计说明"><p>部分自由叙述未通过审计，已撤下；下方仅保留通过核验的内容与结构化证据。</p>{omittedSections.length > 0 && <p className="mt-2">已撤下：{omittedSections.map(reportSectionTitle).join("、")}。</p>}{Array.isArray(report.publication.reason_codes) && report.publication.reason_codes.length > 0 && <p className="mt-2">审计原因：{report.publication.reason_codes.map(String).join("、")}。</p>}{stringField(report.publication, "audit_recovery_state") && <p className="mt-2">恢复状态：{stringField(report.publication, "audit_recovery_state")}。</p>}</section>}
-        {evidenceOnly && <p className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-quiet">本次未发布自由叙述，仅展示已验证的结构化证据、初步信号、范围限制与恢复建议。</p>}
-        {!evidenceOnly && coreSection && <section aria-label="核心结论" className="rounded-r-xl border-l-4 border-[#4f6f5f] bg-[#f6faf7] px-4 py-3"><h4 className="font-semibold">核心结论</h4><p className="mt-2 whitespace-pre-wrap leading-6 text-ink">{reportSectionText(coreSection)}{sectionCitationIds(coreSection).map((id, index) => { const citation = citationsById.get(id); return citation ? citationButton(citation, index) : null; })}</p></section>}
-        {!evidenceOnly && bodySections.map((section) => { const text = reportSectionText(section); const sectionCitations = sectionCitationIds(section).map((id) => citationsById.get(id)).filter((citation): citation is Record<string, unknown> => Boolean(citation)); return <section key={stringField(section, "section_id", reportSectionTitle(section))} className="border-t border-line pt-4"><h4 className="font-semibold">{reportSectionTitle(section)}</h4>{text ? <p className="mt-2 whitespace-pre-wrap leading-6 text-quiet">{text}{sectionCitations.map((citation, index) => citationButton(citation, index))}</p> : <p className="mt-2 text-xs text-quiet">该 section 未发布自由叙述；请查看下方已验证结构化内容与审计说明。</p>}</section>; })}
-        {claims.length > 0 && <section aria-label="主要发现" className="border-t border-line pt-4"><h4 className="font-semibold">{evidenceOnly ? "已验证证据卡" : "主要发现"}</h4><div className="mt-3 space-y-2">{claims.map((item, index) => structuredCard(item, index, "claim"))}</div></section>}
-        {tensions.length > 0 && <section aria-label="跨方向张力" className="border-t border-amber-200 pt-4"><h4 className="font-semibold text-amber-900">跨方向张力</h4><div className="mt-2 space-y-2">{tensions.map((item, index) => <details key={firstString(item, ["cross_direction_record_id", "id"], `tension-${index}`)} className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900"><summary className="cursor-pointer font-medium">{firstString(item, ["summary", "statement", "reason"], "已识别跨方向证据张力")}</summary><p className="mt-2">{firstString(item, ["reason", "resolution_state", "classification"], "该张力仅来自治理层 cross_direction_records。")}</p></details>)}</div></section>}
-        {weakSignals.length > 0 && <section aria-label="初步信号" className="border-t border-line pt-4"><h4 className="font-semibold">初步信号</h4>{weakSignals.map((item, index) => <details key={firstString(item, ["weak_signal_id", "id"], `weak-${index}`)} className="mt-2 border-l-4 border-slate-300 bg-slate-50 px-3 py-2 text-xs leading-5 text-quiet"><summary className="cursor-pointer">{firstString(item, ["statement", "reason", "summary"], "该信号尚不足以构成主要发现。")}</summary><p className="mt-2">未正式准入原因：{firstString(item, ["reason", "limitation", "threshold_state"], "证据范围或样本门槛尚不足。")}</p><p className="mt-1">恢复建议：{firstString(item, ["recovery_action", "next_action", "recovery"], "补充独立来源或样本后重新评估。")}</p></details>)}</section>}
-        {(nextAggregates.length > 0 || limitations.length > 0) && <section className="border-t border-line pt-4"><h4 className="font-semibold">下一步建议</h4><div className="mt-2 space-y-2">{nextAggregates.map((item, index) => structuredCard(item, index, "aggregate"))}{limitations.map((item, index) => <details key={firstString(item, ["limitation_id", "id"], `limit-${index}`)} className="rounded-xl bg-slate-50 px-3 py-2 text-xs text-quiet"><summary className="cursor-pointer">{firstString(item, ["message", "reason", "summary"], "请结合当前证据范围使用本报告。")}</summary><p className="mt-2">恢复建议：{firstString(item, ["recovery_action", "next_action", "recovery"], "补充所缺样本后重新核验。")}</p></details>)}</div></section>}
-        <section className="border-t border-line pt-4"><h4 className="font-semibold">研究范围与限制</h4><p className="mt-2 text-xs text-quiet">{limitations.length ? "限制与恢复建议已在“下一步建议”展开。" : "请在本次冻结样本、引用与审计范围内理解结论。"}</p></section>
-        <section className="border-t border-line pt-4"><h4 className="font-semibold">引用依据</h4><div className="mt-2 flex flex-wrap gap-2">{citations.filter((citation) => !attachedCitationIds.has(stringField(citation, "citation_group_id"))).map((citation, index) => citationButton(citation, index, "standalone"))}{remainingCitations > 0 && <button type="button" onClick={() => void loadMoreCitations()} disabled={loadingMore} className="rounded-lg border border-line bg-white px-2.5 py-1 text-xs hover:bg-slate-50 disabled:opacity-40">{loadingMore ? "加载中" : `加载其余 ${remainingCitations} 组引用`}</button>}{citations.length === 0 && <span className="text-xs text-quiet">本报告没有可展示的引用依据。</span>}</div></section>
+  const card = (item: Record<string, unknown>, index: number, observation: boolean) => (
+    <details
+      key={`${observation ? "observation" : "finding"}-${index}`}
+      aria-label={observation ? "样本观察卡" : "核心发现卡"}
+      className="rounded-xl border border-line bg-white px-3 py-3"
+    >
+      <summary className="cursor-pointer font-medium">
+        {stringField(item, "statement", observation ? "已验证样本观察" : "已验证发现")}
+      </summary>
+      <dl className="mt-3 grid gap-2 text-xs text-quiet">
+        {stringField(item, "direction") && <div><dt className="font-medium text-ink">方向</dt><dd>{stringField(item, "direction")}</dd></div>}
+        {stringField(item, "sample_summary") && <div><dt className="font-medium text-ink">样本范围</dt><dd>{stringField(item, "sample_summary")}</dd></div>}
+        {stringField(item, "scope") && <div><dt className="font-medium text-ink">结论范围</dt><dd>{stringField(item, "scope")}</dd></div>}
+      </dl>
+      <div className="mt-3 flex flex-wrap gap-2">
+        {arrayField(item, "citation_group_ids").map((id, citationIndex) => {
+          const citation = citationsById.get(id);
+          return citation ? citationButton(citation, citationIndex) : null;
+        })}
       </div>
-      {selectedCitation && <aside className="border-t border-line bg-slate-50 px-5 py-4" aria-label="Content Research citation evidence"><div className="flex justify-between gap-3"><div><p className="font-semibold">引用 [{String(selectedCitation.display_index ?? "—")}]</p><p className="mt-2 text-xs leading-5 text-quiet">{firstString(objectField(selectedCitation, "preview_ref"), ["quote", "snippet"], "引用详情已冻结于此报告版本。")}</p></div><button type="button" onClick={() => setSelectedCitation(null)} aria-label="关闭引用依据">关闭</button></div>{Array.isArray(selectedCitation.evidence_refs) && selectedCitation.evidence_refs.length > 0 && <div className="mt-3 space-y-2 border-t border-line pt-3"><p className="text-xs font-semibold text-quiet">同组证据</p>{selectedCitation.evidence_refs.filter((ref): ref is Record<string, unknown> => Boolean(ref) && typeof ref === "object" && !Array.isArray(ref)).map((ref, index) => <div key={`${stringField(ref, "source_url")}-${index}`} className="rounded-lg bg-white px-3 py-2 text-xs text-quiet"><p>{firstString(ref, ["quote", "snippet", "title"], "已冻结证据")}</p><p className="mt-1">{[stringField(ref, "title"), stringField(ref, "source_type", stringField(ref, "source_kind")), stringField(ref, "captured_at"), stringField(ref, "field_path")].filter(Boolean).join(" · ") || "已冻结来源元数据"}</p>{stringField(ref, "source_url") && stringField(ref, "jump_state") !== "unavailable" ? <a className="mt-1 inline-flex underline" href={stringField(ref, "source_url")} target="_blank" rel="noopener noreferrer">打开原笔记</a> : <span className="mt-1 block">原笔记链接不可用</span>}</div>)}</div>}{!Array.isArray(selectedCitation.evidence_refs) || selectedCitation.evidence_refs.length === 0 ? <p className="mt-3 text-xs text-quiet">该冻结引用未提供可展示的证据明细。</p> : null}</aside>}
-    </article>
-  </div>;
-}
+    </details>
+  );
 
-interface TraceTimelineStep {
-  id: string;
-  number: number;
-  stage: string;
-  title: string;
-  durationText: string;
-  modelLabel: string;
-  tokenText: string;
-  actor: string;
-  output: string;
-  status: string;
-}
-
-function objectField(source: Record<string, unknown> | undefined | null, key: string): Record<string, unknown> {
-  const value = source?.[key];
-  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
-}
-
-function publishedReportTraceTimeline(report: ContentResearchPublishedReportResponse): TraceTimelineStep[] {
-  const trace = objectField(report as unknown as Record<string, unknown>, "trace");
-  const checkpointSummary = objectField(trace, "checkpoint_summary");
-  const stages = Array.isArray(checkpointSummary.stages) ? checkpointSummary.stages : [];
-  return stages.filter((stage): stage is Record<string, unknown> => Boolean(stage) && typeof stage === "object" && !Array.isArray(stage)).map((stage, index) => {
-    const duration = typeof stage.duration_ms === "number" ? `${(stage.duration_ms / 1000).toFixed(1)}s` : "耗时未知";
-    const stageName = stringField(stage, "stage_name", "执行阶段");
-    return {
-      id: `${stageName}-${stringField(stage, "input_fingerprint", String(index))}`,
-      number: index + 1,
-      stage: traceStepGroup(stageName),
-      title: traceStepTitle(stageName),
-      durationText: duration,
-      modelLabel: "仅展示安全 Trace 投影",
-      tokenText: "按需查看 usage",
-      actor: "内容调研",
-      output: `状态：${workflowStatusLabel(stringField(stage, "status", "unknown"))}\n重试：${String(stage.retry_count ?? 0)}\n输出引用：${Array.isArray(stage.output_refs) ? stage.output_refs.length : 0}`,
-      status: workflowStatusLabel(stringField(stage, "status", "unknown")),
-    };
-  });
-}
-
-function traceStepTitle(stepName: string) {
-  if (stepName === "presearch") return "识别调研主体与候选方向";
-  if (stepName === "brief_confirm") return "确认调研 Brief";
-  if (stepName === "plan_build") return "拆解调研计划";
-  if (stepName === "formal_research") return "并行执行专家调研";
-  if (["packet", "facts", "admission", "reconcile", "aggregate", "governance"].includes(stepName)) return "证据准入与跨方向治理";
-  if (["compose", "faithfulness"].includes(stepName)) return "报告生成与忠实度审计";
-  return stepName.replaceAll("_", " ");
-}
-
-function traceStepGroup(stepName: string) {
-  if (["presearch", "brief_confirm", "plan_build"].includes(stepName)) return "研究范围与计划";
-  if (stepName === "formal_research") return "来源收集与字段提取";
-  if (["packet", "facts", "admission", "reconcile", "aggregate", "governance"].includes(stepName)) return "证据准入与跨方向治理";
-  if (["compose", "faithfulness"].includes(stepName)) return "报告生成与忠实度审计";
-  return "安全执行阶段";
-}
-
-function ContentResearchTraceInspector({
-  run,
-  expanded,
-  onExpandedChange,
-  onRefresh,
-  onRetry,
-}: {
-  run: ContentResearchRunState;
-  expanded: boolean;
-  onExpandedChange: (expanded: boolean) => void;
-  onRefresh: () => void;
-  onRetry: () => void;
-}) {
-  const [qrLogin, setQrLogin] = useState<{ status: string; image?: string | null; attemptId?: string } | null>(null);
-  const trace = run.trace;
-  // A published report is the only U1 Trace source.  Live workflow progress
-  // remains in its workflow card; it must not expose legacy observation/runtime
-  // inputs as an audit trace before R4 has produced its safe projection.
-  const timeline = run.report ? publishedReportTraceTimeline(run.report) : [];
-  const reportFaithfulness = run.report ? objectField(objectField(run.report as unknown as Record<string, unknown>, "trace"), "faithfulness") : {};
-  const reportUsage = objectField(reportFaithfulness, "usage");
-  const reportTokenText = typeof reportUsage.total_tokens === "number" ? reportUsage.total_tokens.toLocaleString("en-US") : "未记录";
-  const reportCostUnknown = reportUsage.cost_unknown === true;
-  const reportCostText = reportCostUnknown
-    ? "成本未知"
-    : typeof reportUsage.cost_usd === "number"
-      ? `$${reportUsage.cost_usd}`
-      : "未记录";
-  const displayTimeline = [...timeline].reverse();
-  const providerFailure = [...(trace?.provider_operations ?? [])]
-    .reverse()
-    .find((operation) => operation.status !== "completed" && operation.status !== "running");
-  const loginRequired = providerFailure?.failure_code === "auth_required" || providerFailure?.failure_reason === "auth_required";
-  useEffect(() => {
-    if (!loginRequired || qrLogin !== null) return;
-    void getCurrentXHSQRLogin()
-      .then((value) => setQrLogin({ status: value.status, image: value.qr_image_data_url, attemptId: value.attempt_id }))
-      .catch(() => undefined);
-  }, [loginRequired, qrLogin]);
-  useEffect(() => {
-    if (qrLogin?.status !== "pending") return;
-    const refreshLoginStatus = () => void getCurrentXHSQRLogin()
-      .then((value) => setQrLogin({ status: value.status, image: value.qr_image_data_url, attemptId: value.attempt_id }))
-      .catch(() => undefined);
-    refreshLoginStatus();
-    const timer = window.setInterval(refreshLoginStatus, 1500);
-    return () => window.clearInterval(timer);
-  }, [qrLogin?.status]);
-  const [expandedStepId, setExpandedStepId] = useState<string | null>(null);
-  const selectedStep = timeline.find((step) => step.id === expandedStepId) ?? timeline[timeline.length - 1] ?? null;
-  useEffect(() => {
-    if (!expanded) return;
-    const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onExpandedChange(false);
-    };
-    window.addEventListener("keydown", closeOnEscape);
-    return () => window.removeEventListener("keydown", closeOnEscape);
-  }, [expanded, onExpandedChange]);
-  const statusText = run.formalResearchStatus === "collecting"
-    ? "专家调研中"
-    : run.formalResearchStatus === "invalid"
-      ? "所属对话已不存在"
-    : run.formalResearchStatus === "failed"
-      ? "部分专家需重试"
-      : trace?.run_status === "succeeded"
-        ? "专家调研已完成"
-        : "等待启动";
-  if (!expanded) {
-    return (
-      <section
-        className="rounded-xl border border-line bg-white p-4 text-ink"
-        aria-label="Content Research Trace inspector"
-      >
-        <div className="flex items-start justify-between gap-3">
-          <button
-            type="button"
-            onClick={() => onExpandedChange(true)}
-            className="min-w-0 flex-1 text-left"
-            aria-label="展开 Content Research Trace"
-          >
-            <p className="text-sm font-semibold">证据与 Trace</p>
-            <p className="mt-1 text-xs text-quiet">
-              {timeline.length} 条审计记录 · {providerFailure ? "发现可诊断的采集异常" : statusText}
-            </p>
-          </button>
-          <button
-            type="button"
-            onClick={() => onExpandedChange(true)}
-            className="rounded-lg border border-line px-2 py-1 text-xs hover:bg-slate-50"
-            aria-label="查看 Trace"
-          >
-            查看 Trace
-          </button>
-        </div>
-      </section>
-    );
-  }
+  const refs = selectedCitation ? recordList(selectedCitation.evidence_refs) : [];
 
   return (
-    <section
-      className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/30 p-6"
-      aria-label="Content Research Trace"
-      onClick={(event) => {
-        if (event.target === event.currentTarget) onExpandedChange(false);
-      }}
-    >
-      <div
-        className="flex max-h-[min(760px,calc(100vh-48px))] w-full max-w-xl flex-col overflow-hidden rounded-2xl border border-line bg-white text-ink shadow-[0_24px_72px_rgba(15,23,42,0.20)]"
-        role="dialog"
-        aria-modal="true"
-        aria-label="Agent 决策日志 · Trace"
-        onClick={(event) => event.stopPropagation()}
+    <div className="flex justify-start" data-report-publication-id={stringField(report.publication, "report_publication_id")}>
+      <article
+        className="w-full max-w-[92%] overflow-hidden rounded-2xl border border-line bg-white text-sm text-ink shadow-sm"
+        aria-label="Content Research published report"
       >
-        <div className="flex items-center justify-between gap-3 bg-[#486b5b] px-4 py-3 text-white">
-          <div className="min-w-0 flex items-center gap-2">
-            <span className="text-lg leading-none">⌁</span>
-            <div className="min-w-0">
-              <p className="truncate text-base font-semibold">查看调研过程</p>
-              <p className="mt-0.5 truncate text-[11px] text-white/70">「{contentResearchSubject(run)}」</p>
-              <p className="mt-0.5 truncate text-[11px] text-white/70">workflow_run · {run.workflowRunId}</p>
+        <header className="border-b border-line bg-[#fbfcfb] px-5 py-4" aria-label="Content Research report header">
+          <p className="text-[10px] font-semibold tracking-wider text-[#4f6f5f]">研究结论</p>
+          <div className="mt-1 flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <h3 className="text-lg font-semibold leading-7">
+                {report.subject || "本轮调研"} · {evidenceOnly ? "已保存依据" : "调研结果"}
+              </h3>
+              <p className="mt-1 text-xs text-quiet">{liteCollectedDate(report.collected_at)}</p>
             </div>
+            <span className="rounded-full bg-[#fff4df] px-2.5 py-1 text-xs font-medium text-[#a16207]">
+              {reportStateLabel(publicationState)}
+            </span>
           </div>
-          <div className="flex shrink-0 items-center gap-2">
-            <button
-              type="button"
-              onClick={() => onRefresh()}
-              className="rounded-full bg-white/12 px-2.5 py-1 text-xs font-medium text-white hover:bg-white/20"
-            >
-              刷新
-            </button>
-            <button
-              type="button"
-              onClick={() => onExpandedChange(false)}
-              className="flex h-7 w-7 items-center justify-center rounded-lg bg-white/12 text-lg leading-none text-white hover:bg-white/20"
-              aria-label="关闭 Trace 对话框"
-            >
-              ×
-            </button>
-          </div>
-        </div>
+        </header>
 
-      <div className="border-b border-line px-4 py-3 text-xs text-quiet">
-        <span className="truncate">当前进度：{statusText}</span>
-        {run.report && <div className="mt-3 grid grid-cols-3 gap-2" aria-label="安全 Trace 指标">
-          <div className="rounded-lg border border-line bg-white px-2 py-2 text-center"><strong className="block text-sm text-ink">{reportTokenText}</strong><span>累计 tokens</span></div>
-          <div className="rounded-lg border border-line bg-white px-2 py-2 text-center"><strong className="block text-sm text-ink">未公开</strong><span>LLM 调用</span></div>
-          <div className="rounded-lg border border-line bg-white px-2 py-2 text-center"><strong className="block text-sm text-ink">{reportCostText}</strong><span>成本</span></div>
-        </div>}
-      </div>
+        <div className="space-y-5 px-5 py-5">
+          <p className="rounded-xl bg-slate-50 px-3 py-2 text-xs text-quiet">{statusText}</p>
 
-      <div className="min-h-0 flex-1 overflow-y-auto px-3 py-3">
-        {providerFailure && (
-          <article className="mb-3 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-ink" aria-label="采集异常诊断">
-            <p className="font-semibold">采集异常诊断</p>
-            <p className="mt-1 text-xs text-quiet">
-              {providerFailure.operation ?? "provider"} · {providerFailure.failure_code ?? providerFailure.status}
+          {(partial || evidenceOnly) && stringField(report.publication, "publication_reason") && (
+            <p className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900">
+              {stringField(report.publication, "publication_reason")}
             </p>
-            <p className="mt-2 text-xs leading-5 text-ink">
-              {providerFailure.recovery_action ?? "该外部调用未产生可安全重放的结果，请先确认外部状态。"}
-            </p>
-            {loginRequired && <div className="mt-3"><button type="button" onClick={() => void startXHSQRLogin().then((value) => setQrLogin({ status: value.status, image: value.qr_image_data_url, attemptId: value.attempt_id }))} className="rounded-lg bg-[#486b5b] px-3 py-1.5 text-xs font-medium text-white">扫码登录小红书</button>{qrLogin?.image && qrLogin.status === "pending" && <><img src={qrLogin.image} alt="小红书登录二维码" className="mt-3 h-40 w-40 rounded bg-white p-2" /><p className="mt-2 text-xs text-quiet">请在小红书 App 扫码并确认。</p></>}{qrLogin?.status === "authenticated" && <button type="button" onClick={onRetry} className="mt-3 block rounded-lg border border-[#486b5b] px-3 py-1.5 text-xs font-medium text-[#486b5b]">登录成功，重试本轮调研</button>}</div>}
-          </article>
-        )}
-        {displayTimeline.length ? (
-          <div className="space-y-3">
-            {displayTimeline.map((step) => {
-              const isExpanded = selectedStep?.id === step.id;
-              return (
-                <article
-                  key={step.id}
-                  className={[
-                    "rounded-2xl border bg-white px-3 py-3 text-sm shadow-sm transition",
-                    isExpanded ? "border-[#9fb8aa] ring-2 ring-[#e4eee8]" : "border-line hover:border-[#c7d5cc]",
-                  ].join(" ")}
-                >
-                  <button
-                    type="button"
-                    onClick={() => setExpandedStepId(isExpanded ? null : step.id)}
-                    className="w-full text-left"
-                  >
-                    <div className="flex items-start justify-between gap-3">
-                      <div className="flex min-w-0 gap-2.5">
-                        <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-[#e8f1ea] text-xs font-semibold text-[#4f6f5f]">
-                          {step.number}
-                        </span>
-                        <div className="min-w-0">
-                          <div className="min-w-0">
-                            <span className="block text-xs text-quiet">{step.stage}</span>
-                            <span className="mt-0.5 block font-semibold leading-5 text-ink">{step.title}</span>
-                          </div>
-                          <div className="mt-2 flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-1 text-xs text-quiet">
-                            <span>{step.actor}</span>
-                            <span>·</span>
-                            <span>{step.status}</span>
-                          </div>
-                        </div>
-                      </div>
-                      <div className="flex shrink-0 flex-col items-end gap-1 text-sm text-quiet">
-                        <span>{step.durationText}</span>
-                        <span className="text-lg leading-none">{isExpanded ? "⌃" : "⌄"}</span>
-                      </div>
-                    </div>
-                  </button>
-
-                  {isExpanded && <div className="mt-4 border-t border-line pt-4"><p className="text-xs font-semibold tracking-wide text-quiet">安全审计投影</p><pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap rounded-xl bg-slate-50 px-3 py-3 text-xs leading-5 text-ink">{step.output || "暂无可展示信息。"}</pre></div>}
-                </article>
-              );
-            })}
-          </div>
-        ) : (
-          <div className="rounded-2xl border border-line bg-slate-50 px-4 py-5 text-sm text-quiet">
-            暂无 trace 记录。确认 brief 后会自动写入执行轨迹。
-          </div>
-        )}
-
-        <div className="mt-4 flex justify-end gap-2">
-          {run.formalResearchStatus === "failed" && (
-            <button
-              type="button"
-              onClick={onRetry}
-              className="rounded-lg bg-ink px-3 py-1.5 text-xs font-medium text-white hover:bg-slate-800"
-            >
-              重试失败专家
-            </button>
           )}
+
+          {findings.length > 0 && (
+            <section aria-label="核心发现" className="border-t border-line pt-4">
+              <h4 className="font-semibold">核心发现</h4>
+              <div className="mt-3 space-y-2">{findings.map((item, index) => card(item, index, false))}</div>
+            </section>
+          )}
+
+          {observations.length > 0 && (
+            <section aria-label="样本观察" className="border-t border-line pt-4">
+              <h4 className="font-semibold">样本观察</h4>
+              <div className="mt-3 space-y-2">{observations.map((item, index) => card(item, index, true))}</div>
+            </section>
+          )}
+
+          {leads.length > 0 && (
+            <section aria-label="线索" className="border-t border-line pt-4">
+              <h4 className="font-semibold">线索</h4>
+              {leads.map((item, index) => (
+                <details
+                  key={`lead-${index}`}
+                  className="mt-2 border-l-4 border-slate-300 bg-slate-50 px-3 py-2 text-xs leading-5 text-quiet"
+                >
+                  <summary className="cursor-pointer">{stringField(item, "statement", "证据尚不足以构成发现。")}</summary>
+                  {stringField(item, "direction") && <p className="mt-2">方向：{stringField(item, "direction")}</p>}
+                  {stringField(item, "sample_summary") && <p className="mt-1">样本范围：{stringField(item, "sample_summary")}</p>}
+                  <p className="mt-1">{stringField(item, "qualification_reason", "证据范围或样本门槛尚不足。")}</p>
+                  <p className="mt-1 font-medium text-ink">仅供参考，不构成结论。</p>
+                  <div className="mt-2 flex flex-wrap gap-2">
+                    {arrayField(item, "citation_group_ids").map((id, citationIndex) => {
+                      const citation = citationsById.get(id);
+                      return citation ? citationButton(citation, citationIndex) : null;
+                    })}
+                  </div>
+                </details>
+              ))}
+            </section>
+          )}
+
+          {directionStates.length > 0 && (
+            <section aria-label="方向状态" className="border-t border-line pt-4">
+              <h4 className="font-semibold">方向状态</h4>
+              <div className="mt-2 space-y-2">
+                {directionStates.map((item, index) => (
+                  <div key={`${stringField(item, "direction")}-${index}`} className="rounded-lg bg-slate-50 px-3 py-2 text-xs text-quiet">
+                    <p className="font-medium text-ink">{liteDirectionLabel(stringField(item, "direction", "未知方向"))} · {stringField(item, "state", "unavailable")}</p>
+                    {stringField(item, "reason_code") && <p className="mt-1">{stringField(item, "reason_code")}</p>}
+                    {stringField(item, "recovery_action") && <p className="mt-1">{stringField(item, "recovery_action")}</p>}
+                  </div>
+                ))}
+              </div>
+            </section>
+          )}
+
+          {!evidenceOnly && (
+            <section aria-label="研究限制" className="border-t border-line pt-4">
+              <h4 className="font-semibold">研究限制</h4>
+              <div className="mt-2 space-y-2 text-xs text-quiet">
+                {limitations.length
+                  ? limitations.map((item, index) => <p key={`limitation-${index}`}>{firstString(item, ["message", "reason", "summary"])}</p>)
+                  : <p>请在本次冻结样本与引用范围内理解结果。</p>}
+              </div>
+            </section>
+          )}
+
+          <section aria-label="证据与来源" className="border-t border-line pt-4">
+            <h4 className="font-semibold">{evidenceOnly ? "已保存依据" : "证据与来源"}</h4>
+            <div className="mt-2 flex flex-wrap gap-2">
+              {citations.map(citationButton)}
+              {citations.length === 0 && <span className="text-xs text-quiet">没有可展示的冻结引用。</span>}
+            </div>
+          </section>
         </div>
-      </div>
-      </div>
-    </section>
+
+        {selectedCitation && (
+          <aside className="border-t border-line bg-slate-50 px-5 py-4" aria-label="Content Research citation evidence">
+            <div className="flex justify-between gap-3">
+              <p className="font-semibold">引用 [{String(selectedCitation.display_index ?? "—")}]</p>
+              <button type="button" onClick={() => setSelectedCitation(null)} aria-label="关闭引用依据">关闭</button>
+            </div>
+            {refs.length > 0 ? (
+              <div className="mt-3 space-y-2 border-t border-line pt-3">
+                <p className="text-xs font-semibold text-quiet">同组证据</p>
+                {refs.map((ref, index) => {
+                  const navigationState = stringField(ref, "navigation_state", "missing_source_url");
+                  const sourceUrl = stringField(ref, "source_url");
+                  return (
+                    <div key={`${stringField(ref, "source_text_hash")}-${index}`} className="rounded-lg bg-white px-3 py-2 text-xs text-quiet">
+                      <p>{stringField(ref, "quote", "已冻结证据")}</p>
+                      <div className="mt-1 flex flex-wrap gap-x-2">
+                        <span>{stringField(ref, "field_path", "字段未公开")}</span>
+                        <span>{stringField(ref, "source_collected_at", "采集时间未公开")}</span>
+                      </div>
+                      {sourceUrl && navigationState === "available" && (
+                        <a className="mt-1 inline-flex underline" href={sourceUrl} target="_blank" rel="noopener noreferrer">打开原笔记</a>
+                      )}
+                      {navigationState === "missing_source_url" && (
+                        <p className="mt-1">未保存来源链接；可查看原文片段与采集时间</p>
+                      )}
+                      {navigationState === "navigation_unavailable" && (
+                        <p className="mt-1">来源链接当前不可打开；可查看原文片段与采集时间</p>
+                      )}
+                      {stringField(ref, "navigation_reason") && <p className="mt-1">{stringField(ref, "navigation_reason")}</p>}
+                    </div>
+                  );
+                })}
+              </div>
+            ) : (
+              <p className="mt-3 text-xs text-quiet">该冻结引用未提供可展示的证据明细。</p>
+            )}
+          </aside>
+        )}
+      </article>
+    </div>
   );
 }
 
@@ -1279,7 +1126,11 @@ interface ContentResearchContextStage {
 }
 
 function contentResearchContextStatus(run: ContentResearchRunState): string {
-  if (run.report) return reportStateLabel(run.report.publication_state);
+  if (run.report) {
+    const state = litePublicationState(run.report);
+    if (state) return reportStateLabel(state);
+    if (run.report.recovery_projection) return "调研可继续";
+  }
   if (run.formalResearchStatus === "invalid") return "所属对话已不存在";
   if (run.formalResearchStatus === "failed") return "专家调研启动失败";
   if (run.formalResearchStatus === "collecting") return "专家调研进行中";
@@ -1287,53 +1138,47 @@ function contentResearchContextStatus(run: ContentResearchRunState): string {
   return "等待启动";
 }
 
-function contentResearchContextStages(report: ContentResearchPublishedReportResponse): ContentResearchContextStage[] {
-  const tensions = report.cross_direction_records.length;
+function contentResearchContextStages(report: ContentResearchLiteReportResponse): ContentResearchContextStage[] {
+  const state = litePublicationState(report);
+  if (!state) return [];
   return [
     {
       id: "scope",
       title: "范围与检索冻结",
-      detail: `${report.citation_total} 条冻结引用可追溯。`,
+      detail: `${report.citations.length} 条冻结引用可追溯。`,
       tone: "complete",
     },
     {
       id: "governance",
       title: "证据准入与归纳",
-      detail: `${report.claim_cards.length} 条受治理结论已进入报告。`,
+      detail: `${numberField(report.status_strip, "admitted_finding_count")} 条已准入发现已进入报告。`,
       tone: "complete",
     },
     {
       id: "publication",
       title: "报告发布与范围",
-      detail: tensions > 0
-        ? `${tensions} 组跨方向证据张力已保留，等待补采或治理。`
-        : `${reportStateLabel(report.publication_state)}；请结合报告中的范围与限制使用。`,
-      tone: tensions > 0 || report.publication_state !== "complete_verified_report" ? "warning" : "complete",
+      detail: `${reportStateLabel(state)}；请结合报告中的范围与限制使用。`,
+      tone: state !== "complete_verified_report" ? "warning" : "complete",
     },
   ];
 }
 
 function ContentResearchContextSidebar({
   run,
-  expanded,
-  onExpandedChange,
-  onRefresh,
-  onRetry,
   onModifyDirections,
 }: {
   run: ContentResearchRunState;
-  expanded: boolean;
-  onExpandedChange: (expanded: boolean) => void;
-  onRefresh: () => void;
-  onRetry: () => void;
   onModifyDirections: () => void;
 }) {
   const report = run.report;
-  const stages = report ? contentResearchContextStages(report) : [];
+  const published = report ? litePublicationState(report) !== null : false;
+  const evidenceOnly = report ? litePublicationState(report) === "evidence_only_report" : false;
+  const stages = report && !evidenceOnly ? contentResearchContextStages(report) : [];
+  const requestedDirectionCount = report ? selectRequestedDirectionStates(report).length : 0;
 
   return (
     <aside className="hidden w-[300px] shrink-0 overflow-y-auto border-l border-line bg-slate-50 p-4 lg:block" aria-label="内容调研上下文">
-      <h2 className="mb-3 text-sm font-semibold text-ink">研究运行 / Trace</h2>
+      <h2 className="mb-3 text-sm font-semibold text-ink">研究运行</h2>
       <section className="mb-4 rounded-xl border border-line bg-white p-4" aria-label="内容调研运行摘要">
         <p className="text-sm font-semibold text-ink">{contentResearchContextStatus(run)}</p>
         <p className="mt-1 text-xs leading-5 text-quiet">主体：{contentResearchSubject(run)}</p>
@@ -1346,23 +1191,25 @@ function ContentResearchContextSidebar({
             <div><p className="font-medium text-ink">{stage.title}</p><p className="mt-0.5 leading-5 text-quiet">{stage.detail}</p></div>
           </div>)}
         </div>}
-        {!report && <p className="mt-3 border-t border-line pt-3 text-xs leading-5 text-quiet">研究摘要将在正式报告发布后显示。</p>}
-        {run.formalResearchStatus === "invalid" ? <p className="mt-3 text-xs leading-5 text-quiet">该历史任务不能重试。请新建或选择有效对话后重新发起调研。</p> : null}
-        {run.formalResearchStatus === "failed" && <div className="mt-3 flex flex-wrap gap-2"><button type="button" onClick={onRetry} className="rounded-lg bg-ink px-3 py-1.5 text-xs font-medium text-white">重试</button><button type="button" onClick={onModifyDirections} className="rounded-lg border border-line px-3 py-1.5 text-xs">返回 checklist</button></div>}
-        <button type="button" onClick={() => onExpandedChange(true)} className="mt-3 w-full border-t border-line pt-3 text-left text-xs font-semibold text-blue-600 hover:text-blue-700" aria-label="查看完整 workflow trace">查看完整 workflow trace →</button>
+        {!published && <p className="mt-3 border-t border-line pt-3 text-xs leading-5 text-quiet">研究摘要将在正式报告发布后显示。</p>}
+        {run.formalResearchStatus === "invalid" ? <p className="mt-3 text-xs leading-5 text-quiet">该历史任务不能继续。请新建或选择有效对话后重新发起调研。</p> : null}
+        {run.formalResearchStatus === "failed" && <button type="button" onClick={onModifyDirections} className="mt-3 rounded-lg border border-line px-3 py-1.5 text-xs">返回 checklist</button>}
+        {run.reportStatus === "failed" && run.reportError && (
+          <p className="mt-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs leading-5 text-red-700">
+            正式报告暂不可读取：{run.reportError}
+          </p>
+        )}
       </section>
 
       <h2 className="mb-3 text-sm font-semibold text-ink">本次研究摘要</h2>
       <section className="mb-4 rounded-xl border border-line bg-white p-4" aria-label="内容调研研究摘要">
-        {report ? <ul className="space-y-2 text-xs leading-5 text-quiet">
-          <li>{report.citation_total} 条冻结引用</li>
-          <li>{report.claim_cards.length} 条受治理结论</li>
-          <li>{report.cross_direction_records.length} 组跨方向证据张力</li>
-          <li>{report.weak_signals.length} 条初步信号</li>
+        {report && published ? <ul className="space-y-2 text-xs leading-5 text-quiet">
+          <li>{evidenceOnly ? numberField(report.status_strip, "saved_evidence_count") : report.citations.length} 条冻结引用</li>
+          {!evidenceOnly && <li>{numberField(report.status_strip, "admitted_finding_count")} 条已准入发现</li>}
+          {!evidenceOnly && <li>{requestedDirectionCount} 个请求方向状态</li>}
+          {!evidenceOnly && <li>{numberField(report.status_strip, "lead_count")} 条初步信号</li>}
         </ul> : <p className="text-xs leading-5 text-quiet">暂无已发布报告；此处不会显示未冻结的来源、结论或指标。</p>}
       </section>
-
-      <ContentResearchTraceInspector run={run} expanded={expanded} onExpandedChange={onExpandedChange} onRefresh={onRefresh} onRetry={onRetry} />
     </aside>
   );
 }
@@ -1376,7 +1223,6 @@ export default function CreatorPage() {
   const [contentResearchMode, setContentResearchMode] = useState(false);
   const [contentResearchIntent, setContentResearchIntent] = useState<ContentResearchIntentState | null>(null);
   const [contentResearchRun, setContentResearchRun] = useState<ContentResearchRunState | null>(null);
-  const [traceExpanded, setTraceExpanded] = useState(false);
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
   const [editingText, setEditingText] = useState("");
   const [activeMenuId, setActiveMenuId] = useState<string | null>(null);
@@ -1422,15 +1268,22 @@ export default function CreatorPage() {
     async function loadInitialThread() {
       const workflowRunId = new URLSearchParams(window.location.search).get("contentResearchRunId")?.trim() || null;
       let restoredThreadId: string | null = null;
+      let workflowRestoreError: string | null = null;
       if (workflowRunId) {
         try {
-          const { workflow } = await restoreContentResearchWorkflow(workflowRunId);
+          const workflow = await getContentResearchWorkflow(workflowRunId);
           if (cancelled) return;
           restoredThreadId = workflow.brief.thread_id;
           saveContentResearchRunForThread(restoredThreadId, workflowRunId);
-        } catch {
-          // A broken direct link must not reuse an unrelated thread's run.
-          restoredThreadId = "__content_research_run_not_found__";
+        } catch (error) {
+          if (isExpectedLiteReportAbsence(error)) {
+            // A broken direct link must not reuse an unrelated thread's run.
+            restoredThreadId = "__content_research_run_not_found__";
+          } else {
+            workflowRestoreError = error instanceof Error ? error.message : "运行读取失败";
+            restoredThreadId = contentResearchThreadForRun(workflowRunId)
+              ?? "__content_research_run_restore_failed__";
+          }
         }
       }
 
@@ -1448,7 +1301,9 @@ export default function CreatorPage() {
             setActiveThreadId(null);
             setMessages([
               WELCOME_MESSAGE,
-              { id: "content-research-run-thread-unavailable", role: "system", text: "该内容调研所属对话不可访问，未切换到其他对话。" },
+              workflowRestoreError
+                ? { id: "content-research-run-restore-failed", role: "system", text: `内容调研运行暂不可读取：${workflowRestoreError}` }
+                : { id: "content-research-run-thread-unavailable", role: "system", text: "该内容调研所属对话不可访问，未切换到其他对话。" },
             ]);
           }
           return;
@@ -1524,7 +1379,7 @@ export default function CreatorPage() {
             });
           })
           .catch(() => {
-            appendMessage({ role: "assistant", text: "任务完成，但读取结果失败，请刷新页面重试。" });
+            appendMessage({ role: "assistant", text: "任务完成，但读取结果失败，请刷新页面后继续查看。" });
           });
       },
       onFailed: () => {
@@ -1554,11 +1409,15 @@ export default function CreatorPage() {
     setMessages((current) => [...current, { ...message, id: createId("msg") }]);
   }
 
-  function appendPublishedReportMessage(report: ContentResearchPublishedReportResponse) {
-    const artifactId = stringField(report.artifact, "artifact_id", stringField(report.publication, "report_publication_id"));
-    setMessages((current) => current.some((message) => message.report && stringField(message.report.artifact, "artifact_id") === artifactId)
-      ? current
-      : [...current, { id: `report-${artifactId}`, role: "assistant", text: "", messageType: "artifact_result", report }]);
+  function appendLiteReportMessage(report: ContentResearchLiteReportResponse) {
+    const reportId = report.workflow_run_id;
+    setMessages((current) => {
+      const existing = current.findIndex((message) => message.report?.workflow_run_id === reportId);
+      if (existing < 0) {
+        return [...current, { id: `report-${reportId}`, role: "assistant", text: "", messageType: "artifact_result", report }];
+      }
+      return current.map((message, index) => index === existing ? { ...message, report } : message);
+    });
   }
 
   function applySnapshot(snapshot: WorkflowRunSnapshot | null | undefined, threadId: string) {
@@ -1582,35 +1441,21 @@ export default function CreatorPage() {
     setMessages([WELCOME_MESSAGE]);
     setContentResearchIntent(null);
     setContentResearchRun(null);
-    setTraceExpanded(false);
     setTask(null);
     setStatusLog([]);
     setGeneratedResult(null);
     setIsAccepted(false);
   }
 
-  async function refreshContentResearchTrace(workflowRunId: string) {
-    const trace = await getContentResearchTrace(workflowRunId);
-    setContentResearchRun((current) =>
-      current && current.workflowRunId === workflowRunId
-        ? {
-            ...current,
-            trace,
-          }
-        : current
-    );
-    return trace;
-  }
-
-  async function refreshContentResearchReport(workflowRunId: string): Promise<ContentResearchPublishedReportResponse | null> {
+  async function refreshContentResearchReport(workflowRunId: string): Promise<ContentResearchLiteReportResponse | null> {
     setContentResearchRun((current) =>
       current && current.workflowRunId === workflowRunId
         ? { ...current, reportStatus: "loading", reportError: null }
         : current
     );
     try {
-      const report = await getContentResearchPublishedReport(workflowRunId);
-      appendPublishedReportMessage(report);
+      const report = await getContentResearchLiteReport(workflowRunId);
+      appendLiteReportMessage(report);
       setContentResearchRun((current) =>
         current && current.workflowRunId === workflowRunId
           ? {
@@ -1623,7 +1468,7 @@ export default function CreatorPage() {
       );
       return report;
     } catch (error) {
-      const unavailable = error instanceof Error && /not found|404/i.test(error.message);
+      const unavailable = isExpectedLiteReportAbsence(error);
       setContentResearchRun((current) =>
         current && current.workflowRunId === workflowRunId
           ? {
@@ -1633,19 +1478,38 @@ export default function CreatorPage() {
             }
           : current
       );
-      return null;
+      if (unavailable) return null;
+      throw error;
     }
   }
 
+  async function pollContentResearchReport(
+    workflowRunId: string,
+    { requirePublication = false }: { requirePublication?: boolean } = {}
+  ): Promise<ContentResearchLiteReportResponse | null> {
+    for (let attempt = 0; attempt < 120; attempt += 1) {
+      const report = await refreshContentResearchReport(workflowRunId);
+      if (
+        report
+        && (
+          litePublicationState(report)
+          || (!requirePublication && report.publication.state === null && report.recovery_projection)
+        )
+      ) {
+        return report;
+      }
+      await new Promise<void>((resolve) => window.setTimeout(resolve, 1000));
+    }
+    return null;
+  }
 
-  async function startContentResearchForRun(workflowRunId: string, retry = false) {
+  async function startContentResearchForRun(workflowRunId: string) {
     setContentResearchRun((current) =>
       current && current.workflowRunId === workflowRunId ? { ...current, formalResearchStatus: "collecting" } : current
     );
     let formalResearch: ContentResearchFormalResearchResponse | null = null;
     try {
-      const dispatch = retry ? retryContentResearchFormalResearch : startContentResearchFormalResearch;
-      formalResearch = await dispatch(workflowRunId, {
+      formalResearch = await startContentResearchFormalResearch(workflowRunId, {
         source_kind: "search_result",
         sort: "likes",
         provider: "xiaohongshu",
@@ -1663,11 +1527,6 @@ export default function CreatorPage() {
           current && current.workflowRunId === workflowRunId ? { ...current, formalResearchStatus: failure.status } : current
         );
         appendMessage({ role: "system", text: failure.message });
-        try {
-          await refreshContentResearchTrace(workflowRunId);
-        } catch {
-          // Keep the retry affordance visible even if trace refresh fails.
-        }
         return;
       }
     }
@@ -1683,25 +1542,8 @@ export default function CreatorPage() {
       );
     }
     try {
-      let trace = await refreshContentResearchTrace(workflowRunId);
-      const terminalRunStatuses = ["succeeded", "partial", "completed", "failed", "cancelled"];
-      // Formal research is durably dispatched. Keep the public Creator view in
-      // sync with that background work instead of taking one immediate trace
-      // snapshot and leaving a completed report invisible until a manual refresh.
-      for (let attempt = 0; !terminalRunStatuses.includes(trace.run_status ?? "") && attempt < 90; attempt += 1) {
-        await new Promise<void>((resolve) => window.setTimeout(resolve, 1000));
-        trace = await refreshContentResearchTrace(workflowRunId);
-      }
-      if (["succeeded", "partial", "completed"].includes(trace.run_status ?? "")) {
-        // The worker terminalizes its workflow before the report-publication
-        // transaction is necessarily observable to a separate read
-        // connection. Retry that read briefly rather than requiring a manual
-        // refresh after a valid completed run.
-        let report: ContentResearchPublishedReportResponse | null = null;
-        for (let attempt = 0; report === null && attempt < 10; attempt += 1) {
-          report = await refreshContentResearchReport(workflowRunId);
-          if (report === null) await new Promise<void>((resolve) => window.setTimeout(resolve, 1000));
-        }
+      const projection = await pollContentResearchReport(workflowRunId);
+      if (projection && litePublicationState(projection)) {
         setContentResearchRun((current) =>
           current && current.workflowRunId === workflowRunId
             ? { ...current, formalResearchStatus: "completed" }
@@ -1709,18 +1551,37 @@ export default function CreatorPage() {
         );
       }
       if (formalResearch?.status === "failed") {
-        setStatusLog((log) => [...log, `${formalResearch.failed_tasks.length} 个专家任务未完成，可在调研过程卡片中重试。`].slice(-6));
+        setStatusLog((log) => [...log, `${formalResearch.failed_tasks.length} 个专家任务未完成。`].slice(-6));
       } else if (formalResearch) {
-        setStatusLog((log) => [...log, retry ? "失败专家已重试，调研过程已更新。" : `已完成 ${formalResearch.task_count} 个专家的独立采集与分析。`].slice(-6));
+        setStatusLog((log) => [...log, `已提交 ${formalResearch.task_count} 个专家的独立采集与分析。`].slice(-6));
       }
-    } catch {
-      // Dispatch already succeeded. A transient Trace/report read must not be
-      // misreported as a source, auth, or start failure; reload can restore the
-      // persisted run and this state remains visibly in progress.
+    } catch (error) {
       appendMessage({
         role: "system",
-        text: "调研已启动，但运行状态暂时读取失败。请稍后刷新本对话查看进度；无需重复发起调研。",
+        text: `调研已启动，但正式报告读取失败：${error instanceof Error ? error.message : "未知错误"}`,
       });
+    }
+  }
+
+  async function resumeContentResearchForRun(workflowRunId: string) {
+    setContentResearchRun((current) =>
+      current && current.workflowRunId === workflowRunId
+        ? { ...current, formalResearchStatus: "collecting", reportError: null }
+        : current
+    );
+    try {
+      await resumeContentResearchFormalResearch(workflowRunId);
+      const report = await pollContentResearchReport(workflowRunId, { requirePublication: true });
+      if (report && litePublicationState(report)) {
+        setContentResearchRun((current) =>
+          current && current.workflowRunId === workflowRunId
+            ? { ...current, formalResearchStatus: "completed" }
+            : current
+        );
+      }
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : "未知错误";
+      appendMessage({ role: "system", text: `继续调研失败：${detail}` });
     }
   }
 
@@ -1746,7 +1607,6 @@ export default function CreatorPage() {
       const presearch = await createContentResearchPresearch({ seed_text: subject, user_note: null, thread_id: activeThreadId });
       setContentResearchIntent({ seed: subject, presearch: { ...presearch, competitor_tags: [...new Set([...presearch.competitor_tags, ...competitors])], research_directions: directions.length ? directions : presearch.research_directions } });
       setContentResearchRun(null);
-      setTraceExpanded(false);
       appendMessage({ role: "assistant", text: "已新建一轮调研 checklist，可以修改主体、竞品或调研方向后重新确认。" });
     } catch {
       appendMessage({ role: "system", text: "回到 checklist 失败，请稍后重试。" });
@@ -1761,7 +1621,6 @@ export default function CreatorPage() {
       removeContentResearchRunForThread(run.summary.brief.thread_id);
       setContentResearchRun(null);
       setContentResearchIntent(null);
-      setTraceExpanded(false);
       appendMessage({ role: "assistant", text: "已结束本次内容调研，并清除当前线程的调研恢复入口。" });
     } catch (error) {
       appendMessage({
@@ -1777,23 +1636,16 @@ export default function CreatorPage() {
     setContentResearchRun({
       workflowRunId: summary.workflow_run_id,
       summary,
-      trace: null,
       formalResearch: null,
       formalResearchStatus: "idle",
       report: null,
       reportStatus: "idle",
       reportError: null,
     });
-    setTraceExpanded(false);
     appendMessage({
       role: "assistant",
       text: "已确认调研范围，正在开始内容调研。",
     });
-    try {
-      await refreshContentResearchTrace(summary.workflow_run_id);
-    } catch {
-      appendMessage({ role: "system", text: "调研过程暂时不可用，稍后可刷新重试。" });
-    }
     void startContentResearchForRun(summary.workflow_run_id);
   }
 
@@ -1807,52 +1659,82 @@ export default function CreatorPage() {
       // Discard stale response if user already switched to another thread
       if (loadingThreadRef.current !== threadId) return;
       let restoredRunId: string | null = null;
-      let latestReport: ContentResearchPublishedReportResponse | null = null;
+      let latestReport: ContentResearchLiteReportResponse | null = null;
       let latestFailure: { messageId: string; workflowRunId: string; error: string } | undefined;
       if (history.length > 0) {
         const timelineMessages = history.map(chatMessageFromRecord);
+        const artifactRunIds = history
+          .filter((message) => message.message_type === "artifact_result" && message.run_id)
+          .map((message) => message.run_id as string);
         const reports = await Promise.all(history.map(async (message) => {
           if (message.message_type !== "artifact_result" || !message.run_id) return null;
           try {
-            return { messageId: message.message_id, report: await getContentResearchPublishedReport(message.run_id) };
+            return { messageId: message.message_id, report: await getContentResearchLiteReport(message.run_id) };
           } catch (error) {
             return { messageId: message.message_id, workflowRunId: message.run_id, error: error instanceof Error ? error.message : "报告读取失败" };
           }
         }));
         if (loadingThreadRef.current !== threadId) return;
-        const reportResults = reports.filter((value): value is { messageId: string; report: ContentResearchPublishedReportResponse } => value !== null && "report" in value);
+        const reportResults = reports.filter((value): value is { messageId: string; report: ContentResearchLiteReportResponse } => value !== null && "report" in value);
         const reportByMessageId = new Map(reportResults.map((value) => [value.messageId, value.report]));
         const reportFailures = reports.filter((value): value is { messageId: string; workflowRunId: string; error: string } => value !== null && "error" in value);
+        const visibleFailures = reportFailures.filter((failure) => !/not found|404/i.test(failure.error));
         setMessages([
           ...timelineMessages.map((message) => ({ ...message, report: reportByMessageId.get(message.id) })),
-          ...reportFailures.map((failure) => ({ id: `report-error-${failure.messageId}`, role: "system" as const, text: `正式报告暂不可读取：${failure.error}` })),
+          ...visibleFailures.map((failure) => ({ id: `report-error-${failure.messageId}`, role: "system" as const, text: `正式报告暂不可读取：${failure.error}` })),
         ]);
         latestReport = reportResults[reportResults.length - 1]?.report ?? null;
-        latestFailure = reportFailures[reportFailures.length - 1];
-        restoredRunId = latestReport?.workflow_run_id ?? latestFailure?.workflowRunId ?? null;
+        latestFailure = visibleFailures[visibleFailures.length - 1];
+        restoredRunId = latestReport?.workflow_run_id ?? artifactRunIds[artifactRunIds.length - 1] ?? null;
       }
       const runIdForThread = restoredRunId ?? contentResearchRunForThread(threadId);
       if (runIdForThread) {
         try {
-          const restored = await restoreContentResearchWorkflow(runIdForThread);
-          if (loadingThreadRef.current !== threadId || restored.workflow.brief.thread_id !== threadId) return;
+          const workflow = await getContentResearchWorkflow(runIdForThread);
+          if (loadingThreadRef.current !== threadId || workflow.brief.thread_id !== threadId) return;
           saveContentResearchRunForThread(threadId, runIdForThread);
-          const restoredRun = contentResearchRunWithReport(runIdForThread, restored.workflow, restored.trace, null, latestReport);
+          if (!latestReport && !latestFailure) {
+            try {
+              const projection = await getContentResearchLiteReport(runIdForThread);
+              if (
+                litePublicationState(projection)
+                || (projection.publication.state === null && projection.recovery_projection)
+              ) {
+                latestReport = projection;
+                appendLiteReportMessage(projection);
+              }
+            } catch (error) {
+              if (!isExpectedLiteReportAbsence(error)) {
+                const detail = error instanceof Error ? error.message : "报告读取失败";
+                latestFailure = {
+                  messageId: `active-${runIdForThread}`,
+                  workflowRunId: runIdForThread,
+                  error: detail,
+                };
+                appendMessage({ role: "system", text: `正式报告暂不可读取：${detail}` });
+              }
+            }
+          }
+          const restoredRun = contentResearchRunWithReport(runIdForThread, workflow, null, latestReport);
           // A historical artifact can outlive its readable publication. Keep
           // the restored workflow visible and expose the report failure; do
           // not silently substitute a legacy result or clear the Timeline.
           if (latestFailure) {
-            const unavailable = /not found|404/i.test(latestFailure.error);
             setContentResearchRun({
               ...restoredRun,
-              reportStatus: unavailable ? "unavailable" : "failed",
-              reportError: unavailable ? null : latestFailure.error,
+              reportStatus: "failed",
+              reportError: latestFailure.error,
             });
           } else {
             setContentResearchRun(restoredRun);
           }
-        } catch {
-          removeContentResearchRunForThread(threadId);
+        } catch (error) {
+          if (isExpectedLiteReportAbsence(error)) {
+            removeContentResearchRunForThread(threadId);
+          } else {
+            const detail = error instanceof Error ? error.message : "运行读取失败";
+            appendMessage({ role: "system", text: `内容调研运行暂不可读取：${detail}` });
+          }
           // The Timeline report remains visible even if an old workflow summary is unavailable.
         }
       }
@@ -2209,7 +2091,12 @@ export default function CreatorPage() {
                   key={message.id}
                   className={["group flex", isUser ? "justify-end" : "justify-start"].join(" ")}
                 >
-                  {message.report ? <ContentResearchReportMessage report={message.report} /> : (
+                  {message.report ? (
+                    <ContentResearchReportMessage
+                      report={message.report}
+                      onRecover={() => void resumeContentResearchForRun(message.report!.workflow_run_id)}
+                    />
+                  ) : (
                   <div
                     className={[
                       "relative max-w-[80%] rounded-2xl px-4 py-3 text-sm leading-6",
@@ -2478,19 +2365,21 @@ export default function CreatorPage() {
                   +
                 </button>
                 <span className="h-6 w-px shrink-0 bg-line" />
-                <button
-                  type="button"
-                  onClick={() => setContentResearchMode((current) => !current)}
-                  className={[
-                    "inline-flex h-9 shrink-0 items-center gap-2 rounded-full border px-3 text-sm font-medium transition",
-                    contentResearchMode
-                      ? "border-ink bg-slate-100 text-ink"
-                      : "border-transparent text-ink hover:bg-slate-100",
-                  ].join(" ")}
-                >
-                  <span className="text-base">⌕</span>
-                  内容调研
-                </button>
+                {F003_LITE_PREVIEW_ENABLED && (
+                  <button
+                    type="button"
+                    onClick={() => setContentResearchMode((current) => !current)}
+                    className={[
+                      "inline-flex h-9 shrink-0 items-center gap-2 rounded-full border px-3 text-sm font-medium transition",
+                      contentResearchMode
+                        ? "border-ink bg-slate-100 text-ink"
+                        : "border-transparent text-ink hover:bg-slate-100",
+                    ].join(" ")}
+                  >
+                    <span className="text-base">⌕</span>
+                    内容调研
+                  </button>
+                )}
               </div>
               <button
                 type="button"
@@ -2519,10 +2408,6 @@ export default function CreatorPage() {
       </section>
       {contentResearchRun && <ContentResearchContextSidebar
         run={contentResearchRun}
-        expanded={traceExpanded}
-        onExpandedChange={setTraceExpanded}
-        onRefresh={() => void refreshContentResearchTrace(contentResearchRun.workflowRunId)}
-        onRetry={() => void startContentResearchForRun(contentResearchRun.workflowRunId, true)}
         onModifyDirections={() => void modifyContentResearchDirections()}
       />}
     </div>

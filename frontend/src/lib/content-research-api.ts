@@ -16,6 +16,7 @@ export interface ContentResearchPresearchResponse {
   subject_confirmation: string;
   competitor_tags: string[];
   research_directions: string[];
+  direction_catalog: string[];
   custom_research_question: string;
   custom_competitor_input?: string;
   timeout_status: string;
@@ -67,45 +68,6 @@ export interface ContentResearchWorkflowSummary {
   runtime_child_tasks: JsonObject[];
 }
 
-export interface ContentResearchTrace {
-  workflow_run_id: string;
-  thread_id?: string | null;
-  current_stage?: string | null;
-  run_status?: string | null;
-  recoverable: boolean;
-  duration_ms: number;
-  error_count: number;
-  retry_count: number;
-  traces: JsonObject[];
-  observation_events: JsonObject[];
-  workflow_events: JsonObject[];
-  runtime_steps: JsonObject[];
-  runtime_child_tasks: JsonObject[];
-  usage_summary: {
-    total_calls?: number;
-    prompt_tokens?: number;
-    completion_tokens?: number;
-    total_tokens?: number;
-    total_cost?: number;
-    currency?: string;
-    latency_ms?: number;
-    [key: string]: unknown;
-  };
-  usage_steps: JsonObject[];
-  usage_events: JsonObject[];
-  provider_operations: Array<{
-    operation_fingerprint: string;
-    operation?: string | null;
-    status: string;
-    started_at?: string | null;
-    finished_at?: string | null;
-    failure_code?: string | null;
-    failure_reason?: string | null;
-    retryable: boolean;
-    recovery_action?: string | null;
-  }>;
-}
-
 export interface ContentResearchSourceCollectionRequest {
   query?: string | null;
   source_kind?: string;
@@ -139,7 +101,7 @@ export interface ContentResearchFormalResearchResponse {
 
 export interface ContentResearchWorkflowActionRequest {
   schema_version?: string;
-  action: "confirm_brief" | "start_formal_research" | "retry_formal_research" | "end_content_research";
+  action: "confirm_brief" | "start_formal_research" | "resume_formal_research" | "end_content_research";
   payload?: JsonObject;
 }
 
@@ -174,61 +136,24 @@ export async function getXHSQRLogin(attemptId: string): Promise<XHSQRLoginRespon
   return contentResearchFetch(`/content-research/providers/xiaohongshu/login/qr/${encodeURIComponent(attemptId)}`);
 }
 
-/** R4's only formal report contract; UI rendering is owned by U1. */
-export interface ContentResearchPublishedReportResponse {
+/** Narrow public projection from the immutable report publication. */
+export interface ContentResearchLiteReportResponse {
   schema_version: string;
   workflow_run_id: string;
-  workflow_terminal_state: string;
-  publication_state: "complete_verified_report" | "partial_verified_report" | "evidence_only_report";
-  artifact: JsonObject;
-  publication: JsonObject;
-  sections: JsonObject[];
-  citation_groups: JsonObject[];
-  citation_total: number;
-  citation_offset: number;
-  citation_limit: number;
-  claim_cards: JsonObject[];
-  weak_signals: JsonObject[];
-  cross_direction_records: JsonObject[];
-  aggregate_claims: JsonObject[];
-  limitations_recovery: JsonObject[];
-  trace: JsonObject;
-}
-
-export interface ContentResearchEvidenceBundleView {
-  schema_version: string;
-  bundle_id: string;
-  workflow_run_id: string;
-  research_brief_id?: string | null;
-  research_plan_id?: string | null;
-  research_direction_id?: string | null;
-  status: string;
-  bundle_type: string;
-  bundle_version: string;
-  summary: string;
-  coverage: JsonObject;
-  retrieval_metrics: JsonObject;
-  faithfulness_metrics: JsonObject;
-  cross_source_metrics: JsonObject;
-  contradiction_summary: JsonObject;
-  citation_coverage: JsonObject;
-  unsupported_claim_count: number;
-  missing_evidence: JsonObject[];
-  priority_policy_id?: string | null;
-  evidence_boundary_policy_id?: string | null;
-  decision_card: JsonObject;
-  priority: JsonObject;
-  evidence_state: string;
-  evidence_grade: string;
-  claim_scope: JsonObject;
-  next_action: JsonObject;
-  items: JsonObject[];
-  evidence_by_role: Record<string, JsonObject[]>;
-  lineage_by_evidence_id: Record<string, JsonObject[]>;
-  source_links: JsonObject[];
-  metadata: JsonObject;
-  created_at: string;
-  updated_at: string;
+  workflow_execution_state: string;
+  subject?: string | null;
+  frozen_scope: JsonObject;
+  collected_at?: string | null;
+  publication: JsonObject & { state?: string | null };
+  sections: {
+    main_findings: JsonObject[];
+    weak_signals: JsonObject[];
+    limitations_scope: JsonObject[];
+  };
+  status_strip: JsonObject;
+  citations: JsonObject[];
+  run_direction_states: JsonObject[];
+  recovery_projection?: JsonObject | null;
 }
 
 export interface ContentResearchHumanDecisionRequest {
@@ -311,25 +236,18 @@ export async function getContentResearchWorkflow(workflowRunId: string): Promise
   return contentResearchFetch(`/content-research/workflows/${encodeURIComponent(workflowRunId)}`);
 }
 
-export async function getContentResearchTrace(workflowRunId: string): Promise<ContentResearchTrace> {
-  return contentResearchFetch(`/content-research/workflows/${encodeURIComponent(workflowRunId)}/trace`);
-}
-
-export async function getContentResearchPublishedReport(
+export async function getContentResearchLiteReport(
   workflowRunId: string,
-  options: { researchPlanId?: string; publicationId?: string; citationOffset?: number; citationLimit?: number } = {}
-): Promise<ContentResearchPublishedReportResponse> {
+  options: { researchPlanId?: string; publicationId?: string; citationGroupIds?: string[] } = {}
+): Promise<ContentResearchLiteReportResponse> {
   const query = new URLSearchParams();
   if (options.researchPlanId) query.set("research_plan_id", options.researchPlanId);
   if (options.publicationId) query.set("publication_id", options.publicationId);
-  if (options.citationOffset !== undefined) query.set("citation_offset", String(options.citationOffset));
-  if (options.citationLimit !== undefined) query.set("citation_limit", String(options.citationLimit));
+  for (const citationGroupId of options.citationGroupIds ?? []) {
+    query.append("citation_group_ids", citationGroupId);
+  }
   const suffix = query.size ? `?${query.toString()}` : "";
-  return contentResearchFetch(`/content-research/workflows/${encodeURIComponent(workflowRunId)}/report${suffix}`);
-}
-
-export async function getContentResearchEvidenceBundle(bundleId: string): Promise<ContentResearchEvidenceBundleView> {
-  return contentResearchFetch(`/content-research/evidence-bundles/${encodeURIComponent(bundleId)}`);
+  return contentResearchFetch(`/content-research/workflows/${encodeURIComponent(workflowRunId)}/lite-report${suffix}`);
 }
 
 export async function submitContentResearchBrandDecision(
@@ -369,15 +287,17 @@ export async function startContentResearchFormalResearch(
   return response.result;
 }
 
-export async function retryContentResearchFormalResearch(
-  workflowRunId: string,
-  payload: ContentResearchSourceCollectionRequest
-): Promise<ContentResearchFormalResearchResponse> {
-  const response = await runContentResearchWorkflowAction<ContentResearchFormalResearchResponse>(workflowRunId, {
-    action: "retry_formal_research",
-    payload: payload as unknown as JsonObject,
+export async function resumeContentResearchFormalResearch(
+  workflowRunId: string
+): Promise<ContentResearchWorkflowActionResponse<{
+  workflow_run_id: string;
+  status: string;
+  recoverable: boolean;
+}>> {
+  return runContentResearchWorkflowAction(workflowRunId, {
+    action: "resume_formal_research",
+    payload: {},
   });
-  return response.result;
 }
 
 export async function endContentResearchWorkflow(workflowRunId: string): Promise<ContentResearchWorkflowActionResponse> {
@@ -405,17 +325,6 @@ export async function runContentResearchWorkflowAction<T = JsonObject>(
     method: "POST",
     body: payload,
   });
-}
-
-export async function restoreContentResearchWorkflow(workflowRunId: string): Promise<{
-  workflow: ContentResearchWorkflowSummary;
-  trace: ContentResearchTrace;
-}> {
-  const [workflow, trace] = await Promise.all([
-    getContentResearchWorkflow(workflowRunId),
-    getContentResearchTrace(workflowRunId),
-  ]);
-  return { workflow, trace };
 }
 
 async function contentResearchFetch<T>(

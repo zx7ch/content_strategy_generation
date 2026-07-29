@@ -23,7 +23,6 @@ from app.content_research.api_schemas import (
     ContentResearchLiteReportResponse,
     ContentResearchPresearchRequest,
     ContentResearchPresearchResponse,
-    ContentResearchPublishedReportResponse,
     ContentResearchSourceCollectionRequest,
     ContentResearchSourceCollectionResponse,
     ContentResearchTraceResponse,
@@ -31,11 +30,10 @@ from app.content_research.api_schemas import (
     ContentResearchWorkflowActionResponse,
     ContentResearchWorkflowEventsResponse,
     ContentResearchWorkflowSummaryResponse,
-    XHSQRLoginResponse,
-    EvidenceBundleView,
     HumanDecisionRequest,
     HumanDecisionResponse,
     HumanDecisionsResponse,
+    XHSQRLoginResponse,
 )
 from app.content_research.presearch.service import PresearchService
 from app.content_research.service import (
@@ -822,6 +820,16 @@ def _get_content_research_service(request: Request) -> ContentResearchService:
     )
 
 
+def _require_f003_lite_preview() -> None:
+    if settings.F003_LITE_PREVIEW_ENABLED:
+        return
+    raise APIError(
+        status_code=403,
+        error_code="F003_LITE_PREVIEW_DISABLED",
+        error_message="F003 Lite internal preview is disabled",
+    )
+
+
 def _content_research_error(exc: Exception) -> APIError:
     if isinstance(exc, ContentResearchNotFoundError):
         return APIError(
@@ -882,6 +890,7 @@ async def create_content_research_presearch(
     request: Request,
     x_user_id: str = Header(default=DEFAULT_USER_ID, alias="X-User-Id"),
 ) -> ContentResearchPresearchResponse:
+    _require_f003_lite_preview()
     service = _get_content_research_service(request)
     try:
         return await service.submit_presearch(
@@ -944,6 +953,7 @@ async def confirm_content_research_brief(
     payload: ContentResearchBriefConfirmRequest,
     request: Request,
 ) -> ContentResearchWorkflowSummaryResponse:
+    _require_f003_lite_preview()
     service = _get_content_research_service(request)
     try:
         return await service.confirm_brief(brief_id=brief_id, confirmation_request=payload)
@@ -960,6 +970,7 @@ async def create_content_research_workflow_from_brief(
     request: Request,
     brief_id: str = Query(...),
 ) -> ContentResearchWorkflowSummaryResponse:
+    _require_f003_lite_preview()
     service = _get_content_research_service(request)
     try:
         return await service.confirm_brief(brief_id=brief_id, confirmation_request=payload)
@@ -1079,31 +1090,6 @@ async def list_content_research_human_decisions(
 
 
 @app.get(
-    "/content-research/workflows/{workflow_run_id}/report",
-    response_model=ContentResearchPublishedReportResponse,
-)
-async def get_content_research_published_report(
-    workflow_run_id: str,
-    request: Request,
-    research_plan_id: str | None = Query(default=None),
-    publication_id: str | None = Query(default=None),
-    citation_offset: int = Query(default=0, ge=0),
-    citation_limit: int = Query(default=50, ge=1, le=100),
-) -> ContentResearchPublishedReportResponse:
-    service = _get_content_research_service(request)
-    try:
-        return await service.get_published_report(
-            workflow_run_id=workflow_run_id,
-            research_plan_id=research_plan_id,
-            publication_id=publication_id,
-            citation_offset=citation_offset,
-            citation_limit=citation_limit,
-        )
-    except Exception as exc:  # noqa: BLE001
-        raise _content_research_error(exc) from exc
-
-
-@app.get(
     "/content-research/workflows/{workflow_run_id}/lite-report",
     response_model=ContentResearchLiteReportResponse,
 )
@@ -1112,33 +1098,19 @@ async def get_content_research_lite_report(
     request: Request,
     research_plan_id: str | None = Query(default=None),
     publication_id: str | None = Query(default=None),
+    citation_group_ids: list[str] | None = Query(default=None),
 ) -> ContentResearchLiteReportResponse:
-    """Formal Lite read seam; it never changes the established /report payload."""
+    """Read the Lite projection from frozen, materialized publication facts."""
     service = _get_content_research_service(request)
     try:
         return await service.get_lite_report(
             workflow_run_id=workflow_run_id,
             research_plan_id=research_plan_id,
             publication_id=publication_id,
+            citation_group_ids=citation_group_ids,
         )
     except Exception as exc:  # noqa: BLE001
         raise _content_research_error(exc) from exc
-
-
-@app.get(
-    "/content-research/evidence-bundles/{bundle_id}",
-    response_model=EvidenceBundleView,
-)
-async def get_content_research_evidence_bundle(
-    bundle_id: str,
-    request: Request,
-) -> EvidenceBundleView:
-    service = _get_content_research_service(request)
-    try:
-        return service.get_evidence_bundle_view(bundle_id)
-    except Exception as exc:  # noqa: BLE001
-        raise _content_research_error(exc) from exc
-
 
 @app.post(
     "/content-research/workflows/{workflow_run_id}/actions",
@@ -1149,6 +1121,8 @@ async def run_content_research_workflow_action(
     payload: ContentResearchWorkflowActionRequest,
     request: Request,
 ) -> ContentResearchWorkflowActionResponse:
+    if payload.action.strip() == "confirm_brief":
+        _require_f003_lite_preview()
     service = _get_content_research_service(request)
     try:
         return await service.run_workflow_action(workflow_run_id=workflow_run_id, request=payload)

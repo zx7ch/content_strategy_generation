@@ -10,8 +10,6 @@ from typing import Any, TypeVar
 from app.content_research.bootstrap import bootstrap_content_research_schema
 from app.content_research.contracts import DirectionContract, RunPolicySnapshot, SamplePolicy
 from app.content_research.evidence.models import (
-    EvidenceBundleItemRecord,
-    EvidenceBundleRecord,
     EvidenceLineageRecord,
     EvidenceRecord,
 )
@@ -200,13 +198,10 @@ class SQLiteContentResearchStore:
 
     def delete_workflow(self, workflow_run_id: str) -> None:
         with self._connect() as conn:
-            bundle_ids = [row[0] for row in conn.execute("SELECT id FROM content_research_evidence_bundles WHERE workflow_run_id = ?", (workflow_run_id,))]
             evidence_ids = [row[0] for row in conn.execute("SELECT id FROM content_research_evidence_records WHERE workflow_run_id = ?", (workflow_run_id,))]
-            for bundle_id in bundle_ids:
-                conn.execute("DELETE FROM content_research_evidence_bundle_items WHERE bundle_id = ?", (bundle_id,))
             for evidence_id in evidence_ids:
                 conn.execute("DELETE FROM content_research_evidence_lineage WHERE evidence_record_id = ?", (evidence_id,))
-            for table in ("content_research_evidence_bundles", "content_research_evidence_records", "content_research_human_decisions", "content_research_observation_events", "content_research_traces", "content_research_result_snapshots", "content_research_subagent_tasks", "content_research_directions", "content_research_plans", "content_research_briefs"):
+            for table in ("content_research_evidence_records", "content_research_human_decisions", "content_research_observation_events", "content_research_traces", "content_research_result_snapshots", "content_research_subagent_tasks", "content_research_directions", "content_research_plans", "content_research_briefs"):
                 conn.execute(f"DELETE FROM {table} WHERE workflow_run_id = ?", (workflow_run_id,))
 
     def save_plan(self, plan: ResearchPlanRecord) -> ResearchPlanRecord:
@@ -599,136 +594,6 @@ class SQLiteContentResearchStore:
             ).fetchall()
         return [self._row_to_evidence_lineage(row) for row in rows]
 
-    def save_evidence_bundle(self, bundle: EvidenceBundleRecord) -> EvidenceBundleRecord:
-        with self._connect() as conn:
-            conn.execute(
-                """INSERT INTO content_research_evidence_bundles
-                     (id, workflow_run_id, research_brief_id, research_plan_id,
-                      research_direction_id, schema_version, status, bundle_type,
-                      bundle_version, summary, coverage_json, retrieval_metrics_json,
-                      faithfulness_metrics_json, cross_source_metrics_json,
-                      contradiction_summary_json, citation_coverage_json,
-                      unsupported_claim_count, missing_evidence_json, priority_policy_id,
-                      evidence_boundary_policy_id, decision_card_json, priority_json,
-                      evidence_state, evidence_grade, claim_scope_json, next_action_json,
-                      metadata_json, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                   ON CONFLICT(id) DO UPDATE SET
-                     workflow_run_id=excluded.workflow_run_id,
-                     research_brief_id=excluded.research_brief_id,
-                     research_plan_id=excluded.research_plan_id,
-                     research_direction_id=excluded.research_direction_id,
-                     schema_version=excluded.schema_version,
-                     status=excluded.status,
-                     bundle_type=excluded.bundle_type,
-                     bundle_version=excluded.bundle_version,
-                     summary=excluded.summary,
-                     coverage_json=excluded.coverage_json,
-                     retrieval_metrics_json=excluded.retrieval_metrics_json,
-                     faithfulness_metrics_json=excluded.faithfulness_metrics_json,
-                     cross_source_metrics_json=excluded.cross_source_metrics_json,
-                     contradiction_summary_json=excluded.contradiction_summary_json,
-                     citation_coverage_json=excluded.citation_coverage_json,
-                     unsupported_claim_count=excluded.unsupported_claim_count,
-                     missing_evidence_json=excluded.missing_evidence_json,
-                     priority_policy_id=excluded.priority_policy_id,
-                     evidence_boundary_policy_id=excluded.evidence_boundary_policy_id,
-                     decision_card_json=excluded.decision_card_json,
-                     priority_json=excluded.priority_json,
-                     evidence_state=excluded.evidence_state,
-                     evidence_grade=excluded.evidence_grade,
-                     claim_scope_json=excluded.claim_scope_json,
-                     next_action_json=excluded.next_action_json,
-                     metadata_json=excluded.metadata_json,
-                     updated_at=excluded.updated_at""",
-                (
-                    bundle.id,
-                    bundle.workflow_run_id,
-                    bundle.research_brief_id,
-                    bundle.research_plan_id,
-                    bundle.research_direction_id,
-                    bundle.schema_version,
-                    bundle.status,
-                    bundle.bundle_type,
-                    bundle.bundle_version,
-                    bundle.summary,
-                    _dumps(bundle.coverage),
-                    _dumps(bundle.retrieval_metrics),
-                    _dumps(bundle.faithfulness_metrics),
-                    _dumps(bundle.cross_source_metrics),
-                    _dumps(bundle.contradiction_summary),
-                    _dumps(bundle.citation_coverage),
-                    bundle.unsupported_claim_count,
-                    _dumps_list(bundle.missing_evidence),
-                    bundle.priority_policy_id,
-                    bundle.evidence_boundary_policy_id,
-                    _dumps(bundle.decision_card),
-                    _dumps(bundle.priority),
-                    bundle.evidence_state,
-                    bundle.evidence_grade,
-                    _dumps(bundle.claim_scope),
-                    _dumps(bundle.next_action),
-                    _dumps(bundle.metadata),
-                    _fmt_dt(bundle.created_at),
-                    _fmt_dt(bundle.updated_at),
-                ),
-            )
-        return bundle
-
-    def get_evidence_bundle(self, bundle_id: str) -> EvidenceBundleRecord | None:
-        with self._connect() as conn:
-            row = conn.execute(
-                "SELECT * FROM content_research_evidence_bundles WHERE id = ?",
-                (bundle_id,),
-            ).fetchone()
-        return self._row_to_evidence_bundle(row) if row else None
-
-    def list_evidence_bundles_for_workflow(self, workflow_run_id: str) -> list[EvidenceBundleRecord]:
-        with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT * FROM content_research_evidence_bundles WHERE workflow_run_id = ? ORDER BY created_at ASC",
-                (workflow_run_id,),
-            ).fetchall()
-        return [self._row_to_evidence_bundle(row) for row in rows]
-
-    def add_evidence_bundle_item(self, item: EvidenceBundleItemRecord) -> EvidenceBundleItemRecord:
-        _validate_payload("EvidenceBundleItem", item.payload)
-        with self._connect() as conn:
-            conn.execute(
-                """INSERT INTO content_research_evidence_bundle_items
-                     (id, bundle_id, evidence_record_id, role, sort_order, schema_version,
-                      payload_json, metadata_json, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                   ON CONFLICT(id) DO UPDATE SET
-                     bundle_id=excluded.bundle_id,
-                     evidence_record_id=excluded.evidence_record_id,
-                     role=excluded.role,
-                     sort_order=excluded.sort_order,
-                     schema_version=excluded.schema_version,
-                     payload_json=excluded.payload_json,
-                     metadata_json=excluded.metadata_json""",
-                (
-                    item.id,
-                    item.bundle_id,
-                    item.evidence_record_id,
-                    item.role,
-                    item.sort_order,
-                    item.schema_version,
-                    _dumps(item.payload),
-                    _dumps(item.metadata),
-                    _fmt_dt(item.created_at),
-                ),
-            )
-        return item
-
-    def list_evidence_bundle_items(self, bundle_id: str) -> list[EvidenceBundleItemRecord]:
-        with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT * FROM content_research_evidence_bundle_items WHERE bundle_id = ? ORDER BY sort_order ASC, created_at ASC",
-                (bundle_id,),
-            ).fetchall()
-        return [self._row_to_evidence_bundle_item(row) for row in rows]
-
     def save_result_snapshot(self, snapshot: ResearchResultSnapshotRecord) -> ResearchResultSnapshotRecord:
         if not snapshot.schema_version:
             raise ValueError("ResearchResultSnapshot must include schema_version")
@@ -739,13 +604,13 @@ class SQLiteContentResearchStore:
                          (id, workflow_run_id, research_brief_id, research_plan_id,
                           schema_version, snapshot_version, result_type, status,
                           title, executive_summary, findings_json, recommendations_json,
-                          evidence_bundle_ids_json, claim_count, supported_claim_count,
+                          claim_count, supported_claim_count,
                           unsupported_claim_count, citation_coverage_score, faithfulness_score,
                           answer_relevancy_score, derivation_completeness_score,
                           evidence_boundary_calibration_score, decision_summary_json, decision_cards_json,
                           priority_summary_json, evidence_boundary_summary_json, limitations_json,
                           abstentions_json, metadata_json, created_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         snapshot.id,
                         snapshot.workflow_run_id,
@@ -759,7 +624,6 @@ class SQLiteContentResearchStore:
                         snapshot.executive_summary,
                         _dumps_list(snapshot.findings),
                         _dumps_list(snapshot.recommendations),
-                        _dumps_any_list(snapshot.evidence_bundle_ids),
                         snapshot.claim_count,
                         snapshot.supported_claim_count,
                         snapshot.unsupported_claim_count,
@@ -1314,54 +1178,6 @@ class SQLiteContentResearchStore:
         )
 
     @staticmethod
-    def _row_to_evidence_bundle(row: sqlite3.Row) -> EvidenceBundleRecord:
-        return EvidenceBundleRecord(
-            id=row["id"],
-            workflow_run_id=row["workflow_run_id"],
-            research_brief_id=row["research_brief_id"],
-            research_plan_id=row["research_plan_id"],
-            research_direction_id=row["research_direction_id"],
-            schema_version=row["schema_version"],
-            status=row["status"],
-            bundle_type=row["bundle_type"],
-            bundle_version=row["bundle_version"],
-            summary=row["summary"],
-            coverage=_loads(row["coverage_json"]),
-            retrieval_metrics=_loads(row["retrieval_metrics_json"]),
-            faithfulness_metrics=_loads(row["faithfulness_metrics_json"]),
-            cross_source_metrics=_loads(row["cross_source_metrics_json"]),
-            contradiction_summary=_loads(row["contradiction_summary_json"]),
-            citation_coverage=_loads(row["citation_coverage_json"]),
-            unsupported_claim_count=row["unsupported_claim_count"],
-            missing_evidence=_loads_list(row["missing_evidence_json"]),
-            priority_policy_id=row["priority_policy_id"],
-            evidence_boundary_policy_id=row["evidence_boundary_policy_id"],
-            decision_card=_loads(row["decision_card_json"]),
-            priority=_loads(row["priority_json"]),
-            evidence_state=row["evidence_state"],
-            evidence_grade=row["evidence_grade"],
-            claim_scope=_loads(row["claim_scope_json"]),
-            next_action=_loads(row["next_action_json"]),
-            metadata=_loads(row["metadata_json"]),
-            created_at=_parse_dt(row["created_at"]),
-            updated_at=_parse_dt(row["updated_at"]),
-        )
-
-    @staticmethod
-    def _row_to_evidence_bundle_item(row: sqlite3.Row) -> EvidenceBundleItemRecord:
-        return EvidenceBundleItemRecord(
-            id=row["id"],
-            bundle_id=row["bundle_id"],
-            evidence_record_id=row["evidence_record_id"],
-            role=row["role"],
-            sort_order=row["sort_order"],
-            schema_version=row["schema_version"],
-            payload=_loads(row["payload_json"]),
-            metadata=_loads(row["metadata_json"]),
-            created_at=_parse_dt(row["created_at"]),
-        )
-
-    @staticmethod
     def _row_to_result_snapshot(row: sqlite3.Row) -> ResearchResultSnapshotRecord:
         return ResearchResultSnapshotRecord(
             id=row["id"],
@@ -1376,7 +1192,6 @@ class SQLiteContentResearchStore:
             executive_summary=row["executive_summary"],
             findings=_loads_list(row["findings_json"]),
             recommendations=_loads_list(row["recommendations_json"]),
-            evidence_bundle_ids=[str(item) for item in _loads_any_list(row["evidence_bundle_ids_json"])],
             claim_count=row["claim_count"],
             supported_claim_count=row["supported_claim_count"],
             unsupported_claim_count=row["unsupported_claim_count"],

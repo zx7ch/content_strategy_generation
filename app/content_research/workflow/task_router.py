@@ -172,7 +172,6 @@ class SubagentTaskRouter:
                 "evidence_count": len(result.evidence_records),
                 "finding_count": len(result.findings),
                 "missing_evidence_count": len(result.missing_evidence),
-                "evidence_bundle_id": result.evidence_bundle.id if result.evidence_bundle else None,
             },
         )
         return terminal
@@ -391,7 +390,6 @@ class SubagentTaskRouter:
                 "findings": [finding.payload for finding in result.findings],
                 "evidence_refs": [record.id for record in result.evidence_records],
                 "missing_evidence": result.missing_evidence,
-                "evidence_bundle_id": result.evidence_bundle.id if result.evidence_bundle else None,
                 "failure_reason": result.failure_reason,
                 "metadata": result.metadata,
             }

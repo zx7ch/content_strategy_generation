@@ -1,5 +1,4 @@
 """Domain records for Content Research evidence."""
-
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -63,59 +62,3 @@ class EvidenceLineageRecord:
     parent_evidence_record_id: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
     created_at: datetime = field(default_factory=utcnow)
-
-
-@dataclass(frozen=True)
-class EvidenceBundleRecord:
-    id: str
-    workflow_run_id: str
-    schema_version: str
-    status: str
-    bundle_type: str
-    bundle_version: str
-    research_brief_id: str | None = None
-    research_plan_id: str | None = None
-    research_direction_id: str | None = None
-    summary: str = ""
-    coverage: dict[str, Any] = field(default_factory=dict)
-    retrieval_metrics: dict[str, Any] = field(default_factory=dict)
-    faithfulness_metrics: dict[str, Any] = field(default_factory=dict)
-    cross_source_metrics: dict[str, Any] = field(default_factory=dict)
-    contradiction_summary: dict[str, Any] = field(default_factory=dict)
-    citation_coverage: dict[str, Any] = field(default_factory=dict)
-    unsupported_claim_count: int = 0
-    missing_evidence: list[dict[str, Any]] = field(default_factory=list)
-    priority_policy_id: str | None = None
-    evidence_boundary_policy_id: str | None = None
-    decision_card: dict[str, Any] = field(default_factory=dict)
-    priority: dict[str, Any] = field(default_factory=dict)
-    evidence_state: str = "signal"
-    evidence_grade: str = "C"
-    claim_scope: dict[str, Any] = field(default_factory=dict)
-    next_action: dict[str, Any] = field(default_factory=dict)
-    metadata: dict[str, Any] = field(default_factory=dict)
-    created_at: datetime = field(default_factory=utcnow)
-    updated_at: datetime = field(default_factory=utcnow)
-
-
-@dataclass(frozen=True)
-class EvidenceBundleItemRecord:
-    id: str
-    bundle_id: str
-    role: str
-    sort_order: int
-    schema_version: str
-    evidence_record_id: str | None = None
-    payload: dict[str, Any] = field(default_factory=dict)
-    metadata: dict[str, Any] = field(default_factory=dict)
-    created_at: datetime = field(default_factory=utcnow)
-
-
-@dataclass(frozen=True)
-class ExpandedEvidenceBundle:
-    bundle: EvidenceBundleRecord
-    items: list[EvidenceBundleItemRecord]
-    evidence_by_role: dict[str, list[EvidenceRecord]]
-    lineage_by_evidence_id: dict[str, list[EvidenceLineageRecord]]
-    source_links: list[dict[str, str]]
-    missing_evidence: list[dict[str, Any]]

@@ -58,17 +58,6 @@ class ResearchPlanBuilder:
                 "execution_mode": "spec_only",
                 "subagent_execution": "deferred",
             },
-            "priority_policy": {
-                "id": "pp_default_p0",
-                "version": "priority_v1",
-                "focus": ["task_fit", "decision_value", "evidence_state"],
-            },
-            "evidence_boundary_policy": {
-                "id": "ebp_default_p0",
-                "version": "evidence_boundary_v1",
-                "states": ["invalid", "case_only", "signal", "partially_supported", "verified"],
-                "unsupported_rule": "Do not present evidence-insufficient signals as conclusions.",
-            },
             "evidence_requirements": {
                 "minimum_source_kinds": ["search_result"],
                 "required_fields": ["source_url", "canonical_id", "source_kind", "captured_at"],

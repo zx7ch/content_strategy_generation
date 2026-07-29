@@ -146,6 +146,7 @@ class ReportPublicationMaterializer:
             verified_section_ids=publication.payload["verified_section_ids"],
             structured_card_section_ids=publication.payload["structured_card_section_ids"],
             governed_snapshot=snapshot.metadata.get("governed_snapshot"),
+            preserve_all=publication.publication_state == "evidence_only_report",
         )
         return {
             "schema_version": "content_research_published_report_artifact_v1",
@@ -175,6 +176,7 @@ def _artifact_citation_groups(
     verified_section_ids: object,
     structured_card_section_ids: object,
     governed_snapshot: object,
+    preserve_all: bool = False,
 ) -> list[dict[str, Any]]:
     """Project citation groups without changing their snapshot-owned identity."""
     if not isinstance(sections, list) or any(not isinstance(section, dict) for section in sections):
@@ -194,7 +196,7 @@ def _artifact_citation_groups(
 
     retained_ids = set(_string_list(verified_section_ids, "verified section ids"))
     retained_ids.update(_string_list(structured_card_section_ids, "structured-card section ids"))
-    used_ids: set[str] = set()
+    used_ids: set[str] = set(frozen_groups) if preserve_all else set()
     for section in sections:
         section_id = section.get("section_id")
         if section_id not in retained_ids:
@@ -257,7 +259,14 @@ def _validate_frozen_citation_group(group: dict[str, Any]) -> None:
             or not isinstance(end, int)
             or start < 0
             or end - start != len(quote)
-            or not all(isinstance(ref.get(key), str) and ref[key] for key in ("field_path", "source_text_hash", "source_url"))
+            or not all(
+                isinstance(ref.get(key), str) and ref[key]
+                for key in ("field_path", "source_text_hash")
+            )
+            or (
+                ref.get("source_url") is not None
+                and not isinstance(ref.get("source_url"), str)
+            )
         ):
             raise ValueError("governed citation evidence ref is incomplete")
 

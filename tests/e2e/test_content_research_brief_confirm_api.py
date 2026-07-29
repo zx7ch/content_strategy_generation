@@ -7,6 +7,7 @@ import httpx
 import pytest
 
 from app.api.routes.router import app
+from app.config import settings
 from app.content_research.presearch.service import PresearchService
 from app.content_research.service import ContentResearchService
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
@@ -95,6 +96,18 @@ async def _create_presearch(client):
 
 
 @pytest.mark.asyncio
+async def test_presearch_exposes_fixed_lite_direction_catalog_separately_from_llm_suggestions(client):
+    presearch = await _create_presearch(client)
+
+    assert presearch["research_directions"] == ["产品营销", "用户评论痛点"]
+    assert presearch["direction_catalog"] == [
+        "product_marketing",
+        "competitor_discovery",
+        "content_performance",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_confirm_brief_creates_plan_directions_tasks_and_workflow_summary(client):
     presearch = await _create_presearch(client)
 
@@ -105,7 +118,7 @@ async def test_confirm_brief_creates_plan_directions_tasks_and_workflow_summary(
             "subject_type": "category",
             "selected_competitors": ["迪卡侬"],
             "custom_competitors": ["凯乐石"],
-            "selected_directions": ["product_marketing", "comment_insight"],
+            "selected_directions": ["product_marketing", "competitor_discovery"],
             "custom_research_question": "关注夏季轻量户外",
         },
     )
@@ -117,11 +130,18 @@ async def test_confirm_brief_creates_plan_directions_tasks_and_workflow_summary(
     assert payload["brief"]["payload"]["confirmed_subject"] == "徒步短裤"
     assert payload["brief"]["payload"]["selected_competitors"] == ["迪卡侬"]
     assert payload["brief"]["payload"]["custom_competitors"] == ["凯乐石"]
-    assert payload["plan"]["payload"]["priority_policy"]["version"] == "priority_v1"
-    assert payload["plan"]["payload"]["evidence_boundary_policy"]["version"] == "evidence_boundary_v1"
+    assert payload["brief"]["payload"]["direction_catalog"] == [
+        "product_marketing",
+        "competitor_discovery",
+        "content_performance",
+    ]
+    assert payload["brief"]["payload"]["requested_direction_ids"] == [
+        "product_marketing",
+        "competitor_discovery",
+    ]
     assert [item["payload"]["direction_id"] for item in payload["directions"]] == [
         "product_marketing",
-        "comment_insight",
+        "competitor_discovery",
     ]
     assert [item["status"] for item in payload["subagent_tasks"]] == ["queued", "queued"]
 
@@ -136,7 +156,7 @@ async def test_confirm_brief_creates_plan_directions_tasks_and_workflow_summary(
     assert snapshot_payload["effective_policy_hash"]
     assert snapshot_payload["effective_policy"]["direction_ids"] == [
         "product_marketing",
-        "comment_insight",
+        "competitor_discovery",
     ]
     assert len(snapshot_payload["direction_contracts"]) == 2
     assert len(snapshot_payload["sample_policies"]) == 2
@@ -145,7 +165,19 @@ async def test_confirm_brief_creates_plan_directions_tasks_and_workflow_summary(
 
 
 @pytest.mark.asyncio
-async def test_confirm_brief_rejects_unknown_direction(client):
+@pytest.mark.parametrize(
+    "requested",
+    [
+        ["product_marketing"],
+        ["competitor_discovery"],
+        ["content_performance"],
+        ["product_marketing", "competitor_discovery"],
+        ["product_marketing", "content_performance"],
+        ["competitor_discovery", "content_performance"],
+        ["product_marketing", "competitor_discovery", "content_performance"],
+    ],
+)
+async def test_confirm_freezes_catalog_and_requested_subset(client, requested):
     presearch = await _create_presearch(client)
 
     response = await client.post(
@@ -153,7 +185,45 @@ async def test_confirm_brief_rejects_unknown_direction(client):
         json={
             "confirmed_subject": "徒步短裤",
             "subject_type": "category",
-            "selected_directions": ["unknown_direction"],
+            "selected_directions": requested,
+        },
+    )
+
+    assert response.status_code == 200
+    policy = await client.get(
+        f"/content-research/workflows/{presearch['workflow_run_id']}/policy-snapshot"
+    )
+    assert policy.status_code == 200
+    assert policy.json()["effective_policy"]["direction_catalog_version"] == "direction_catalog_v1"
+    assert policy.json()["effective_policy"]["requested_direction_ids"] == requested
+
+
+@pytest.mark.asyncio
+async def test_confirm_brief_rejects_empty_requested_direction_selection(client):
+    presearch = await _create_presearch(client)
+
+    response = await client.post(
+        f"/content-research/briefs/{presearch['brief_id']}/confirm",
+        json={
+            "confirmed_subject": "徒步短裤",
+            "subject_type": "category",
+            "selected_directions": [],
+        },
+    )
+
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_confirm_brief_rejects_direction_outside_lite_catalog(client):
+    presearch = await _create_presearch(client)
+
+    response = await client.post(
+        f"/content-research/briefs/{presearch['brief_id']}/confirm",
+        json={
+            "confirmed_subject": "徒步短裤",
+            "subject_type": "category",
+            "selected_directions": ["comment_insight"],
         },
     )
 
@@ -177,3 +247,48 @@ async def test_create_workflow_alias_confirms_brief(client):
 
     assert response.status_code == 200
     assert response.json()["plan"]["payload"]["selected_directions"] == ["product_marketing"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "confirmation_endpoint",
+    ["brief", "workflow_alias", "workflow_action"],
+)
+async def test_preview_off_rejects_every_confirmation_entry_before_persisting_plan(
+    client,
+    monkeypatch: pytest.MonkeyPatch,
+    confirmation_endpoint: str,
+):
+    presearch = await _create_presearch(client)
+    service = app.state.content_research_service
+    brief_before = service._store.get_brief(presearch["brief_id"])
+    assert brief_before is not None
+    assert service._store.list_plans_for_brief(presearch["brief_id"]) == []
+    monkeypatch.setattr(settings, "F003_LITE_PREVIEW_ENABLED", False)
+    confirmation = {
+        "confirmed_subject": "徒步短裤",
+        "subject_type": "category",
+        "selected_directions": ["product_marketing"],
+    }
+
+    if confirmation_endpoint == "brief":
+        response = await client.post(
+            f"/content-research/briefs/{presearch['brief_id']}/confirm",
+            json=confirmation,
+        )
+    elif confirmation_endpoint == "workflow_alias":
+        response = await client.post(
+            "/content-research/workflows",
+            params={"brief_id": presearch["brief_id"]},
+            json=confirmation,
+        )
+    else:
+        response = await client.post(
+            f"/content-research/workflows/{presearch['workflow_run_id']}/actions",
+            json={"action": "confirm_brief", "payload": confirmation},
+        )
+
+    assert response.status_code == 403
+    assert response.json()["error_code"] == "F003_LITE_PREVIEW_DISABLED"
+    assert service._store.get_brief(presearch["brief_id"]) == brief_before
+    assert service._store.list_plans_for_brief(presearch["brief_id"]) == []

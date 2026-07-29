@@ -16,7 +16,12 @@ def _required(*values: str) -> None:
 
 def _forbid_legacy_report_payload(value: Any) -> None:
     if isinstance(value, dict):
-        forbidden = {"evidence_bundle_id", "evidence_bundle_ids", "items", "recommendations"}
+        forbidden = {
+            "evidence_bundle_id",
+            "evidence_bundle_ids",
+            "items",
+            "recommendations",
+        }
         if forbidden & set(value):
             raise ValueError("report payload cannot contain legacy bundle/result fields")
         for nested in value.values():

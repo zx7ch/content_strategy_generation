@@ -7,7 +7,12 @@ import uuid
 from typing import Any
 
 from app.content_research.api_schemas import HumanDecisionResponse
-from app.content_research.models import ResearchBriefRecord, ResearchResultSnapshotRecord, SubagentTaskRecord, utcnow
+from app.content_research.models import (
+    ResearchBriefRecord,
+    ResearchResultSnapshotRecord,
+    SubagentTaskRecord,
+    utcnow,
+)
 from app.content_research.stores.base import ContentResearchStore
 
 
@@ -67,7 +72,7 @@ class DecisionAdvancementService:
                 "target_type": decision.target_type,
                 "target_id": decision.target_id,
                 "target_name": target_name,
-                "source_bundle_ids": list(base_snapshot.evidence_bundle_ids) if base_snapshot else [],
+                "source_snapshot_id": base_snapshot.id if base_snapshot else None,
             },
             "input_payload": {
                 "schema_version": "content_research_subagent_input_v1",
@@ -137,9 +142,7 @@ class DecisionAdvancementService:
                 "action": "等待已选焦点的深度调研完成后，再复核最终洞察中的证据边界。",
                 "action_type": "await_deep_research",
                 "based_on_findings": [str(item.get("result_item_id")) for item in findings],
-                "evidence_bundle_ids": list(base_snapshot.evidence_bundle_ids) if base_snapshot else [],
             }],
-            evidence_bundle_ids=list(base_snapshot.evidence_bundle_ids) if base_snapshot else [],
             claim_count=len(findings),
             supported_claim_count=sum(1 for item in findings if item.get("claim_status") == "supported"),
             unsupported_claim_count=sum(1 for item in findings if item.get("claim_status") != "supported"),

@@ -54,6 +54,10 @@ class Settings(BaseSettings):
         default="http://localhost:3000,http://127.0.0.1:3000,https://content-strategy-generation.vercel.app",
         validation_alias=_env_alias("CORS_ALLOWED_ORIGINS"),
     )
+    F003_LITE_PREVIEW_ENABLED: bool = Field(
+        default=False,
+        validation_alias=_env_alias("F003_LITE_PREVIEW_ENABLED"),
+    )
 
     # LLM providers
     LLM_PROVIDER: str = "anthropic"

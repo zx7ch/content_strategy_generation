@@ -6,6 +6,7 @@ import httpx
 import pytest
 
 from app.api.routes.router import app
+from app.config import settings
 from app.content_research.presearch.service import PresearchService
 from app.content_research.service import ContentResearchService
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
@@ -95,3 +96,31 @@ async def test_content_research_presearch_get_missing_attempt_returns_404(client
 
     assert response.status_code == 404
     assert response.json()["error_code"] == "CONTENT_RESEARCH_PRESEARCH_NOT_FOUND"
+
+
+@pytest.mark.asyncio
+async def test_preview_off_rejects_presearch_before_persisting_a_run(
+    client,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(settings, "F003_LITE_PREVIEW_ENABLED", False)
+
+    response = await client.post(
+        "/content-research/presearch",
+        headers={"X-User-Id": "user-1"},
+        json={
+            "seed_text": "Satisfy Running",
+            "user_note": "关注竞品",
+            "thread_id": "thread-preview-off",
+        },
+    )
+
+    assert response.status_code == 403
+    assert response.json()["error_code"] == "F003_LITE_PREVIEW_DISABLED"
+    service = app.state.content_research_service
+    assert (
+        service._store.get_brief_by_workflow(
+            "run_thread-preview-off_user-1_Sa"
+        )
+        is None
+    )

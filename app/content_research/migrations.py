@@ -256,6 +256,25 @@ _V12_DISPATCH_LEASE_COLUMNS = {
     ),
 }
 
+# 0013 removes the unreleased aggregate-persistence experiment.  These legacy
+# names remain only in this migration so databases created before Gate 4A lose
+# the obsolete tables and snapshot column as they advance to the Lite schema.
+_V13_LEGACY_TABLES = (
+    "content_research_evidence_bundle_items",
+    "content_research_evidence_bundles",
+)
+_V13_LEGACY_SNAPSHOT_COLUMN = "evidence_bundle_ids_json"
+
+
+def _apply_0013(conn: sqlite3.Connection) -> None:
+    for table in _V13_LEGACY_TABLES:
+        conn.execute(f"DROP TABLE IF EXISTS {table}")
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(content_research_result_snapshots)")}
+    if _V13_LEGACY_SNAPSHOT_COLUMN in columns:
+        conn.execute(
+            f"ALTER TABLE content_research_result_snapshots DROP COLUMN {_V13_LEGACY_SNAPSHOT_COLUMN}"
+        )
+
 
 def _apply_0010(conn: sqlite3.Connection) -> None:
     _add_columns(conn, _V10_COLUMNS)
@@ -300,6 +319,7 @@ def _expected_checksums(migration_0002_sql: str, legacy_checksum: str) -> dict[s
         "0010": _checksum(_V10_COLUMNS),
         "0011": hashlib.sha256(_V11_DISPATCH_TABLE_SQL.encode("utf-8")).hexdigest(),
         "0012": _checksum(_V12_DISPATCH_LEASE_COLUMNS),
+        "0013": _checksum((_V13_LEGACY_TABLES, _V13_LEGACY_SNAPSHOT_COLUMN)),
     }
 
 
@@ -463,6 +483,13 @@ def apply_content_research_migrations(
                 name="dispatch_lease_fencing",
                 checksum=expected_checksums["0012"],
                 apply=lambda: _add_columns(conn, _V12_DISPATCH_LEASE_COLUMNS),
+            )
+            _apply_migration(
+                conn,
+                version="0013",
+                name="remove_legacy_evidence_bundle_persistence",
+                checksum=expected_checksums["0013"],
+                apply=lambda: _apply_0013(conn),
             )
         except Exception:
             conn.rollback()

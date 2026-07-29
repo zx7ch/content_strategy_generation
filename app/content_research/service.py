@@ -28,7 +28,6 @@ from app.content_research.api_schemas import (
     ContentResearchLiteReportResponse,
     ContentResearchPlanResponse,
     ContentResearchPresearchResponse,
-    ContentResearchPublishedReportResponse,
     ContentResearchSourceCollectionRequest,
     ContentResearchSourceCollectionResponse,
     ContentResearchSubagentTaskResponse,
@@ -37,22 +36,19 @@ from app.content_research.api_schemas import (
     ContentResearchWorkflowActionResponse,
     ContentResearchWorkflowEventsResponse,
     ContentResearchWorkflowSummaryResponse,
-    EvidenceBundleView,
     HumanDecisionRequest,
     HumanDecisionResponse,
     HumanDecisionsResponse,
     SnapshotResponse,
 )
 from app.content_research.async_dispatch import AsyncFormalResearchDispatchRepository
-from app.content_research.contracts import build_default_snapshot
-from app.content_research.decision_policy import DecisionPolicyService
+from app.content_research.contracts import DIRECTION_CATALOG_V1, build_default_snapshot
 from app.content_research.decisions import ResearchDecisionService
-from app.content_research.evidence import EvidenceBundleService, EvidenceService
+from app.content_research.evidence import EvidenceService
 from app.content_research.evidence.governance_reader import (
     GovernanceReadModelReader,
     safe_public_projection,
 )
-from app.content_research.evidence.models import EvidenceRecord
 from app.content_research.evidence.packet_reader import PacketEvidenceReader
 from app.content_research.models import (
     ObservationEventRecord,
@@ -86,10 +82,7 @@ from app.content_research.reporting.faithfulness import (
 )
 from app.content_research.reporting.lite_read_model import LiteReportReader
 from app.content_research.reporting.publication_materializer import ReportPublicationMaterializer
-from app.content_research.reporting.read_model import (
-    PublishedReportNotFoundError,
-    PublishedReportReader,
-)
+from app.content_research.reporting.read_model import PublishedReportNotFoundError
 from app.content_research.runtime import canonical_fingerprint
 from app.content_research.sources import (
     SourceAdapterRegistry,
@@ -378,14 +371,12 @@ class ContentResearchService:
         self._plan_builder = ResearchPlanBuilder()
         self._trace_service = ContentResearchTraceService(store=store, db_path=store._db_path)
         self._source_registry = source_registry or SourceAdapterRegistry()
-        self._bundle_service = EvidenceBundleService(store)
         self._evidence_service = EvidenceService(store)
         self._task_router = SubagentTaskRouter(store=store, source_registry=self._source_registry)
         self._decision_service = ResearchDecisionService(
             store=store, workflow_runtime=workflow_runtime
         )
         self._decision_advancement_service = DecisionAdvancementService(store=store)
-        self._decision_policy_service = DecisionPolicyService(store)
         self._cross_direction_governance = CrossDirectionGovernanceService(store)
         self._report_execution = ReportExecutionService(store)
         self._dispatch = AsyncFormalResearchDispatchRepository(store._db_path)
@@ -500,6 +491,10 @@ class ContentResearchService:
         selected_direction_ids = self._direction_registry.canonicalize_many(
             confirmation_request.selected_directions
         )
+        if not set(selected_direction_ids).issubset(DIRECTION_CATALOG_V1):
+            raise ContentResearchValidationError(
+                "Selected directions must belong to the Lite direction catalog"
+            )
         directions = self._direction_registry.require_many(selected_direction_ids)
         confirmation = BriefConfirmation(
             confirmed_subject=confirmation_request.confirmed_subject.strip(),
@@ -538,6 +533,7 @@ class ContentResearchService:
                 "selected_competitors": confirmation.selected_competitors,
                 "custom_competitors": confirmation.custom_competitors,
                 "selected_directions": confirmation.selected_directions,
+                "requested_direction_ids": confirmation.selected_directions,
                 "custom_research_question": confirmation.custom_research_question,
             },
             updated_at=utcnow(),
@@ -556,7 +552,8 @@ class ContentResearchService:
             workflow_run_id=brief.workflow_run_id,
             brief_id=brief.id,
             plan_id=plan.id,
-            direction_ids=selected_direction_ids,
+            direction_ids=tuple(selected_direction_ids),
+            direction_catalog=DIRECTION_CATALOG_V1,
             provider_capabilities=_freeze_adapter_capabilities(self._source_registry),
         )
         saved_directions: list[ResearchDirectionRecord] = []
@@ -867,39 +864,20 @@ class ContentResearchService:
         saved = self._store.save_result_snapshot(snapshot)
         return self._snapshot_response(saved)
 
-    async def get_published_report(
-        self,
-        *,
-        workflow_run_id: str,
-        research_plan_id: str | None = None,
-        publication_id: str | None = None,
-        citation_offset: int = 0,
-        citation_limit: int = 50,
-    ) -> ContentResearchPublishedReportResponse:
-        try:
-            payload = await PublishedReportReader(self._store, self._store._db_path).read(
-                workflow_run_id=workflow_run_id,
-                research_plan_id=research_plan_id,
-                publication_id=publication_id,
-                citation_offset=citation_offset,
-                citation_limit=citation_limit,
-            )
-        except PublishedReportNotFoundError as exc:
-            raise ContentResearchNotFoundError(str(exc)) from exc
-        return ContentResearchPublishedReportResponse(**payload)
-
     async def get_lite_report(
         self,
         *,
         workflow_run_id: str,
         research_plan_id: str | None = None,
         publication_id: str | None = None,
+        citation_group_ids: list[str] | None = None,
     ) -> ContentResearchLiteReportResponse:
         try:
             payload = await LiteReportReader(self._store, self._store._db_path).read(
                 workflow_run_id=workflow_run_id,
                 research_plan_id=research_plan_id,
                 publication_id=publication_id,
+                citation_group_ids=citation_group_ids,
             )
         except PublishedReportNotFoundError as exc:
             raise ContentResearchNotFoundError(str(exc)) from exc
@@ -1324,53 +1302,6 @@ class ContentResearchService:
             weak_signals=weak_signals,
             offset=offset,
             limit=limit,
-        )
-
-    def get_evidence_bundle_view(self, bundle_id: str) -> EvidenceBundleView:
-        expanded = self._bundle_service.expand_bundle(bundle_id)
-        if expanded is None:
-            raise ContentResearchNotFoundError(f"Evidence bundle not found: {bundle_id}")
-        bundle = expanded.bundle
-        bundle = self._decision_policy_service.apply_to_bundle(bundle)
-        return EvidenceBundleView(
-            bundle_id=bundle.id,
-            workflow_run_id=bundle.workflow_run_id,
-            research_brief_id=bundle.research_brief_id,
-            research_plan_id=bundle.research_plan_id,
-            research_direction_id=bundle.research_direction_id,
-            status=bundle.status,
-            bundle_type=bundle.bundle_type,
-            bundle_version=bundle.bundle_version,
-            summary=bundle.summary,
-            coverage=bundle.coverage,
-            retrieval_metrics=bundle.retrieval_metrics,
-            faithfulness_metrics=bundle.faithfulness_metrics,
-            cross_source_metrics=bundle.cross_source_metrics,
-            contradiction_summary=bundle.contradiction_summary,
-            citation_coverage=bundle.citation_coverage,
-            unsupported_claim_count=bundle.unsupported_claim_count,
-            missing_evidence=_normalize_missing_evidence(expanded.missing_evidence),
-            priority_policy_id=bundle.priority_policy_id,
-            evidence_boundary_policy_id=bundle.evidence_boundary_policy_id,
-            decision_card=bundle.decision_card,
-            priority=bundle.priority,
-            evidence_state=bundle.evidence_state,
-            evidence_grade=bundle.evidence_grade,
-            claim_scope=bundle.claim_scope,
-            next_action=bundle.next_action,
-            items=[asdict(item) for item in expanded.items],
-            evidence_by_role={
-                role: [_evidence_record_view(record) for record in records]
-                for role, records in expanded.evidence_by_role.items()
-            },
-            lineage_by_evidence_id={
-                evidence_id: [asdict(lineage) for lineage in lineage_items]
-                for evidence_id, lineage_items in expanded.lineage_by_evidence_id.items()
-            },
-            source_links=expanded.source_links,
-            metadata=bundle.metadata,
-            created_at=bundle.created_at.isoformat(),
-            updated_at=bundle.updated_at.isoformat(),
         )
 
     async def run_workflow_action(
@@ -2199,6 +2130,7 @@ class ContentResearchService:
             "subject_confirmation": checklist.subject_confirmation,
             "competitor_tags": checklist.competitor_tags,
             "research_directions": checklist.research_directions,
+            "direction_catalog": list(DIRECTION_CATALOG_V1),
             "custom_research_question": checklist.custom_research_question,
             "custom_competitor_input": checklist.custom_competitor_input,
             "timeout_status": outcome.timeout_status,
@@ -2236,6 +2168,7 @@ class ContentResearchService:
             subject_confirmation=str(payload.get("subject_confirmation") or ""),
             competitor_tags=list(payload.get("competitor_tags") or []),
             research_directions=list(payload.get("research_directions") or []),
+            direction_catalog=list(payload.get("direction_catalog") or DIRECTION_CATALOG_V1),
             custom_research_question=str(payload.get("custom_research_question") or ""),
             custom_competitor_input=str(payload.get("custom_competitor_input") or ""),
             timeout_status=str(payload.get("timeout_status") or "none"),
@@ -2267,25 +2200,6 @@ def _dedupe(values: list[str]) -> list[str]:
             seen.add(normalized)
             result.append(normalized)
     return result
-
-
-def _normalize_missing_evidence(values: Any) -> list[dict[str, Any]]:
-    if not isinstance(values, list):
-        return []
-    normalized: list[dict[str, Any]] = []
-    for index, value in enumerate(values, start=1):
-        if isinstance(value, dict):
-            normalized.append(value)
-        else:
-            normalized.append(
-                {
-                    "schema_version": "content_research_missing_evidence_v1",
-                    "reason": "missing_evidence",
-                    "message": str(value),
-                    "sequence_no": index,
-                }
-            )
-    return normalized
 
 
 def _snapshot_title(brief: ResearchBriefRecord, result_type: str) -> str:
@@ -2320,27 +2234,6 @@ def _freeze_adapter_capabilities(
                 for item in capabilities
             },
         }
-    }
-
-
-def _evidence_record_view(record: EvidenceRecord) -> dict[str, Any]:
-    return {
-        "id": record.id,
-        "workflow_run_id": record.workflow_run_id,
-        "source_type": record.source_type,
-        "source_platform": record.source_platform,
-        "source_url": record.source_url,
-        "source_id": record.source_id,
-        "evidence_type": record.evidence_type,
-        "title": record.title,
-        "text_excerpt": record.text_excerpt,
-        "claim": record.claim,
-        "metrics": record.metrics,
-        "retrieval_query": record.retrieval_query,
-        "retrieval_rank": record.retrieval_rank,
-        "retrieval_score": record.retrieval_score,
-        "metadata": record.metadata,
-        "collected_at": record.collected_at.isoformat(),
     }
 
 

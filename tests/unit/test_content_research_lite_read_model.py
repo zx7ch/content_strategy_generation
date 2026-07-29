@@ -1,8 +1,72 @@
 from app.content_research.reporting.lite_read_model import (
+    LiteReportReader,
     _citation_ref,
     _lite_citations,
     _weak_signal,
 )
+
+
+class _StoreWithoutBrief:
+    """Smallest store seam needed by the published projection under test."""
+
+    def get_brief_by_workflow(self, workflow_run_id: str):
+        return None
+
+
+def test_lite_projection_with_empty_requested_scope_exposes_no_directional_data():
+    reader = LiteReportReader(_StoreWithoutBrief(), ":memory:")
+    report = {
+        "workflow_run_id": "run_empty_scope",
+        "workflow_terminal_state": "succeeded",
+        "publication_state": "complete_verified_report",
+        "publication": {"compose_mode": "template_only"},
+        "release": {
+            "direction_set_version": "direction_set_v1",
+            "direction_ids": [],
+        },
+        "claim_cards": [
+            {
+                "claim_candidate_id": "claim_product",
+                "direction_id": "product_marketing",
+                "admission_state": "admitted",
+                "statement": "must remain hidden",
+                "claim_type": "finding",
+                "scope": "one sample",
+            }
+        ],
+        "weak_signals": [
+            {
+                "claim_candidate_id": "weak_product",
+                "direction_id": "product_marketing",
+                "statement": "must also remain hidden",
+            }
+        ],
+        "citation_groups": [
+            {
+                "citation_group_id": "cg_product",
+                "display_index": 1,
+                "claim_candidate_id": "claim_product",
+                "evidence_refs": [
+                    {
+                        "field_path": "content_text",
+                        "quote": "private directional evidence",
+                        "source_url": "https://example.test/private",
+                    }
+                ],
+            }
+        ],
+        "run_direction_states": [
+            {"direction": "product_marketing", "state": "completed"}
+        ],
+        "limitations_recovery": [],
+    }
+
+    payload = reader._published_projection(report, citation_group_ids=None)
+
+    assert payload["sections"]["main_findings"] == []
+    assert payload["sections"]["weak_signals"] == []
+    assert payload["citations"] == []
+    assert payload["status_strip"]["admitted_finding_count"] == 0
 
 
 def test_lite_citations_retain_only_note_title_and_body_fields_with_navigation_reason():

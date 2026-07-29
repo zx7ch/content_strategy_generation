@@ -1,3 +1,4 @@
+import sqlite3
 from dataclasses import replace
 
 import httpx
@@ -8,16 +9,16 @@ from app.config import settings
 from app.content_research.contracts import build_default_snapshot
 from app.content_research.models import ResearchBriefRecord
 from app.content_research.persistence_models import StageCheckpointRecord
+from app.content_research.reporting.composer import ResearchReportComposer
 from app.content_research.reporting.publication_materializer import ReportPublicationMaterializer
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
 from app.memory.thread_store import ThreadStore
 from app.services.workflow_run_manager import WorkflowRunManager
 from tests.integration.test_content_research_report_store import (
     _decision,
-    _draft,
     _publication,
-    _snapshot,
 )
+from tests.unit.test_content_research_report_composer import _snapshot as _governed_snapshot
 
 
 @pytest.mark.asyncio
@@ -35,8 +36,49 @@ async def test_creator_timeline_api_exposes_one_materialized_report_result_and_r
         thread = await thread_store.create_thread(title="调研报告")
         async with WorkflowRunManager(db_path) as manager:
             run = await manager.start_run(thread_id=thread["id"], user_id="user-1")
-        snapshot = replace(_snapshot(), workflow_run_id=run.run_id)
-        draft = replace(_draft(), workflow_run_id=run.run_id)
+        store.save_brief(
+            ResearchBriefRecord(
+                id="brief_existing_publication_selector_mismatch",
+                workflow_run_id=run.run_id,
+                thread_id=thread["id"],
+                schema_version="content_research_brief_v1",
+                status="ready",
+                payload={
+                    "schema_version": "content_research_brief_payload_v1",
+                    "confirmed_subject": "已有报告不应进入恢复",
+                },
+            )
+        )
+        governed = _governed_snapshot().metadata["governed_snapshot"]
+        frozen_citations = [
+            {
+                **governed["citation_groups"][0],
+                "citation_group_id": "cg_1",
+                "display_index": 1,
+            },
+            {
+                **governed["citation_groups"][0],
+                "citation_group_id": "cg_2",
+                "display_index": 2,
+            },
+        ]
+        snapshot = replace(
+            _governed_snapshot(),
+                workflow_run_id=run.run_id,
+                metadata={
+                    "governed_snapshot": {
+                        **governed,
+                        "policy_scope": {
+                            **governed["policy_scope"],
+                            "direction_set_version": "direction_set_v1",
+                            "direction_ids": ["product_marketing"],
+                        },
+                        "citation_groups": frozen_citations,
+                    },
+                    "governed_input_fingerprint": "timeline_frozen_citations",
+                },
+            )
+        draft = ResearchReportComposer().compose(snapshot)
         decision = replace(_decision(draft), workflow_run_id=run.run_id)
         publication = replace(_publication(draft, decision), workflow_run_id=run.run_id)
         store.save_result_snapshot(snapshot)
@@ -49,14 +91,40 @@ async def test_creator_timeline_api_exposes_one_materialized_report_result_and_r
         materializer = ReportPublicationMaterializer(store, db_path)
         artifact = await materializer.materialize(publication.id)
         await materializer.materialize(publication.id)
+        # A failed/paused run normally qualifies for recovery.  A committed
+        # publication must still block recovery when a caller provides a
+        # selector that does not resolve to it.
+        with sqlite3.connect(db_path) as connection:
+            connection.execute(
+                "UPDATE workflow_runs SET status = 'paused' WHERE run_id = ?",
+                (run.run_id,),
+            )
+        store.save_stage_checkpoint(
+            StageCheckpointRecord(
+                id="checkpoint_existing_publication_selector_mismatch",
+                schema_version="content_research_stage_checkpoint_v1",
+                payload={"reason_code": "auth_expired"},
+                workflow_run_id=run.run_id,
+                subagent_task_id="task_existing_publication_selector_mismatch",
+                stage_name="collect",
+                input_fingerprint="existing-publication-selector-mismatch",
+                status="failed",
+            )
+        )
 
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
             response = await client.get(f"/threads/{thread['id']}/timeline")
-            report_response = await client.get(f"/content-research/workflows/{run.run_id}/report")
             lite_response = await client.get(
-                f"/content-research/workflows/{run.run_id}/lite-report"
+                f"/content-research/workflows/{run.run_id}/lite-report?citation_group_ids=cg_1"
             )
+            unavailable_citation_response = await client.get(
+                f"/content-research/workflows/{run.run_id}/lite-report?citation_group_ids=cg_missing"
+            )
+            selector_mismatch_response = await client.get(
+                f"/content-research/workflows/{run.run_id}/lite-report?publication_id=publication_missing"
+            )
+            report_response = await client.get(f"/content-research/workflows/{run.run_id}/report")
             legacy_response = await client.get(f"/content-research/workflows/{run.run_id}/results")
         assert response.status_code == 200
         results = [
@@ -72,20 +140,20 @@ async def test_creator_timeline_api_exposes_one_materialized_report_result_and_r
             reference["artifact"]["materialized_payload_json"]["report_publication_id"]
             == publication.id
         )
-        assert report_response.status_code == 200, report_response.text
+        assert report_response.status_code == 404, report_response.text
         assert lite_response.status_code == 200, lite_response.text
+        assert unavailable_citation_response.status_code == 404
+        assert selector_mismatch_response.status_code == 404
         assert legacy_response.status_code == 404
-        report = report_response.json()
-        assert report["workflow_terminal_state"] == "succeeded"
-        assert report["publication_state"] == "complete_verified_report"
-        assert report["artifact"]["artifact_id"] == artifact.artifact_id
-        assert report["publication"]["report_publication_id"] == publication.id
-        assert "items" not in report and "recommendations" not in report
         lite = lite_response.json()
         assert lite["publication"]["state"] == "complete_verified_report"
         assert isinstance(lite["status_strip"]["admitted_finding_count"], int)
-        assert lite["sections"]["main_findings"] == []
-        assert lite["citations"] == []
+        assert [item["citation_group_id"] for item in lite["citations"]] == ["cg_1"]
+        assert [
+            ref["quote"]
+            for citation in lite["citations"]
+            for ref in citation["evidence_refs"]
+        ] == ["通勤"]
     finally:
         app.state.thread_store = original_thread_store
         await thread_store.close()

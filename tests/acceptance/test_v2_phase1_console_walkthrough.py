@@ -1,29 +1,16 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
 import os
-from pathlib import Path
 import re
-import signal
-import socket
-import subprocess
 import time
-from typing import Iterator
+from pathlib import Path
 
 import httpx
-from playwright.sync_api import Page, sync_playwright
 import pytest
+from playwright.sync_api import Page, sync_playwright
 
 from tests.acceptance.conftest import write_acceptance_artifact
-
-
-def _reserve_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        try:
-            sock.bind(("127.0.0.1", 0))
-        except PermissionError as exc:  # pragma: no cover - env specific
-            pytest.skip(f"socket bind unavailable in current environment: {exc}")
-        return int(sock.getsockname()[1])
+from tests.browser_process import chrome_executable, reserve_port, run_process
 
 
 def _headers(workspace_id: str) -> dict[str, str]:
@@ -33,72 +20,6 @@ def _headers(workspace_id: str) -> dict[str, str]:
     }
 
 
-def _chrome_executable() -> str:
-    candidates = [
-        os.getenv("PLAYWRIGHT_CHROME_EXECUTABLE", "").strip(),
-        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-    ]
-    for candidate in candidates:
-        if candidate and Path(candidate).exists():
-            return candidate
-    pytest.skip("Chrome executable unavailable for Playwright console walkthrough")
-
-
-@contextmanager
-def _run_process(
-    *,
-    cmd: list[str],
-    cwd: Path,
-    env: dict[str, str],
-    ready_url: str,
-    ready_timeout: float,
-    name: str,
-) -> Iterator[None]:
-    process = subprocess.Popen(
-        cmd,
-        cwd=str(cwd),
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
-    output: list[str] = []
-    try:
-        deadline = time.time() + ready_timeout
-        while time.time() < deadline:
-            if process.poll() is not None:
-                if process.stdout is not None:
-                    output.append(process.stdout.read())
-                raise AssertionError(f"{name} exited before startup:\n{''.join(output)}")
-            try:
-                response = httpx.get(ready_url, timeout=0.5, follow_redirects=True)
-                if response.status_code < 500:
-                    break
-            except httpx.HTTPError:
-                pass
-            time.sleep(0.1)
-        else:  # pragma: no cover - startup failure
-            if process.stdout is not None:
-                # `read()` waits for EOF, but the process is still alive here.
-                # Terminate it before collecting diagnostics so a failed
-                # readiness probe cannot hang the acceptance harness forever.
-                process.terminate()
-                try:
-                    stdout, _ = process.communicate(timeout=5)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    stdout, _ = process.communicate(timeout=5)
-                output.append(stdout)
-            raise AssertionError(f"{name} did not start in time:\n{''.join(output)}")
-        yield
-    finally:
-        if process.poll() is None:
-            process.send_signal(signal.SIGTERM)
-            try:
-                process.wait(timeout=10)
-            except subprocess.TimeoutExpired:  # pragma: no cover - shutdown failure
-                process.kill()
-                process.wait(timeout=5)
 
 
 def _seed_phase1_setup(base_url: str) -> dict[str, str]:
@@ -242,8 +163,8 @@ def test_v2_phase1_console_walkthrough(
 ) -> None:
     repo_root = Path(__file__).resolve().parents[2]
     frontend_root = repo_root / "frontend"
-    backend_port = _reserve_port()
-    frontend_port = _reserve_port()
+    backend_port = reserve_port()
+    frontend_port = reserve_port()
     backend_url = f"http://127.0.0.1:{backend_port}"
     frontend_url = f"http://127.0.0.1:{frontend_port}"
 
@@ -264,7 +185,7 @@ def test_v2_phase1_console_walkthrough(
 
     started = time.perf_counter()
 
-    with _run_process(
+    with run_process(
         cmd=[
             "python3",
             "-m",
@@ -285,7 +206,7 @@ def test_v2_phase1_console_walkthrough(
     ):
         seeded = _seed_phase1_setup(backend_url)
 
-        with _run_process(
+        with run_process(
             cmd=[
                 "npm",
                 "run",
@@ -305,7 +226,7 @@ def test_v2_phase1_console_walkthrough(
             with sync_playwright() as p:
                 browser = p.chromium.launch(
                     headless=True,
-                    executable_path=_chrome_executable(),
+                    executable_path=chrome_executable(),
                 )
                 page = browser.new_page()
                 page.goto(f"{frontend_url}/brands", wait_until="networkidle")
@@ -392,8 +313,8 @@ def test_v2_brand_creation_from_console(
 ) -> None:
     repo_root = Path(__file__).resolve().parents[2]
     frontend_root = repo_root / "frontend"
-    backend_port = _reserve_port()
-    frontend_port = _reserve_port()
+    backend_port = reserve_port()
+    frontend_port = reserve_port()
     backend_url = f"http://127.0.0.1:{backend_port}"
     frontend_url = f"http://127.0.0.1:{frontend_port}"
 
@@ -414,7 +335,7 @@ def test_v2_brand_creation_from_console(
 
     started = time.perf_counter()
 
-    with _run_process(
+    with run_process(
         cmd=[
             "python3",
             "-m",
@@ -433,7 +354,7 @@ def test_v2_brand_creation_from_console(
         ready_timeout=15,
         name="backend",
     ):
-        with _run_process(
+        with run_process(
             cmd=[
                 "npm",
                 "run",
@@ -453,7 +374,7 @@ def test_v2_brand_creation_from_console(
             with sync_playwright() as p:
                 browser = p.chromium.launch(
                     headless=True,
-                    executable_path=_chrome_executable(),
+                    executable_path=chrome_executable(),
                 )
                 page = browser.new_page()
                 page.goto(f"{frontend_url}/brands", wait_until="networkidle")

@@ -20,6 +20,7 @@ def test_settings_default_values() -> None:
     assert settings.RUNTIME_SERVICE_NAME == "xhs-agent-runtime"
     assert settings.RUNTIME_VERSION
     assert settings.RUNTIME_API_CONTRACT == "local-runtime-v1"
+    assert settings.F003_LITE_PREVIEW_ENABLED is False
     assert settings.cors_allowed_origins == [
         "http://localhost:3000",
         "http://127.0.0.1:3000",
@@ -42,12 +43,14 @@ def test_settings_env_override(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) 
         "CORS_ALLOWED_ORIGINS",
         "http://localhost:3000, https://xhs-growth-agent.vercel.app ",
     )
+    monkeypatch.setenv("F003_LITE_PREVIEW_ENABLED", "true")
 
     settings = Settings(_env_file=None)
     assert settings.LLM_PROVIDER == "deepseek"
     assert settings.XHS_SPIDER_MAX_RETRIES == 7
     assert settings.SESSION_ALIVE_HOURS == 48
     assert settings.CHROMA_PERSIST_DIR == str(chroma_dir)
+    assert settings.F003_LITE_PREVIEW_ENABLED is True
     assert settings.cors_allowed_origins == [
         "http://localhost:3000",
         "https://xhs-growth-agent.vercel.app",
