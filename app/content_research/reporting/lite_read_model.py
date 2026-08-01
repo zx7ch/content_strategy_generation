@@ -108,9 +108,8 @@ class LiteReportReader:
                 "published report has unsupported compose mode"
             )
         requested_directions = set(_frozen_scope(report)["direction_ids"])
-        claim_cards = _records_in_directions(
-            report.get("claim_cards"), requested_directions
-        )
+        raw_claim_cards = report.get("claim_cards")
+        claim_cards = _records_in_directions(raw_claim_cards, requested_directions)
         weak_signal_records = _records_in_directions(
             report.get("weak_signals"), requested_directions
         )
@@ -142,6 +141,15 @@ class LiteReportReader:
             _validated_card(card, citations_by_claim)
             for card in claim_cards
         ]
+        if publication_state != "evidence_only_report" and (
+            not isinstance(raw_claim_cards, list)
+            or any(not isinstance(card, dict) for card in raw_claim_cards)
+            or len(claim_cards) != len(raw_claim_cards)
+            or any(card is None for card in cards)
+        ):
+            raise PublishedReportNotFoundError(
+                "published report governed card identity is invalid"
+            )
         findings = [
             _finding(card)
             for card in cards
@@ -369,13 +377,15 @@ def _lite_citation_group(group: object) -> dict[str, Any] | None:
         return None
     source_url = source_urls.pop()
     navigation_state = _group_navigation_state(raw_refs, source_url)
+    projectable_refs = [ref for ref in raw_refs if ref.get("field_path") in _LITE_FIELDS]
+    if not projectable_refs or any(
+        not _valid_frozen_quote_ref(ref) for ref in projectable_refs
+    ):
+        return None
     refs = [
         _citation_ref(ref, navigation_state=navigation_state)
-        for ref in raw_refs
-        if ref.get("field_path") in _LITE_FIELDS
+        for ref in projectable_refs
     ]
-    if not refs:
-        return None
     return {
         "citation_group_id": group.get("citation_group_id"),
         "display_index": group.get("display_index"),
@@ -437,8 +447,38 @@ def _citation_ref(
     )
     return {
         key: ref.get(key)
-        for key in ("quote", "field_path", "source_url", "source_collected_at", "source_text_hash")
+        for key in (
+            "quote",
+            "field_path",
+            "text_start",
+            "text_end",
+            "source_url",
+            "source_collected_at",
+            "source_text_hash",
+        )
     } | {"navigation_state": state, "navigation_reason": ref.get("navigation_reason")}
+
+
+def _valid_frozen_quote_ref(
+    ref: dict[str, Any], *, eligible_fields: set[str] = _LITE_FIELDS
+) -> bool:
+    quote = ref.get("quote")
+    start = ref.get("text_start")
+    end = ref.get("text_end")
+    return (
+        ref.get("field_path") in eligible_fields
+        and isinstance(quote, str)
+        and bool(quote)
+        and isinstance(start, int)
+        and not isinstance(start, bool)
+        and isinstance(end, int)
+        and not isinstance(end, bool)
+        and start >= 0
+        and end > start
+        and end - start == len(quote)
+        and isinstance(ref.get("source_text_hash"), str)
+        and bool(ref["source_text_hash"])
+    )
 
 
 def _citations_by_claim(citations: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
@@ -485,11 +525,7 @@ def _validated_card(
         if citation.get("citation_group_id")
         and citation.get("admission_decision_id") == admission_id
         and any(
-            ref.get("field_path") in eligible_fields
-            and isinstance(ref.get("quote"), str)
-            and bool(ref["quote"])
-            and isinstance(ref.get("source_text_hash"), str)
-            and bool(ref["source_text_hash"])
+            _valid_frozen_quote_ref(ref, eligible_fields=eligible_fields)
             for ref in citation.get("evidence_refs") or []
             if isinstance(ref, dict)
         )

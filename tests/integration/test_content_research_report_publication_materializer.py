@@ -395,7 +395,7 @@ async def test_materialization_rejects_incomplete_frozen_citation_before_artifac
 
 
 @pytest.mark.asyncio
-async def test_migration_purges_legacy_report_lineage_artifact_and_creator_message_idempotently(
+async def test_migration_purges_legacy_report_lineage_but_preserves_same_run_non_report_results(
     tmp_path,
 ):
     db_path = str(tmp_path / "legacy-report-purge.db")
@@ -593,6 +593,29 @@ async def test_migration_purges_legacy_report_lineage_artifact_and_creator_messa
                 }
             ],
         )
+        async with WorkflowRunManager(db_path) as manager:
+            unrelated_artifact = await manager.attach_artifact(
+                run_id=run.run_id,
+                artifact_type=WorkflowArtifactType.FINAL_RESULT,
+                payload={"kind": "same_run_non_report_result"},
+                payload_mode=WorkflowArtifactPayloadMode.SNAPSHOT,
+                summary_text="其他工作流结果",
+            )
+        unrelated_message = await thread_store.append_message(
+            thread_id=thread["id"],
+            role="assistant",
+            text="其他工作流结果已生成。",
+            message_type="artifact_result",
+            run_id=run.run_id,
+            artifact_refs=[
+                {
+                    "artifact_id": unrelated_artifact.artifact_id,
+                    "artifact_type": unrelated_artifact.artifact_type.value,
+                    "artifact_version": unrelated_artifact.artifact_version,
+                    "parent_artifact_id": unrelated_artifact.parent_artifact_id,
+                }
+            ],
+        )
         with sqlite3.connect(db_path) as conn:
             conn.execute(
                 "UPDATE workflow_artifacts SET payload_json = ? WHERE artifact_id = ?",
@@ -640,8 +663,8 @@ async def test_migration_purges_legacy_report_lineage_artifact_and_creator_messa
         }
 
         assert first_state == second_state == {
-            "artifacts": [],
-            "messages": [],
+            "artifacts": [unrelated_artifact.artifact_id],
+            "messages": [unrelated_message["id"]],
             "publications": [],
             "drafts": [],
             "decisions": [],
@@ -670,6 +693,8 @@ async def test_migration_purges_legacy_report_lineage_artifact_and_creator_messa
 
         with pytest.raises(ValueError, match="missing report publication"):
             await ReportPublicationMaterializer(migrated_store, db_path).materialize(publication.id)
-        assert await thread_store.get_thread_messages(thread["id"]) == []
+        assert [
+            item["id"] for item in await thread_store.get_thread_messages(thread["id"])
+        ] == [unrelated_message["id"]]
     finally:
         await thread_store.close()

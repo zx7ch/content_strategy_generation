@@ -9,6 +9,7 @@ the temporary generic-role records created by the early refactor.
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
 from collections.abc import Callable
 from datetime import datetime, timezone
@@ -286,36 +287,103 @@ _V14_REPORT_TABLES = (
 
 
 def _apply_0014(conn: sqlite3.Connection) -> None:
-    workflow_run_ids = sorted(
-        {
-            row[0]
-            for row in conn.execute(
-                "SELECT workflow_run_id FROM content_research_report_publications"
-            )
-        }
+    publication_rows = list(
+        conn.execute(
+            "SELECT id, workflow_run_id, report_draft_id, faithfulness_decision_id "
+            "FROM content_research_report_publications"
+        )
     )
+    publication_ids = {row[0] for row in publication_rows}
+    workflow_run_ids = sorted({row[1] for row in publication_rows})
+    draft_ids = {row[2] for row in publication_rows}
+    decision_ids = {row[3] for row in publication_rows}
     if workflow_run_ids:
         workflow_placeholders = ", ".join("?" for _ in workflow_run_ids)
-        conn.execute(
-            f"""
-            DELETE FROM creator_messages
-            WHERE run_id IN ({workflow_placeholders})
-              AND message_type = 'artifact_result'
-            """,
-            workflow_run_ids,
+        artifact_rows = list(
+            conn.execute(
+                f"""
+                SELECT artifact_id, payload_json, summary_text, storage_table, storage_key
+                FROM workflow_artifacts
+                WHERE run_id IN ({workflow_placeholders})
+                  AND artifact_type = 'final_result'
+                """,
+                workflow_run_ids,
+            )
         )
-        conn.execute(
-            f"""
-            DELETE FROM workflow_artifacts
-            WHERE run_id IN ({workflow_placeholders})
-              AND artifact_type = 'final_result'
-            """,
-            workflow_run_ids,
+        artifact_ids = {row[0] for row in artifact_rows}
+        report_artifact_ids: set[str] = set()
+        for artifact_id, raw_payload, summary_text, storage_table, storage_key in artifact_rows:
+            try:
+                payload = json.loads(raw_payload) if raw_payload else None
+            except (TypeError, ValueError):
+                payload = None
+            if (
+                summary_text == "内容调研报告已发布"
+                or storage_table in _V14_REPORT_TABLES
+                or storage_key in publication_ids | draft_ids | decision_ids
+                or (
+                    isinstance(payload, dict)
+                    and (
+                        payload.get("schema_version")
+                        == "content_research_published_report_artifact_v1"
+                        or payload.get("report_publication_id") in publication_ids
+                        or payload.get("report_draft_id") in draft_ids
+                        or payload.get("faithfulness_decision_id") in decision_ids
+                    )
+                )
+            ):
+                report_artifact_ids.add(artifact_id)
+
+        message_rows = list(
+            conn.execute(
+                f"""
+                SELECT id, text, artifact_refs_json
+                FROM creator_messages
+                WHERE run_id IN ({workflow_placeholders})
+                  AND message_type = 'artifact_result'
+                """,
+                workflow_run_ids,
+            )
         )
-    # A persisted report publication defines the pre-cutover report contract
-    # for its workflow run. Every final-result artifact and artifact-result
-    # message in that run is therefore an old-contract report output; JSON
-    # validity is irrelevant to this contract boundary.
+        parsed_message_refs: dict[str, set[str]] = {}
+        report_message_ids: set[str] = set()
+        for message_id, message_text, raw_refs in message_rows:
+            try:
+                refs = json.loads(raw_refs) if raw_refs else []
+            except (TypeError, ValueError):
+                refs = []
+            referenced_artifact_ids = {
+                ref.get("artifact_id")
+                for ref in refs
+                if isinstance(ref, dict)
+                and isinstance(ref.get("artifact_id"), str)
+                and ref["artifact_id"] in artifact_ids
+            }
+            parsed_message_refs[message_id] = referenced_artifact_ids
+            if message_text == "内容调研报告已生成。":
+                report_message_ids.add(message_id)
+                report_artifact_ids.update(referenced_artifact_ids)
+
+        report_message_ids.update(
+            message_id
+            for message_id, referenced_artifact_ids in parsed_message_refs.items()
+            if referenced_artifact_ids & report_artifact_ids
+        )
+        if report_message_ids:
+            message_placeholders = ", ".join("?" for _ in report_message_ids)
+            conn.execute(
+                f"DELETE FROM creator_messages WHERE id IN ({message_placeholders})",
+                sorted(report_message_ids),
+            )
+        if report_artifact_ids:
+            artifact_placeholders = ", ".join("?" for _ in report_artifact_ids)
+            conn.execute(
+                f"DELETE FROM workflow_artifacts WHERE artifact_id IN ({artifact_placeholders})",
+                sorted(report_artifact_ids),
+            )
+
+    # Report-level tables themselves define the old contract boundary, even
+    # when their JSON payloads are malformed. Gate 2 and non-report rows remain.
     for table in _V14_REPORT_TABLES:
         conn.execute(f"DELETE FROM {table}")
 

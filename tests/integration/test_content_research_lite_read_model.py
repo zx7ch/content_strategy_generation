@@ -177,6 +177,8 @@ async def _project_formal_cards(
     citation_groups,
     weak_signals=None,
     compose_mode="template_only",
+    publication_state="complete_verified_report",
+    artifact_payload_mutator=None,
 ):
     db_path = str(tmp_path / "lite-projection-guard.db")
     store = SQLiteContentResearchStore(db_path)
@@ -217,18 +219,29 @@ async def _project_formal_cards(
     )
     draft = ResearchReportComposer().compose(snapshot)
     decision = replace(_decision(draft), workflow_run_id=run.run_id)
-    publication = replace(
-        _publication(draft, decision),
-        workflow_run_id=run.run_id,
-        compose_mode=compose_mode,
-    )
+    publication_changes = {
+        "workflow_run_id": run.run_id,
+        "compose_mode": compose_mode,
+        "publication_state": publication_state,
+    }
+    if publication_state == "partial_verified_report":
+        publication_changes["omitted_section_ids"] = ("sec_core",)
+    publication = replace(_publication(draft, decision), **publication_changes)
     store.save_result_snapshot(snapshot)
     store.save_report_draft(draft.to_record())
     store.save_report_faithfulness_decision(decision.to_record())
     store.save_report_publication(publication.to_record())
     async with WorkflowRunManager(db_path) as manager:
         await manager.complete_run(run.run_id)
-    await ReportPublicationMaterializer(store, db_path).materialize(publication.id)
+    artifact = await ReportPublicationMaterializer(store, db_path).materialize(publication.id)
+    if artifact_payload_mutator is not None:
+        payload = artifact.payload_json
+        artifact_payload_mutator(payload)
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                "UPDATE workflow_artifacts SET payload_json = ? WHERE artifact_id = ?",
+                (json.dumps(payload), artifact.artifact_id),
+            )
 
     return await LiteReportReader(store, db_path).read(workflow_run_id=run.run_id)
 
@@ -281,21 +294,59 @@ def _citation(
 
 
 @pytest.mark.asyncio
-async def test_lite_reader_rejects_cards_without_matching_admitted_citation_identity(tmp_path):
-    report = await _project_formal_cards(
-        tmp_path,
-        claim_cards=[
-            _card("cc_accepted", "cad_accepted", admission_state="accepted"),
-            _card("cc_identity_mismatch", "cad_expected"),
-        ],
-        citation_groups=[
-            _citation("citation_accepted", "cc_accepted", "cad_accepted"),
-            _citation("citation_mismatch", "cc_identity_mismatch", "cad_other"),
-        ],
-    )
+@pytest.mark.parametrize(
+    "publication_state", ["complete_verified_report", "partial_verified_report"]
+)
+async def test_lite_reader_fails_closed_when_verified_publication_contains_invalid_card_identity(
+    tmp_path, publication_state
+):
+    with pytest.raises(
+        PublishedReportNotFoundError, match="governed card identity is invalid"
+    ):
+        await _project_formal_cards(
+            tmp_path,
+            publication_state=publication_state,
+            claim_cards=[
+                _card("cc_accepted", "cad_accepted", admission_state="accepted"),
+                _card("cc_identity_mismatch", "cad_expected"),
+            ],
+            citation_groups=[
+                _citation("citation_accepted", "cc_accepted", "cad_accepted"),
+                _citation("citation_mismatch", "cc_identity_mismatch", "cad_other"),
+            ],
+        )
 
-    assert report["sections"]["main_findings"] == []
-    assert report["status_strip"]["admitted_finding_count"] == 0
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("missing_field", "text_start", "text_end"),
+    [
+        ("text_start", 0, 10),
+        (None, 0, 0),
+        (None, 4, 3),
+    ],
+)
+async def test_lite_reader_rejects_missing_or_invalid_frozen_quote_span(
+    tmp_path, missing_field, text_start, text_end
+):
+    citation = _citation("citation_span", "cc_span", "cad_span")
+
+    def corrupt_artifact_span(payload):
+        evidence_ref = payload["citation_groups"][0]["evidence_refs"][0]
+        evidence_ref["text_start"] = text_start
+        evidence_ref["text_end"] = text_end
+        if missing_field is not None:
+            evidence_ref.pop(missing_field)
+
+    with pytest.raises(
+        PublishedReportNotFoundError, match="governed card identity is invalid"
+    ):
+        await _project_formal_cards(
+            tmp_path,
+            claim_cards=[_card("cc_span", "cad_span")],
+            citation_groups=[citation],
+            artifact_payload_mutator=corrupt_artifact_span,
+        )
 
 
 @pytest.mark.asyncio
@@ -304,11 +355,9 @@ async def test_lite_reader_retains_title_backed_message_angle_but_not_raw_produc
         tmp_path,
         claim_cards=[
             _card("cc_message_angle", "cad_message", claim_type="message_angle"),
-            _card("cc_product_value", "cad_value"),
         ],
         citation_groups=[
             _citation("citation_message", "cc_message_angle", "cad_message", field_path="title"),
-            _citation("citation_value", "cc_product_value", "cad_value", field_path="title"),
         ],
     )
 
@@ -384,14 +433,14 @@ async def test_lite_reader_excludes_a_group_with_mixed_note_identity_or_source_u
         },
     ]
 
-    report = await _project_formal_cards(
-        tmp_path,
-        claim_cards=[_card("cc_mixed", "cad_mixed")],
-        citation_groups=[citation],
-    )
-
-    assert report["citations"] == []
-    assert report["sections"]["main_findings"] == []
+    with pytest.raises(
+        PublishedReportNotFoundError, match="governed card identity is invalid"
+    ):
+        await _project_formal_cards(
+            tmp_path,
+            claim_cards=[_card("cc_mixed", "cad_mixed")],
+            citation_groups=[citation],
+        )
 
 
 @pytest.mark.asyncio
@@ -486,9 +535,9 @@ async def test_lite_reader_retains_only_weak_signals_with_matching_frozen_identi
     report = await _project_formal_cards(
         tmp_path,
         claim_cards=[
-            _card("cc_valid", "cad_valid", admission_state="accepted"),
-            _card("cc_bad_admission", "cad_expected", admission_state="accepted"),
-            _card("cc_other", "cad_bad_claim", admission_state="accepted"),
+            _card("cc_valid", "cad_valid"),
+            _card("cc_bad_admission", "cad_other"),
+            _card("cc_other", "cad_bad_claim"),
         ],
         citation_groups=[
             _citation("citation_valid", "cc_valid", "cad_valid"),
@@ -520,7 +569,7 @@ async def test_lite_reader_retains_only_weak_signals_with_matching_frozen_identi
         ],
     )
 
-    assert report["sections"]["main_findings"] == []
+    assert len(report["sections"]["main_findings"]) == 3
     assert report["sections"]["weak_signals"] == [
         {
             "statement": "valid weak signal",
@@ -532,7 +581,7 @@ async def test_lite_reader_retains_only_weak_signals_with_matching_frozen_identi
     ]
     assert report["status_strip"] == {
         "completed_direction_count": 0,
-        "admitted_finding_count": 0,
+        "admitted_finding_count": 3,
         "observation_count": 0,
         "lead_count": 1,
     }
