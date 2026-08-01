@@ -68,6 +68,44 @@ export interface ContentResearchWorkflowSummary {
   runtime_child_tasks: JsonObject[];
 }
 
+export interface ContentResearchTrace {
+  schema_version: string;
+  workflow_run_id: string;
+  thread_id?: string | null;
+  current_stage?: string | null;
+  run_status?: string | null;
+  recoverable: boolean;
+  duration_ms: number;
+  error_count: number;
+  retry_count: number;
+  traces: JsonObject[];
+  observation_events: JsonObject[];
+  workflow_events: JsonObject[];
+  runtime_steps: JsonObject[];
+  runtime_child_tasks: JsonObject[];
+  usage_summary: JsonObject;
+  external_api_summary: JsonObject;
+  provider_operations: Array<{
+    operation_fingerprint: string;
+    operation?: string | null;
+    provider?: string | null;
+    provider_operation?: string | null;
+    source_kind?: string | null;
+    result_status?: string | null;
+    item_count?: number | null;
+    completeness?: string | null;
+    status: string;
+    started_at?: string | null;
+    finished_at?: string | null;
+    failure_code?: string | null;
+    failure_reason?: string | null;
+    retryable: boolean;
+    recovery_action?: string | null;
+  }>;
+  usage_steps: JsonObject[];
+  usage_events: JsonObject[];
+}
+
 export interface ContentResearchSourceCollectionRequest {
   query?: string | null;
   source_kind?: string;
@@ -234,6 +272,10 @@ export async function confirmContentResearchBriefLegacy(
 
 export async function getContentResearchWorkflow(workflowRunId: string): Promise<ContentResearchWorkflowSummary> {
   return contentResearchFetch(`/content-research/workflows/${encodeURIComponent(workflowRunId)}`);
+}
+
+export async function getContentResearchTrace(workflowRunId: string): Promise<ContentResearchTrace> {
+  return contentResearchFetch(`/content-research/workflows/${encodeURIComponent(workflowRunId)}/trace`);
 }
 
 export async function getContentResearchLiteReport(

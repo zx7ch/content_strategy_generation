@@ -285,16 +285,110 @@ def test_creator_complete_report_uses_lite_with_direct_source_navigation(
     expect(drawer.get_by_text("可打开来源", exact=True)).to_be_visible()
     expect(drawer.get_by_text("2026-07-21T00:00:00Z", exact=True)).to_be_visible()
     expect(drawer.get_by_role("link", name="打开原笔记")).to_have_count(1)
+    sidebar = page.locator('aside[aria-label="内容调研上下文"]')
+    sidebar.get_by_label("查看完整 workflow trace").click()
+    trace = page.locator('section[aria-label="Content Research Trace"]')
+    expect(trace).to_be_visible()
+    expect(trace.get_by_role("button", name="继续本轮调研")).to_have_count(0)
+    expect(trace.get_by_role("button", name="登录成功，继续本轮调研")).to_have_count(0)
+    expect(trace.get_by_role("button", name="扫码登录小红书")).to_have_count(0)
+    with page.expect_response(
+        lambda response: response.url.endswith("/trace")
+        and response.request.method == "GET",
+        timeout=15000,
+    ):
+        trace.get_by_role("button", name="刷新", exact=True).click()
+    trace.get_by_label("关闭 Trace 对话框").click()
 
     assert any(
         f"/content-research/workflows/{seeded['run_id']}/lite-report" in url
         for url in requested_urls
     )
-    assert not any(url.endswith("/trace") for url in requested_urls)
+    assert any(url.endswith("/trace") for url in requested_urls)
     assert not any(
         url.endswith(f"/content-research/workflows/{seeded['run_id']}/report")
         for url in requested_urls
     )
+
+
+def test_creator_trace_prioritizes_auth_required_child_and_resumes_once_after_qr(
+    browser_page,
+):
+    page, stack = browser_page
+    brand_id = default_brand_id(stack["backend_url"])
+    seeded = run_async_in_thread(
+        seed_auth_required_trace(
+            stack["db_path"],
+            brand_id=brand_id,
+            title="等待登录的 Lite 调研",
+        )
+    )
+    requested_urls: list[str] = []
+    resume_payloads: list[dict] = []
+
+    def record_request(request) -> None:
+        requested_urls.append(request.url)
+        if request.url.endswith("/actions") and request.post_data:
+            payload = request.post_data_json
+            if payload.get("action") == "resume_formal_research":
+                resume_payloads.append(payload)
+
+    page.on("request", record_request)
+    open_creator_with_restored_run(page, stack["frontend_url"], seeded["run_id"])
+
+    sidebar = page.locator('aside[aria-label="内容调研上下文"]')
+    expect(sidebar.get_by_text("研究运行 / Trace", exact=True)).to_be_visible(
+        timeout=20000
+    )
+    expect(sidebar.get_by_text("需要登录小红书网页端", exact=True)).to_be_visible()
+    expect(sidebar.get_by_text("专家调研进行中", exact=True)).to_have_count(0)
+    full_trace = sidebar.get_by_label("查看完整 workflow trace")
+    expect(full_trace).to_be_visible()
+    full_trace.click()
+
+    trace = page.locator('section[aria-label="Content Research Trace"]')
+    expect(trace).to_be_visible()
+    expect(trace.get_by_text("当前进度：需要登录小红书网页端", exact=True)).to_be_visible()
+    expect(trace.locator('section[aria-label="Content Research Trace timeline"]')).to_be_visible()
+    child = trace.locator('article[aria-label="内容调研子任务"]')
+    expect(child.get_by_text("产品营销专家", exact=True)).to_be_visible()
+    expect(child.get_by_text("需要登录", exact=True)).to_be_visible()
+    provider = trace.locator('article[aria-label="采集异常诊断"]')
+    expect(provider.get_by_text("discover_candidates · auth_required", exact=True)).to_be_visible()
+    expect(provider.get_by_text("更新小红书登录态后继续。", exact=True)).to_be_visible()
+    expect(trace.get_by_text("RAW_PROVIDER_QUERY_MUST_NOT_RENDER", exact=True)).to_have_count(0)
+    expect(trace.get_by_role("button", name="继续本轮调研")).to_have_count(0)
+
+    with page.expect_response(
+        lambda response: response.url.endswith(
+            "/content-research/providers/xiaohongshu/login/qr"
+        )
+        and response.request.method == "POST",
+        timeout=15000,
+    ) as qr_response_info:
+        trace.get_by_role("button", name="扫码登录小红书").click()
+    assert qr_response_info.value.status == 200
+    expect(trace.get_by_alt_text("小红书登录二维码")).to_be_visible()
+    resume = trace.get_by_role("button", name="登录成功，继续本轮调研")
+    expect(resume).to_be_visible(timeout=10000)
+
+    with sqlite3.connect(stack["db_path"]) as connection:
+        connection.execute(
+            "UPDATE workflow_runs SET status = 'paused' WHERE run_id = ?",
+            (seeded["run_id"],),
+        )
+    with page.expect_response(
+        lambda response: response.url.endswith("/actions")
+        and '"action":"resume_formal_research"'
+        in (response.request.post_data or ""),
+        timeout=15000,
+    ) as resume_response_info:
+        resume.click()
+    assert resume_response_info.value.status == 200
+    assert resume_payloads == [{"action": "resume_formal_research", "payload": {}}]
+    assert any(url.endswith("/trace") for url in requested_urls)
+    assert any("/lite-report" in url for url in requested_urls)
+    assert not any(url.endswith("/report") or url.endswith("/results") for url in requested_urls)
 
 
 @pytest.mark.parametrize(
@@ -461,11 +555,24 @@ def test_creator_replaces_recovery_with_publication_after_resume(browser_page):
     expect(recovery).to_be_visible(timeout=20000)
     expect(published_report(page)).to_have_count(0)
 
+    recovery.get_by_role("button", name="打开登录恢复").click()
+    trace = page.locator('section[aria-label="Content Research Trace"]')
+    expect(trace).to_be_visible()
+    with page.expect_response(
+        lambda response: response.url.endswith(
+            "/content-research/providers/xiaohongshu/login/qr"
+        )
+        and response.request.method == "POST",
+        timeout=15000,
+    ):
+        trace.get_by_role("button", name="扫码登录小红书").click()
+    resume = trace.get_by_role("button", name="登录成功，继续本轮调研")
+    expect(resume).to_be_visible(timeout=10000)
     with page.expect_response(
         lambda response: response.url.endswith("/actions"),
         timeout=15000,
     ) as response_info:
-        recovery.get_by_role("button", name="更新登录后继续").click()
+        resume.click()
     action_response = response_info.value
     assert action_response.status == 200
     assert action_response.json()["action"] == "resume_formal_research"
@@ -811,6 +918,103 @@ async def seed_recovery(
     }
 
 
+async def seed_auth_required_trace(
+    db_path: str,
+    *,
+    brand_id: str,
+    title: str,
+) -> dict[str, str]:
+    async with ThreadStore(db_path) as thread_store:
+        thread = await thread_store.create_thread(
+            title=title,
+            workspace_id=WORKSPACE_ID,
+            brand_id=brand_id,
+        )
+    async with WorkflowRunManager(db_path) as manager:
+        run = await manager.start_run(thread_id=thread["id"], user_id="browser-e2e")
+        steps = await manager.initialize_steps(
+            run.run_id,
+            [{"step_name": "formal_research", "phase": "retrieval", "max_attempts": 1}],
+        )
+        await manager.start_step(run.run_id, "formal_research")
+        children = await manager.create_child_tasks(
+            run_id=run.run_id,
+            step_id=steps[0].step_id,
+            tasks=[
+                {
+                    "task_type": "content_research.product_marketing",
+                    "max_attempts": 2,
+                }
+            ],
+        )
+        await manager.start_child_task(children[0].child_task_id)
+        await manager.fail_child_task(
+            children[0].child_task_id,
+            {"code": "auth_required", "message": "provider authentication required"},
+        )
+    brief = ResearchBriefRecord(
+        id=f"brief_{run.run_id}",
+        workflow_run_id=run.run_id,
+        thread_id=thread["id"],
+        schema_version="content_research_brief_v1",
+        status="ready",
+        payload={
+            "schema_version": "content_research_brief_payload_v1",
+            "confirmed_subject": title,
+            "selected_directions": ["product_marketing"],
+            "requested_direction_ids": ["product_marketing"],
+            "direction_catalog": list(DIRECTION_CATALOG_V1),
+        },
+    )
+    store = SQLiteContentResearchStore(db_path)
+    store.save_brief(brief)
+    policy, _, _ = build_default_snapshot(
+        snapshot_id=f"policy_{run.run_id}",
+        workflow_run_id=run.run_id,
+        brief_id=brief.id,
+        plan_id=f"plan_{run.run_id}",
+        direction_set_version="direction_set_v1",
+        direction_ids=("product_marketing",),
+        direction_catalog=DIRECTION_CATALOG_V1,
+        report_compose_mode="template_only",
+    )
+    store.save_run_policy_snapshot(policy)
+    store.save_stage_checkpoint(
+        StageCheckpointRecord(
+            id=f"checkpoint_auth_required_{run.run_id}",
+            schema_version="content_research_stage_checkpoint_v1",
+            payload={
+                "operation": "discover_candidates",
+                "operation_fingerprint": "browser-auth-required-operation",
+                "request": {"query": "RAW_PROVIDER_QUERY_MUST_NOT_RENDER"},
+                "completion": {
+                    "provider": "xiaohongshu",
+                    "provider_operation": "discover_candidates",
+                    "source_kind": "search_result_minimal",
+                    "result_status": "failed",
+                    "item_count": 0,
+                    "completeness": "unavailable",
+                    "failure_code": "auth_required",
+                    "failure_reason": "auth_required",
+                    "retryable": False,
+                    "recovery_action": "更新小红书登录态后继续。",
+                },
+            },
+            workflow_run_id=run.run_id,
+            subagent_task_id=children[0].child_task_id,
+            stage_name="operation",
+            input_fingerprint="browser-auth-required-operation",
+            status="auth_required",
+        )
+    )
+    return {
+        "run_id": run.run_id,
+        "thread_id": thread["id"],
+        "brief_id": brief.id,
+        "child_task_id": children[0].child_task_id,
+    }
+
+
 async def seed_historical_message(
     db_path: str,
     *,
@@ -891,8 +1095,17 @@ async def save_publication(
                 "citation_groups": [
                     {
                         **citation_group,
+                        "admission_decision_id": governed["claim_cards"][0]["admission_decision_id"],
                         "evidence_refs": evidence_refs,
                     }
+                ],
+                "claim_cards": [
+                    {
+                        **card,
+                        "claim_type": "message_angle",
+                        "scope": {"sample": "selected_packets"},
+                    }
+                    for card in governed["claim_cards"]
                 ],
                 "direction_results": [
                     {

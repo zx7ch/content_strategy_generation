@@ -316,7 +316,7 @@ Lite 的证据字段只允许 `content_text` 与 `title`（投影过滤）。评
 ### Gate 4A：最新合同与 UI 收口（内部预发布）
 
 - 原子引入 `direction_catalog_v1 + requested_direction_ids`、`not_requested` 共享状态、用户非空多选 Brief、冻结 scope/read model/API schema 与后端 capability 投影；空选择被拒绝。
-- Creator 只接入 `/lite-report`；citation drawer 通过同一路径按需读取冻结 citation detail。删除 `/report`、`/results`、`/evidence-bundles` 与其所有消费者、旧 Creator report/retry/二次深研/聚合建议 UI、EvidenceBundle service/store/schema/table/测试。不得保留 fallback。
+- Creator 接入 `/lite-report`，并恢复只读安全 `/trace` 的正式 Trace Panel、认证恢复与同 run resume UI；citation drawer 通过 `/lite-report` 按需读取冻结 citation detail。继续删除 `/report`、`/results`、`/evidence-bundles` 与其所有消费者、旧 Creator report/二次深研/聚合建议 UI、EvidenceBundle service/store/schema/table/测试。Trace/retry UI 不再删除，但不得读取旧报告、EvidenceBundle、未冻结来源或 raw provider payload。
 - `F003_LITE_PREVIEW_ENABLED` 是唯一的整体验收隔离开关：默认 off；off 时 Creator 不显示入口且后端拒绝创建/确认新 Lite run；它不得控制单一方向。Gate 4B 发布时移除。
 - Gate 2 的已验证 workflow、run、checkpoint、canonical source、冻结 citation group、trace 和验收产物保留。删除 EvidenceBundle 表前，必须证明这些留存证据不依赖旧模型，并用迁移前后回归保护。
 - API/schema 覆盖全部 7 种非空选择组合和空选择拒绝；浏览器覆盖单选、双选、全选。真实采集复用 `product_marketing`；`partial`、`evidence_only`、恢复卡与 citation 跳转三态使用后端受控真实状态，浏览器不得 mock API payload。

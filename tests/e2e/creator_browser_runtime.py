@@ -89,6 +89,39 @@ class DeterministicWorkflowRestoreFailure:
         raise RuntimeError("deterministic workflow restore failure")
 
 
+class DeterministicQRLoginSession:
+    """Expose a pending QR once, then a redacted authenticated projection."""
+
+    def __init__(self) -> None:
+        self._started = False
+        self._poll_count = 0
+
+    def start(self):
+        self._started = True
+        self._poll_count = 0
+        return self._projection("pending")
+
+    def current_status(self):
+        if not self._started:
+            return None
+        self._poll_count += 1
+        return self._projection("pending" if self._poll_count == 1 else "authenticated")
+
+    def status(self, attempt_id: str):
+        if not self._started or attempt_id != "xhsqr_browser_e2e":
+            return None
+        return self.current_status()
+
+    @staticmethod
+    def _projection(status: str):
+        return {
+            "attempt_id": "xhsqr_browser_e2e",
+            "status": status,
+            "qr_image_data_url": "data:image/png;base64,AA==",
+            "failure_code": None,
+        }
+
+
 _production_lifespan = production.app.router.lifespan_context
 
 
@@ -107,6 +140,7 @@ async def deterministic_lifespan(application):
         )
         service._source_registry = registry
         service._task_router._source_registry = registry
+        application.state.xhs_qr_login_session = DeterministicQRLoginSession()
         if os.getenv("CREATOR_E2E_FAIL_WORKFLOW_RESTORE") == "1":
             service._workflow_runtime = DeterministicWorkflowRestoreFailure(
                 service._workflow_runtime

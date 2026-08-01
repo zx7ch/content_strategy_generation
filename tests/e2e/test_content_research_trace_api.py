@@ -7,8 +7,10 @@ import pytest
 
 from app.api.routes.router import app
 from app.content_research.presearch.service import PresearchService
+from app.content_research.persistence_models import StageCheckpointRecord
 from app.content_research.service import ContentResearchService, WorkflowRunManagerRuntime
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
+from app.services.workflow_run_manager import WorkflowRunManager
 from app.services.llm.pricing import UsageCost
 from app.services.llm.types import LLMCallContext, LLMResponse, TokenUsage
 from app.services.llm.usage_tracker import LLMUsageEventInput, LLMUsageTracker
@@ -96,7 +98,7 @@ async def test_content_research_trace_api_restores_runtime_observation_and_usage
             "subject_type": "brand",
             "selected_competitors": ["District Vision"],
             "custom_competitors": ["Salomon"],
-            "selected_directions": ["product_marketing", "brand_activity"],
+            "selected_directions": ["product_marketing", "content_performance"],
             "custom_research_question": "关注跑步社群活动",
         },
     )
@@ -129,6 +131,107 @@ async def test_content_research_trace_api_restores_runtime_observation_and_usage
     assert trace["usage_summary"]["total_tokens"] == 33
     assert trace["usage_steps"][0]["agent_name"] == "PresearchAgent"
     assert trace["usage_events"][0]["job_id"] == presearch["workflow_run_id"]
+
+
+@pytest.mark.asyncio
+async def test_content_research_trace_api_keeps_running_parent_and_safe_auth_required_child(
+    client_with_db,
+):
+    client, db_path = client_with_db
+    presearch_response = await client.post(
+        "/content-research/presearch",
+        headers={"X-User-Id": "user-trace-auth"},
+        json={
+            "seed_text": "Satisfy Running",
+            "user_note": "关注登录恢复",
+            "thread_id": "thread-trace-auth",
+        },
+    )
+    assert presearch_response.status_code == 201
+    presearch = presearch_response.json()
+    confirm_response = await client.post(
+        f"/content-research/briefs/{presearch['brief_id']}/confirm",
+        json={
+            "confirmed_subject": "Satisfy Running",
+            "subject_type": "brand",
+            "selected_competitors": [],
+            "custom_competitors": [],
+            "selected_directions": ["product_marketing"],
+            "custom_research_question": "",
+        },
+    )
+    assert confirm_response.status_code == 200
+    child_task_id = confirm_response.json()["runtime_child_tasks"][0]["child_task_id"]
+    async with WorkflowRunManager(db_path) as manager:
+        await manager.start_child_task(child_task_id)
+        await manager.fail_child_task(
+            child_task_id,
+            {"code": "auth_required", "message": "provider authentication required"},
+        )
+    SQLiteContentResearchStore(db_path).save_stage_checkpoint(
+        StageCheckpointRecord(
+            id="checkpoint-trace-auth-required",
+            schema_version="content_research_stage_checkpoint_v1",
+            workflow_run_id=presearch["workflow_run_id"],
+            subagent_task_id=child_task_id,
+            stage_name="operation",
+            input_fingerprint="trace-auth-required-operation",
+            status="auth_required",
+            payload={
+                "operation": "discover_candidates",
+                "operation_fingerprint": "trace-auth-required-operation",
+                "request": {"query": "RAW_PROVIDER_QUERY_MUST_NOT_ESCAPE"},
+                "completion": {
+                    "provider": "xiaohongshu",
+                    "provider_operation": "discover_candidates",
+                    "source_kind": "search_result_minimal",
+                    "result_status": "failed",
+                    "item_count": 0,
+                    "completeness": "unavailable",
+                    "failure_code": "auth_required",
+                    "failure_reason": "auth_required",
+                    "retryable": False,
+                    "recovery_action": "更新小红书登录态后继续。",
+                },
+            },
+        )
+    )
+
+    response = await client.get(
+        f"/content-research/workflows/{presearch['workflow_run_id']}/trace"
+    )
+
+    assert response.status_code == 200
+    trace = response.json()
+    assert trace["run_status"] == "running"
+    failed_child = next(
+        task
+        for task in trace["runtime_child_tasks"]
+        if task["child_task_id"] == child_task_id
+    )
+    assert failed_child["status"] == "failed"
+    assert failed_child["error_code"] == "auth_required"
+    assert trace["provider_operations"] == [
+        {
+            "operation_fingerprint": "trace-auth-required-operation",
+            "operation": "discover_candidates",
+            "provider": "xiaohongshu",
+            "provider_operation": "discover_candidates",
+            "source_kind": "search_result_minimal",
+            "result_status": "failed",
+            "item_count": 0,
+            "completeness": "unavailable",
+            "cookie_status": None,
+            "status": "auth_required",
+            "started_at": None,
+            "finished_at": None,
+            "failure_code": "auth_required",
+            "failure_reason": "auth_required",
+            "retryable": False,
+            "recovery_action": "更新小红书登录态后继续。",
+        }
+    ]
+    assert "RAW_PROVIDER_QUERY_MUST_NOT_ESCAPE" not in response.text
 
 
 @pytest.mark.asyncio
