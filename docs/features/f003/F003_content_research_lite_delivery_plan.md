@@ -432,3 +432,10 @@ Lite 的证据字段只允许 `content_text` 与 `title`（投影过滤）。评
   - `npx tsc --noEmit`：通过
   - `npm run lint`：通过，保留 4 条既有 React Hook warning
   - `npm run build`：通过，保留同一组既有 React Hook warning
+
+### 2026-08-01 Task 5E 有界验证记录
+
+- `pytest -q tests/unit/test_content_research_product_marketing_admission.py tests/integration/test_content_research_lite_read_model.py tests/integration/test_content_research_direction_pipeline_store.py tests/integration/test_content_research_report_publication_materializer.py`：退出码 `0`；`87 passed in 8.80s`。
+- `cd frontend && npm test -- --run src/app/creator/page.test.tsx && npx tsc --noEmit`：退出码 `0`；Node test runner 为 `tests 37`、`pass 37`、`fail 0`、`cancelled 0`、`skipped 0`、`todo 0`；`npx tsc --noEmit` 无输出并成功退出。运行中出现 4 次既有 `[MODULE_TYPELESS_PACKAGE_JSON]` 性能 warning，均不影响退出状态。
+- `pytest -q tests/e2e/test_content_research_creator_browser.py -k 'complete_report_uses_lite'`：退出码 `0`；`3 passed, 16 deselected in 24.96s`。本次未发生 browser socket sandbox 阻塞，故无 skip/block 记录。
+- 有界结论：上述结果仅证明 Task 5 指定 admission/read-model/pipeline/materializer、Creator 定向测试/类型检查，以及受控 `complete_report_uses_lite` 浏览器回归的当前状态。**不据此声明 Gate 3 完成、Gate 4B 完成，或三个方向真实来源 canary 完成。**
