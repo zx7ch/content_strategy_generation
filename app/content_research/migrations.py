@@ -276,6 +276,50 @@ def _apply_0013(conn: sqlite3.Connection) -> None:
         )
 
 
+# 0014 cuts Creator and Lite over from the pre-cutover report publication
+# lineage. Gate 2 evidence remains the durable audit and replay boundary.
+_V14_REPORT_TABLES = (
+    "content_research_report_publications",
+    "content_research_report_faithfulness_decisions",
+    "content_research_report_drafts",
+)
+
+
+def _apply_0014(conn: sqlite3.Connection) -> None:
+    workflow_run_ids = sorted(
+        {
+            row[0]
+            for row in conn.execute(
+                "SELECT workflow_run_id FROM content_research_report_publications"
+            )
+        }
+    )
+    if workflow_run_ids:
+        workflow_placeholders = ", ".join("?" for _ in workflow_run_ids)
+        conn.execute(
+            f"""
+            DELETE FROM creator_messages
+            WHERE run_id IN ({workflow_placeholders})
+              AND message_type = 'artifact_result'
+            """,
+            workflow_run_ids,
+        )
+        conn.execute(
+            f"""
+            DELETE FROM workflow_artifacts
+            WHERE run_id IN ({workflow_placeholders})
+              AND artifact_type = 'final_result'
+            """,
+            workflow_run_ids,
+        )
+    # A persisted report publication defines the pre-cutover report contract
+    # for its workflow run. Every final-result artifact and artifact-result
+    # message in that run is therefore an old-contract report output; JSON
+    # validity is irrelevant to this contract boundary.
+    for table in _V14_REPORT_TABLES:
+        conn.execute(f"DELETE FROM {table}")
+
+
 def _apply_0010(conn: sqlite3.Connection) -> None:
     _add_columns(conn, _V10_COLUMNS)
 
@@ -320,6 +364,7 @@ def _expected_checksums(migration_0002_sql: str, legacy_checksum: str) -> dict[s
         "0011": hashlib.sha256(_V11_DISPATCH_TABLE_SQL.encode("utf-8")).hexdigest(),
         "0012": _checksum(_V12_DISPATCH_LEASE_COLUMNS),
         "0013": _checksum((_V13_LEGACY_TABLES, _V13_LEGACY_SNAPSHOT_COLUMN)),
+        "0014": _checksum(_V14_REPORT_TABLES),
     }
 
 
@@ -490,6 +535,13 @@ def apply_content_research_migrations(
                 name="remove_legacy_evidence_bundle_persistence",
                 checksum=expected_checksums["0013"],
                 apply=lambda: _apply_0013(conn),
+            )
+            _apply_migration(
+                conn,
+                version="0014",
+                name="purge_pre_cutover_report_artifacts",
+                checksum=expected_checksums["0014"],
+                apply=lambda: _apply_0014(conn),
             )
         except Exception:
             conn.rollback()

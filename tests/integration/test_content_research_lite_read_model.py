@@ -5,6 +5,8 @@ from dataclasses import replace
 import pytest
 
 from app.content_research.contracts import build_default_snapshot
+from app.content_research.bootstrap import _bootstrap_legacy_content_research_schema
+from app.content_research.migrations import apply_content_research_migrations
 from app.content_research.models import ResearchBriefRecord
 from app.content_research.persistence_models import StageCheckpointRecord
 from app.content_research.reporting.composer import ResearchReportComposer
@@ -675,5 +677,78 @@ async def test_lite_reader_never_turns_an_existing_corrupt_publication_into_reco
             (run.run_id,),
         )
 
-    with pytest.raises(RuntimeError, match="existing publication is unreadable"):
+    with pytest.raises(PublishedReportNotFoundError, match="artifact is malformed"):
         await LiteReportReader(store, db_path).read(workflow_run_id=run.run_id)
+
+
+@pytest.mark.asyncio
+async def test_lite_reader_rejects_a_malformed_persisted_publication_without_recovery_or_message(
+    tmp_path,
+):
+    db_path = str(tmp_path / "malformed-persisted-publication.db")
+    store = SQLiteContentResearchStore(db_path)
+    async with ThreadStore(db_path) as threads:
+        thread = await threads.create_thread(title="malformed persisted publication")
+        async with WorkflowRunManager(db_path) as manager:
+            run = await manager.start_run(thread_id=thread["id"], user_id="user")
+        snapshot = replace(_snapshot(), workflow_run_id=run.run_id)
+        draft = ResearchReportComposer().compose(snapshot)
+        decision = replace(_decision(draft), workflow_run_id=run.run_id)
+        publication = replace(_publication(draft, decision), workflow_run_id=run.run_id)
+        store.save_result_snapshot(snapshot)
+        store.save_report_draft(draft.to_record())
+        store.save_report_faithfulness_decision(decision.to_record())
+        store.save_report_publication(publication.to_record())
+        async with WorkflowRunManager(db_path) as manager:
+            await manager.complete_run(run.run_id)
+        await ReportPublicationMaterializer(store, db_path).materialize(publication.id)
+        before_messages = await threads.get_thread_messages(thread["id"])
+        with sqlite3.connect(db_path) as connection:
+            connection.execute(
+                "UPDATE content_research_report_publications "
+                "SET faithfulness_decision_id = 'missing_decision' WHERE id = ?",
+                (publication.id,),
+            )
+            connection.execute(
+                "UPDATE workflow_runs SET status = 'paused' WHERE run_id = ?",
+                (run.run_id,),
+            )
+
+        with pytest.raises(PublishedReportNotFoundError, match="audit is missing"):
+            await LiteReportReader(store, db_path).read(workflow_run_id=run.run_id)
+        assert await threads.get_thread_messages(thread["id"]) == before_messages
+
+
+@pytest.mark.asyncio
+async def test_lite_reader_rejects_malformed_or_purged_legacy_publication_without_recovery_or_message(
+    tmp_path,
+):
+    db_path = str(tmp_path / "purged-legacy-publication.db")
+    store = SQLiteContentResearchStore(db_path)
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "DELETE FROM content_research_schema_migrations WHERE version = '0014'"
+        )
+    async with ThreadStore(db_path) as threads:
+        thread = await threads.create_thread(title="purged legacy publication")
+        async with WorkflowRunManager(db_path) as manager:
+            run = await manager.start_run(thread_id=thread["id"], user_id="user")
+        snapshot = replace(_snapshot(), workflow_run_id=run.run_id)
+        draft = ResearchReportComposer().compose(snapshot)
+        decision = replace(_decision(draft), workflow_run_id=run.run_id)
+        publication = replace(_publication(draft, decision), workflow_run_id=run.run_id)
+        store.save_result_snapshot(snapshot)
+        store.save_report_draft(draft.to_record())
+        store.save_report_faithfulness_decision(decision.to_record())
+        store.save_report_publication(publication.to_record())
+        async with WorkflowRunManager(db_path) as manager:
+            await manager.complete_run(run.run_id)
+        await ReportPublicationMaterializer(store, db_path).materialize(publication.id)
+
+        apply_content_research_migrations(db_path, _bootstrap_legacy_content_research_schema)
+
+        with pytest.raises(PublishedReportNotFoundError, match="published report not found"):
+            await LiteReportReader(SQLiteContentResearchStore(db_path), db_path).read(
+                workflow_run_id=run.run_id
+            )
+        assert await threads.get_thread_messages(thread["id"]) == []

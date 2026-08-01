@@ -4,10 +4,21 @@ from dataclasses import replace
 import pytest
 
 from app.content_research.bootstrap import _bootstrap_legacy_content_research_schema
+from app.content_research.admission.candidates import source_text_hash
+from app.content_research.contracts import build_default_snapshot
 from app.content_research.evidence.models import EvidenceRecord
 from app.content_research.migrations import apply_content_research_migrations
 from app.content_research.models import TraceRecord, utcnow
-from app.content_research.persistence_models import CanonicalSourceRecord, StageCheckpointRecord
+from app.content_research.persistence_models import (
+    CanonicalSourceRecord,
+    ClaimAdmissionDecisionRecord,
+    ClaimCandidateRecord,
+    DirectionalEvidencePacketRecord,
+    ReportDraftRecord,
+    ReportFaithfulnessDecisionRecord,
+    ReportPublicationRecord,
+    StageCheckpointRecord,
+)
 from app.content_research.reporting.composer import ResearchReportComposer
 from app.content_research.reporting.lite_read_model import LiteReportReader
 from app.content_research.reporting.publication_materializer import ReportPublicationMaterializer
@@ -85,18 +96,19 @@ async def test_materializes_published_report_as_one_creator_snapshot_and_timelin
 
 
 @pytest.mark.asyncio
-async def test_pre_0013_gate2_artifact_survives_bundle_removal_and_remains_lite_readable(tmp_path):
+async def test_pre_0013_gate2_evidence_survives_bundle_and_report_artifact_purges(tmp_path):
     db_path = str(tmp_path / "pre-0013-artifact.db")
     store = SQLiteContentResearchStore(db_path)
     thread_store = ThreadStore(db_path)
     await thread_store.connect()
     thread = await thread_store.create_thread(title="Gate 2 artifact")
     try:
-        # Recreate the exact schema delta owned by 0013, and remove only its
-        # ledger entry, before persisting the legacy artifact below.
+        # Recreate the schema delta owned by 0013 and leave both later
+        # migrations pending before persisting the legacy report artifact.
         with sqlite3.connect(db_path) as conn:
             conn.execute(
-                "DELETE FROM content_research_schema_migrations WHERE version = '0013'"
+                "DELETE FROM content_research_schema_migrations "
+                "WHERE version IN ('0013', '0014')"
             )
             conn.execute(
                 "CREATE TABLE content_research_evidence_bundles (id TEXT PRIMARY KEY)"
@@ -224,18 +236,16 @@ async def test_pre_0013_gate2_artifact_survives_bundle_removal_and_remains_lite_
         async with WorkflowRunManager(db_path) as manager:
             await manager.complete_run(run.run_id)
 
-        artifact = await ReportPublicationMaterializer(store, db_path).materialize(publication.id)
+        await ReportPublicationMaterializer(store, db_path).materialize(publication.id)
         apply_content_research_migrations(
             db_path, _bootstrap_legacy_content_research_schema
         )
         migrated_store = SQLiteContentResearchStore(db_path)
-        report = await LiteReportReader(migrated_store, db_path).read(
-            workflow_run_id=run.run_id
-        )
 
-        assert artifact.payload_json["citation_groups"]
-        assert report["publication"]["state"] == "complete_verified_report"
-        assert [citation["citation_group_id"] for citation in report["citations"]] == ["citation_7"]
+        assert migrated_store.list_typed_records(ReportPublicationRecord) == []
+        async with WorkflowStore(db_path) as workflow_store:
+            assert await workflow_store.list_artifacts(run.run_id) == []
+        assert await thread_store.get_thread_messages(thread["id"]) == []
         assert (
             migrated_store.get_canonical_source("source_legacy").canonical_url
             == "https://example.test/legacy-note"
@@ -380,5 +390,286 @@ async def test_materialization_rejects_incomplete_frozen_citation_before_artifac
         assert await thread_store.get_thread_messages(thread["id"]) == []
         async with WorkflowStore(db_path) as workflow_store:
             assert await workflow_store.list_artifacts(run.run_id) == []
+    finally:
+        await thread_store.close()
+
+
+@pytest.mark.asyncio
+async def test_migration_purges_legacy_report_lineage_artifact_and_creator_message_idempotently(
+    tmp_path,
+):
+    db_path = str(tmp_path / "legacy-report-purge.db")
+    store = SQLiteContentResearchStore(db_path)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "DELETE FROM content_research_schema_migrations WHERE version = '0014'"
+        )
+    thread_store = ThreadStore(db_path)
+    await thread_store.connect()
+    thread = await thread_store.create_thread(title="legacy report purge")
+    try:
+        async with WorkflowRunManager(db_path) as manager:
+            run = await manager.start_run(thread_id=thread["id"], user_id="user-1")
+        policy, _, _ = build_default_snapshot(
+            snapshot_id="policy_gate2",
+            workflow_run_id=run.run_id,
+            brief_id="brief_gate2",
+            plan_id="plan_gate2",
+            direction_set_version="direction_set_v1",
+            direction_ids=("product_marketing",),
+            report_compose_mode="template_only",
+        )
+        store.save_run_policy_snapshot(policy)
+        now = utcnow()
+        store.save_trace(
+            TraceRecord(
+                id="trace_gate2",
+                workflow_run_id=run.run_id,
+                thread_id=thread["id"],
+                schema_version="content_research_trace_v1",
+                status="completed",
+                started_at=now,
+                payload={"schema_version": "content_research_trace_payload_v1"},
+            )
+        )
+        store.save_evidence_record(
+            EvidenceRecord(
+                id="evidence_gate2",
+                workflow_run_id=run.run_id,
+                research_plan_id="plan_gate2",
+                research_direction_id="product_marketing",
+                trace_id="trace_gate2",
+                schema_version="content_research_evidence_record_v1",
+                status="accepted",
+                source_type="note",
+                source_platform="xhs",
+                source_url="https://example.test/gate2-note",
+                source_id="gate2-note",
+                evidence_type="note",
+                normalized_payload={
+                    "schema_version": "content_research_source_payload_v1",
+                    "source_id": "gate2-note",
+                },
+                title="Gate 2 source",
+                text_excerpt="retained evidence",
+                raw_content_ref="gate2-hash",
+                content_hash="gate2-hash",
+                dedupe_key="gate2-note",
+                retrieval_query="gate2",
+            )
+        )
+        store.save_canonical_source(
+            CanonicalSourceRecord(
+                id="source_gate2",
+                schema_version="content_research_canonical_source_v1",
+                payload={"source_id": "gate2-note"},
+                platform="xhs",
+                platform_source_kind="note",
+                platform_source_id="gate2-note",
+                canonical_url="https://example.test/gate2-note",
+            )
+        )
+        store.save_stage_checkpoint(
+            StageCheckpointRecord(
+                id="checkpoint_gate2",
+                schema_version="content_research_stage_checkpoint_v1",
+                payload={"schema_version": "content_research_checkpoint_payload_v1"},
+                workflow_run_id=run.run_id,
+                subagent_task_id="task_gate2",
+                stage_name="collect",
+                input_fingerprint="gate2-fingerprint",
+                status="completed",
+            )
+        )
+        store.save_directional_evidence_packet(
+            DirectionalEvidencePacketRecord(
+                "packet_gate2",
+                "content_research_directional_packet_v1",
+                {
+                    "field_projection": {
+                        "content_text": "claim",
+                        "source_url": "https://example.test/gate2-note",
+                    }
+                },
+                workflow_run_id=run.run_id,
+                research_direction_id="product_marketing",
+                canonical_source_id="source_gate2",
+                field_projection_hash="gate2-packet-hash",
+            )
+        )
+        store.save_claim_candidate(
+            ClaimCandidateRecord(
+                "claim_gate2",
+                "content_research_claim_candidate_v1",
+                {
+                    "quote_refs": [
+                        {
+                            "field_path": "content_text",
+                            "quote": "claim",
+                            "text_start": 0,
+                            "text_end": 5,
+                            "source_text_hash": source_text_hash("claim"),
+                            "source_url": "https://example.test/gate2-note",
+                        }
+                    ]
+                },
+                workflow_run_id=run.run_id,
+                research_direction_id="product_marketing",
+                evidence_packet_id="packet_gate2",
+                statement="claim",
+                intent_id="intent_gate2",
+                claim_type="observation",
+            )
+        )
+        store.save_claim_admission_decision(
+            ClaimAdmissionDecisionRecord(
+                "admission_gate2",
+                "content_research_claim_admission_v1",
+                {"reason_codes": []},
+                research_direction_id="product_marketing",
+                claim_candidate_id="claim_gate2",
+                decision="admitted",
+                policy_snapshot_id="policy_gate2",
+            )
+        )
+        snapshot = replace(
+            _snapshot(),
+            workflow_run_id=run.run_id,
+            metadata={
+                "governed_snapshot": {
+                    "schema_version": "governed_v1",
+                    "citation_groups": [
+                        {
+                            "citation_group_id": "citation_gate2",
+                            "display_index": 1,
+                            "evidence_refs": [
+                                {
+                                    "field_path": "content_text",
+                                    "quote": "claim",
+                                    "text_start": 0,
+                                    "text_end": 5,
+                                    "source_text_hash": source_text_hash("claim"),
+                                    "source_url": "https://example.test/gate2-note",
+                                }
+                            ],
+                        }
+                    ],
+                }
+            },
+        )
+        draft = replace(_draft(), workflow_run_id=run.run_id)
+        decision = replace(_decision(draft), workflow_run_id=run.run_id)
+        publication = replace(_publication(draft, decision), workflow_run_id=run.run_id)
+        store.save_result_snapshot(snapshot)
+        store.save_report_draft(draft.to_record())
+        store.save_report_faithfulness_decision(decision.to_record())
+        store.save_report_publication(publication.to_record())
+        async with WorkflowRunManager(db_path) as manager:
+            await manager.complete_run(run.run_id)
+        report_artifact = await ReportPublicationMaterializer(store, db_path).materialize(
+            publication.id
+        )
+        report_message = (await thread_store.get_thread_messages(thread["id"]))[0]
+        async with WorkflowRunManager(db_path) as manager:
+            additional_report_artifact = await manager.attach_artifact(
+                run_id=run.run_id,
+                artifact_type=WorkflowArtifactType.FINAL_RESULT,
+                payload={"kind": "additional_legacy_report_result"},
+                payload_mode=WorkflowArtifactPayloadMode.SNAPSHOT,
+                summary_text="内容调研报告已发布",
+            )
+        await thread_store.append_message(
+            thread_id=thread["id"],
+            role="assistant",
+            text="内容调研报告已生成。",
+            message_type="artifact_result",
+            run_id=run.run_id,
+            artifact_refs=[
+                {
+                    "artifact_id": additional_report_artifact.artifact_id,
+                    "artifact_type": additional_report_artifact.artifact_type.value,
+                    "artifact_version": additional_report_artifact.artifact_version,
+                    "parent_artifact_id": additional_report_artifact.parent_artifact_id,
+                }
+            ],
+        )
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                "UPDATE workflow_artifacts SET payload_json = ? WHERE artifact_id = ?",
+                ("{malformed", report_artifact.artifact_id),
+            )
+            conn.execute(
+                "UPDATE creator_messages SET artifact_refs_json = ? WHERE id = ?",
+                ("{malformed", report_message["id"]),
+            )
+
+        apply_content_research_migrations(db_path, _bootstrap_legacy_content_research_schema)
+        migrated_store = SQLiteContentResearchStore(db_path)
+        async with WorkflowStore(db_path) as workflow_store:
+            first_artifacts = await workflow_store.list_artifacts(run.run_id)
+        first_messages = await thread_store.get_thread_messages(thread["id"])
+        first_state = {
+            "artifacts": [item.artifact_id for item in first_artifacts],
+            "messages": [item["id"] for item in first_messages],
+            "publications": [
+                item.id
+                for item in migrated_store.list_typed_records(ReportPublicationRecord)
+            ],
+            "drafts": [item.id for item in migrated_store.list_typed_records(ReportDraftRecord)],
+            "decisions": [
+                item.id
+                for item in migrated_store.list_typed_records(ReportFaithfulnessDecisionRecord)
+            ],
+        }
+        apply_content_research_migrations(db_path, _bootstrap_legacy_content_research_schema)
+        async with WorkflowStore(db_path) as workflow_store:
+            second_artifacts = await workflow_store.list_artifacts(run.run_id)
+        second_messages = await thread_store.get_thread_messages(thread["id"])
+        second_state = {
+            "artifacts": [item.artifact_id for item in second_artifacts],
+            "messages": [item["id"] for item in second_messages],
+            "publications": [
+                item.id
+                for item in migrated_store.list_typed_records(ReportPublicationRecord)
+            ],
+            "drafts": [item.id for item in migrated_store.list_typed_records(ReportDraftRecord)],
+            "decisions": [
+                item.id
+                for item in migrated_store.list_typed_records(ReportFaithfulnessDecisionRecord)
+            ],
+        }
+
+        assert first_state == second_state == {
+            "artifacts": [],
+            "messages": [],
+            "publications": [],
+            "drafts": [],
+            "decisions": [],
+        }
+        assert migrated_store.get_trace("trace_gate2").workflow_run_id == run.run_id
+        async with WorkflowStore(db_path) as workflow_store:
+            assert (await workflow_store.get_run(run.run_id)).run_id == run.run_id
+        assert migrated_store.get_evidence_record("evidence_gate2").trace_id == "trace_gate2"
+        assert migrated_store.get_canonical_source("source_gate2").canonical_url == (
+            "https://example.test/gate2-note"
+        )
+        assert [
+            item.id for item in migrated_store.list_typed_records(StageCheckpointRecord)
+        ] == ["checkpoint_gate2"]
+        assert [
+            item.id
+            for item in migrated_store.list_typed_records(DirectionalEvidencePacketRecord)
+        ] == ["packet_gate2"]
+        assert [
+            item.id
+            for item in migrated_store.list_typed_records(ClaimAdmissionDecisionRecord)
+        ] == ["admission_gate2"]
+        assert migrated_store.list_result_snapshots_for_workflow(run.run_id)[0].metadata[
+            "governed_snapshot"
+        ]["citation_groups"]
+
+        with pytest.raises(ValueError, match="missing report publication"):
+            await ReportPublicationMaterializer(migrated_store, db_path).materialize(publication.id)
+        assert await thread_store.get_thread_messages(thread["id"]) == []
     finally:
         await thread_store.close()

@@ -39,10 +39,6 @@ _PUBLICATION_STATES = {
 _RECOVERABLE_RUN_STATES = {"failed", "paused"}
 
 
-class ExistingPublicationUnreadableError(RuntimeError):
-    """Raised when a committed publication exists but cannot be projected safely."""
-
-
 class LiteReportReader:
     """Project formal report facts without composing, collecting, or writing.
 
@@ -92,14 +88,9 @@ class LiteReportReader:
             if citation_group_ids is not None:
                 raise
             if self._has_publication(workflow_run_id=workflow_run_id):
-                if research_plan_id is not None or publication_id is not None:
-                    # A caller asked for a specific frozen publication and it
-                    # did not resolve.  Keep that ordinary not-found result;
-                    # it must never masquerade as a recoverable run.
-                    raise
-                raise ExistingPublicationUnreadableError(
-                    "existing publication is unreadable"
-                ) from exc
+                # A malformed persisted publication is not a recoverable run;
+                # preserve the current contract's ordinary not-found result.
+                raise
             return await self._recoverable_projection(workflow_run_id)
         return self._published_projection(report, citation_group_ids=citation_group_ids)
 
