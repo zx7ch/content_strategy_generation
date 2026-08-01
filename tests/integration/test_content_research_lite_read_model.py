@@ -179,6 +179,7 @@ async def _project_formal_cards(
     compose_mode="template_only",
     publication_state="complete_verified_report",
     artifact_payload_mutator=None,
+    citation_group_ids=None,
 ):
     db_path = str(tmp_path / "lite-projection-guard.db")
     store = SQLiteContentResearchStore(db_path)
@@ -243,7 +244,10 @@ async def _project_formal_cards(
                 (json.dumps(payload), artifact.artifact_id),
             )
 
-    return await LiteReportReader(store, db_path).read(workflow_run_id=run.run_id)
+    return await LiteReportReader(store, db_path).read(
+        workflow_run_id=run.run_id,
+        citation_group_ids=citation_group_ids,
+    )
 
 
 def _card(
@@ -528,6 +532,33 @@ async def test_lite_reader_reads_every_frozen_citation_group_in_publication_orde
         item["citation_group_ids"][0] for item in report["sections"]["main_findings"]
     ] == expected_group_ids
     assert report["status_strip"]["admitted_finding_count"] == 51
+
+
+@pytest.mark.asyncio
+async def test_lite_reader_detail_read_validates_all_cards_before_selecting_one_citation_group(
+    tmp_path,
+):
+    report = await _project_formal_cards(
+        tmp_path,
+        claim_cards=[
+            _card("cc_one", "cad_one"),
+            _card("cc_two", "cad_two"),
+        ],
+        citation_groups=[
+            _citation("citation_one", "cc_one", "cad_one", display_index=1),
+            _citation("citation_two", "cc_two", "cad_two", display_index=2),
+        ],
+        citation_group_ids=["citation_two"],
+    )
+
+    assert [item["citation_group_id"] for item in report["citations"]] == [
+        "citation_two"
+    ]
+    assert [item["statement"] for item in report["sections"]["main_findings"]] == [
+        "statement for cc_one",
+        "statement for cc_two",
+    ]
+    assert report["status_strip"]["admitted_finding_count"] == 2
 
 
 @pytest.mark.asyncio

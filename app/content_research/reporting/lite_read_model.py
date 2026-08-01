@@ -65,9 +65,7 @@ class LiteReportReader:
                 research_plan_id=research_plan_id,
                 publication_id=publication_id,
             )
-            if citation_group_ids is None and report["citation_total"] > len(
-                report["citation_groups"]
-            ):
+            if report["citation_total"] > len(report["citation_groups"]):
                 report = await self._published.read(
                     workflow_run_id=workflow_run_id,
                     research_plan_id=research_plan_id,
@@ -75,15 +73,12 @@ class LiteReportReader:
                     citation_limit=report["citation_total"],
                 )
             if citation_group_ids:
-                report = {
-                    **report,
-                    "citation_groups": await self._published.citation_groups(
-                        workflow_run_id=workflow_run_id,
-                        research_plan_id=research_plan_id,
-                        publication_id=publication_id,
-                        citation_group_ids=set(citation_group_ids),
-                    ),
-                }
+                await self._published.citation_groups(
+                    workflow_run_id=workflow_run_id,
+                    research_plan_id=research_plan_id,
+                    publication_id=publication_id,
+                    citation_group_ids=set(citation_group_ids),
+                )
         except PublishedReportNotFoundError as exc:
             if citation_group_ids is not None:
                 raise
@@ -123,19 +118,16 @@ class LiteReportReader:
             and item.get("direction_id") not in requested_directions
             and item.get("claim_candidate_id")
         }
-        citations = (
-            _select_citations(
-                [
-                    citation
-                    for citation in _lite_citations(report.get("citation_groups"))
-                    if citation.get("claim_candidate_id") not in excluded_claim_ids
-                ],
-                citation_group_ids,
-            )
+        all_citations = (
+            [
+                citation
+                for citation in _lite_citations(report.get("citation_groups"))
+                if citation.get("claim_candidate_id") not in excluded_claim_ids
+            ]
             if requested_directions
             else []
         )
-        citations_by_claim = _citations_by_claim(citations)
+        citations_by_claim = _citations_by_claim(all_citations)
         direction_states = _direction_states(report)
         cards = [
             _validated_card(card, citations_by_claim)
@@ -164,6 +156,7 @@ class LiteReportReader:
         observations = [item for item in findings if item["card_kind"] == "observation"]
         finding_cards = [item for item in findings if item["card_kind"] == "finding"]
         is_evidence_only = publication_state == "evidence_only_report"
+        citations = _select_citations(all_citations, citation_group_ids)
         return {
             "workflow_run_id": report["workflow_run_id"],
             "workflow_execution_state": report.get("workflow_terminal_state"),
