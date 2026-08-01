@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
+import unicodedata
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
+from app.content_research.admission.quote_fields import CLAIM_QUOTE_FIELDS
 from app.content_research.models import utcnow
 
 CLAIM_EVIDENCE_STATES = (
@@ -35,18 +39,134 @@ ADMISSION_REASON_CODES = (
     "comment_operation_unavailable",
     "missing_comment_field",
     "capability_unavailable",
+    "query_subject_not_supported",
 )
 
 
-_DIRECTION_CONTRACT_SPECS: dict[str, dict[str, tuple[str, ...]]] = {
-    "product_marketing": {"blocking_note_fields": ("title", "content_text", "tags", "note_type", "metrics", "metrics_observed_at"), "warning_note_fields": ("source_published_at", "ip_location", "media"), "claim_rules": ("product_value_expression", "use_context", "target_audience_framing", "message_angle")},
-    "content_performance": {"blocking_note_fields": ("title", "content_text", "note_type", "source_published_at", "metrics", "metrics_observed_at", "media"), "warning_note_fields": ("tags", "ip_location"), "claim_rules": ("observed_high_engagement_sample", "visible_content_format")},
-    "competitor_discovery": {"blocking_note_fields": ("title", "content_text", "author", "tags", "metrics", "metrics_observed_at"), "warning_note_fields": ("source_published_at", "ip_location"), "claim_rules": ("named_competitor", "visible_content_expression")},
-    "ugc_community": {"blocking_note_fields": ("title", "content_text", "author", "source_published_at"), "warning_note_fields": ("metrics", "tags"), "blocking_comment_fields": ("comment_text", "source_published_at", "like_count", "reply_depth"), "claim_rules": ("observed_discussion_scenario", "interaction_pattern", "sampled_language")},
-    "comment_insight": {"blocking_note_fields": ("title", "content_text"), "warning_note_fields": ("metrics",), "blocking_comment_fields": ("comment_text", "source_published_at", "like_count", "reply_depth"), "claim_rules": ("explicit_question", "objection_or_failure", "repeated_need_language")},
-    "brand_activity": {"blocking_note_fields": ("title", "content_text", "source_published_at", "tags", "note_type", "metrics", "metrics_observed_at"), "warning_note_fields": ("ip_location", "media"), "claim_rules": ("campaign_signal", "launch_signal", "collaboration_signal", "dissemination_signal")},
-    "keyword_growth": {"blocking_note_fields": ("title", "content_text", "tags", "source_published_at", "metrics", "metrics_observed_at"), "warning_note_fields": ("author", "ip_location"), "claim_rules": ("sampled_keyword_pattern", "keyword_growth_with_comparable_baseline")},
+_DIRECTION_CONTRACT_SPECS: dict[str, dict[str, Any]] = {
+    "product_marketing": {
+        "blocking_note_fields": ("title", "content_text", "tags", "note_type", "metrics", "metrics_observed_at"),
+        "warning_note_fields": ("source_published_at", "ip_location", "media"),
+        "claim_rules": ("product_value_expression", "use_context", "target_audience_framing", "message_angle"),
+    },
+    "content_performance": {
+        "blocking_note_fields": ("title", "content_text", "note_type", "source_published_at", "metrics", "metrics_observed_at", "media"),
+        "warning_note_fields": ("tags", "ip_location"),
+        "claim_rules": ("observed_high_engagement_sample", "visible_content_format"),
+    },
+    "competitor_discovery": {
+        "blocking_note_fields": ("title", "content_text", "author", "tags", "metrics", "metrics_observed_at"),
+        "warning_note_fields": ("source_published_at", "ip_location"),
+        "claim_rules": ("named_competitor", "visible_content_expression"),
+    },
+    "ugc_community": {
+        "blocking_note_fields": ("title", "content_text", "author", "source_published_at"),
+        "warning_note_fields": ("metrics", "tags"),
+        "blocking_comment_fields": ("comment_text", "source_published_at", "like_count", "reply_depth"),
+        "claim_rules": ("observed_discussion_scenario", "interaction_pattern", "sampled_language"),
+    },
+    "comment_insight": {
+        "blocking_note_fields": ("title", "content_text"),
+        "warning_note_fields": ("metrics",),
+        "blocking_comment_fields": ("comment_text", "source_published_at", "like_count", "reply_depth"),
+        "claim_rules": ("explicit_question", "objection_or_failure", "repeated_need_language"),
+    },
+    "brand_activity": {
+        "blocking_note_fields": ("title", "content_text", "source_published_at", "tags", "note_type", "metrics", "metrics_observed_at"),
+        "warning_note_fields": ("ip_location", "media"),
+        "claim_rules": ("campaign_signal", "launch_signal", "collaboration_signal", "dissemination_signal"),
+    },
+    "keyword_growth": {
+        "blocking_note_fields": ("title", "content_text", "tags", "source_published_at", "metrics", "metrics_observed_at"),
+        "warning_note_fields": ("author", "ip_location"),
+        "claim_rules": ("sampled_keyword_pattern", "keyword_growth_with_comparable_baseline"),
+    },
 }
+
+QUERY_RELEVANCE_SCHEMA_VERSION = "content_research_query_relevance_v1"
+QUERY_RELEVANCE_MATCHING_MODE = "normalized_substring_any_anchor_v1"
+QUERY_RELEVANCE_ALGORITHM_VERSION = "query_relevance_v1"
+QUERY_SUBJECT_NOT_SUPPORTED = "query_subject_not_supported"
+LOCKED_QUERY_PLAN_SCHEMA_VERSION = "content_research_locked_query_plan_v1"
+ADMISSION_ALGORITHM_VERSION = "claim_admission_v2"
+
+_CATEGORY_SYNONYM_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("短裤", ("徒步短裤", "跑步短裤", "速干短裤", "运动短裤", "五分裤")),
+    ("徒步短裤", ("短裤", "速干短裤", "运动短裤", "五分裤")),
+    ("跑步短裤", ("短裤", "速干短裤", "运动短裤", "五分裤")),
+    ("徒步鞋", ("登山鞋", "户外鞋")),
+    ("跑鞋", ("运动鞋",)),
+    ("冲锋衣", ("户外夹克",)),
+    ("防晒衣", ("防晒服",)),
+    ("背包", ("双肩包", "徒步包")),
+)
+
+
+def normalize_relevance_text(value: str) -> str:
+    """Normalize an anchor or direct quote without treating a full query as a key."""
+    normalized = unicodedata.normalize("NFKC", value).casefold()
+    return re.sub(r"[^0-9a-z\u3400-\u9fff]+", "", normalized)
+
+
+def build_query_relevance_contract(
+    *,
+    direction_id: str,
+    confirmed_subject: str,
+    query_group_ids: tuple[str, ...],
+) -> dict[str, Any]:
+    """Build the immutable subject/category gate shared by policy and admission."""
+    subject_anchor = normalize_relevance_text(confirmed_subject)
+    if not subject_anchor:
+        raise ValueError("query relevance requires a confirmed subject anchor")
+    frozen_query_group_ids = tuple(
+        sorted({item.strip() for item in query_group_ids if item.strip()})
+    )
+    if not frozen_query_group_ids:
+        raise ValueError("query relevance requires frozen query group ids")
+    category_anchors: list[str] = []
+    allowed_synonyms: dict[str, list[str]] = {}
+    for category, synonyms in _CATEGORY_SYNONYM_GROUPS:
+        normalized_category = normalize_relevance_text(category)
+        if normalized_category not in subject_anchor:
+            continue
+        category_anchors.append(normalized_category)
+        allowed_synonyms[normalized_category] = sorted(
+            {normalize_relevance_text(item) for item in synonyms}
+        )
+        break
+    quote_fields = CLAIM_QUOTE_FIELDS.get(direction_id, {})
+    return {
+        "schema_version": QUERY_RELEVANCE_SCHEMA_VERSION,
+        "algorithm_version": QUERY_RELEVANCE_ALGORITHM_VERSION,
+        "subject_anchors": sorted({subject_anchor}),
+        "category_anchors": sorted(set(category_anchors)),
+        "allowed_synonyms": {
+            key: allowed_synonyms[key] for key in sorted(allowed_synonyms)
+        },
+        "matching_mode": QUERY_RELEVANCE_MATCHING_MODE,
+        "query_group_ids": list(frozen_query_group_ids),
+        "claim_quote_fields": {
+            claim_type: sorted(fields)
+            for claim_type, fields in sorted(quote_fields.items())
+        },
+        "reason_code": QUERY_SUBJECT_NOT_SUPPORTED,
+    }
+
+
+def frozen_query_relevance(
+    contract: DirectionContract,
+    policy_snapshot: RunPolicySnapshot,
+) -> dict[str, Any] | None:
+    """Return the run-frozen contract after checking both persisted copies agree."""
+    contract_value = contract.metadata.get("query_relevance")
+    policy_value = (
+        policy_snapshot.effective_policy.get("query_relevance") or {}
+    ).get(contract.direction_id)
+    if contract_value is None and policy_value is None:
+        return None
+    if not isinstance(contract_value, dict) or contract_value != policy_value:
+        raise ValueError("direction and run policy query relevance contracts differ")
+    return dict(contract_value)
 
 
 def _require_aware(value: datetime, field_name: str) -> None:
@@ -60,6 +180,55 @@ def _canonical_json(value: dict[str, Any]) -> str:
 
 def policy_hash(value: dict[str, Any]) -> str:
     return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def _locked_query_plan(
+    *,
+    requested_ids: tuple[str, ...],
+    query_groups_by_direction: Mapping[
+        str, tuple[Mapping[str, Any], ...]
+    ],
+    custom_research_question: str,
+) -> dict[str, Any]:
+    if set(query_groups_by_direction) != set(requested_ids):
+        raise ValueError("query groups must cover exactly the requested directions")
+    directions: dict[str, dict[str, Any]] = {}
+    for direction_id in requested_ids:
+        groups: list[dict[str, Any]] = []
+        for value in query_groups_by_direction[direction_id]:
+            group = {
+                "id": str(value.get("id") or "").strip(),
+                "direction_id": str(value.get("direction_id") or "").strip(),
+                "normalized_query": " ".join(
+                    str(value.get("normalized_query") or "").split()
+                ),
+                "priority": int(value.get("priority", 0)),
+                "sort": str(value.get("sort") or "").strip(),
+                "time_window": dict(value.get("time_window") or {}),
+                "candidate_cap": int(value.get("candidate_cap", 0)),
+            }
+            if (
+                not group["id"]
+                or group["direction_id"] != direction_id
+                or not group["normalized_query"]
+                or not group["sort"]
+                or not group["time_window"].get("end_at")
+                or group["candidate_cap"] < 1
+            ):
+                raise ValueError("locked query group is incomplete")
+            groups.append(group)
+        groups.sort(key=lambda item: (item["priority"], item["id"]))
+        if not groups or len({item["id"] for item in groups}) != len(groups):
+            raise ValueError("locked query groups must be non-empty and unique")
+        directions[direction_id] = {
+            "query_groups": groups,
+            "query_plan_hash": policy_hash({"query_groups": groups}),
+        }
+    return {
+        "schema_version": LOCKED_QUERY_PLAN_SCHEMA_VERSION,
+        "custom_research_question": " ".join(custom_research_question.split()),
+        "directions": directions,
+    }
 
 
 def evaluate_capability_preflight(
@@ -173,6 +342,19 @@ class DirectionContract:
             raise ValueError("DirectionContract requires identity, snapshot, version, and sample policy")
         if not self.required_note_fields:
             raise ValueError("DirectionContract requires at least one required note field")
+        relevance = self.metadata.get("query_relevance")
+        if relevance is not None:
+            if (
+                not isinstance(relevance, dict)
+                or relevance.get("schema_version") != QUERY_RELEVANCE_SCHEMA_VERSION
+                or relevance.get("algorithm_version")
+                != QUERY_RELEVANCE_ALGORITHM_VERSION
+                or relevance.get("matching_mode") != QUERY_RELEVANCE_MATCHING_MODE
+                or relevance.get("reason_code") != QUERY_SUBJECT_NOT_SUPPORTED
+                or not relevance.get("subject_anchors")
+                or not relevance.get("query_group_ids")
+            ):
+                raise ValueError("DirectionContract has an invalid query relevance contract")
 
 
 @dataclass(frozen=True)
@@ -200,7 +382,26 @@ class RunPolicySnapshot:
             raise ValueError("RunPolicySnapshot effective_policy_hash does not match effective_policy")
 
 
-def build_default_snapshot(*, snapshot_id: str, workflow_run_id: str, brief_id: str, plan_id: str, run_as_of_at: datetime | None = None, provider_capabilities: dict[str, dict[str, Any]] | None = None, direction_set_version: str = "formal_v1", direction_ids: tuple[str, ...] | None = None, direction_catalog: tuple[str, ...] | None = None, report_compose_mode: str = "prose") -> tuple[RunPolicySnapshot, list[SamplePolicy], list[DirectionContract]]:
+def build_default_snapshot(
+    *,
+    snapshot_id: str,
+    workflow_run_id: str,
+    brief_id: str,
+    plan_id: str,
+    run_as_of_at: datetime | None = None,
+    provider_capabilities: dict[str, dict[str, Any]] | None = None,
+    direction_set_version: str = "formal_v1",
+    direction_ids: tuple[str, ...] | None = None,
+    direction_catalog: tuple[str, ...] | None = None,
+    report_compose_mode: str = "prose",
+    confirmed_subject: str | None = None,
+    query_group_ids_by_direction: Mapping[str, tuple[str, ...]] | None = None,
+    query_groups_by_direction: Mapping[
+        str, tuple[Mapping[str, Any], ...]
+    ]
+    | None = None,
+    custom_research_question: str = "",
+) -> tuple[RunPolicySnapshot, list[SamplePolicy], list[DirectionContract]]:
     from app.content_research.admission.governance_keys import GOVERNANCE_POLICY_V1
     from app.content_research.workflow.direction_registry import ResearchDirectionRegistry
 
@@ -223,8 +424,53 @@ def build_default_snapshot(*, snapshot_id: str, workflow_run_id: str, brief_id: 
     if report_compose_mode not in {"prose", "template_only"}:
         raise ValueError("invalid report_compose_mode")
     definitions = [definitions_by_id[direction_id] for direction_id in requested_ids]
+    locked_query_plan: dict[str, Any] | None = None
+    if query_groups_by_direction is not None:
+        locked_query_plan = _locked_query_plan(
+            requested_ids=requested_ids,
+            query_groups_by_direction=query_groups_by_direction,
+            custom_research_question=custom_research_question,
+        )
+        frozen_group_ids = {
+            direction_id: tuple(
+                group["id"]
+                for group in locked_query_plan["directions"][direction_id][
+                    "query_groups"
+                ]
+            )
+            for direction_id in requested_ids
+        }
+        if (
+            query_group_ids_by_direction is not None
+            and {
+                key: tuple(sorted(value))
+                for key, value in query_group_ids_by_direction.items()
+            }
+            != {
+                key: tuple(sorted(value)) for key, value in frozen_group_ids.items()
+            }
+        ):
+            raise ValueError("query group ids differ from the locked query plan")
+        query_group_ids_by_direction = frozen_group_ids
+    relevance_by_direction: dict[str, dict[str, Any]] = {}
+    if confirmed_subject is not None or query_group_ids_by_direction is not None:
+        if not confirmed_subject or query_group_ids_by_direction is None:
+            raise ValueError(
+                "confirmed_subject and query_group_ids_by_direction must be frozen together"
+            )
+        if set(query_group_ids_by_direction) != set(requested_ids):
+            raise ValueError("query group ids must cover exactly the requested directions")
+        relevance_by_direction = {
+            direction_id: build_query_relevance_contract(
+                direction_id=direction_id,
+                confirmed_subject=confirmed_subject,
+                query_group_ids=tuple(query_group_ids_by_direction[direction_id]),
+            )
+            for direction_id in requested_ids
+        }
     policy = {
         "schema_version": "content_research_policy_v2",
+        "admission_algorithm_version": ADMISSION_ALGORITHM_VERSION,
         "direction_set_version": direction_set_version,
         "direction_ids": list(requested_ids),
         "report_compose_mode": report_compose_mode,
@@ -243,6 +489,10 @@ def build_default_snapshot(*, snapshot_id: str, workflow_run_id: str, brief_id: 
             }
         },
     }
+    if relevance_by_direction:
+        policy["query_relevance"] = relevance_by_direction
+    if locked_query_plan is not None:
+        policy["locked_query_plan"] = locked_query_plan
     if direction_catalog is not None:
         policy |= {
             "direction_catalog_version": DIRECTION_CATALOG_VERSION,
@@ -257,7 +507,15 @@ def build_default_snapshot(*, snapshot_id: str, workflow_run_id: str, brief_id: 
             optional_note_fields=_DIRECTION_CONTRACT_SPECS[item.id]["warning_note_fields"],
             required_comment_fields=_DIRECTION_CONTRACT_SPECS[item.id].get("blocking_comment_fields", ()),
             claim_rules=_DIRECTION_CONTRACT_SPECS[item.id]["claim_rules"],
-            metadata={"contract_role": "admission", "field_vocabulary": "content_research_normalized_fields_v1"},
+            metadata={
+                "contract_role": "admission",
+                "field_vocabulary": "content_research_normalized_fields_v1",
+                **(
+                    {"query_relevance": relevance_by_direction[item.id]}
+                    if relevance_by_direction
+                    else {}
+                ),
+            },
         )
         for item, sample_policy in zip(definitions, policies, strict=True)
     ]

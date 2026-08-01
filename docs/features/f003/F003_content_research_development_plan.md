@@ -207,6 +207,7 @@ locked query plan
 - author cap 高于 query coverage：若为满足某个 query 的覆盖而必须突破 author cap，则保留 coverage gap，写入 `query_coverage_unmet` 与 `author_cap_reached`，方向后续以 `incomplete/insufficient_evidence` 处理，不伪造跨作者覆盖。
 - 每个方向的检索停止条件由其 `DirectionContract/SamplePolicy` 决定：达到 `minimum_samples`、`minimum_independent_authors`，且未违反 `author_cap`、blocking field 和时间窗条件后即停止；不另设任意 sample cap。
 - 同一 canonical note 在多页或多个 query 命中时，候选池只保留一条 direction-local identity，但保留全部 query/rank 命中。搜索卡可判定的时间窗不合格项在 selection 前排除；仅详情可判定的时间窗不合格项在 detail 后写 `out_of_time_window` 并按冻结排序补位。
+- 确认 Brief 时必须为每个已请求方向把 `subject_anchors`、`category_anchors`、受控 `allowed_synonyms`、`matching_mode=normalized_substring_any_anchor_v1`、claim-type 可引用字段和全部 `query_group_ids` 同时冻结到 `RunPolicySnapshot` 与对应 `DirectionContract`；两份 payload 必须完全一致。这里的 anchor 来自确认主体和受控品类词表，不得把包含方向问题的完整 query 当作字面匹配词。
 - detail/comment blocking field 不可用时不得把搜索卡降级为正式 evidence。真实 run 记录 capability limitation 并以 `incomplete/insufficient_evidence` 结束；Day 2 的确定性验收可使用已审查 replay detail/comment fixture。详情缺 blocking field、时间窗不合格或其他 eligibility 失败时，允许在 detail fetch cap 内按冻结候选排序补位；每次补位追加 selection revision，原 selection manifest 不覆盖。
 - 评论 packet 必须记录 parent note、实际/目标评论数、cursor、排序、top-level/reply-depth policy、截断原因、去重后 comment/author 数；部分集只能表述为按策略采样，不能表述为全部评论。
 - 每方向分别报告 `selected_source_count`（被选中并尝试采集）、`eligible_source_count`（通过字段/时间/作者规则）和 `independent_source_count`（跨方向汇总后去除同一底层 source 的独立数）。
@@ -255,6 +256,7 @@ Foundation 全部勾选后，按以下 checklist 串行实现并逐项更新 §9
 **共同实现内容**：
 
 - 确定性 `ClaimAdmissionEvaluator`，明确 blocking/warning field、样本量、独立作者、可推导范围及禁止推导。
+- 正式主体相关性采用双层 admission gate：source packet 必须保存命中冻结 `QueryGroup` 的谱系，但该谱系只是必要条件；candidate 的直接 quote 还必须按冻结 matching mode 命中该方向的 subject/category anchor 或受控同义词，并来自该 claim type 允许的字段。任一条件不满足即以稳定 reason code `query_subject_not_supported` rejected，互动指标不能覆盖该拒绝。`product_marketing.message_angle` 继续允许 title 或正文直接支撑，但 quote 本身仍须命中 anchor。
 - 仅在合同定义的灰区使用 LLM；其输入、输出、版本、证据引用和理由均写入 Evidence Layer。
 - 被拒绝但有价值的材料进入 `WeakSignalPool`，不可静默丢弃。
 - `DirectionResultDecision` 只消费 admitted claim 与明确标识的 weak signal。

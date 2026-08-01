@@ -8,7 +8,11 @@ from app.content_research.contracts import build_default_snapshot
 from app.content_research.models import ResearchBriefRecord
 from app.content_research.persistence_models import StageCheckpointRecord
 from app.content_research.reporting.composer import ResearchReportComposer
-from app.content_research.reporting.lite_read_model import LiteReportReader, _direction_states
+from app.content_research.reporting.lite_read_model import (
+    LiteReportReader,
+    PublishedReportNotFoundError,
+    _direction_states,
+)
 from app.content_research.reporting.publication_materializer import ReportPublicationMaterializer
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
 from app.memory.thread_store import ThreadStore
@@ -84,9 +88,19 @@ async def test_lite_reader_projects_each_formal_publication_without_writing(
                             "recovery_actions": [],
                         }
                     ],
+                    "claim_cards": [
+                        {
+                            **governed["claim_cards"][0],
+                            "claim_type": "product_value_expression",
+                            "scope": {"sample": "selected_packets"},
+                        }
+                    ],
                     "citation_groups": [
                         {
                             **citation_group,
+                            "admission_decision_id": governed["claim_cards"][0][
+                                "admission_decision_id"
+                            ],
                             "evidence_refs": [
                                 {
                                     **citation_group["evidence_refs"][0],
@@ -129,6 +143,7 @@ async def test_lite_reader_projects_each_formal_publication_without_writing(
         publication_changes = {
             "workflow_run_id": run.run_id,
             "publication_state": publication_state,
+            "compose_mode": "template_only",
         }
         if publication_state == "partial_verified_report":
             publication_changes["omitted_section_ids"] = ("sec_core",)
@@ -169,6 +184,309 @@ async def test_lite_reader_projects_each_formal_publication_without_writing(
         assert len(artifacts) == 1
     finally:
         await threads.close()
+
+
+async def _project_formal_cards(
+    tmp_path,
+    *,
+    claim_cards,
+    citation_groups,
+    weak_signals=None,
+    compose_mode="template_only",
+):
+    db_path = str(tmp_path / "lite-projection-guard.db")
+    store = SQLiteContentResearchStore(db_path)
+    async with ThreadStore(db_path) as threads:
+        thread = await threads.create_thread(title="projection guard")
+    async with WorkflowRunManager(db_path) as manager:
+        run = await manager.start_run(thread_id=thread["id"], user_id="user")
+    base_snapshot = _snapshot()
+    governed = base_snapshot.metadata["governed_snapshot"]
+    snapshot = replace(
+        base_snapshot,
+        workflow_run_id=run.run_id,
+        metadata={
+            **base_snapshot.metadata,
+            "governed_snapshot": {
+                **governed,
+                "policy_scope": {
+                    **governed["policy_scope"],
+                    "direction_set_version": "direction_set_v1",
+                    "direction_ids": ["product_marketing", "content_performance"],
+                },
+                "direction_results": [
+                    {
+                        "direction_id": direction_id,
+                        "state": "formal_directional_result",
+                        "limitations": [],
+                        "recovery_actions": [],
+                    }
+                    for direction_id in ("product_marketing", "content_performance")
+                ],
+                "weak_signals": weak_signals or [],
+                "cross_direction_records": [],
+                "aggregate_claims": [],
+                "claim_cards": claim_cards,
+                "citation_groups": citation_groups,
+            },
+        },
+    )
+    draft = ResearchReportComposer().compose(snapshot)
+    decision = replace(_decision(draft), workflow_run_id=run.run_id)
+    publication = replace(
+        _publication(draft, decision),
+        workflow_run_id=run.run_id,
+        compose_mode=compose_mode,
+    )
+    store.save_result_snapshot(snapshot)
+    store.save_report_draft(draft.to_record())
+    store.save_report_faithfulness_decision(decision.to_record())
+    store.save_report_publication(publication.to_record())
+    async with WorkflowRunManager(db_path) as manager:
+        await manager.complete_run(run.run_id)
+    await ReportPublicationMaterializer(store, db_path).materialize(publication.id)
+
+    return await LiteReportReader(store, db_path).read(workflow_run_id=run.run_id)
+
+
+def _card(
+    claim_id,
+    admission_id,
+    *,
+    direction="product_marketing",
+    claim_type="product_value_expression",
+    admission_state="admitted",
+):
+    return {
+        "claim_candidate_id": claim_id,
+        "admission_decision_id": admission_id,
+        "admission_state": admission_state,
+        "direction_id": direction,
+        "claim_type": claim_type,
+        "statement": f"statement for {claim_id}",
+        "scope": {"sample": "selected_packets"},
+    }
+
+
+def _citation(
+    group_id,
+    claim_id,
+    admission_id,
+    *,
+    field_path="content_text",
+    display_index=1,
+):
+    quote = f"quote for {group_id}"
+    return {
+        "citation_group_id": group_id,
+        "display_index": display_index,
+        "claim_candidate_id": claim_id,
+        "admission_decision_id": admission_id,
+        "evidence_refs": [
+            {
+                "field_path": field_path,
+                "quote": quote,
+                "text_start": 0,
+                "text_end": len(quote),
+                "source_text_hash": "a" * 64,
+                "source_url": f"https://example.test/{group_id}",
+            }
+        ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_lite_reader_rejects_cards_without_matching_admitted_citation_identity(tmp_path):
+    report = await _project_formal_cards(
+        tmp_path,
+        claim_cards=[
+            _card("cc_accepted", "cad_accepted", admission_state="accepted"),
+            _card("cc_identity_mismatch", "cad_expected"),
+        ],
+        citation_groups=[
+            _citation("citation_accepted", "cc_accepted", "cad_accepted"),
+            _citation("citation_mismatch", "cc_identity_mismatch", "cad_other"),
+        ],
+    )
+
+    assert report["sections"]["main_findings"] == []
+    assert report["status_strip"]["admitted_finding_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_lite_reader_retains_title_backed_message_angle_but_not_raw_product_title(tmp_path):
+    report = await _project_formal_cards(
+        tmp_path,
+        claim_cards=[
+            _card("cc_message_angle", "cad_message", claim_type="message_angle"),
+            _card("cc_product_value", "cad_value"),
+        ],
+        citation_groups=[
+            _citation("citation_message", "cc_message_angle", "cad_message", field_path="title"),
+            _citation("citation_value", "cc_product_value", "cad_value", field_path="title"),
+        ],
+    )
+
+    assert report["sections"]["main_findings"] == [
+        {
+            "statement": "statement for cc_message_angle",
+            "claim_type": "message_angle",
+            "card_kind": "finding",
+            "direction": "product_marketing",
+            "sample_summary": {"sample": "selected_packets"},
+            "scope": {"sample": "selected_packets"},
+            "citation_group_ids": ["citation_message"],
+        }
+    ]
+    assert report["status_strip"]["admitted_finding_count"] == 1
+    assert report["status_strip"]["observation_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_lite_reader_retains_formal_content_performance_observation_card(tmp_path):
+    report = await _project_formal_cards(
+        tmp_path,
+        claim_cards=[
+            _card(
+                "cc_observation",
+                "cad_observation",
+                direction="content_performance",
+                claim_type="observed_high_engagement_sample",
+            )
+        ],
+        citation_groups=[
+            _citation("citation_observation", "cc_observation", "cad_observation", field_path="title")
+        ],
+    )
+
+    assert report["sections"]["main_findings"][0]["card_kind"] == "observation"
+    assert report["sections"]["main_findings"][0]["claim_type"] == (
+        "observed_high_engagement_sample"
+    )
+    assert report["status_strip"]["admitted_finding_count"] == 0
+    assert report["status_strip"]["observation_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_lite_reader_does_not_leak_colliding_citation_identity_into_card(tmp_path):
+    report = await _project_formal_cards(
+        tmp_path,
+        claim_cards=[_card("cc_collision", "cad_expected")],
+        citation_groups=[
+            _citation("citation_expected", "cc_collision", "cad_expected"),
+            _citation("citation_other", "cc_collision", "cad_other"),
+        ],
+    )
+
+    assert report["sections"]["main_findings"][0]["citation_group_ids"] == [
+        "citation_expected"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_lite_reader_rejects_non_template_only_publication(tmp_path):
+    db_path = str(tmp_path / "lite-prose-publication.db")
+    store = SQLiteContentResearchStore(db_path)
+    async with ThreadStore(db_path) as threads:
+        thread = await threads.create_thread(title="prose publication")
+    async with WorkflowRunManager(db_path) as manager:
+        run = await manager.start_run(thread_id=thread["id"], user_id="user")
+    base_snapshot = _snapshot()
+    snapshot = replace(base_snapshot, workflow_run_id=run.run_id)
+    draft = ResearchReportComposer().compose(snapshot)
+    decision = replace(_decision(draft), workflow_run_id=run.run_id)
+    publication = replace(_publication(draft, decision), workflow_run_id=run.run_id)
+    store.save_result_snapshot(snapshot)
+    store.save_report_draft(draft.to_record())
+    store.save_report_faithfulness_decision(decision.to_record())
+    store.save_report_publication(publication.to_record())
+    async with WorkflowRunManager(db_path) as manager:
+        await manager.complete_run(run.run_id)
+    await ReportPublicationMaterializer(store, db_path).materialize(publication.id)
+
+    with pytest.raises(PublishedReportNotFoundError, match="unsupported compose mode"):
+        await LiteReportReader(store, db_path).read(workflow_run_id=run.run_id)
+
+
+@pytest.mark.asyncio
+async def test_lite_reader_reads_every_frozen_citation_group_in_publication_order(tmp_path):
+    report = await _project_formal_cards(
+        tmp_path,
+        claim_cards=[_card(f"cc_{index:03d}", f"cad_{index:03d}") for index in range(1, 52)],
+        citation_groups=[
+            _citation(
+                f"citation_{index:03d}",
+                f"cc_{index:03d}",
+                f"cad_{index:03d}",
+                display_index=index,
+            )
+            for index in range(1, 52)
+        ],
+    )
+
+    expected_group_ids = [f"citation_{index:03d}" for index in range(1, 52)]
+    assert [item["citation_group_id"] for item in report["citations"]] == expected_group_ids
+    assert [
+        item["citation_group_ids"][0] for item in report["sections"]["main_findings"]
+    ] == expected_group_ids
+    assert report["status_strip"]["admitted_finding_count"] == 51
+
+
+@pytest.mark.asyncio
+async def test_lite_reader_retains_only_weak_signals_with_matching_frozen_identity(tmp_path):
+    report = await _project_formal_cards(
+        tmp_path,
+        claim_cards=[
+            _card("cc_valid", "cad_valid", admission_state="accepted"),
+            _card("cc_bad_admission", "cad_expected", admission_state="accepted"),
+            _card("cc_other", "cad_bad_claim", admission_state="accepted"),
+        ],
+        citation_groups=[
+            _citation("citation_valid", "cc_valid", "cad_valid"),
+            _citation("citation_wrong_admission", "cc_bad_admission", "cad_other"),
+            _citation("citation_wrong_claim", "cc_other", "cad_bad_claim"),
+        ],
+        weak_signals=[
+            {
+                "weak_signal_id": "ws_valid",
+                "claim_candidate_id": "cc_valid",
+                "admission_decision_id": "cad_valid",
+                "direction_id": "product_marketing",
+                "reason": "valid weak signal",
+            },
+            {
+                "weak_signal_id": "ws_bad_admission",
+                "claim_candidate_id": "cc_bad_admission",
+                "admission_decision_id": "cad_expected",
+                "direction_id": "product_marketing",
+                "reason": "wrong admission",
+            },
+            {
+                "weak_signal_id": "ws_bad_claim",
+                "claim_candidate_id": "cc_bad_claim",
+                "admission_decision_id": "cad_bad_claim",
+                "direction_id": "product_marketing",
+                "reason": "wrong claim",
+            },
+        ],
+    )
+
+    assert report["sections"]["main_findings"] == []
+    assert report["sections"]["weak_signals"] == [
+        {
+            "statement": "valid weak signal",
+            "direction": "product_marketing",
+            "sample_summary": None,
+            "qualification_reason": "valid weak signal",
+            "citation_group_ids": ["citation_valid"],
+        }
+    ]
+    assert report["status_strip"] == {
+        "completed_direction_count": 0,
+        "admitted_finding_count": 0,
+        "observation_count": 0,
+        "lead_count": 1,
+    }
 
 
 @pytest.mark.asyncio

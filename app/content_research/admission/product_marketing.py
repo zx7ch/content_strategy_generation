@@ -14,6 +14,7 @@ from app.content_research.admission.candidates import (
     build_claim_candidate,
     extract_facts,
 )
+from app.content_research.admission.quote_fields import quote_fields_for_claim
 from app.content_research.admission.strategy import AdmissionStrategy
 from app.content_research.persistence_models import (
     ClaimCandidateRecord,
@@ -27,12 +28,6 @@ PRODUCT_MARKETING_CLAIM_INTENTS = {
     "message_angle": "message_angle",
 }
 
-_ALLOWED_FIELDS = {
-    "product_value_expression": frozenset({"content_text"}),
-    "use_context": frozenset({"content_text"}),
-    "target_audience_framing": frozenset({"content_text"}),
-    "message_angle": frozenset({"title", "content_text"}),
-}
 _PROHIBITED_OUTCOME_TERMS = ("偏好", "转化", "购买", "因果", "效果提升", "表现更好")
 _MAX_DIRECT_OBSERVATION_CHARS = 280
 
@@ -50,7 +45,7 @@ def build_product_marketing_candidate(
         raise ValueError("product-marketing factory requires product_marketing direction")
     if claim_type not in PRODUCT_MARKETING_CLAIM_INTENTS:
         raise ValueError("product-marketing claim type is not allowed")
-    if fact.field_path not in _ALLOWED_FIELDS[claim_type]:
+    if fact.field_path not in quote_fields_for_claim("product_marketing", claim_type):
         raise ValueError("product-marketing claim type cannot use this evidence field")
     quote, text_start = _direct_observation(fact.text)
     if any(term in quote for term in _PROHIBITED_OUTCOME_TERMS):
@@ -143,7 +138,7 @@ def product_marketing_boundary_reason(candidate: ClaimCandidateRecord) -> str | 
     ):
         return "product_marketing_evidence_boundary_violation"
     field_path = str(refs[0].get("field_path") or "")
-    if field_path not in _ALLOWED_FIELDS[candidate.claim_type]:
+    if field_path not in quote_fields_for_claim("product_marketing", candidate.claim_type):
         return "product_marketing_evidence_boundary_violation"
     if candidate.payload.get("scope", {}).get("sample") != "selected_packets":
         return "product_marketing_evidence_boundary_violation"

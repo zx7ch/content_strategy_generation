@@ -10,6 +10,7 @@ from app.content_research.admission.candidates import (
     build_claim_candidate,
     extract_facts,
 )
+from app.content_research.admission.quote_fields import quote_fields_for_direction
 from app.content_research.admission.strategy import AdmissionStrategy
 from app.content_research.persistence_models import (
     ClaimCandidateRecord,
@@ -21,7 +22,7 @@ COMPETITOR_DISCOVERY_CLAIM_INTENTS = {
     "visible_content_expression": "brand_expression",
 }
 
-_ALLOWED_FIELDS = frozenset({"title", "content_text", "tags"})
+_ALLOWED_FIELDS = quote_fields_for_direction("competitor_discovery")
 _PROHIBITED_TERMS = ("官方账号", "官方身份", "市场领导", "市占", "最受欢迎", "竞争表现")
 
 

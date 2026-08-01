@@ -13,11 +13,20 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.content_research.admission.candidates import build_claim_candidate, extract_facts
-from app.content_research.admission.evaluator import ClaimAdmissionEvaluator
+from app.content_research.admission.evaluator import (
+    ALGORITHM_VERSION,
+    ClaimAdmissionEvaluator,
+)
 from app.content_research.admission.registry import DEFAULT_ADMISSION_STRATEGIES
+from app.content_research.admission.relevance import query_relevance_reason
 from app.content_research.admission.results import build_direction_result
 from app.content_research.async_pipeline_store import AsyncDirectionalPersistenceSession
-from app.content_research.contracts import DirectionContract, RunPolicySnapshot, SamplePolicy
+from app.content_research.contracts import (
+    DirectionContract,
+    RunPolicySnapshot,
+    SamplePolicy,
+    frozen_query_relevance,
+)
 from app.content_research.persistence_models import (
     ClaimAdmissionDecisionRecord,
     DirectionalEvidencePacketRecord,
@@ -30,7 +39,7 @@ from app.content_research.sources.canonical_registry import CanonicalSourceRegis
 from app.content_research.stores.base import ContentResearchStore
 
 PACKET_FIELD_NAMES = frozenset({
-    "title", "content_text", "author", "tags", "metrics", "media", "source_url",
+    "title", "content_text", "author_id", "author", "tags", "metrics", "media", "source_url",
     "source_published_at", "source_collected_at", "metrics_observed_at",
     "parent_note_id", "comment_text", "reply_depth", "quote",
     "competitor_names",
@@ -56,6 +65,7 @@ class QueryGroup:
     priority: int
     sort: str = "likes"
     candidate_limit: int = 20
+    time_window: dict[str, str] | None = None
     cursor: str | None = None
 
 
@@ -65,6 +75,7 @@ class CandidateDecision:
     selected: bool
     reasons: tuple[str, ...]
     query_group_ids: tuple[str, ...]
+    query_hits: tuple[dict[str, Any], ...]
 
 
 @dataclass(frozen=True)
@@ -90,20 +101,84 @@ class DirectionEvidenceRun:
 
 
 def compile_query_groups(
-    *, direction_id: str, subject: str, questions: list[str], competitors: list[str], candidate_limit: int = 20,
+    *,
+    direction_id: str,
+    subject: str,
+    questions: list[str],
+    competitors: list[str],
+    candidate_limit: int = 20,
+    run_as_of_at: datetime | None = None,
 ) -> tuple[QueryGroup, ...]:
-    terms = [subject.strip(), *[item.strip() for item in competitors if item.strip()]]
+    terms = [
+        subject.strip(),
+        *sorted({item.strip() for item in competitors if item.strip()}),
+    ]
     groups: list[QueryGroup] = []
     for index, question in enumerate(questions or [direction_id]):
         query = " ".join([*terms, question.strip()]).strip()
         normalized = " ".join(query.split())
         group_id = f"qg_{canonical_fingerprint({'direction': direction_id, 'query': normalized})[:16]}"
-        groups.append(QueryGroup(group_id, direction_id, normalized, index, candidate_limit=candidate_limit))
+        groups.append(
+            QueryGroup(
+                group_id,
+                direction_id,
+                normalized,
+                index,
+                candidate_limit=candidate_limit,
+                time_window={
+                    "end_at": run_as_of_at.isoformat()
+                }
+                if run_as_of_at
+                else None,
+            )
+        )
     return tuple(groups)
 
 
 def query_plan_hash(groups: tuple[QueryGroup, ...]) -> str:
-    return canonical_fingerprint({"groups": [asdict(item) for item in groups]})
+    return canonical_fingerprint(
+        {"query_groups": [_frozen_query_group_payload(item) for item in groups]}
+    )
+
+
+def _frozen_query_group_payload(group: QueryGroup) -> dict[str, Any]:
+    return {
+        "id": group.id,
+        "direction_id": group.direction_id,
+        "normalized_query": group.query,
+        "priority": group.priority,
+        "sort": group.sort,
+        "time_window": dict(group.time_window or {}),
+        "candidate_cap": group.candidate_limit,
+    }
+
+
+def _frozen_query_groups(
+    snapshot: RunPolicySnapshot,
+    direction_id: str,
+) -> tuple[QueryGroup, ...] | None:
+    locked = snapshot.effective_policy.get("locked_query_plan")
+    if not isinstance(locked, dict):
+        return None
+    direction = dict((locked.get("directions") or {}).get(direction_id) or {})
+    values = direction.get("query_groups")
+    if not isinstance(values, list) or not values:
+        raise ValueError("frozen query plan is missing the requested direction")
+    groups = tuple(
+        QueryGroup(
+            id=str(value["id"]),
+            direction_id=str(value["direction_id"]),
+            query=str(value["normalized_query"]),
+            priority=int(value["priority"]),
+            sort=str(value["sort"]),
+            candidate_limit=int(value["candidate_cap"]),
+            time_window=dict(value["time_window"]),
+        )
+        for value in values
+    )
+    if query_plan_hash(groups) != direction.get("query_plan_hash"):
+        raise ValueError("frozen query plan hash does not match its query groups")
+    return groups
 
 
 def select_candidates(
@@ -116,6 +191,7 @@ def select_candidates(
     """Deduplicate before applying the author cap; never trade the cap for coverage."""
     by_id: dict[str, dict[str, Any]] = {}
     hits: dict[str, set[str]] = {}
+    query_hits: dict[str, dict[str, int]] = {}
     for item in candidates:
         source_id = str(item.get("canonical_source_id") or item.get("canonical_id") or "")
         if not source_id:
@@ -123,7 +199,29 @@ def select_candidates(
         normalized = {**item, "canonical_source_id": source_id}
         if _is_after_as_of(normalized, run_as_of_at):
             normalized["out_of_time_window"] = True
-        hits.setdefault(source_id, set()).add(str(normalized.get("query_group_id") or ""))
+        item_query_hits = list(normalized.get("query_hits") or ())
+        query_group_id = str(normalized.get("query_group_id") or "")
+        if query_group_id:
+            item_query_hits.append(
+                {
+                    "query_group_id": query_group_id,
+                    "rank": normalized.get("query_rank"),
+                }
+            )
+        hits.setdefault(source_id, set())
+        for hit in item_query_hits:
+            if not isinstance(hit, dict):
+                continue
+            hit_group_id = str(hit.get("query_group_id") or "")
+            if not hit_group_id:
+                continue
+            hits[source_id].add(hit_group_id)
+            rank = int(hit.get("rank") or 0)
+            source_hits = query_hits.setdefault(source_id, {})
+            source_hits[hit_group_id] = min(
+                rank,
+                source_hits.get(hit_group_id, rank),
+            )
         current = by_id.get(source_id)
         if current is None or _sort_key(normalized) < _sort_key(current):
             by_id[source_id] = normalized
@@ -144,7 +242,7 @@ def select_candidates(
             reasons.append("blocking_field_unavailable")
         if require_detail and item.get("source_kind") in {"search_result", "search_result_minimal"} and not item.get("blocking_unavailable"):
             reasons.append("detail_not_collected")
-        author = str(item.get("author_id") or item.get("author") or "")
+        author = str(item.get("author_id") or "")
         if author and author_counts.get(author, 0) >= author_cap:
             reasons.append("author_cap_reached")
         if selected >= detail_fetch_cap:
@@ -167,7 +265,21 @@ def select_candidates(
                 independent_authors.add(author)
             selected_groups.update(filter(None, hits[source_id]))
             reasons.append("selected_deterministically")
-        decisions.append(CandidateDecision(source_id, is_selected, tuple(reasons), tuple(sorted(filter(None, hits[source_id])))))
+        decisions.append(
+            CandidateDecision(
+                source_id,
+                is_selected,
+                tuple(reasons),
+                tuple(sorted(filter(None, hits[source_id]))),
+                tuple(
+                    {
+                        "query_group_id": group_id,
+                        "rank": query_hits[source_id][group_id],
+                    }
+                    for group_id in sorted(query_hits.get(source_id, {}))
+                ),
+            )
+        )
 
     coverage_unmet = tuple(group.id for group in groups if group.id not in selected_groups)
     if coverage_unmet:
@@ -175,7 +287,20 @@ def select_candidates(
     requirements_met = selected >= minimum_samples and len(independent_authors) >= minimum_independent_authors
     if not requirements_met:
         incomplete = True
-    manifest = [{"id": key, "item": _manifest_value(value), "hits": sorted(hits[key])} for key, value in sorted(by_id.items())]
+    manifest = [
+        {
+            "id": key,
+            "item": _manifest_value(value),
+            "query_hits": [
+                {
+                    "query_group_id": group_id,
+                    "rank": query_hits[key][group_id],
+                }
+                for group_id in sorted(query_hits.get(key, {}))
+            ],
+        }
+        for key, value in sorted(by_id.items())
+    ]
     status = "insufficient_evidence" if not selected else ("incomplete" if incomplete else "complete")
     return DirectionSelection(
         query_plan_hash(groups), canonical_fingerprint({"candidates": manifest}), tuple(decisions),
@@ -252,12 +377,22 @@ class DirectionalExecutionPipeline:
         # isolated instead of allowing an unscoped persisted record.
         self._workflow_run_id = workflow_run_id or f"local_{subagent_task_id}"
         self._checkpoint_started_at = {}
-        groups = compile_query_groups(
+        frozen_groups = (
+            _frozen_query_groups(policy_snapshot, direction_id)
+            if policy_snapshot is not None
+            else None
+        )
+        if policy_snapshot is not None and frozen_groups is None:
+            raise ValueError(
+                "formal collection requires a full locked query plan"
+            )
+        groups = frozen_groups or compile_query_groups(
             direction_id=direction_id,
             subject=subject,
             questions=questions,
             competitors=competitors,
             candidate_limit=candidate_limit_per_query,
+            run_as_of_at=run_as_of_at,
         )
         plan_hash = query_plan_hash(groups)
         collect_record = self._checkpoint(subagent_task_id, "collect", plan_hash)
@@ -302,17 +437,17 @@ class DirectionalExecutionPipeline:
                 "selection": _selection_payload(selection),
             })
 
-        candidate_by_id = {str(item.get("canonical_source_id") or item.get("canonical_id")): item for item in candidates}
+        candidate_by_id = _candidate_map(candidates)
         detail_record = self._checkpoint(subagent_task_id, "detail", selection_fp)
         if detail_record:
-            candidate_by_id = {str(item.get("canonical_source_id") or item.get("canonical_id")): item for item in detail_record.payload["candidates"]}
+            candidate_by_id = _candidate_map(detail_record.payload["candidates"])
             selection = _selection_from_payload(detail_record.payload["selection"])
         elif collect_detail is not None:
             self._start_checkpoint(subagent_task_id, "detail")
             revisions = self._selection_revisions(subagent_task_id, selection_fp)
             if revisions:
                 latest = revisions[-1].payload
-                candidate_by_id = {str(item.get("canonical_source_id") or item.get("canonical_id")): item for item in latest["candidates"]}
+                candidate_by_id = _candidate_map(latest["candidates"])
                 selection = _selection_from_payload(latest["selection"])
             revision_no = len(revisions)
             for candidate_id, candidate in sorted(candidate_by_id.items(), key=lambda pair: _sort_key(pair[1])):
@@ -429,28 +564,15 @@ class DirectionalExecutionPipeline:
         return DirectionEvidenceRun(selection, packet_ids, comment_packet_ids, replayed_collect, replayed_selection, replayed_packet)
 
     def _run_admission(self, task_id: str, direction_id: str, selection: DirectionSelection, packet_ids: tuple[str, ...], contract: DirectionContract, policy: SamplePolicy, snapshot: RunPolicySnapshot) -> None:
-        fingerprint = canonical_fingerprint({"packets": packet_ids, "policy": snapshot.effective_policy_hash, "contract": contract.schema_version})
-        if self._checkpoint(task_id, "admission", fingerprint):
-            return
-        self._start_checkpoint(task_id, "facts")
-        self._start_checkpoint(task_id, "admission")
-        decisions: list[ClaimAdmissionDecisionRecord] = []
+        relevance_contract = frozen_query_relevance(contract, snapshot)
         strategy = DEFAULT_ADMISSION_STRATEGIES.get(direction_id)
         packets = [
             packet for packet_id in packet_ids
             if (packet := self._store.get_typed_record(DirectionalEvidencePacketRecord, packet_id)) is not None
         ]
-        comment_packets = [
-            packet for packet in packets
-            if packet.payload.get("retrieval_context", {}).get("source_kind") == "comment"
-        ]
-        sample_packets = comment_packets or packets
-        sample_authors = {
-            str(packet.payload.get("field_projection", {}).get("author_id") or packet.payload.get("field_projection", {}).get("author") or "")
-            for packet in sample_packets
-        } - {""}
-        selected_source_count = len(sample_packets) if comment_packets else selection.selected_source_count
-        independent_author_count = len(sample_authors) if comment_packets else selection.independent_source_count
+        candidates_by_packet: list[
+            tuple[DirectionalEvidencePacketRecord, list]
+        ] = []
         for packet in packets:
             if strategy is not None:
                 candidates = strategy.build_candidates(packet)
@@ -463,10 +585,114 @@ class DirectionalExecutionPipeline:
                 if fact.field_path == "comment_text":
                     scope["parent_note_canonical_source_id"] = packet.payload.get("retrieval_context", {}).get("parent_note_canonical_source_id")
                 candidates = [build_claim_candidate(workflow_run_id=self._workflow_run_id, direction_id=direction_id, intent_id=contract.claim_rules[0], claim_type=contract.claim_rules[0], statement=fact.text, scope=scope, fact=fact, quote=fact.text, text_start=0, text_end=len(fact.text))]
+            candidates_by_packet.append((packet, candidates))
+        comment_packets = [
+            packet for packet, _ in candidates_by_packet
+            if packet.payload.get("retrieval_context", {}).get("source_kind") == "comment"
+        ]
+        candidate_packets = comment_packets or packets
+        candidate_packet_ids = {packet.id for packet in candidate_packets}
+        relevance_qualified_packet_ids = {
+            packet.id
+            for packet, candidates in candidates_by_packet
+            if packet.id in candidate_packet_ids
+            and any(
+                query_relevance_reason(
+                    candidate=candidate,
+                    packet=packet,
+                    contract=contract,
+                    policy_snapshot=snapshot,
+                ) is None
+                for candidate in candidates
+            )
+        }
+        relevant_packets = [
+            packet for packet in candidate_packets
+            if packet.id in relevance_qualified_packet_ids
+        ]
+        eligible_packets = [
+            packet
+            for packet in relevant_packets
+            if _packet_is_admission_eligible(
+                packet=packet,
+                contract=contract,
+                snapshot=snapshot,
+            )
+        ]
+        sample_authors = {
+            str(packet.payload.get("field_projection", {}).get("author_id") or "")
+            for packet in eligible_packets
+        } - {""}
+        selected_source_count = (
+            len(candidate_packets)
+            if comment_packets
+            else selection.selected_source_count
+        )
+        relevance_qualified_source_count = len(relevant_packets)
+        eligible_source_count = len(eligible_packets)
+        independent_author_count = len(sample_authors)
+        admission_packet_identities = tuple(
+            sorted((packet.id, packet.field_projection_hash) for packet in packets)
+        )
+        checkpoint_identity = {
+            "admission_packets": [
+                {"id": packet_id, "field_projection_hash": packet_hash}
+                for packet_id, packet_hash in admission_packet_identities
+            ],
+            "policy_snapshot_id": snapshot.id,
+            "policy_snapshot_hash": snapshot.effective_policy_hash,
+            "contract": {
+                "id": contract.id,
+                "schema_version": contract.schema_version,
+            },
+            "sample_policy": {
+                "id": policy.id,
+                "schema_version": policy.schema_version,
+                "minimum_samples": policy.minimum_samples,
+                "minimum_independent_authors": (
+                    policy.minimum_independent_authors
+                ),
+                "author_cap": policy.author_cap,
+                "metadata": policy.metadata,
+            },
+            "metrics": {
+                "selected_source_count": selected_source_count,
+                "relevance_qualified_source_count": (
+                    relevance_qualified_source_count
+                ),
+                "eligible_source_count": eligible_source_count,
+                "independent_author_count": independent_author_count,
+            },
+            "relevance_contract": relevance_contract,
+            "relevance_algorithm_version": (
+                relevance_contract.get("algorithm_version")
+                if relevance_contract
+                else None
+            ),
+            "admission_algorithm_version": ALGORITHM_VERSION,
+        }
+        fingerprint = canonical_fingerprint(checkpoint_identity)
+        if self._checkpoint(task_id, "admission", fingerprint):
+            return
+        self._start_checkpoint(task_id, "facts")
+        self._start_checkpoint(task_id, "admission")
+        decisions: list[ClaimAdmissionDecisionRecord] = []
+        for packet, candidates in candidates_by_packet:
             for candidate in candidates:
                 if self._store.get_typed_record(type(candidate), candidate.id) is None:
                     self._store.save_claim_candidate(candidate)
-                decision = ClaimAdmissionEvaluator().evaluate(candidate=candidate, packet=packet, contract=contract, sample_policy=policy, policy_snapshot=snapshot, selected_source_count=selected_source_count, independent_author_count=independent_author_count).record
+                decision = ClaimAdmissionEvaluator().evaluate(
+                    candidate=candidate,
+                    packet=packet,
+                    contract=contract,
+                    sample_policy=policy,
+                    policy_snapshot=snapshot,
+                    selected_source_count=selected_source_count,
+                    relevance_qualified_source_count=relevance_qualified_source_count,
+                    eligible_source_count=eligible_source_count,
+                    independent_author_count=independent_author_count,
+                    admission_packet_identities=admission_packet_identities,
+                ).record
                 if self._store.get_typed_record(ClaimAdmissionDecisionRecord, decision.id) is None:
                     self._store.save_claim_admission_decision(decision)
                 decisions.append(decision)
@@ -477,7 +703,25 @@ class DirectionalExecutionPipeline:
             if self._store.get_typed_record(type(weak), weak.id) is None:
                 self._store.save_weak_signal(weak)
         self._save_checkpoint(task_id, "facts", fingerprint, {"direction_id": direction_id, "packet_ids": list(packet_ids)})
-        self._save_checkpoint(task_id, "admission", fingerprint, {"direction_id": direction_id, "decision_ids": [item.id for item in decisions], "direction_result_id": output.direction_result.id})
+        self._save_checkpoint(
+            task_id,
+            "admission",
+            fingerprint,
+            {
+                "direction_id": direction_id,
+                "decision_ids": [item.id for item in decisions],
+                "direction_result_id": output.direction_result.id,
+                "policy_snapshot_id": snapshot.id,
+                "policy_snapshot_hash": snapshot.effective_policy_hash,
+                "relevance_contract": relevance_contract,
+                "algorithm_version": ALGORITHM_VERSION,
+                "sample_policy": checkpoint_identity["sample_policy"],
+                "computed_metrics": checkpoint_identity["metrics"],
+                "admission_packet_identities": checkpoint_identity[
+                    "admission_packets"
+                ],
+            },
+        )
 
     async def _collect_search_pages(
         self,
@@ -532,8 +776,15 @@ class DirectionalExecutionPipeline:
                     raise
                 remaining = max(group.candidate_limit - len(group_candidates), 0)
                 page_items = [
-                    {**_manifest_value(item), "query_group_id": group.id}
-                    for item in result.items[:remaining]
+                    {
+                        **_manifest_value(item),
+                        "query_group_id": group.id,
+                        "query_rank": len(group_candidates) + index,
+                    }
+                    for index, item in enumerate(
+                        result.items[:remaining],
+                        start=1,
+                    )
                     if isinstance(item, dict)
                 ]
                 group_candidates.extend(page_items)
@@ -717,6 +968,15 @@ class DirectionalExecutionPipeline:
             parent_packet_ids = self._persist_comment_packets(
                 direction_id=direction_id,
                 parent_candidate=candidate,
+                parent_query_hits=next(
+                    (
+                        decision.query_hits
+                        for decision in selection.decisions
+                        if decision.canonical_source_id == parent_id
+                    ),
+                    (),
+                ),
+                parent_query_plan_hash=selection.query_plan_hash,
                 items=items,
                 required_comment_fields=required_comment_fields,
                 collection_metadata={
@@ -741,7 +1001,13 @@ class DirectionalExecutionPipeline:
                 "next_cursor": final_page.payload.get("next_cursor") if final_page else None,
                 "actual_comment_count": len(items),
                 "deduplicated_comment_count": len(parent_packet_ids),
-                "deduplicated_author_count": len({str(item.get("author_id") or item.get("author") or "") for item in items if item.get("author_id") or item.get("author")}),
+                "deduplicated_author_count": len(
+                    {
+                        str(item["author_id"])
+                        for item in items
+                        if item.get("author_id")
+                    }
+                ),
             })
         return {
             "required": True,
@@ -764,14 +1030,19 @@ class DirectionalExecutionPipeline:
             packet = build_packet(
                 direction_id=direction_id, canonical_source_id=source.id,
                 fields=candidate, availability=dict(candidate.get("field_availability") or {}),
-                retrieval_context={"query_group_ids": list(decision.query_group_ids), "query_plan_hash": selection.query_plan_hash, "source_kind": candidate.get("source_kind")},
+                retrieval_context={
+                    "query_group_ids": list(decision.query_group_ids),
+                    "query_hits": list(decision.query_hits),
+                    "query_plan_hash": selection.query_plan_hash,
+                    "source_kind": candidate.get("source_kind"),
+                },
             )
             packet_id = f"dep_{canonical_fingerprint({'run': self._workflow_run_id, 'packet': packet['field_projection_hash']})[:24]}"
             if self._store.get_typed_record(DirectionalEvidencePacketRecord, packet_id) is None:
                 self._store.save_directional_evidence_packet(DirectionalEvidencePacketRecord(packet_id, "content_research_directional_packet_v1", packet, workflow_run_id=self._workflow_run_id, research_direction_id=direction_id, canonical_source_id=source.id, field_projection_hash=packet["field_projection_hash"]))
             projection_id = f"dsp_{canonical_fingerprint({'run': self._workflow_run_id, 'direction': direction_id, 'source': source.id, 'packet': packet_id})[:24]}"
             if self._store.get_typed_record(DirectionSourceProjectionRecord, projection_id) is None:
-                self._store.save_direction_source_projection(DirectionSourceProjectionRecord(projection_id, "content_research_direction_projection_v1", {"selected": True, "reasons": list(decision.reasons), "query_group_ids": list(decision.query_group_ids)}, workflow_run_id=self._workflow_run_id, research_direction_id=direction_id, canonical_source_id=source.id, evidence_packet_id=packet_id))
+                self._store.save_direction_source_projection(DirectionSourceProjectionRecord(projection_id, "content_research_direction_projection_v1", {"selected": True, "reasons": list(decision.reasons), "query_group_ids": list(decision.query_group_ids), "query_hits": list(decision.query_hits)}, workflow_run_id=self._workflow_run_id, research_direction_id=direction_id, canonical_source_id=source.id, evidence_packet_id=packet_id))
             packet_ids.append(packet_id)
         return packet_ids
 
@@ -780,6 +1051,8 @@ class DirectionalExecutionPipeline:
         *,
         direction_id: str,
         parent_candidate: Mapping[str, Any],
+        parent_query_hits: tuple[dict[str, Any], ...],
+        parent_query_plan_hash: str,
         items: list[dict[str, Any]],
         required_comment_fields: tuple[str, ...],
         collection_metadata: dict[str, Any],
@@ -799,7 +1072,7 @@ class DirectionalExecutionPipeline:
                 continue
             seen_comment_ids.add(comment_id)
             unique_items.append(item)
-            author = str(item.get("author_id") or item.get("author") or "")
+            author = str(item.get("author_id") or "")
             if author:
                 author_ids.add(author)
         final_collection = {
@@ -815,7 +1088,7 @@ class DirectionalExecutionPipeline:
             phrase = " ".join(text.split()).lower()
             entry = repeated_need_phrases.setdefault(phrase, {"comment_count": 0, "authors": set()})
             entry["comment_count"] += 1
-            author = str(item.get("author_id") or item.get("author") or "")
+            author = str(item.get("author_id") or "")
             if author:
                 entry["authors"].add(author)
         final_collection["repeated_need_phrases"] = {
@@ -829,6 +1102,11 @@ class DirectionalExecutionPipeline:
             context = {
                 "source_kind": "comment",
                 "parent_note_canonical_source_id": parent.id,
+                "query_group_ids": [
+                    str(item["query_group_id"]) for item in parent_query_hits
+                ],
+                "query_hits": list(parent_query_hits),
+                "query_plan_hash": parent_query_plan_hash,
                 "required_comment_fields": list(required_comment_fields),
                 "collection": final_collection,
             }
@@ -852,7 +1130,7 @@ class DirectionalExecutionPipeline:
                 self._store.save_directional_evidence_packet(DirectionalEvidencePacketRecord(packet_id, "content_research_directional_packet_v1", packet, workflow_run_id=self._workflow_run_id, research_direction_id=direction_id, canonical_source_id=source.id, field_projection_hash=packet["field_projection_hash"]))
             projection_id = f"dsp_{canonical_fingerprint({'run': self._workflow_run_id, 'direction': direction_id, 'source': source.id, 'packet': packet_id})[:24]}"
             if self._store.get_typed_record(DirectionSourceProjectionRecord, projection_id) is None:
-                self._store.save_direction_source_projection(DirectionSourceProjectionRecord(projection_id, "content_research_direction_projection_v1", {"selected": True, "parent_note_canonical_source_id": parent.id, "collection": context["collection"]}, workflow_run_id=self._workflow_run_id, research_direction_id=direction_id, canonical_source_id=source.id, evidence_packet_id=packet_id))
+                self._store.save_direction_source_projection(DirectionSourceProjectionRecord(projection_id, "content_research_direction_projection_v1", {"selected": True, "parent_note_canonical_source_id": parent.id, "query_group_ids": context["query_group_ids"], "query_hits": context["query_hits"], "collection": context["collection"]}, workflow_run_id=self._workflow_run_id, research_direction_id=direction_id, canonical_source_id=source.id, evidence_packet_id=packet_id))
             packet_ids.append(packet_id)
         return packet_ids
 
@@ -1137,7 +1415,25 @@ def _selection_payload(selection: DirectionSelection) -> dict[str, Any]:
 
 
 def _selection_from_payload(payload: dict[str, Any]) -> DirectionSelection:
-    return DirectionSelection(**{**payload, "decisions": tuple(CandidateDecision(**{**item, "reasons": tuple(item["reasons"]), "query_group_ids": tuple(item["query_group_ids"])}) for item in payload["decisions"]), "coverage_unmet_query_group_ids": tuple(payload.get("coverage_unmet_query_group_ids", ()))})
+    return DirectionSelection(
+        **{
+            **payload,
+            "decisions": tuple(
+                CandidateDecision(
+                    **{
+                        **item,
+                        "reasons": tuple(item["reasons"]),
+                        "query_group_ids": tuple(item["query_group_ids"]),
+                        "query_hits": tuple(item.get("query_hits", ())),
+                    }
+                )
+                for item in payload["decisions"]
+            ),
+            "coverage_unmet_query_group_ids": tuple(
+                payload.get("coverage_unmet_query_group_ids", ())
+            ),
+        }
+    )
 
 
 def _is_after_as_of(item: Mapping[str, Any], run_as_of_at: datetime | None) -> bool:
@@ -1150,10 +1446,67 @@ def _is_after_as_of(item: Mapping[str, Any], run_as_of_at: datetime | None) -> b
     return published > run_as_of_at
 
 
+def _packet_is_admission_eligible(
+    *,
+    packet: DirectionalEvidencePacketRecord,
+    contract: DirectionContract,
+    snapshot: RunPolicySnapshot,
+) -> bool:
+    projection = dict(packet.payload.get("field_projection") or {})
+    author_id = str(projection.get("author_id") or "")
+    if not author_id:
+        return False
+    source_kind = packet.payload.get("retrieval_context", {}).get("source_kind")
+    required_fields = (
+        contract.required_comment_fields
+        if source_kind == "comment"
+        else contract.required_note_fields
+    )
+    availability = dict(packet.payload.get("field_availability") or {})
+    if any(availability.get(field) != "present" for field in required_fields):
+        return False
+    return not _is_after_as_of(projection, snapshot.run_as_of_at)
+
+
 def _sort_key(item: Mapping[str, Any]) -> tuple[Any, ...]:
     published = str(item.get("source_published_at") or "")
     return (int(item.get("query_priority") or 0), -float(item.get("relevance") or 0), published, str(item.get("canonical_source_id") or item.get("canonical_id") or ""))
 
 
 def _manifest_value(item: Mapping[str, Any]) -> dict[str, Any]:
-    return {key: item.get(key) for key in ("provider", "canonical_source_id", "canonical_id", "source_url", "source_kind", "query_priority", "relevance", "source_published_at", "source_collected_at", "author_id", "author", "out_of_time_window", "blocking_unavailable", "detail_attempted", "field_availability", *PACKET_FIELD_NAMES)}
+    return {key: item.get(key) for key in ("provider", "canonical_source_id", "canonical_id", "source_url", "source_kind", "query_priority", "query_rank", "query_hits", "relevance", "source_published_at", "source_collected_at", "author_id", "author", "out_of_time_window", "blocking_unavailable", "detail_attempted", "field_availability", *PACKET_FIELD_NAMES)}
+
+
+def _candidate_map(candidates: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Deduplicate detail targets without discarding any frozen query/rank hit."""
+    by_id: dict[str, dict[str, Any]] = {}
+    hits_by_id: dict[str, dict[str, int]] = {}
+    for item in candidates:
+        source_id = str(
+            item.get("canonical_source_id") or item.get("canonical_id") or ""
+        )
+        if not source_id:
+            continue
+        current = by_id.get(source_id)
+        if current is None or _sort_key(item) < _sort_key(current):
+            by_id[source_id] = dict(item)
+        source_hits = hits_by_id.setdefault(source_id, {})
+        for hit in item.get("query_hits") or ():
+            if not isinstance(hit, dict):
+                continue
+            group_id = str(hit.get("query_group_id") or "")
+            rank = int(hit.get("rank") or 0)
+            if group_id:
+                source_hits[group_id] = min(
+                    rank, source_hits.get(group_id, rank)
+                )
+        group_id = str(item.get("query_group_id") or "")
+        if group_id:
+            rank = int(item.get("query_rank") or 0)
+            source_hits[group_id] = min(rank, source_hits.get(group_id, rank))
+    for source_id, item in by_id.items():
+        item["query_hits"] = [
+            {"query_group_id": group_id, "rank": rank}
+            for group_id, rank in sorted(hits_by_id[source_id].items())
+        ]
+    return by_id

@@ -165,7 +165,7 @@ async def test_two_directions_keep_independent_projections_and_share_run_canonic
             "subject_type": "category",
             "selected_competitors": ["迪卡侬"],
             "custom_competitors": [],
-            "selected_directions": ["product_marketing", "brand_activity"],
+            "selected_directions": ["product_marketing", "competitor_discovery"],
         },
     )
     assert confirm_response.status_code == 200, confirm_response.text
@@ -178,17 +178,17 @@ async def test_two_directions_keep_independent_projections_and_share_run_canonic
         }]
 
     await pipeline.execute(workflow_run_id=presearch["workflow_run_id"], subagent_task_id="sat-product-shared", direction_id="product_marketing", subject="徒步短裤", questions=["卖点"], competitors=[], author_cap=1, discover=discover)
-    await pipeline.execute(workflow_run_id=presearch["workflow_run_id"], subagent_task_id="sat-brand-shared", direction_id="brand_activity", subject="徒步短裤", questions=["品牌活动"], competitors=[], author_cap=1, discover=discover)
+    await pipeline.execute(workflow_run_id=presearch["workflow_run_id"], subagent_task_id="sat-competitor-shared", direction_id="competitor_discovery", subject="徒步短裤", questions=["竞品"], competitors=[], author_cap=1, discover=discover)
 
     product = (await client.get(f"/content-research/workflows/{presearch['workflow_run_id']}/directions/product_marketing/evidence?limit=10")).json()
-    brand = (await client.get(f"/content-research/workflows/{presearch['workflow_run_id']}/directions/brand_activity/evidence?limit=10")).json()
+    competitor = (await client.get(f"/content-research/workflows/{presearch['workflow_run_id']}/directions/competitor_discovery/evidence?limit=10")).json()
 
-    assert product["counts"]["independent_source_count"] == brand["counts"]["independent_source_count"] == 1
-    assert product["packets"][0]["canonical_source_id"] == brand["packets"][0]["canonical_source_id"]
-    assert product["packets"][0]["selection"]["query_group_ids"] != brand["packets"][0]["selection"]["query_group_ids"]
-    assert product["direction_id"] != brand["direction_id"]
+    assert product["counts"]["independent_source_count"] == competitor["counts"]["independent_source_count"] == 1
+    assert product["packets"][0]["canonical_source_id"] == competitor["packets"][0]["canonical_source_id"]
+    assert product["packets"][0]["selection"]["query_group_ids"] != competitor["packets"][0]["selection"]["query_group_ids"]
+    assert product["direction_id"] != competitor["direction_id"]
     assert "secret" not in str(product)
-    assert "raw_payload" not in str(brand)
+    assert "raw_payload" not in str(competitor)
     await client.aclose()
 
 
@@ -204,7 +204,7 @@ async def test_direction_evidence_api_counts_complete_run_union_beyond_page_limi
         json={
             "confirmed_subject": "徒步短裤", "subject_type": "category",
             "selected_competitors": [], "custom_competitors": [],
-            "selected_directions": ["product_marketing", "brand_activity"],
+            "selected_directions": ["product_marketing", "competitor_discovery"],
         },
     )
     assert confirm_response.status_code == 200, confirm_response.text
@@ -226,17 +226,17 @@ async def test_direction_evidence_api_counts_complete_run_union_beyond_page_limi
 
     for index in range(51):
         save_projection("product_marketing", f"note-{index}", f"product-{index}")
-    save_projection("brand_activity", "note-0", "brand-shared")
-    save_projection("brand_activity", "note-extra", "brand-extra")
+    save_projection("competitor_discovery", "note-0", "competitor-shared")
+    save_projection("competitor_discovery", "note-extra", "competitor-extra")
 
     first_page = await client.get(f"/content-research/workflows/{presearch['workflow_run_id']}/directions/product_marketing/evidence?limit=50")
     later_page = await client.get(f"/content-research/workflows/{presearch['workflow_run_id']}/directions/product_marketing/evidence?offset=50&limit=1")
-    brand = await client.get(f"/content-research/workflows/{presearch['workflow_run_id']}/directions/brand_activity/evidence?limit=1")
+    competitor = await client.get(f"/content-research/workflows/{presearch['workflow_run_id']}/directions/competitor_discovery/evidence?limit=1")
 
-    assert first_page.status_code == later_page.status_code == brand.status_code == 200
+    assert first_page.status_code == later_page.status_code == competitor.status_code == 200
     assert len(first_page.json()["packets"]) == 50
     assert len(later_page.json()["packets"]) == 1
     assert first_page.json()["counts"]["independent_source_count"] == 52
     assert later_page.json()["counts"]["independent_source_count"] == 52
-    assert brand.json()["counts"]["independent_source_count"] == 52
+    assert competitor.json()["counts"]["independent_source_count"] == 52
     await client.aclose()

@@ -99,6 +99,7 @@ from app.content_research.workflow import (
     ResearchPlanBuilder,
     SubagentTaskRouter,
 )
+from app.content_research.workflow.directional_pipeline import compile_query_groups
 from app.memory.thread_store import ThreadStore
 from app.memory.workflow_store import WorkflowStore
 from app.models.workflow import WorkflowPhase
@@ -547,14 +548,55 @@ class ContentResearchService:
             status="draft",
             payload=plan_payload,
         )
+        run_as_of_at = utcnow()
+        query_groups_by_direction = {
+            direction.id: compile_query_groups(
+                direction_id=direction.id,
+                subject=confirmation.confirmed_subject,
+                questions=[
+                    *direction.default_questions,
+                    *(
+                        [confirmation.custom_research_question]
+                        if confirmation.custom_research_question.strip()
+                        else []
+                    ),
+                ],
+                competitors=sorted(
+                    {
+                        *confirmation.selected_competitors,
+                        *confirmation.custom_competitors,
+                    }
+                ),
+                run_as_of_at=run_as_of_at,
+            )
+            for direction in directions
+        }
         snapshot, sample_policies, direction_contracts = build_default_snapshot(
             snapshot_id=_new_id("rps"),
             workflow_run_id=brief.workflow_run_id,
             brief_id=brief.id,
             plan_id=plan.id,
+            run_as_of_at=run_as_of_at,
             direction_ids=tuple(selected_direction_ids),
             direction_catalog=DIRECTION_CATALOG_V1,
             provider_capabilities=_freeze_adapter_capabilities(self._source_registry),
+            confirmed_subject=confirmation.confirmed_subject,
+            custom_research_question=confirmation.custom_research_question,
+            query_groups_by_direction={
+                direction_id: tuple(
+                    {
+                        "id": group.id,
+                        "direction_id": group.direction_id,
+                        "normalized_query": group.query,
+                        "priority": group.priority,
+                        "sort": group.sort,
+                        "time_window": dict(group.time_window or {}),
+                        "candidate_cap": group.candidate_limit,
+                    }
+                    for group in groups
+                )
+                for direction_id, groups in query_groups_by_direction.items()
+            },
         )
         saved_directions: list[ResearchDirectionRecord] = []
         saved_tasks: list[SubagentTaskRecord] = []
@@ -913,6 +955,7 @@ class ContentResearchService:
             item
             for item in self._store.list_typed_records(ClaimAdmissionDecisionRecord)
             if item.claim_candidate_id in candidates_by_id
+            and item.policy_snapshot_id == policy.id
         ]
         admitted = sorted(
             (item for item in decisions if item.decision == "admitted"),

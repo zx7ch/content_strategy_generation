@@ -165,6 +165,26 @@ def test_governed_snapshot_partitions_admitted_claims_and_weak_signals(tmp_path)
     downgraded = ClaimAdmissionDecisionRecord("cad_snapshot_low", "v1", {"reason_codes": ["sample_threshold_unmet"], "recovery_action": "collect_more"}, research_direction_id="product_marketing", claim_candidate_id=weak_candidate.id, decision="downgraded", policy_snapshot_id=snapshot.id)
     store.save_claim_admission_decision(admitted)
     store.save_claim_admission_decision(downgraded)
+    previous_snapshot, _previous_policies, _previous_contracts = (
+        build_default_snapshot(
+            snapshot_id="rps_previous_policy",
+            workflow_run_id="run_previous_policy",
+            brief_id="rb_previous_policy",
+            plan_id="rp_previous_policy",
+        )
+    )
+    store.save_run_policy_snapshot(previous_snapshot)
+    store.save_claim_admission_decision(
+        ClaimAdmissionDecisionRecord(
+            "cad_snapshot_stale",
+            "v1",
+            {"computed_metrics": {"eligible_source_count": 99}},
+            research_direction_id="product_marketing",
+            claim_candidate_id=weak_candidate.id,
+            decision="admitted",
+            policy_snapshot_id="rps_previous_policy",
+        )
+    )
     store.save_weak_signal(WeakSignalRecord(
         "ws_snapshot", "v1",
         {

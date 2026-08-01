@@ -9,6 +9,7 @@ from app.content_research.admission.candidates import (
     build_claim_candidate,
     extract_facts,
 )
+from app.content_research.admission.quote_fields import quote_fields_for_direction
 from app.content_research.admission.strategy import AdmissionStrategy
 from app.content_research.persistence_models import (
     ClaimCandidateRecord,
@@ -16,7 +17,7 @@ from app.content_research.persistence_models import (
 )
 
 KEYWORD_GROWTH_CLAIM_INTENTS = {"sampled_keyword_pattern": "keyword_discovery", "keyword_growth_with_comparable_baseline": "relative_window_comparison"}
-_FIELDS = frozenset({"title", "content_text", "tags"})
+_FIELDS = quote_fields_for_direction("keyword_growth")
 
 
 def _context(packet: DirectionalEvidencePacketRecord) -> dict[str, Any] | None:

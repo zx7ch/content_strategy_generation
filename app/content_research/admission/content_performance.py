@@ -10,6 +10,7 @@ from app.content_research.admission.candidates import (
     build_claim_candidate,
     extract_facts,
 )
+from app.content_research.admission.quote_fields import quote_fields_for_direction
 from app.content_research.admission.strategy import AdmissionStrategy
 from app.content_research.persistence_models import (
     ClaimCandidateRecord,
@@ -21,7 +22,7 @@ CONTENT_PERFORMANCE_CLAIM_INTENTS = {
     "visible_content_format": "content_pattern",
 }
 
-_ALLOWED_FIELDS = frozenset({"title", "content_text"})
+_ALLOWED_FIELDS = quote_fields_for_direction("content_performance")
 _PROHIBITED_OUTCOME_TERMS = ("表现更好", "互动更高", "点击", "转化", "因果", "导致", "提升效果")
 
 

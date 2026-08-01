@@ -162,6 +162,39 @@ async def test_confirm_brief_creates_plan_directions_tasks_and_workflow_summary(
     assert len(snapshot_payload["sample_policies"]) == 2
     assert snapshot_payload["validation_result"]["schema_version"] == "content_research_admission_capability_preflight_v1"
     assert snapshot_payload["validation_result"]["directions"]["product_marketing"]["status"] == "formal_directional_result"
+    locked = snapshot_payload["effective_policy"]["locked_query_plan"]
+    assert locked["schema_version"] == "content_research_locked_query_plan_v1"
+    assert locked["custom_research_question"] == "关注夏季轻量户外"
+    assert set(locked["directions"]) == {
+        "product_marketing",
+        "competitor_discovery",
+    }
+    for direction_id, direction_plan in locked["directions"].items():
+        assert direction_plan["query_plan_hash"]
+        assert direction_plan["query_groups"]
+        for group in direction_plan["query_groups"]:
+            assert group["direction_id"] == direction_id
+            assert group["normalized_query"]
+            assert group["sort"] == "likes"
+            assert group["time_window"] == {
+                "end_at": snapshot_payload["run_as_of_at"]
+            }
+            assert group["candidate_cap"] == 20
+    assert any(
+        "关注夏季轻量户外" in group["normalized_query"]
+        for direction in locked["directions"].values()
+        for group in direction["query_groups"]
+    )
+    assert all(
+        sorted(contract["metadata"]["query_relevance"]["query_group_ids"])
+        == sorted(
+            group["id"]
+            for group in locked["directions"][contract["direction_id"]][
+                "query_groups"
+            ]
+        )
+        for contract in snapshot_payload["direction_contracts"]
+    )
 
 
 @pytest.mark.asyncio

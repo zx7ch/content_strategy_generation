@@ -17,6 +17,19 @@ from app.content_research.stores.base import ContentResearchStore
 from app.memory.workflow_store import WorkflowStore
 
 _LITE_FIELDS = {"content_text", "title"}
+_PROJECTABLE_CLAIM_TYPES = {
+    "product_marketing": {
+        "product_value_expression",
+        "use_context",
+        "target_audience_framing",
+        "message_angle",
+    },
+    "competitor_discovery": {"named_competitor", "visible_content_expression"},
+    "content_performance": {
+        "observed_high_engagement_sample",
+        "visible_content_format",
+    },
+}
 _PUBLICATION_STATES = {
     "complete_verified_report",
     "partial_verified_report",
@@ -55,6 +68,15 @@ class LiteReportReader:
                 research_plan_id=research_plan_id,
                 publication_id=publication_id,
             )
+            if citation_group_ids is None and report["citation_total"] > len(
+                report["citation_groups"]
+            ):
+                report = await self._published.read(
+                    workflow_run_id=workflow_run_id,
+                    research_plan_id=research_plan_id,
+                    publication_id=publication_id,
+                    citation_limit=report["citation_total"],
+                )
             if citation_group_ids:
                 report = {
                     **report,
@@ -89,6 +111,10 @@ class LiteReportReader:
         publication_state = str(report.get("publication_state") or "")
         if publication_state not in _PUBLICATION_STATES:
             raise PublishedReportNotFoundError("published report has unsupported publication state")
+        if _frozen_scope(report)["report_compose_mode"] != "template_only":
+            raise PublishedReportNotFoundError(
+                "published report has unsupported compose mode"
+            )
         requested_directions = set(_frozen_scope(report)["direction_ids"])
         claim_cards = _records_in_directions(
             report.get("claim_cards"), requested_directions
@@ -120,11 +146,14 @@ class LiteReportReader:
         )
         citations_by_claim = _citations_by_claim(citations)
         direction_states = _direction_states(report)
-        findings = [
-            _finding(card, citations_by_claim)
+        cards = [
+            _validated_card(card, citations_by_claim)
             for card in claim_cards
-            if str(card.get("admission_state") or "admitted") in {"admitted", "accepted"}
-            and _allowed_claim(card, citations_by_claim)
+        ]
+        findings = [
+            _finding(card)
+            for card in cards
+            if card is not None
         ]
         weak_signals = [
             item
@@ -147,7 +176,7 @@ class LiteReportReader:
                 "publication_reason": _publication_reason(report),
             },
             "sections": {
-                "main_findings": [] if is_evidence_only else finding_cards,
+                "main_findings": [] if is_evidence_only else findings,
                 "weak_signals": [] if is_evidence_only else weak_signals,
                 "limitations_scope": list(report.get("limitations_recovery") or []),
             },
@@ -332,6 +361,7 @@ def _lite_citations(groups: object) -> list[dict[str, Any]]:
                     "citation_group_id": group.get("citation_group_id"),
                     "display_index": group.get("display_index"),
                     "claim_candidate_id": group.get("claim_candidate_id"),
+                    "admission_decision_id": group.get("admission_decision_id"),
                     "evidence_refs": refs,
                 }
             )
@@ -371,20 +401,66 @@ def _citations_by_claim(citations: list[dict[str, Any]]) -> dict[str, list[dict[
     return result
 
 
-def _allowed_claim(
+def _validated_card(
     card: dict[str, Any], citations_by_claim: dict[str, list[dict[str, Any]]]
-) -> bool:
-    return bool(citations_by_claim.get(str(card.get("claim_candidate_id") or "")))
+) -> dict[str, Any] | None:
+    """Validate a governed card and retain only its matching frozen citations.
 
-
-def _finding(
-    card: dict[str, Any], citations_by_claim: dict[str, list[dict[str, Any]]]
-) -> dict[str, Any]:
+    This is deliberately a projection guard, not a second admission evaluator:
+    frozen relevance and decision-making remain owned by the formal pipeline.
+    """
     claim_id = str(card.get("claim_candidate_id") or "")
+    direction_id = str(card.get("direction_id") or "")
+    claim_type = str(card.get("claim_type") or "")
+    admission_id = str(card.get("admission_decision_id") or "")
+    scope = card.get("scope")
+    if (
+        str(card.get("admission_state") or "") != "admitted"
+        or not claim_id
+        or not admission_id
+        or claim_type not in _PROJECTABLE_CLAIM_TYPES.get(direction_id, set())
+        or not isinstance(scope, dict)
+        or scope.get("sample") != "selected_packets"
+    ):
+        return None
+    citations = citations_by_claim.get(claim_id) or []
+    eligible_fields = (
+        {"title", "content_text"}
+        if direction_id == "product_marketing" and claim_type == "message_angle"
+        else {"content_text"}
+        if direction_id == "product_marketing"
+        else _LITE_FIELDS
+    )
+    matching_citations = [
+        citation
+        for citation in citations
+        if citation.get("citation_group_id")
+        and citation.get("admission_decision_id") == admission_id
+        and any(
+            ref.get("field_path") in eligible_fields
+            and isinstance(ref.get("quote"), str)
+            and bool(ref["quote"])
+            and isinstance(ref.get("source_text_hash"), str)
+            and bool(ref["source_text_hash"])
+            for ref in citation.get("evidence_refs") or []
+            if isinstance(ref, dict)
+        )
+    ]
+    if not matching_citations:
+        return None
+    return {
+        **card,
+        "_matching_citation_group_ids": [
+            citation["citation_group_id"] for citation in matching_citations
+        ],
+    }
+
+
+def _finding(card: dict[str, Any]) -> dict[str, Any]:
     claim_type = str(card.get("claim_type") or "")
     card_kind = (
         "observation"
-        if claim_type == "observation" and card.get("direction_id") == "content_performance"
+        if card.get("direction_id") == "content_performance"
         else "finding"
     )
     return {
@@ -394,16 +470,23 @@ def _finding(
         "direction": card.get("direction_id"),
         "sample_summary": card.get("scope"),
         "scope": card.get("scope"),
-        "citation_group_ids": [
-            item.get("citation_group_id") for item in citations_by_claim[claim_id]
-        ],
+        "citation_group_ids": list(card["_matching_citation_group_ids"]),
     }
 
 
 def _weak_signal(
     signal: dict[str, Any], citations_by_claim: dict[str, list[dict[str, Any]]]
 ) -> dict[str, Any] | None:
-    citations = citations_by_claim.get(str(signal.get("claim_candidate_id") or ""))
+    claim_id = str(signal.get("claim_candidate_id") or "")
+    admission_id = str(signal.get("admission_decision_id") or "")
+    if not claim_id or not admission_id:
+        return None
+    citations = [
+        citation
+        for citation in citations_by_claim.get(claim_id) or []
+        if citation.get("citation_group_id")
+        and citation.get("admission_decision_id") == admission_id
+    ]
     if not citations:
         return None
     return {

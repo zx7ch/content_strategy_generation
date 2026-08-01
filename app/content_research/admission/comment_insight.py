@@ -5,6 +5,10 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 from app.content_research.admission.candidates import build_claim_candidate, extract_facts
+from app.content_research.admission.quote_fields import (
+    quote_fields_for_claim,
+    quote_fields_for_direction,
+)
 from app.content_research.admission.strategy import AdmissionStrategy
 from app.content_research.persistence_models import (
     ClaimCandidateRecord,
@@ -39,7 +43,7 @@ def build_comment_insight_candidates(packet: DirectionalEvidencePacketRecord) ->
         return []
     candidates = []
     for fact in extract_facts(packet):
-        if fact.field_path != "comment_text":
+        if fact.field_path not in quote_fields_for_direction("comment_insight"):
             continue
         phrase = " ".join(fact.text.split()).lower()
         repeated = dict(collection.get("repeated_need_phrases") or {}).get(phrase) or {}
@@ -57,7 +61,7 @@ def comment_insight_boundary_reason(candidate: ClaimCandidateRecord) -> str | No
     scope = dict(candidate.payload.get("scope") or {})
     refs = list(candidate.payload.get("quote_refs") or [])
     collection = scope.get("collection")
-    if candidate.claim_type not in COMMENT_INSIGHT_CLAIM_INTENTS or len(refs) != 1 or refs[0].get("field_path") != "comment_text" or not scope.get("parent_note_canonical_source_id") or scope.get("reply_relation") is None or not isinstance(collection, Mapping) or not _complete_collection(collection):
+    if candidate.claim_type not in COMMENT_INSIGHT_CLAIM_INTENTS or len(refs) != 1 or refs[0].get("field_path") not in quote_fields_for_claim("comment_insight", candidate.claim_type) or not scope.get("parent_note_canonical_source_id") or scope.get("reply_relation") is None or not isinstance(collection, Mapping) or not _complete_collection(collection):
         return "comment_insight_evidence_boundary_violation"
     return None
 

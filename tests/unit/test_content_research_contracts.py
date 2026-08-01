@@ -134,3 +134,84 @@ def test_adapter_capabilities_are_frozen_once_into_snapshot_shape():
             },
         },
     }
+
+
+def test_frozen_relevance_and_query_plan_are_canonical_across_input_order():
+    run_as_of = datetime(2026, 7, 30, tzinfo=timezone.utc)
+    first_groups = {
+        "product_marketing": (
+            {
+                "id": "qg_second",
+                "direction_id": "product_marketing",
+                "normalized_query": "速干短裤 使用场景",
+                "priority": 2,
+                "sort": "likes",
+                "time_window": {"end_at": run_as_of.isoformat()},
+                "candidate_cap": 20,
+            },
+            {
+                "id": "qg_first",
+                "direction_id": "product_marketing",
+                "normalized_query": "速干短裤 卖点",
+                "priority": 1,
+                "sort": "likes",
+                "time_window": {"end_at": run_as_of.isoformat()},
+                "candidate_cap": 20,
+            },
+        )
+    }
+    second_groups = {
+        "product_marketing": tuple(reversed(first_groups["product_marketing"]))
+    }
+
+    first, _policies, first_contracts = build_default_snapshot(
+        snapshot_id="rps_order",
+        workflow_run_id="run_order",
+        brief_id="rb_order",
+        plan_id="rp_order",
+        run_as_of_at=run_as_of,
+        direction_ids=("product_marketing",),
+        confirmed_subject="速干徒步短裤",
+        custom_research_question="关注夏季轻量",
+        query_groups_by_direction=first_groups,
+    )
+    second, _policies, second_contracts = build_default_snapshot(
+        snapshot_id="rps_order",
+        workflow_run_id="run_order",
+        brief_id="rb_order",
+        plan_id="rp_order",
+        run_as_of_at=run_as_of,
+        direction_ids=("product_marketing",),
+        confirmed_subject="速干徒步短裤",
+        custom_research_question="关注夏季轻量",
+        query_groups_by_direction=second_groups,
+    )
+
+    assert first.effective_policy == second.effective_policy
+    assert first.effective_policy_hash == second.effective_policy_hash
+    frozen = first_contracts[0].metadata["query_relevance"]
+    assert frozen["query_group_ids"] == ["qg_first", "qg_second"]
+    assert frozen["claim_quote_fields"]["message_angle"] == [
+        "content_text",
+        "title",
+    ]
+    direction_plan = first.effective_policy["locked_query_plan"]["directions"][
+        "product_marketing"
+    ]
+    assert first.effective_policy["locked_query_plan"] == {
+        "schema_version": "content_research_locked_query_plan_v1",
+        "custom_research_question": "关注夏季轻量",
+        "directions": {
+            "product_marketing": {
+                "query_plan_hash": direction_plan["query_plan_hash"],
+                "query_groups": [
+                    first_groups["product_marketing"][1],
+                    first_groups["product_marketing"][0],
+                ],
+            }
+        },
+    }
+    assert (
+        first_contracts[0].metadata["query_relevance"]
+        == second_contracts[0].metadata["query_relevance"]
+    )

@@ -10,6 +10,7 @@ from app.content_research.admission.candidates import (
     build_claim_candidate,
     extract_facts,
 )
+from app.content_research.admission.quote_fields import quote_fields_for_direction
 from app.content_research.admission.strategy import AdmissionStrategy
 from app.content_research.persistence_models import (
     ClaimCandidateRecord,
@@ -22,7 +23,7 @@ BRAND_ACTIVITY_CLAIM_INTENTS = {
     "collaboration_signal": "activity_identification",
     "dissemination_signal": "dissemination_expression",
 }
-_ALLOWED_FIELDS = frozenset({"title", "content_text", "tags"})
+_ALLOWED_FIELDS = quote_fields_for_direction("brand_activity")
 _PROHIBITED_TERMS = ("触达", "销量", "销售提升", "活动成功", "带来增长", "因果")
 
 

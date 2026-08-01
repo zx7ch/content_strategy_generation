@@ -83,6 +83,27 @@ Lite 简化的是方向数量、报告深度和用户界面，不简化以下不
 
 Lite 可舍弃的是：七方向统一覆盖、跨方向治理呈现、复杂版本矩阵、LLM 自由总结/重写、完整审计可视化与扩展性预留。它们不在 Lite 主路径执行，也不阻塞 Lite 发布。
 
+### 3.1 Lite 必须继承的正式不变量（Task 5 前置清单）
+
+本节是 Lite 对正式 F003 的**不可裁剪正确性边界**。Lite 可以减少方向、隐藏审计界面、使用 `template_only`，但不得改变下列对象的身份、冻结、准入、谱系、发布或失败语义。每一项均须由后端合同与定向测试证明；前端不得补算、修正或绕过。
+
+| 不变量 | 正式方案对象／依据 | Lite 必须继承的行为 | 禁止的 Lite 简化 | 最低验收 |
+| --- | --- | --- | --- | --- |
+| 运行范围冻结 | `RunPolicySnapshot`；正式计划 §4.4 的 locked query plan | 在开始采集前冻结 Brief、requested directions、主体／品类 anchors、同义词、方向问题、竞品词、`QueryGroup` 的完整 normalized query、direction、priority、sort、时间窗、candidate cap、query-plan hash 与 policy/algorithm version | 只冻结 QueryGroup ID；运行时重新编译／改写 query；遗漏用户补充问题 | 同一 snapshot 重放得到相同 query plan/hash；任一冻结字段改变只重算下游 |
+| QueryGroup 来源谱系 | `QueryGroup`、candidate manifest、`DirectionSourceProjection` | 每个 packet 保留其全部 frozen query/rank hits；多 query 命中不得缩成一个；comment packet 继承父 note 的完整 hit lineage | 仅保留最后一个 `query_group_id`；以 provider 返回顺序替代冻结 hit | 多 group 命中的 note/comment 可完整回放；伪造或非冻结 group 被拒绝 |
+| 相关性双层门槛 | `DirectionContract` + direction strategy + admission | source 必须有 frozen QueryGroup 命中；candidate 的直接允许字段引文必须命中冻结 subject/category anchor 或冻结同义词；`query_subject_not_supported` 是共享、稳定 reason code | 完整 query 字面匹配；前端／Lite-local 判断；仅凭 provider rank、URL、标题或 metrics 放行 | 不相关高指标材料拒绝；相关标题型 `message_angle` 保留；缺 relevance fail-closed |
+| 方向字段与 claim 类型 | direction strategy / shared quote-field policy | 允许 claim type、其直接字段与 card kind 由共享 policy/strategy 一处定义，并随 run policy version 冻结；`product_marketing.message_angle` 可由标题或正文支撑，其他产品营销类型遵循正式字段限制 | Lite reader 自建 allow-list；`accepted` 等 Lite-local admission 状态；标题自动升级为 finding | 每个 Lite 方向/claim type 的 allowed/disallowed field 参数化测试；卡片类型跨进程／跨版本稳定 |
+| stable author identity 与样本计数 | candidate manifest、`SamplePolicy`；正式计划 §4.4 | `author_id` 优先于 display author，且从 selection 到 packet、admission、comment 去重全程保留；分别记录 selected、relevance-qualified、eligible、independent-author 计数 | packet 丢弃 `author_id`；用显示名替代稳定身份；用不相关或 blocking-ineligible 来源凑样本门槛 | author-id-only、同名不同 ID、同 ID 改名、2 relevant + 1 unrelated、2 eligible + 1 缺字段等对抗组合 |
+| eligibility 与 admission 重放 | `ClaimAdmissionDecision`、`StageCheckpoint`、admission fingerprint | 样本门槛只由相关且 field/time/author eligible 的来源计算；admission fingerprint 包含 policy/relevance/algorithm 版本；只消费当前 run + 当前 policy 的 decision | 命中旧 checkpoint 直接跳过新 admission；旧 policy admitted decision 进入新 snapshot | 改 policy/relevance/version 后重新 admission；旧 admitted decision 无法形成新 governed card |
+| Fact、claim、citation 身份 | `ClaimCandidate`、`GovernedResearchSnapshot`、`citation_groups`；CL-06 | 每张 Lite finding/observation 必有 current admitted decision、frozen scope、claim type、quote/span/hash、canonical source/安全 URL 与一一匹配的 citation group/admission identity | 仅按 claim ID 关联 citation；缺 span/hash/source identity 时静默展示；前端重编号／重组 | citation collision、foreign ref、混合 URL/source、缺 span/hash 均不发布完整报告；编号和顺序稳定 |
+| 单笔记 citation 交互 | shared `navigation_state`；Lite §4.2.2 | 每个 Lite citation group 对应一篇小红书 canonical note；组内 refs 共享 source identity/URL；available 时 `[n] 查看原笔记` 一步直达，drawer 仅审计 quote/范围/时间 | 多笔记任取首个 URL；以 drawer 作为外链中转；用 `navigation_unavailable` 掩盖未实现 | available/missing/unavailable 三态；组内 identity/URL 不一致拒绝完整报告 |
+| WeakSignal 与 lead | `WeakSignal`、governed snapshot；CL-06 | downgraded/rejected 材料保留为独立、带 citation、样本范围、qualification reason 的 lead；不进入 finding/observation 或其计数 | 丢弃 weak signal；将其混入发现；无 citation 的空 lead | admitted/weak/rejected 三类互斥；lead 显示“仅供参考，不构成结论”与直接依据 |
+| 报告完整性与 publication | `ReportPublication`、deterministic audit；Lite §4.0/§4.3 | `/lite-report` 只读取当前 `template_only` publication；卡片、citation、scope 任一必需 identity 不完整时拒绝完整/部分报告并降为 `evidence_only` 或 not-found；完整 snapshot 不得因分页截断丢卡 | prose/legacy publication fallback；静默过滤坏卡但保留 complete；只读取前 50 个 citation | complete/partial/evidence-only 三态与实际卡片一致；>50 citation 仍完整或有确定性分页合同 |
+| 历史报告切换与保留证据 | 正式计划 CL-06；Gate 4A 保留规则 | 切换最新合同前，删除全部历史 report-level publication/draft/faithfulness/materialized message；保留 workflow、checkpoint、source、packet、admission、citation、trace 作为审计证据 | 旧 artifact 兼容投影；为保留报告而删除 Gate 2 证据；新旧双写 | migration 幂等；旧 report 不可被 Creator/Lite reader 读取；Gate 2 证据仍可查询 |
+| 确定性与安全投影 | policy hash、safe read model、checkpoint | 所有集合在冻结/哈希前稳定排序；read model 不返回 raw provider payload、prompt、cookie、token；刷新/恢复不重复采集或改写既有 artifact | 无序集合进入 hash；UI 扫 raw packet；以 report 重算恢复位置 | 不同插入顺序／进程得到相同 hash；敏感字段递归检查；replay/refresh 幂等 |
+
+**Task 5 执行规则**：任何实现任务开始前，必须从上表逐项声明“本任务触及哪些不变量、哪些不变量不受影响”，并为触及项列出 RED 用例。发现一个正式不变量尚未在 Lite 映射或测试中出现时，先补本节和实施计划；不得以局部页面修复继续开发。
+
 ---
 
 ## 4. 数据传递与 UI 合同
@@ -303,10 +324,39 @@ Lite 的证据字段只允许 `content_text` 与 `title`（投影过滤）。评
 
 **通过条件**：预发布环境中新合同为唯一 Creator/report 合同；选择、scope、报告三态、恢复卡和 citation drawer 均通过上述 API/浏览器验收。Gate 4A 不对正式用户发布，也不代表所有目录方向的采集能力已完成。
 
+### Task 5：Lite 报告质量合同收口
+
+**目标**：将 Lite 报告收敛为“可信的结构化研究发现”，修复 `/lite-report` 将原始样本、弱信号或不相关来源误投影为"核心发现"的风险。Lite 严格复用正式方案的 `admitted ClaimCandidate -> GovernedResearchSnapshot -> LiteReportReadModel` 合同；它交付相关、可追溯、有范围限制的 finding/observation，不承诺自由 prose、跨方向综合或营销策略结论。
+
+**任务边界**：
+
+1. **共同推导链必须执行**：冻结 Brief/scope、`QueryGroup`、确定性 related-selection、canonical source 与 packet 谱系、Fact、方向专用 `ClaimCandidate`、admission、`DirectionResultDecision`、`WeakSignal`、`GovernedResearchSnapshot`、冻结 citation group、deterministic audit 和幂等 report materialization。它们是正式方案同一对象，不得以 Lite-local fallback 或前端推断替代。
+2. **实现单元 A：read-model 合同一致性**：Lite 只验证并投影既有 `GovernedResearchSnapshot` 合同，不在 read model 重造 admission。`main_findings` 中的每张卡必须有 admitted decision、合法 direction/claim type、冻结 scope 和一一对应的 citation identity；finding 与 observation 均保留在该 section，由 `card_kind` 分组并由后端互斥计数。`product_marketing.message_angle` 可由相关标题或正文支撑，但标题、搜索命中、原始 packet 和普通 citation 均不得自动成为 finding。
+3. **实现单元 B：正式主体相关性合同**：先在正式 `DirectionContract`/direction strategy 冻结相关性双层门槛：source 必须保存冻结 `QueryGroup` 命中谱系；candidate 的直接引文必须命中冻结的 subject anchor 或 category anchor，且字段符合该 direction/claim type。anchors、同义词、匹配模式和 `query_subject_not_supported` reason code 随 run policy 冻结。不得用 Lite-local、前端或完整 query 字面匹配替代该正式合同；不相关材料必须 rejected/downgraded，不能进入 finding。
+4. **实现单元 C：Lite citation 直接跳转**：Lite 的每个 frozen citation group 固定对应一篇小红书 canonical note；组内可含标题／正文等多个 evidence ref，但必须共享同一 canonical source/安全 `source_url`。当 `navigation_state=available` 时，`[n] 查看原笔记` 直接打开该小红书笔记；evidence drawer 仅用于按需查看 quote、字段、范围和采集时间，不作为外链中转。`missing_source_url` 与 `navigation_unavailable` 使用共享合同文案。
+5. **实现单元 D：历史 artifact 清理**：切换最新 Lite report 合同前，以 idempotent migration 一次性删除所有既有 report-level `ReportPublication`、`ReportDraft`、`ReportFaithfulnessDecision`、materialized report link 与关联 Creator `artifact_result` message；不得再由 `/lite-report` 投影。保留 Gate 2 已验证的 workflow、checkpoint、canonical source、packet、admission decision、冻结 citation group 和 trace，避免为清理报告而重复真实采集。
+
+**明确不做**：
+
+- 不实现 `competitor_discovery`、`content_performance` 的真实采集能力或三方向真实 canary（Gate 3 / Gate 4B）。
+- 不生成或渲染 `AggregateClaim`、跨方向张力、行动假设、核心 prose 结论、推荐或下一步业务建议。
+- 不运行 semantic LLM audit 或报告重写；`template_only` 下只运行对象身份、计数、citation anchor 与 scope 一致性的 deterministic audit，semantic audit 为 `not_applicable`。本任务不承诺“分析师式”综合洞察；该能力另行以正式 prose/aggregate 任务交付。
+- 不把本任务变成全量真实 E2E 重跑；以 admission/read-model/API/UI 定向测试为主，最后只增加一条受控浏览器回归。
+
+**独立验收**：
+
+1. 不相关笔记标题、搜索命中、`title + metric` 和未准入样本均不能出现在 `main_findings`。
+2. 每一张 finding/observation 卡均可回链到 admitted decision、冻结 direction/scope、quote/span/hash 与稳定 citation group；finding/observation 均可渲染且计数互斥，缺任一项即不发布完整报告。
+3. `WeakSignal` 与 finding/observation 在 section、计数、视觉标签和语义上互斥；前者明确为"仅供参考，不构成结论"。
+4. 每个具备安全 `source_url` 的 Lite citation group 可一步打开其唯一的小红书原笔记，同时仍可按需展开 evidence drawer；组内 evidence ref 的 source identity/URL 不一致时不得发布完整报告；三种 navigation state 均由后端 read model 控制。
+5. 清理后，legacy report artifact 不能通过 Creator、`/lite-report` 或任何兼容 fallback 显示；保留的 Gate 2 证据仍可用于新合同 read model 的定向回归。
+6. 定向后端与前端测试覆盖：相关 admitted finding、不相关材料的正式 admission 拒绝、标题支撑的 admitted `message_angle`、admitted observation、WeakSignal 分流、单笔记 citation 的三种来源跳转状态、legacy artifact 清理；受控浏览器回归验证报告页面不再出现标题集合型"核心发现"。
+
 ### Gate 4B：真实能力与正式交付验收
 
 - 完成 Gate 3 后，三个方向各自通过一次真实成功 canary，并完成一次三方向全选的真实 run，验证并行、汇总计数、幂等报告物化和 citation。
 - 完成一次已请求方向的证据不足 run 与一次可恢复失败后继续的 run；在移除 preview flag 的候选发布环境重跑 Gate 4A 的浏览器主路径。
+- Task 5 的报告质量合同与 legacy report artifact 清理必须通过，才可将三方向真实 canary 的输出视为正式 Lite 报告。
 
 **通过条件**：满足 §1.1 的六项完成定义、Gate 3 的真实方向验收与本 Gate 的发布组合；移除 `F003_LITE_PREVIEW_ENABLED` 后，正式发布 Lite。
 

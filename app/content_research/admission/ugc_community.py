@@ -4,6 +4,10 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 from app.content_research.admission.candidates import build_claim_candidate, extract_facts
+from app.content_research.admission.quote_fields import (
+    quote_fields_for_claim,
+    quote_fields_for_direction,
+)
 from app.content_research.admission.strategy import AdmissionStrategy
 from app.content_research.persistence_models import (
     ClaimCandidateRecord,
@@ -35,7 +39,7 @@ def build_ugc_candidates(packet: DirectionalEvidencePacketRecord) -> list[ClaimC
         return []
     candidates = []
     for fact in extract_facts(packet):
-        if fact.field_path != "comment_text":
+        if fact.field_path not in quote_fields_for_direction("ugc_community"):
             continue
         for claim_type, intent in UGC_CLAIM_INTENTS.items():
             reply_relation = packet.payload.get("field_projection", {}).get("reply_depth")
@@ -49,7 +53,7 @@ def ugc_boundary_reason(candidate: ClaimCandidateRecord) -> str | None:
     scope = dict(candidate.payload.get("scope") or {})
     collection = scope.get("collection")
     refs = list(candidate.payload.get("quote_refs") or [])
-    if candidate.claim_type not in UGC_CLAIM_INTENTS or len(refs) != 1 or refs[0].get("field_path") != "comment_text" or not scope.get("parent_note_canonical_source_id") or scope.get("reply_relation") is None or not isinstance(collection, Mapping) or not _complete_collection(collection):
+    if candidate.claim_type not in UGC_CLAIM_INTENTS or len(refs) != 1 or refs[0].get("field_path") not in quote_fields_for_claim("ugc_community", candidate.claim_type) or not scope.get("parent_note_canonical_source_id") or scope.get("reply_relation") is None or not isinstance(collection, Mapping) or not _complete_collection(collection):
         return "ugc_comment_sample_insufficient"
     return None
 
