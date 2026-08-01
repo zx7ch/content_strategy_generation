@@ -104,28 +104,10 @@ async def test_lite_reader_projects_each_formal_publication_without_writing(
                             "evidence_refs": [
                                 {
                                     **citation_group["evidence_refs"][0],
+                                    "canonical_note_id": "note-one",
+                                    "source_url": "https://www.xiaohongshu.com/explore/note-one",
                                     "source_collected_at": "2026-07-21T00:00:00Z",
-                                },
-                                {
-                                    "field_path": "title",
-                                    "quote": "missing",
-                                    "text_start": 0,
-                                    "text_end": 7,
-                                    "source_text_hash": "b" * 64,
-                                    "source_url": None,
-                                    "source_collected_at": "2026-07-21T00:01:00Z",
-                                },
-                                {
-                                    "field_path": "title",
-                                    "quote": "locked",
-                                    "text_start": 0,
-                                    "text_end": 6,
-                                    "source_text_hash": "c" * 64,
-                                    "source_url": "https://example.test/locked",
-                                    "source_collected_at": "2026-07-21T00:02:00Z",
-                                    "navigation_state": "navigation_unavailable",
-                                    "navigation_reason": "provider_auth_required",
-                                },
+                                }
                             ],
                         }
                     ],
@@ -171,7 +153,7 @@ async def test_lite_reader_projects_each_formal_publication_without_writing(
         assert [
             item["navigation_state"]
             for item in first["citations"][0]["evidence_refs"]
-        ] == ["available", "missing_source_url", "navigation_unavailable"]
+        ] == ["available"]
         if publication_state == "evidence_only_report":
             assert first["publication"]["publication_reason"] == (
                 "insufficient_admitted_evidence"
@@ -289,7 +271,8 @@ def _citation(
                 "text_start": 0,
                 "text_end": len(quote),
                 "source_text_hash": "a" * 64,
-                "source_url": f"https://example.test/{group_id}",
+                "canonical_note_id": f"note-{group_id}",
+                "source_url": f"https://www.xiaohongshu.com/explore/{group_id}",
             }
         ],
     }
@@ -381,6 +364,70 @@ async def test_lite_reader_does_not_leak_colliding_citation_identity_into_card(t
     assert report["sections"]["main_findings"][0]["citation_group_ids"] == [
         "citation_expected"
     ]
+
+
+@pytest.mark.asyncio
+async def test_lite_reader_excludes_a_group_with_mixed_note_identity_or_source_url(tmp_path):
+    citation = _citation("citation_mixed", "cc_mixed", "cad_mixed")
+    citation["evidence_refs"] = [
+        {
+            **citation["evidence_refs"][0],
+            "canonical_note_id": "note-one",
+            "source_url": "https://www.xiaohongshu.com/explore/note-one",
+        },
+        {
+            **citation["evidence_refs"][0],
+            "canonical_note_id": "note-two",
+            "source_url": "https://www.xiaohongshu.com/explore/note-two",
+        },
+    ]
+
+    report = await _project_formal_cards(
+        tmp_path,
+        claim_cards=[_card("cc_mixed", "cad_mixed")],
+        citation_groups=[citation],
+    )
+
+    assert report["citations"] == []
+    assert report["sections"]["main_findings"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("source_url", "navigation_state", "expected_state"),
+    [
+        (None, None, "missing_source_url"),
+        (
+            "https://www.xiaohongshu.com/explore/note-one",
+            "navigation_unavailable",
+            "navigation_unavailable",
+        ),
+    ],
+)
+async def test_lite_reader_retains_single_note_groups_without_direct_navigation(
+    tmp_path, source_url, navigation_state, expected_state
+):
+    citation = _citation("citation_one", "cc_one", "cad_one")
+    citation["evidence_refs"] = [
+        {
+            **citation["evidence_refs"][0],
+            "canonical_note_id": "note-one",
+            "source_url": source_url,
+            "navigation_state": navigation_state,
+        }
+    ]
+
+    report = await _project_formal_cards(
+        tmp_path,
+        claim_cards=[_card("cc_one", "cad_one")],
+        citation_groups=[citation],
+    )
+
+    assert report["sections"]["main_findings"][0]["citation_group_ids"] == [
+        "citation_one"
+    ]
+    assert report["citations"][0]["navigation_state"] == expected_state
+    assert report["citations"][0]["source_url"] is None
 
 
 @pytest.mark.asyncio

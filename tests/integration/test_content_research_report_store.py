@@ -47,7 +47,12 @@ def _decision(draft: ReportDraft) -> ReportFaithfulnessDecision:
     )
 
 
-def _publication(draft: ReportDraft, decision: ReportFaithfulnessDecision) -> ReportPublication:
+def _publication(
+    draft: ReportDraft,
+    decision: ReportFaithfulnessDecision,
+    *,
+    compose_mode: str = "prose",
+) -> ReportPublication:
     publication = ReportPublication(
         workflow_run_id=draft.workflow_run_id, research_plan_id=draft.research_plan_id,
         governed_snapshot_id=draft.governed_snapshot_id, governed_snapshot_version=draft.governed_snapshot_version,
@@ -55,7 +60,8 @@ def _publication(draft: ReportDraft, decision: ReportFaithfulnessDecision) -> Re
         report_draft_id=draft.id, faithfulness_decision_id=decision.id, publication_state="complete_verified_report",
         verified_section_ids=tuple(section.section_id for section in draft.sections),
         verified_section_kinds=tuple(section.section_kind for section in draft.sections),
-        structured_card_section_ids=tuple(section.section_id for section in draft.sections), audit_recovery_state="all_required_sections_passed", has_free_prose=True,
+        structured_card_section_ids=tuple(section.section_id for section in draft.sections), audit_recovery_state="all_required_sections_passed", has_free_prose=compose_mode == "prose",
+        compose_mode=compose_mode,
     )
     return publication
 

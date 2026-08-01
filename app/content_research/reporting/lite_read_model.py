@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Any
+from urllib.parse import urlparse
 
 from app.content_research.contracts import DIRECTION_CATALOG_V1
 from app.content_research.persistence_models import (
@@ -348,24 +349,78 @@ def _single_reason(value: object) -> str | None:
 def _lite_citations(groups: object) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     for group in groups if isinstance(groups, list) else []:
-        if not isinstance(group, dict):
-            continue
-        refs = [
-            _citation_ref(ref)
-            for ref in group.get("evidence_refs", [])
-            if isinstance(ref, dict) and ref.get("field_path") in _LITE_FIELDS
-        ]
-        if refs:
-            result.append(
-                {
-                    "citation_group_id": group.get("citation_group_id"),
-                    "display_index": group.get("display_index"),
-                    "claim_candidate_id": group.get("claim_candidate_id"),
-                    "admission_decision_id": group.get("admission_decision_id"),
-                    "evidence_refs": refs,
-                }
-            )
+        citation = _lite_citation_group(group)
+        if citation is not None:
+            result.append(citation)
     return result
+
+
+def _lite_citation_group(group: object) -> dict[str, Any] | None:
+    if not isinstance(group, dict):
+        return None
+    raw_refs = group.get("evidence_refs")
+    if not isinstance(raw_refs, list) or not raw_refs or any(
+        not isinstance(ref, dict) for ref in raw_refs
+    ):
+        return None
+    note_ids = {
+        ref.get("canonical_note_id")
+        for ref in raw_refs
+        if isinstance(ref.get("canonical_note_id"), str)
+        and ref["canonical_note_id"]
+    }
+    if len(note_ids) != 1 or len(note_ids) != len(
+        {ref.get("canonical_note_id") for ref in raw_refs}
+    ):
+        return None
+    source_urls = {_frozen_source_url(ref) for ref in raw_refs}
+    if len(source_urls) != 1:
+        return None
+    source_url = source_urls.pop()
+    navigation_state = _group_navigation_state(raw_refs, source_url)
+    refs = [
+        _citation_ref(ref, navigation_state=navigation_state)
+        for ref in raw_refs
+        if ref.get("field_path") in _LITE_FIELDS
+    ]
+    if not refs:
+        return None
+    return {
+        "citation_group_id": group.get("citation_group_id"),
+        "display_index": group.get("display_index"),
+        "claim_candidate_id": group.get("claim_candidate_id"),
+        "admission_decision_id": group.get("admission_decision_id"),
+        "navigation_state": navigation_state,
+        "source_url": source_url if navigation_state == "available" else None,
+        "evidence_refs": refs,
+    }
+
+
+def _frozen_source_url(ref: dict[str, Any]) -> str | None:
+    source_url = ref.get("source_url")
+    return source_url if isinstance(source_url, str) and source_url else None
+
+
+def _group_navigation_state(
+    refs: list[dict[str, Any]], source_url: str | None
+) -> str:
+    if source_url is None:
+        return "missing_source_url"
+    if not _is_safe_xiaohongshu_note_url(source_url) or any(
+        ref.get("navigation_state") == "navigation_unavailable" for ref in refs
+    ):
+        return "navigation_unavailable"
+    return "available"
+
+
+def _is_safe_xiaohongshu_note_url(source_url: str) -> bool:
+    parsed = urlparse(source_url)
+    hostname = (parsed.hostname or "").lower()
+    return (
+        parsed.scheme == "https"
+        and (hostname == "xiaohongshu.com" or hostname.endswith(".xiaohongshu.com"))
+        and bool(parsed.path)
+    )
 
 
 def _select_citations(
@@ -378,9 +433,11 @@ def _select_citations(
     return [citation for citation in citations if citation.get("citation_group_id") in requested]
 
 
-def _citation_ref(ref: dict[str, Any]) -> dict[str, Any]:
+def _citation_ref(
+    ref: dict[str, Any], *, navigation_state: str | None = None
+) -> dict[str, Any]:
     source_url = ref.get("source_url")
-    state = (
+    state = navigation_state or (
         "navigation_unavailable"
         if source_url and ref.get("navigation_state") == "navigation_unavailable"
         else "available"

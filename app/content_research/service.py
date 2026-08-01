@@ -2306,7 +2306,15 @@ def _citation_groups(claim_cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "display_index": index,
             "claim_candidate_id": card["claim_candidate_id"],
             "admission_decision_id": card["admission_decision_id"],
-            "evidence_refs": safe_public_projection(card["evidence_refs"]),
+            "evidence_refs": safe_public_projection(
+                [
+                    {
+                        **ref,
+                        "canonical_note_id": card["canonical_source_id"],
+                    }
+                    for ref in card["evidence_refs"]
+                ]
+            ),
             "preview_ref": safe_public_projection((card["evidence_refs"] or [None])[0]),
             "report_section_ref": {"section": "formal_observations", "index": index - 1},
         }

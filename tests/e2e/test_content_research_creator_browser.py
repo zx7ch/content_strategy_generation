@@ -244,7 +244,7 @@ def test_creator_hides_lite_entry_when_preview_is_disabled(browser_page):
     expect(page.get_by_role("button", name=re.compile("内容调研"))).to_have_count(0)
 
 
-def test_creator_complete_report_uses_lite_and_handles_all_navigation_states(
+def test_creator_complete_report_uses_lite_with_direct_source_navigation(
     browser_page,
 ):
     page, stack = browser_page
@@ -263,7 +263,7 @@ def test_creator_complete_report_uses_lite_and_handles_all_navigation_states(
                     "recovery_actions": [],
                 }
             },
-            evidence_refs=all_navigation_evidence_refs(),
+            evidence_refs=all_navigation_evidence_refs()[:1],
         )
     )
     requested_urls: list[str] = []
@@ -273,26 +273,18 @@ def test_creator_complete_report_uses_lite_and_handles_all_navigation_states(
     report = published_report(page)
     expect(report).to_be_visible(timeout=20000)
     expect(report.get_by_text("已完整核验", exact=True)).to_be_visible()
-    report.get_by_role("button", name="打开引用 7").first.click()
+    source_link = report.get_by_role("link", name="查看原笔记")
+    expect(source_link).to_have_count(1)
+    expect(source_link).to_have_attribute(
+        "href", "https://www.xiaohongshu.com/explore/available"
+    )
+    expect(source_link).to_have_attribute("target", "_blank")
+    expect(source_link).to_have_attribute("rel", "noopener noreferrer")
+    report.get_by_role("button", name="证据详情").first.click()
     drawer = report.locator('aside[aria-label="Content Research citation evidence"]')
     expect(drawer.get_by_text("可打开来源", exact=True)).to_be_visible()
-    expect(drawer.get_by_text("未保存链接来源", exact=True)).to_be_visible()
-    expect(drawer.get_by_text("当前不可导航来源", exact=True)).to_be_visible()
     expect(drawer.get_by_text("2026-07-21T00:00:00Z", exact=True)).to_be_visible()
     expect(drawer.get_by_role("link", name="打开原笔记")).to_have_count(1)
-    expect(
-        drawer.get_by_text(
-            "未保存来源链接；可查看原文片段与采集时间",
-            exact=True,
-        )
-    ).to_be_visible()
-    expect(
-        drawer.get_by_text(
-            "来源链接当前不可打开；可查看原文片段与采集时间",
-            exact=True,
-        )
-    ).to_be_visible()
-    expect(drawer.get_by_text("provider_auth_required", exact=True)).to_be_visible()
 
     assert any(
         f"/content-research/workflows/{seeded['run_id']}/lite-report" in url
@@ -303,6 +295,69 @@ def test_creator_complete_report_uses_lite_and_handles_all_navigation_states(
         url.endswith(f"/content-research/workflows/{seeded['run_id']}/report")
         for url in requested_urls
     )
+
+
+@pytest.mark.parametrize(
+    ("title", "ref_index", "explanation", "navigation_reason"),
+    [
+        (
+            "缺失来源链接 Lite 报告",
+            1,
+            "未保存来源链接；可查看原文片段与采集时间",
+            None,
+        ),
+        (
+            "不可导航来源 Lite 报告",
+            2,
+            "来源链接当前不可打开；可查看原文片段与采集时间",
+            "provider_auth_required",
+        ),
+    ],
+)
+def test_creator_complete_report_uses_lite_keeps_non_navigable_citation_details(
+    browser_page,
+    title,
+    ref_index,
+    explanation,
+    navigation_reason,
+):
+    page, stack = browser_page
+    brand_id = default_brand_id(stack["backend_url"])
+    evidence_ref = all_navigation_evidence_refs()[ref_index]
+    seeded = run_async_in_thread(
+        seed_publication(
+            stack["db_path"],
+            brand_id=brand_id,
+            title=title,
+            publication_state="complete_verified_report",
+            requested_directions=("product_marketing",),
+            direction_results={
+                "product_marketing": {
+                    "state": "formal_directional_result",
+                    "limitations": [],
+                    "recovery_actions": [],
+                }
+            },
+            evidence_refs=[evidence_ref],
+        )
+    )
+
+    open_creator_with_restored_run(page, stack["frontend_url"], seeded["run_id"])
+    report = published_report(page)
+    expect(report).to_be_visible(timeout=20000)
+    expect(report.get_by_role("link", name="查看原笔记")).to_have_count(0)
+    report.get_by_role("button", name="证据详情").first.click()
+    drawer = report.locator('aside[aria-label="Content Research citation evidence"]')
+    expect(drawer.get_by_text(evidence_ref["quote"], exact=True)).to_be_visible()
+    expect(
+        drawer.get_by_text(evidence_ref["source_collected_at"], exact=True)
+    ).to_be_visible()
+    expect(drawer.get_by_text(explanation, exact=True)).to_be_visible()
+    expect(drawer.get_by_role("link", name="打开原笔记")).to_have_count(0)
+    if navigation_reason:
+        expect(drawer.get_by_text(navigation_reason, exact=True)).to_be_visible()
+    else:
+        expect(drawer.get_by_text("provider_auth_required", exact=True)).to_have_count(0)
 
 
 def test_creator_partial_report_shows_requested_unavailable_direction_only(
@@ -831,7 +886,7 @@ async def save_publication(
                     **governed["policy_scope"],
                     "direction_set_version": "direction_set_v1",
                     "direction_ids": list(requested_directions),
-                    "report_compose_mode": "prose",
+                    "report_compose_mode": "template_only",
                 },
                 "citation_groups": [
                     {
@@ -891,7 +946,7 @@ async def save_publication(
             "structured_card_section_ids": (),
         }
     publication = replace(
-        _publication(draft, decision),
+        _publication(draft, decision, compose_mode="template_only"),
         **publication_changes,
     )
     store.save_result_snapshot(snapshot)
@@ -908,7 +963,7 @@ def all_navigation_evidence_refs() -> list[dict]:
     return [
         frozen_ref(
             quote="可打开来源",
-            source_url="https://example.test/available",
+            source_url="https://www.xiaohongshu.com/explore/available",
             collected_at="2026-07-21T00:00:00Z",
             hash_char="a",
         ),
@@ -920,7 +975,7 @@ def all_navigation_evidence_refs() -> list[dict]:
         ),
         frozen_ref(
             quote="当前不可导航来源",
-            source_url="https://example.test/unavailable",
+            source_url="https://www.xiaohongshu.com/explore/unavailable",
             collected_at="2026-07-21T00:02:00Z",
             hash_char="c",
             navigation_state="navigation_unavailable",
@@ -939,6 +994,7 @@ def frozen_ref(
     navigation_reason: str | None = None,
 ) -> dict:
     return {
+        "canonical_note_id": "note-available",
         "field_path": "content_text",
         "quote": quote,
         "text_start": 0,

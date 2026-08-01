@@ -934,16 +934,31 @@ function ContentResearchReportMessage({
 
   const citationButton = (citation: Record<string, unknown>, index: number) => {
     const displayIndex = String(citation.display_index ?? index + 1);
+    const navigationState = stringField(citation, "navigation_state", "missing_source_url");
+    const sourceUrl = stringField(citation, "source_url");
     return (
-      <button
+      <div
         key={stringField(citation, "citation_group_id", String(index))}
-        type="button"
-        className="rounded-lg border border-line bg-white px-2.5 py-1 text-xs hover:bg-slate-50"
-        onClick={() => setSelectedCitation(citation)}
-        aria-label={`打开引用 ${displayIndex}`}
+        className="flex flex-wrap gap-2"
       >
-        [{displayIndex}] 查看依据
-      </button>
+        {sourceUrl && navigationState === "available" && (
+          <a
+            className="rounded-lg border border-line bg-white px-2.5 py-1 text-xs hover:bg-slate-50"
+            href={sourceUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            查看原笔记
+          </a>
+        )}
+        <button
+          type="button"
+          className="rounded-lg border border-line bg-white px-2.5 py-1 text-xs hover:bg-slate-50"
+          onClick={() => setSelectedCitation(citation)}
+        >
+          证据详情
+        </button>
+      </div>
     );
   };
 
