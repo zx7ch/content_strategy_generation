@@ -188,6 +188,19 @@ class WorkflowRunManager:
             raise WorkflowTransitionError(f"Workflow child task not found: {child_task_id}")
         return row
 
+    async def _has_auth_required_child(self, run_id: str) -> bool:
+        assert self._conn is not None
+        async with self._conn.execute(
+            """
+            SELECT 1 FROM workflow_child_tasks
+            WHERE run_id = ? AND status = 'failed'
+              AND error_code IN ('auth_required', 'auth_expired')
+            LIMIT 1
+            """,
+            (run_id,),
+        ) as cursor:
+            return await cursor.fetchone() is not None
+
     async def _append_event(
         self,
         *,
@@ -390,6 +403,27 @@ class WorkflowRunManager:
             row = await self._fetch_run_row(run_id)
             status = row["status"]
             self._ensure_not_terminal(status, "resume_run")
+            if status == WorkflowRunStatus.RUNNING.value:
+                if not await self._has_auth_required_child(run_id):
+                    raise WorkflowTransitionError(
+                        "resume_run for a running run requires an auth-required child task"
+                    )
+                # A provider may require interactive authentication while the
+                # parent orchestration remains running.  This is a safe,
+                # idempotent wake-up: do not rewrite the run state, only
+                # notify any persisted jobs that authentication completed.
+                resumed_jobs = await self._resume_workflow_jobs_if_present(run_id)
+                await self._conn.execute(
+                    "UPDATE workflow_runs SET updated_at=CURRENT_TIMESTAMP WHERE run_id=?",
+                    (run_id,),
+                )
+                await self._append_event(
+                    run_id=run_id,
+                    thread_id=row["thread_id"],
+                    event_type="run_resume_requested",
+                    payload={"resumed_job_count": resumed_jobs, "already_running": True},
+                )
+                return self._run(await self._fetch_run_row(run_id))
             if status not in {"paused", "waiting_user"}:
                 raise WorkflowTransitionError(f"resume_run not allowed from {status}")
             resumed_jobs = await self._resume_workflow_jobs_if_present(run_id)

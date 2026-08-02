@@ -64,8 +64,12 @@ class ContentResearchTraceService:
         usage_steps_dicts = [_json_dict(step) for step in usage_steps]
         usage_events_dicts = [_json_dict(event) for event in usage_events]
         workflow_event_dicts = [_json_dict(event) for event in workflow_events]
-        observation_event_dicts = [_observation_event_dict(event) for event in observation_events]
+        # Aggregate from the durable records before narrowing their public
+        # representation.  The records contain provider payloads and must
+        # never cross the Lite Trace API boundary.
         provider_operations = _provider_operations(self._store, workflow_run_id)
+        observation_event_dicts = [_safe_observation_event_dict(event) for event in observation_events]
+        source_operation_events = [_source_operation_event_dict(event) for event in observation_events]
 
         return ContentResearchTraceResponse(
             workflow_run_id=workflow_run_id,
@@ -80,18 +84,18 @@ class ContentResearchTraceService:
                 usage_events=usage_events_dicts,
             ),
             retry_count=_retry_count(workflow_events=workflow_event_dicts, usage_steps=usage_steps_dicts),
-            traces=[_trace_dict(trace) for trace in traces],
+            traces=[_safe_trace_dict(trace) for trace in traces],
             observation_events=observation_event_dicts,
-            workflow_events=workflow_event_dicts,
-            runtime_steps=[_json_dict(step) for step in runtime_steps],
-            runtime_child_tasks=[_json_dict(task) for task in runtime_child_tasks],
-            usage_summary=_usage_summary_dict(usage_summary),
+            workflow_events=[_safe_workflow_event_dict(event) for event in workflow_event_dicts],
+            runtime_steps=[_safe_runtime_step_dict(step) for step in runtime_steps],
+            runtime_child_tasks=[_safe_runtime_child_task_dict(task) for task in runtime_child_tasks],
+            usage_summary={},
             external_api_summary=_external_api_summary(
-                observation_event_dicts, provider_operations
+                source_operation_events, provider_operations
             ),
-            provider_operations=provider_operations,
-            usage_steps=usage_steps_dicts,
-            usage_events=usage_events_dicts,
+            provider_operations=[_safe_provider_operation_dict(item) for item in provider_operations],
+            usage_steps=[],
+            usage_events=[],
         )
 
 
@@ -107,42 +111,79 @@ def _json_dict(value: Any) -> dict:
     return {}
 
 
-def _trace_dict(trace: TraceRecord) -> dict:
-    return _json_safe(
-        {
-            "id": trace.id,
-            "workflow_run_id": trace.workflow_run_id,
-            "thread_id": trace.thread_id,
-            "schema_version": trace.schema_version,
-            "status": trace.status,
-            "started_at": trace.started_at,
-            "created_at": trace.created_at,
-            "updated_at": trace.updated_at,
-            "payload": trace.payload,
-            "metadata": trace.metadata,
-        }
-    )
+def _safe_trace_dict(trace: TraceRecord) -> dict:
+    return _json_safe({
+        "id": trace.id,
+        "workflow_run_id": trace.workflow_run_id,
+        "thread_id": trace.thread_id,
+        "schema_version": trace.schema_version,
+        "status": trace.status,
+        "started_at": trace.started_at,
+        "created_at": trace.created_at,
+        "updated_at": trace.updated_at,
+    })
 
 
-def _observation_event_dict(event: ObservationEventRecord) -> dict:
-    return _json_safe(
-        {
-            "id": event.id,
-            "trace_id": event.trace_id,
-            "workflow_run_id": event.workflow_run_id,
-            "thread_id": event.thread_id,
-            "schema_version": event.schema_version,
-            "status": event.status,
-            "sequence_no": event.sequence_no,
-            "event_type": event.event_type,
-            "event_name": event.event_name,
-            "timestamp": event.timestamp,
-            "created_at": event.created_at,
-            "updated_at": event.updated_at,
-            "payload": event.payload,
-            "metadata": event.metadata,
-        }
-    )
+def _safe_observation_event_dict(event: ObservationEventRecord) -> dict:
+    return _json_safe({
+        "id": event.id,
+        "trace_id": event.trace_id,
+        "workflow_run_id": event.workflow_run_id,
+        "thread_id": event.thread_id,
+        "schema_version": event.schema_version,
+        "status": event.status,
+        "sequence_no": event.sequence_no,
+        "event_type": event.event_type,
+        "event_name": event.event_name,
+        "timestamp": event.timestamp,
+        "created_at": event.created_at,
+        "updated_at": event.updated_at,
+    })
+
+
+def _source_operation_event_dict(event: ObservationEventRecord) -> dict:
+    """Retain only the provider/operation labels needed for aggregate counts."""
+    payload = event.payload if isinstance(event.payload, dict) else {}
+    return {
+        "event_name": event.event_name,
+        "payload": {
+            "provider": payload.get("provider"),
+            "operation": payload.get("operation"),
+        },
+    }
+
+
+def _safe_workflow_event_dict(event: dict) -> dict:
+    return _select_safe_fields(event, {
+        "id", "run_id", "thread_id", "step_id", "job_id", "event_type",
+        "event_level", "created_at",
+    })
+
+
+def _safe_runtime_step_dict(step: Any) -> dict:
+    return _select_safe_fields(_json_dict(step), {
+        "step_id", "step_name", "phase", "status", "attempt_count",
+        "max_attempts", "started_at", "completed_at",
+    })
+
+
+def _safe_runtime_child_task_dict(task: Any) -> dict:
+    return _select_safe_fields(_json_dict(task), {
+        "child_task_id", "step_id", "task_type", "status", "attempt_count",
+        "max_attempts", "started_at", "completed_at", "error_code",
+    })
+
+
+def _safe_provider_operation_dict(operation: dict) -> dict:
+    return _select_safe_fields(operation, {
+        "operation_fingerprint", "operation", "provider", "provider_operation",
+        "source_kind", "result_status", "status", "started_at", "finished_at",
+        "failure_code", "retryable",
+    })
+
+
+def _select_safe_fields(value: dict, allowed: set[str]) -> dict:
+    return {key: _json_safe(value[key]) for key in allowed if key in value}
 
 
 def _usage_summary_dict(summary: LLMUsageSummary) -> dict:
@@ -230,10 +271,6 @@ def _derive_current_stage(*, run: dict, steps: list[dict], traces: list[TraceRec
     for step in steps:
         if step.get("status") == "running":
             return str(step.get("step_name") or "")
-    for trace in reversed(traces):
-        stage = trace.payload.get("stage") or trace.payload.get("current_stage")
-        if stage:
-            return str(stage)
     return None
 
 

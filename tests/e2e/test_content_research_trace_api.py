@@ -6,11 +6,13 @@ import httpx
 import pytest
 
 from app.api.routes.router import app
+from app.content_research.models import ObservationEventRecord, TraceRecord, utcnow
+from app.content_research.observation.trace_service import _derive_current_stage
 from app.content_research.presearch.service import PresearchService
 from app.content_research.persistence_models import StageCheckpointRecord
 from app.content_research.service import ContentResearchService, WorkflowRunManagerRuntime
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
-from app.services.workflow_run_manager import WorkflowRunManager
+from app.services.workflow_run_manager import WorkflowRunManager, WorkflowTransitionError
 from app.services.llm.pricing import UsageCost
 from app.services.llm.types import LLMCallContext, LLMResponse, TokenUsage
 from app.services.llm.usage_tracker import LLMUsageEventInput, LLMUsageTracker
@@ -127,10 +129,10 @@ async def test_content_research_trace_api_restores_runtime_observation_and_usage
         "running",
     ]
     assert len(trace["runtime_child_tasks"]) == 2
-    assert trace["usage_summary"]["total_calls"] == 1
-    assert trace["usage_summary"]["total_tokens"] == 33
-    assert trace["usage_steps"][0]["agent_name"] == "PresearchAgent"
-    assert trace["usage_events"][0]["job_id"] == presearch["workflow_run_id"]
+    # Lite Trace intentionally exposes execution state, not LLM usage payloads.
+    assert trace["usage_summary"] == {}
+    assert trace["usage_steps"] == []
+    assert trace["usage_events"] == []
 
 
 @pytest.mark.asyncio
@@ -219,19 +221,153 @@ async def test_content_research_trace_api_keeps_running_parent_and_safe_auth_req
             "provider_operation": "discover_candidates",
             "source_kind": "search_result_minimal",
             "result_status": "failed",
-            "item_count": 0,
-            "completeness": "unavailable",
-            "cookie_status": None,
             "status": "auth_required",
             "started_at": None,
             "finished_at": None,
             "failure_code": "auth_required",
-            "failure_reason": "auth_required",
             "retryable": False,
-            "recovery_action": "更新小红书登录态后继续。",
         }
     ]
     assert "RAW_PROVIDER_QUERY_MUST_NOT_ESCAPE" not in response.text
+
+
+@pytest.mark.asyncio
+async def test_content_research_trace_api_redacts_persisted_source_results(
+    client_with_db,
+):
+    client, db_path = client_with_db
+    presearch_response = await client.post(
+        "/content-research/presearch",
+        headers={"X-User-Id": "user-trace-safe-projection"},
+        json={
+            "seed_text": "Satisfy Running",
+            "user_note": "验证安全 Trace 投影",
+            "thread_id": "thread-trace-safe-projection",
+        },
+    )
+    assert presearch_response.status_code == 201
+    presearch = presearch_response.json()
+    store = SQLiteContentResearchStore(db_path)
+    trace = TraceRecord(
+        id="trace-safe-source-result",
+        workflow_run_id=presearch["workflow_run_id"],
+        thread_id="thread-trace-safe-projection",
+        schema_version="content_research_trace_v1",
+        status="running",
+        started_at=utcnow(),
+        payload={
+            "schema_version": "content_research_trace_payload_v1",
+            "request": {"query": "RAW_TRACE_REQUEST_MUST_NOT_ESCAPE"},
+        },
+        metadata={"access_token": "RAW_TRACE_TOKEN_MUST_NOT_ESCAPE"},
+    )
+    store.save_trace(trace)
+    store.append_observation_event(
+        ObservationEventRecord(
+            id="event-safe-source-started",
+            trace_id=trace.id,
+            workflow_run_id=presearch["workflow_run_id"],
+            thread_id="thread-trace-safe-projection",
+            schema_version="content_research_observation_event_v1",
+            status="running",
+            sequence_no=1,
+            event_type="task_started",
+            event_name="source_collection_started",
+            timestamp=utcnow(),
+            payload={
+                "schema_version": "content_research_observation_event_v1",
+                "provider": "xiaohongshu",
+                "operation": "discover_candidates",
+                "request": {"query": "RAW_PROVIDER_REQUEST_MUST_NOT_ESCAPE"},
+            },
+        )
+    )
+    store.append_observation_event(
+        ObservationEventRecord(
+            id="event-safe-source-completed",
+            trace_id=trace.id,
+            workflow_run_id=presearch["workflow_run_id"],
+            thread_id="thread-trace-safe-projection",
+            schema_version="content_research_observation_event_v1",
+            status="completed",
+            sequence_no=2,
+            event_type="task_completed",
+            event_name="source_collection_completed",
+            timestamp=utcnow(),
+            payload={
+                "schema_version": "content_research_observation_event_v1",
+                "source_collection": {
+                    "status": "completed",
+                    "items": [{"title": "RAW_SOURCE_ITEM_MUST_NOT_ESCAPE"}],
+                    "metadata": {
+                        "provider_response": "RAW_SOURCE_METADATA_MUST_NOT_ESCAPE"
+                    },
+                }
+            },
+        )
+    )
+
+    response = await client.get(
+        f"/content-research/workflows/{presearch['workflow_run_id']}/trace"
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["workflow_run_id"] == presearch["workflow_run_id"]
+    assert payload["run_status"] == "running"
+    assert payload["external_api_summary"] == {
+        "call_count": 1,
+        "completed_count": 1,
+        "failed_count": 0,
+        "by_provider": {"xiaohongshu": 1},
+        "by_operation": {"discover_candidates": 1},
+    }
+    assert set(payload["runtime_steps"][0]) <= {
+        "step_id",
+        "step_name",
+        "phase",
+        "status",
+        "attempt_count",
+        "max_attempts",
+        "started_at",
+        "completed_at",
+    }
+    serialized = response.text
+    for forbidden in (
+        "RAW_TRACE_REQUEST_MUST_NOT_ESCAPE",
+        "RAW_TRACE_TOKEN_MUST_NOT_ESCAPE",
+        "RAW_PROVIDER_REQUEST_MUST_NOT_ESCAPE",
+        "RAW_SOURCE_ITEM_MUST_NOT_ESCAPE",
+        "RAW_SOURCE_METADATA_MUST_NOT_ESCAPE",
+    ):
+        assert forbidden not in serialized
+
+
+def test_trace_stage_never_uses_raw_trace_payload() -> None:
+    trace = TraceRecord(
+        id="trace-raw-stage",
+        workflow_run_id="run-raw-stage",
+        thread_id="thread-raw-stage",
+        schema_version="content_research_trace_v1",
+        status="running",
+        started_at=utcnow(),
+        payload={"stage": "RAW_TRACE_STAGE_MUST_NOT_ESCAPE"},
+    )
+    assert _derive_current_stage(run={}, steps=[], traces=[trace]) is None
+
+
+@pytest.mark.asyncio
+async def test_running_run_cannot_resume_without_auth_required_child(client_with_db):
+    client, db_path = client_with_db
+    presearch_response = await client.post(
+        "/content-research/presearch",
+        headers={"X-User-Id": "user-running-resume"},
+        json={"seed_text": "Satisfy Running", "thread_id": "thread-running-resume"},
+    )
+    assert presearch_response.status_code == 201
+    with pytest.raises(WorkflowTransitionError, match="auth-required child"):
+        async with WorkflowRunManager(db_path) as manager:
+            await manager.resume_run(presearch_response.json()["workflow_run_id"])
 
 
 @pytest.mark.asyncio

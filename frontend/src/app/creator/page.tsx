@@ -1209,26 +1209,34 @@ function contentResearchTraceTimeline(trace: ContentResearchTrace | null): Trace
 
 function contentResearchRecoveryState(run: ContentResearchRunState): ContentResearchRecoveryState {
   const published = run.report ? litePublicationState(run.report) !== null : false;
-  const providerFailure = [...(run.trace?.provider_operations ?? [])]
+  const providerFailures = [...(run.trace?.provider_operations ?? [])]
     .reverse()
-    .find((operation) => !["completed", "running", "pending"].includes(operation.status)) ?? null;
-  const childFailure = [...recordList(run.trace?.runtime_child_tasks)]
+    .filter((operation) => !["completed", "running", "pending"].includes(operation.status));
+  const providerFailure = providerFailures[0] ?? null;
+  const childFailures = [...recordList(run.trace?.runtime_child_tasks)]
     .reverse()
-    .find((task) => stringField(task, "status") === "failed") ?? null;
+    .filter((task) => stringField(task, "status") === "failed");
+  const childFailure = childFailures[0] ?? null;
   const reportRecoveryReason = run.report?.recovery_projection
     ? stringField(run.report.recovery_projection, "reason_code")
     : "";
-  const failureCode = providerFailure?.failure_code
-    || providerFailure?.failure_reason
-    || stringField(childFailure, "error_code")
-    || reportRecoveryReason;
-  const authRequired = !published && ["auth_expired", "auth_required"].includes(failureCode ?? "");
-  const hasRecoverableState = Boolean(providerFailure || childFailure || run.report?.recovery_projection);
+  const authCodes = new Set(["auth_expired", "auth_required"]);
+  const childFailureCode = stringField(childFailure, "error_code");
+  const authChildFailure = childFailures.find((task) => authCodes.has(stringField(task, "error_code"))) ?? null;
+  const authProviderFailure = providerFailures.find((operation) => authCodes.has(operation.failure_code ?? "")) ?? null;
+  const authRequired = !published && Boolean(
+    authProviderFailure || authChildFailure || authCodes.has(reportRecoveryReason)
+  );
+  const selectedProviderFailure = authProviderFailure ?? providerFailure;
+  const recoverableCodes = new Set(["auth_expired", "auth_required", "timeout", "transient_error", "rate_limited", "unavailable"]);
+  const providerRecoverable = Boolean(selectedProviderFailure?.retryable && recoverableCodes.has(selectedProviderFailure.failure_code ?? ""));
+  const childRecoverable = childFailures.some((task) => recoverableCodes.has(stringField(task, "error_code")));
+  const reportRecoverable = recoverableCodes.has(reportRecoveryReason);
   return {
-    providerFailure,
+    providerFailure: selectedProviderFailure,
     childFailure,
     authRequired,
-    recoverable: !published && hasRecoverableState && (run.trace?.recoverable ?? true),
+    recoverable: !published && (providerRecoverable || childRecoverable || reportRecoverable),
   };
 }
 
@@ -1425,7 +1433,7 @@ function ContentResearchTraceInspector({
                 {recovery.providerFailure.provider_operation ?? recovery.providerFailure.operation ?? "provider"} · {recovery.providerFailure.failure_code ?? recovery.providerFailure.failure_reason ?? recovery.providerFailure.status}
               </p>
               <p className="mt-2 text-xs leading-5 text-ink">
-                {recovery.providerFailure.recovery_action ?? "该外部调用未产生可安全继续的结果，请先确认外部状态。"}
+                {recovery.authRequired ? "更新小红书登录态后继续。" : "该外部调用未产生可安全继续的结果，请先确认外部状态。"}
               </p>
               {authenticationControls}
             </article>
@@ -2817,6 +2825,14 @@ export default function CreatorPage() {
           </div>
         </div>
       </section>
+      {contentResearchRun && <button
+        type="button"
+        onClick={() => setTraceExpanded(true)}
+        className="fixed bottom-20 right-4 z-30 rounded-full border border-line bg-white px-3 py-2 text-xs font-semibold text-blue-600 shadow-lg lg:hidden"
+        aria-label="查看完整 workflow trace"
+      >
+        查看完整 Trace
+      </button>}
       {contentResearchRun && <ContentResearchContextSidebar
         run={contentResearchRun}
         onExpandedChange={setTraceExpanded}

@@ -20,7 +20,7 @@ from app.content_research.contracts import (
     DIRECTION_CATALOG_V1,
     build_default_snapshot,
 )
-from app.content_research.models import ResearchBriefRecord
+from app.content_research.models import ResearchBriefRecord, SubagentTaskRecord
 from app.content_research.persistence_models import StageCheckpointRecord
 from app.content_research.reporting.composer import ResearchReportComposer
 from app.content_research.reporting.publication_materializer import (
@@ -321,6 +321,7 @@ def test_creator_trace_prioritizes_auth_required_child_and_resumes_once_after_qr
             stack["db_path"],
             brand_id=brand_id,
             title="等待登录的 Lite 调研",
+            include_masking_non_auth_failure=True,
         )
     )
     requested_urls: list[str] = []
@@ -373,10 +374,10 @@ def test_creator_trace_prioritizes_auth_required_child_and_resumes_once_after_qr
     expect(resume).to_be_visible(timeout=10000)
 
     with sqlite3.connect(stack["db_path"]) as connection:
-        connection.execute(
-            "UPDATE workflow_runs SET status = 'paused' WHERE run_id = ?",
+        assert connection.execute(
+            "SELECT status FROM workflow_runs WHERE run_id = ?",
             (seeded["run_id"],),
-        )
+        ).fetchone()[0] == "running"
     with page.expect_response(
         lambda response: response.url.endswith("/actions")
         and '"action":"resume_formal_research"'
@@ -389,6 +390,111 @@ def test_creator_trace_prioritizes_auth_required_child_and_resumes_once_after_qr
     assert any(url.endswith("/trace") for url in requested_urls)
     assert any("/lite-report" in url for url in requested_urls)
     assert not any(url.endswith("/report") or url.endswith("/results") for url in requested_urls)
+
+
+def test_creator_nonrecoverable_provider_failure_never_offers_resume(browser_page):
+    page, stack = browser_page
+    brand_id = default_brand_id(stack["backend_url"])
+    seeded = run_async_in_thread(
+        seed_auth_required_trace(
+            stack["db_path"],
+            brand_id=brand_id,
+            title="不可恢复的 Lite 调研",
+            child_failure_code="provider_access_rejected",
+        )
+    )
+    resume_payloads: list[dict] = []
+
+    def record_request(request) -> None:
+        if request.url.endswith("/actions") and request.post_data:
+            payload = request.post_data_json
+            if payload.get("action") == "resume_formal_research":
+                resume_payloads.append(payload)
+
+    page.on("request", record_request)
+    open_creator_with_restored_run(page, stack["frontend_url"], seeded["run_id"])
+
+    sidebar = page.locator('aside[aria-label="内容调研上下文"]')
+    expect(sidebar.get_by_text(re.compile("可继续"))).to_have_count(0)
+    sidebar.get_by_label("查看完整 workflow trace").click()
+    trace = page.locator('section[aria-label="Content Research Trace"]')
+    expect(trace).to_be_visible()
+    expect(trace.get_by_text(re.compile("可继续"))).to_have_count(0)
+    expect(trace.get_by_role("button", name="继续本轮调研")).to_have_count(0)
+    expect(trace.get_by_role("button", name="登录成功，继续本轮调研")).to_have_count(0)
+    expect(trace.get_by_role("button", name="扫码登录小红书")).to_have_count(0)
+    assert resume_payloads == []
+
+
+def test_creator_auth_required_child_beats_later_non_auth_child(browser_page):
+    page, stack = browser_page
+    brand_id = default_brand_id(stack["backend_url"])
+    seeded = run_async_in_thread(
+        seed_auth_required_trace(
+            stack["db_path"],
+            brand_id=brand_id,
+            title="子任务认证优先级",
+            include_masking_non_auth_child=True,
+            include_provider_checkpoint=False,
+        )
+    )
+
+    open_creator_with_restored_run(page, stack["frontend_url"], seeded["run_id"])
+    sidebar = page.locator('aside[aria-label="内容调研上下文"]')
+    expect(sidebar.get_by_text("需要登录小红书网页端", exact=True)).to_be_visible()
+    sidebar.get_by_label("查看完整 workflow trace").click()
+    trace = page.locator('section[aria-label="Content Research Trace"]')
+    expect(trace.get_by_role("button", name="扫码登录小红书")).to_be_visible()
+
+
+def test_creator_full_trace_entry_is_visible_on_narrow_screens_for_every_run_state(
+    browser_page,
+):
+    page, stack = browser_page
+    brand_id = default_brand_id(stack["backend_url"])
+    running = run_async_in_thread(
+        seed_auth_required_trace(
+            stack["db_path"],
+            brand_id=brand_id,
+            title="窄屏运行中调研",
+        )
+    )
+    terminal = run_async_in_thread(
+        seed_publication(
+            stack["db_path"],
+            brand_id=brand_id,
+            title="窄屏已完成调研",
+            publication_state="complete_verified_report",
+            requested_directions=("product_marketing",),
+            direction_results={
+                "product_marketing": {
+                    "state": "formal_directional_result",
+                    "limitations": [],
+                    "recovery_actions": [],
+                }
+            },
+            evidence_refs=all_navigation_evidence_refs()[:1],
+        )
+    )
+    failed = run_async_in_thread(
+        seed_auth_required_trace(
+            stack["db_path"],
+            brand_id=brand_id,
+            title="窄屏失败调研",
+            child_failure_code="provider_access_rejected",
+            fail_parent=True,
+        )
+    )
+    page.set_viewport_size({"width": 640, "height": 800})
+
+    for seeded in (running, terminal, failed):
+        open_creator_with_restored_run(page, stack["frontend_url"], seeded["run_id"])
+        entry = page.locator('[aria-label="查看完整 workflow trace"]:visible')
+        expect(entry).to_have_count(1)
+        entry.click()
+        trace = page.locator('section[aria-label="Content Research Trace"]')
+        expect(trace).to_be_visible()
+        trace.get_by_label("关闭 Trace 对话框").click()
 
 
 @pytest.mark.parametrize(
@@ -923,6 +1029,11 @@ async def seed_auth_required_trace(
     *,
     brand_id: str,
     title: str,
+    child_failure_code: str = "auth_required",
+    include_masking_non_auth_failure: bool = False,
+    include_masking_non_auth_child: bool = False,
+    include_provider_checkpoint: bool = True,
+    fail_parent: bool = False,
 ) -> dict[str, str]:
     async with ThreadStore(db_path) as thread_store:
         thread = await thread_store.create_thread(
@@ -950,8 +1061,21 @@ async def seed_auth_required_trace(
         await manager.start_child_task(children[0].child_task_id)
         await manager.fail_child_task(
             children[0].child_task_id,
-            {"code": "auth_required", "message": "provider authentication required"},
+            {"code": child_failure_code, "message": "provider failure"},
         )
+        if include_masking_non_auth_child:
+            masking_child = (await manager.create_child_tasks(
+                run_id=run.run_id,
+                step_id=steps[0].step_id,
+                tasks=[{"task_type": "content_research.competitor_discovery", "max_attempts": 2}],
+            ))[0]
+            await manager.start_child_task(masking_child.child_task_id)
+            await manager.fail_child_task(
+                masking_child.child_task_id,
+                {"code": "provider_unavailable", "message": "provider unavailable"},
+            )
+        if fail_parent:
+            await manager.fail_run(run.run_id, {"code": child_failure_code, "message": "provider failure"})
     brief = ResearchBriefRecord(
         id=f"brief_{run.run_id}",
         workflow_run_id=run.run_id,
@@ -979,13 +1103,14 @@ async def seed_auth_required_trace(
         report_compose_mode="template_only",
     )
     store.save_run_policy_snapshot(policy)
-    store.save_stage_checkpoint(
+    if include_provider_checkpoint:
+        store.save_stage_checkpoint(
         StageCheckpointRecord(
-            id=f"checkpoint_auth_required_{run.run_id}",
+            id=f"checkpoint_provider_failure_{run.run_id}",
             schema_version="content_research_stage_checkpoint_v1",
             payload={
                 "operation": "discover_candidates",
-                "operation_fingerprint": "browser-auth-required-operation",
+                "operation_fingerprint": "browser-provider-failure-operation",
                 "request": {"query": "RAW_PROVIDER_QUERY_MUST_NOT_RENDER"},
                 "completion": {
                     "provider": "xiaohongshu",
@@ -994,19 +1119,44 @@ async def seed_auth_required_trace(
                     "result_status": "failed",
                     "item_count": 0,
                     "completeness": "unavailable",
-                    "failure_code": "auth_required",
-                    "failure_reason": "auth_required",
-                    "retryable": False,
-                    "recovery_action": "更新小红书登录态后继续。",
+                    "failure_code": child_failure_code,
+                    "failure_reason": child_failure_code,
+                    "retryable": child_failure_code == "auth_required",
+                    "recovery_action": "更新小红书登录态后继续。" if child_failure_code == "auth_required" else None,
                 },
             },
             workflow_run_id=run.run_id,
             subagent_task_id=children[0].child_task_id,
             stage_name="operation",
-            input_fingerprint="browser-auth-required-operation",
-            status="auth_required",
+            input_fingerprint="browser-provider-failure-operation",
+            status=child_failure_code,
         )
-    )
+        )
+    if include_masking_non_auth_failure:
+        store.save_stage_checkpoint(
+            StageCheckpointRecord(
+                id=f"checkpoint_non_auth_failure_{run.run_id}",
+                schema_version="content_research_stage_checkpoint_v1",
+                payload={
+                    "operation": "collect_detail",
+                    "operation_fingerprint": "browser-non-auth-failure-operation",
+                    "completion": {
+                        "provider": "xiaohongshu",
+                        "provider_operation": "collect_detail",
+                        "source_kind": "search_result_minimal",
+                        "result_status": "failed",
+                        "failure_code": "provider_unavailable",
+                        "failure_reason": "provider_unavailable",
+                        "retryable": True,
+                    },
+                },
+                workflow_run_id=run.run_id,
+                subagent_task_id=children[0].child_task_id,
+                stage_name="operation",
+                input_fingerprint="browser-non-auth-failure-operation",
+                status="failed",
+            )
+        )
     return {
         "run_id": run.run_id,
         "thread_id": thread["id"],
