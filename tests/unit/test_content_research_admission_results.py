@@ -16,3 +16,19 @@ def test_direction_result_only_exposes_admitted_claims_and_retains_weak_signals(
 def test_no_admitted_claim_produces_insufficient_direction_result():
     output = build_direction_result(direction_id="product_marketing", policy_snapshot_id="rps_1", decisions=[_decision("cad_no", "rejected")])
     assert output.direction_result.payload["state"] == "insufficient_evidence"
+
+
+def test_direction_result_identity_changes_when_admission_decisions_change():
+    insufficient = build_direction_result(
+        direction_id="product_marketing",
+        policy_snapshot_id="rps_1",
+        decisions=[_decision("cad_old", "rejected")],
+    )
+    admitted = build_direction_result(
+        direction_id="product_marketing",
+        policy_snapshot_id="rps_1",
+        decisions=[_decision("cad_new", "admitted")],
+    )
+
+    assert insufficient.direction_result.id != admitted.direction_result.id
+    assert admitted.direction_result.payload["state"] == "formal_directional_result"

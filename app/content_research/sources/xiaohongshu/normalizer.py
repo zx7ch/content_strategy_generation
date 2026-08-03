@@ -33,6 +33,7 @@ class XiaohongshuSourceNormalizer:
         return {
             "schema_version": "content_research_source_payload_v1",
             "provider": SOURCE_PROVIDER,
+            "provider_item_type": post.provider_item_type,
             "source_kind": source_kind,
             "source_url": note_url,
             "canonical_id": note_id or note_url,

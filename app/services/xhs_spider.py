@@ -36,6 +36,7 @@ class XHSPost(BaseModel):
     images: List[str]
     note_type: str = ""
     source_published_at: str | None = None
+    provider_item_type: str = "note"
 
 
 class SpiderError(Exception):
@@ -45,7 +46,10 @@ class SpiderError(Exception):
 
 class SpiderTransientError(SpiderError):
     """临时错误（可重试）"""
-    pass
+
+    def __init__(self, message: str, *, retry_count: int = 0) -> None:
+        super().__init__(message)
+        self.retry_count = retry_count
 
 
 class SpiderPermanentError(SpiderError):
@@ -126,13 +130,21 @@ class XHSSpiderClient:
         return default
 
     def _resolve_retry_budget(self) -> int:
-        # Spec: 3 auto retries + 2 user retries.
+        # This client owns one provider operation, so it may consume only the
+        # automatic retry budget. User-triggered recovery is accounted for by
+        # the workflow and must never be folded into this loop.
         auto = self._safe_int(getattr(settings, "XHS_SPIDER_MAX_AUTO_RETRIES", None), default=-1)
-        user = self._safe_int(getattr(settings, "XHS_SPIDER_MAX_USER_RETRIES", None), default=-1)
-        if auto >= 0 and user >= 0:
-            return auto + user
-        # Backward-compatible fallback
+        if auto >= 0:
+            return auto
+        # Backward-compatible fallback for configurations created before the
+        # separate automatic retry setting existed.
         return self._safe_int(getattr(settings, "XHS_SPIDER_MAX_RETRIES", 5), default=5)
+
+    def authentication_ready(self) -> bool:
+        """Return whether this process has credentials available for a retry."""
+        if self._auth_provider is not None:
+            return self._auth_provider() is not None
+        return bool(str(self.cookies or "").strip())
     
     def _get_api(self):
         """Create one bootstrapped current-upstream API lifecycle per client.
@@ -279,8 +291,23 @@ class XHSSpiderClient:
         sort: int = 2,
         on_page: Optional[Callable[[List["XHSPost"]], None]] = None,
     ) -> List[XHSPost]:
+        posts, _retry_count = await self.search_with_retry_result(
+            query,
+            num=num,
+            sort=sort,
+            on_page=on_page,
+        )
+        return posts
+
+    async def search_with_retry_result(
+        self,
+        query: str,
+        num: int = 50,
+        sort: int = 2,
+        on_page: Optional[Callable[[List["XHSPost"]], None]] = None,
+    ) -> tuple[List[XHSPost], int]:
         """
-        带重试的搜索
+        带重试的搜索，并返回本次 provider operation 实际消耗的自动重试次数。
         
         Args:
             query: 搜索关键词
@@ -300,7 +327,7 @@ class XHSSpiderClient:
                 success, msg, posts = await self.search(query, num, sort, on_page=on_page)
                 
                 if success:
-                    return posts
+                    return posts, retry_count
                 else:
                     # API-level failures still carry their typed provider reason.
                     # In particular, an expired Cookie must reach the workflow
@@ -314,6 +341,7 @@ class XHSSpiderClient:
                 
             except SpiderPermanentError as e:
                 _logger.error("spider permanent error, aborting retries", attempt=retry_count, error=str(e))
+                e.retry_count = retry_count
                 raise
             
             # Calculate backoff: 2^attempt seconds (2, 4, 8, 16, 32)
@@ -322,8 +350,9 @@ class XHSSpiderClient:
                 await asyncio.sleep(wait_time)
         
         # Max retries exceeded
-        raise SpiderPermanentError(
-            f"Spider failed after {self.max_retries} retries. Last error: {last_error}"
+        raise SpiderTransientError(
+            f"Spider failed after {self.max_retries} retries. Last error: {last_error}",
+            retry_count=self.max_retries,
         )
 
     async def collect_comment_page(
@@ -497,6 +526,7 @@ class XHSSpiderClient:
             images=self._extract_images(raw_post, note_card),
             note_type=note_type,
             source_published_at=published_at,
+            provider_item_type=self._safe_str(raw_post.get("model_type") or "note"),
         )
 
     @staticmethod

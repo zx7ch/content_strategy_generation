@@ -71,7 +71,7 @@ async def _confirmed_workflow(service):
             subject_type="category",
             selected_competitors=["迪卡侬"],
             custom_competitors=["凯乐石"],
-            selected_directions=["product_marketing", "comment_insight"],
+            selected_directions=["product_marketing", "content_performance"],
             custom_research_question="关注轻量速干",
         ),
     )
@@ -146,13 +146,9 @@ async def test_trace_aggregates_runtime_observations_and_usage(db_path, service)
         "formal_research",
     ]
     assert len(trace.runtime_child_tasks) == 2
-    assert trace.usage_summary["total_calls"] == 2
-    assert trace.usage_summary["total_tokens"] == 35
-    assert [step["agent_name"] for step in trace.usage_steps] == [
-        "PresearchAgent",
-        "CommentInsightAgent",
-    ]
-    assert trace.usage_events[1]["error_message"] == "temporary failure"
+    assert trace.usage_summary == {}
+    assert trace.usage_steps == []
+    assert trace.usage_events == []
 
 
 @pytest.mark.asyncio
@@ -161,8 +157,7 @@ async def test_trace_returns_zero_usage_defaults_when_no_usage_rows(service):
 
     trace = await service.get_workflow_trace(presearch.workflow_run_id)
 
-    assert trace.usage_summary["total_calls"] == 0
-    assert trace.usage_summary["total_tokens"] == 0
+    assert trace.usage_summary == {}
     assert trace.usage_steps == []
     assert trace.usage_events == []
 
@@ -203,24 +198,22 @@ async def test_trace_projects_durable_provider_failure_without_raw_request(servi
 
     trace = await service.get_workflow_trace(presearch.workflow_run_id)
 
-    assert trace.provider_operations == [{
+    assert len(trace.provider_operations) == 1
+    operation = trace.provider_operations[0]
+    assert operation.pop("operation_id").startswith("op_")
+    assert operation == {
         "operation_fingerprint": "fingerprint-1",
         "operation": "discover",
         "provider": None,
         "provider_operation": None,
         "source_kind": None,
         "result_status": None,
-        "item_count": None,
-        "completeness": None,
-        "cookie_status": None,
         "status": "auth_required",
         "started_at": None,
         "finished_at": None,
         "failure_code": "auth_required",
-        "failure_reason": "auth_required",
         "retryable": False,
-        "recovery_action": "更新小红书登录态后继续。",
-    }]
+    }
 
 
 @pytest.mark.asyncio
@@ -264,24 +257,22 @@ async def test_trace_projects_provider_access_rejection_with_safe_browser_sessio
 
     trace = await service.get_workflow_trace(presearch.workflow_run_id)
 
-    assert trace.provider_operations == [{
+    assert len(trace.provider_operations) == 1
+    operation = trace.provider_operations[0]
+    assert operation.pop("operation_id").startswith("op_")
+    assert operation == {
         "operation_fingerprint": "fingerprint-detail-1",
         "operation": "collect_note_detail",
         "provider": "xiaohongshu",
         "provider_operation": "collect_note_detail",
         "source_kind": "note_detail",
         "result_status": "failed",
-        "item_count": 0,
-        "completeness": "unavailable",
-        "cookie_status": "valid",
         "status": "failed",
         "started_at": None,
         "finished_at": None,
         "failure_code": "provider_access_rejected",
-        "failure_reason": "provider_access_rejected",
         "retryable": False,
-        "recovery_action": "笔记详情请求的浏览器安全上下文不兼容；请启用或更新兼容的浏览器会话详情采集提供者后重新发起调研。",
-    }]
+    }
     assert trace.external_api_summary == {
         "call_count": 1,
         "completed_count": 0,

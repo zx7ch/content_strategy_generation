@@ -15,6 +15,7 @@ from app.content_research.contracts import (
     DirectionContract,
     RunPolicySnapshot,
     SamplePolicy,
+    admission_author_identity_kind,
     frozen_query_relevance,
 )
 from app.content_research.persistence_models import (
@@ -203,6 +204,7 @@ class ClaimAdmissionEvaluator:
                 "eligible_source_count": eligible_count,
                 "independent_author_count": independent_author_count,
                 "author_id": str(projection.get("author_id") or ""),
+                "author_identity_kind": admission_author_identity_kind(projection),
                 "missing_required_fields": missing,
             },
             "evidence_refs": [packet.id],

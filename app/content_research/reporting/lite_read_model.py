@@ -36,7 +36,23 @@ _PUBLICATION_STATES = {
     "partial_verified_report",
     "evidence_only_report",
 }
-_RECOVERABLE_RUN_STATES = {"failed", "paused"}
+_RECOVERABLE_RUN_STATES = {"failed", "paused", "waiting_user", "running"}
+_RECOVERABLE_FAILURE_CODES = {
+    "auth_required",
+    "auth_expired",
+    "timeout",
+    "transient_error",
+    "rate_limited",
+    "unavailable",
+}
+_FAILURE_CHECKPOINT_STATUSES = {
+    "failed",
+    "failed_recoverable",
+    "outcome_unknown",
+    "auth_required",
+    "rate_limited",
+    "timed_out",
+}
 
 
 class LiteReportReader:
@@ -79,7 +95,7 @@ class LiteReportReader:
                     publication_id=publication_id,
                     citation_group_ids=set(citation_group_ids),
                 )
-        except PublishedReportNotFoundError as exc:
+        except PublishedReportNotFoundError:
             if citation_group_ids is not None:
                 raise
             if self._has_publication(workflow_run_id=workflow_run_id):
@@ -178,7 +194,8 @@ class LiteReportReader:
                 if is_evidence_only
                 else {
                     "completed_direction_count": sum(
-                        item["state"] == "completed" for item in direction_states
+                        item["state"] in {"formal_directional_result", "completed"}
+                        for item in direction_states
                     ),
                     "admitted_finding_count": len(finding_cards),
                     "observation_count": len(observations),
@@ -198,10 +215,12 @@ class LiteReportReader:
             getattr(run, "status", "unknown")
         )
         checkpoints = self._checkpoints(workflow_run_id)
+        recovery_reason = _recovery_reason(self._store, workflow_run_id)
         if (
             brief is None
             or state not in _RECOVERABLE_RUN_STATES
             or not _has_persisted_failure(checkpoints)
+            or recovery_reason not in _RECOVERABLE_FAILURE_CODES
         ):
             raise PublishedReportNotFoundError("published report not found")
         completed_stages = sorted(
@@ -222,7 +241,7 @@ class LiteReportReader:
                 policy.effective_policy if policy else {}
             ),
             "recovery_projection": {
-                "reason_code": _recovery_reason(self._store, workflow_run_id),
+                "reason_code": recovery_reason,
                 "completed_stages": completed_stages,
                 "next_action": "resume_run",
                 "actionability": "available",
@@ -610,9 +629,7 @@ def _publication_reason(report: dict[str, Any]) -> str | None:
 
 
 def _has_persisted_failure(checkpoints: list[StageCheckpointRecord]) -> bool:
-    return any(
-        item.status in {"failed", "failed_recoverable", "outcome_unknown"} for item in checkpoints
-    )
+    return any(item.status in _FAILURE_CHECKPOINT_STATUSES for item in checkpoints)
 
 
 def _recovery_reason(store: ContentResearchStore, workflow_run_id: str) -> str:
@@ -620,8 +637,14 @@ def _recovery_reason(store: ContentResearchStore, workflow_run_id: str) -> str:
         item
         for item in store.list_typed_records(StageCheckpointRecord)
         if item.workflow_run_id == workflow_run_id
-        and item.status in {"failed", "failed_recoverable", "outcome_unknown"}
+        and item.status in _FAILURE_CHECKPOINT_STATUSES
     ]
     if not failures:
         return "temporary_error"
-    return str(failures[-1].payload.get("reason_code") or "temporary_error")
+    payload = failures[-1].payload
+    return str(
+        payload.get("reason_code")
+        or (payload.get("completion") or {}).get("failure_code")
+        or payload.get("failure_reason")
+        or "temporary_error"
+    )

@@ -18,9 +18,10 @@ from app.content_research.worker import ContentResearchDispatchWorker
 from app.memory.thread_store import ThreadStore
 from app.services.llm.types import LLMResponse, TokenUsage
 
-ALL_DIRECTIONS = [
-    "product_marketing", "content_performance", "competitor_discovery",
-    "ugc_community", "comment_insight", "brand_activity", "keyword_growth",
+LITE_DIRECTIONS = [
+    "product_marketing",
+    "content_performance",
+    "competitor_discovery",
 ]
 
 
@@ -30,7 +31,7 @@ class FakeLLM:
             content=json.dumps({
                 "subject_confirmation": "徒步短裤",
                 "competitor_tags": ["迪卡侬"],
-                "research_directions": ALL_DIRECTIONS,
+                "research_directions": LITE_DIRECTIONS,
                 "custom_research_question": "请给出下一步建议",
                 "custom_competitor_input": "",
             }, ensure_ascii=False),
@@ -45,6 +46,11 @@ class CapableFakeAdapter:
         self.calls: list[tuple[str, str]] = []
         self.delay_seconds = 0.0
         self.discover_failure_reason: str | None = None
+        self.detail_failure_reason: str | None = None
+        self.authenticated = False
+
+    def authentication_ready(self) -> bool:
+        return self.authenticated
 
     def capabilities(self):
         note_fields = (
@@ -85,6 +91,18 @@ class CapableFakeAdapter:
     async def collect_note_detail(self, request):
         direction = str(request.context["direction_id"])
         self.calls.append(("detail", direction))
+        if self.detail_failure_reason:
+            return SourceOperationResult(
+                provider="xiaohongshu",
+                operation="collect_note_detail",
+                source_kind="note_detail",
+                status="failed",
+                items=[],
+                failure_reason=self.detail_failure_reason,
+                retryable=self.detail_failure_reason
+                in {"timeout", "transient_error", "rate_limited"},
+                completeness="unavailable",
+            )
         index = request.note_id.rsplit("-", 1)[-1]
         return SourceOperationResult(
             provider="xiaohongshu", operation="collect_note_detail", source_kind="note_detail", status="completed",
@@ -121,16 +139,18 @@ async def formal_client(tmp_path):
     original = getattr(app.state, "content_research_service", None)
     adapter = CapableFakeAdapter()
     db_path = str(tmp_path / "cl10.db")
+    dispatch_wake_event = asyncio.Event()
     app.state.content_research_service = ContentResearchService(
         store=SQLiteContentResearchStore(db_path),
         presearch=PresearchService(FakeLLM(), first_feedback_timeout_seconds=0.05, hard_cutoff_seconds=0.1),
         workflow_runtime=WorkflowRunManagerRuntime(db_path),
         source_registry=SourceAdapterRegistry({"xiaohongshu": adapter}),
+        dispatch_wake_event=dispatch_wake_event,
     )
     dispatch_worker = ContentResearchDispatchWorker(
         store=app.state.content_research_service._store,
         service_factory=lambda: app.state.content_research_service,
-        recovery_scan_seconds=0.005,
+        wake_event=dispatch_wake_event,
     )
     dispatch_stop_event = asyncio.Event()
     dispatch_task = asyncio.create_task(dispatch_worker.run_loop(stop_event=dispatch_stop_event))
@@ -139,6 +159,7 @@ async def formal_client(tmp_path):
         yield client, adapter, db_path
     finally:
         dispatch_stop_event.set()
+        dispatch_wake_event.set()
         await dispatch_task
         await client.aclose()
         if original is None:
@@ -158,7 +179,7 @@ async def test_formal_workflow_public_api_e2e_is_packet_only_safe_and_replayable
     workflow = created.json()
     confirmed = await client.post(
         f"/content-research/briefs/{workflow['brief_id']}/confirm",
-        json={"confirmed_subject": "徒步短裤", "subject_type": "category", "selected_competitors": ["迪卡侬"], "custom_competitors": [], "selected_directions": ALL_DIRECTIONS, "custom_research_question": "请给出下一步建议"},
+        json={"confirmed_subject": "徒步短裤", "subject_type": "category", "selected_competitors": ["迪卡侬"], "custom_competitors": [], "selected_directions": ["product_marketing"], "custom_research_question": "请给出下一步建议"},
     )
     assert confirmed.status_code == 200, confirmed.text
 
@@ -167,7 +188,7 @@ async def test_formal_workflow_public_api_e2e_is_packet_only_safe_and_replayable
         json={"action": "start_formal_research", "payload": {"provider": "xiaohongshu", "source_kind": "search_result", "limit": 20}},
     )
     assert action.status_code == 200, action.text
-    assert action.json()["status"] == "queued"
+    assert action.json()["status"] in {"queued", "running"}
     report_messages = []
     for _ in range(100):
         summary = (await client.get(f"/content-research/workflows/{workflow['workflow_run_id']}")).json()
@@ -181,13 +202,19 @@ async def test_formal_workflow_public_api_e2e_is_packet_only_safe_and_replayable
     assert len(report_messages) == 1
     await thread_store.close()
 
-    assert {item["direction_id"] for item in summary["subagent_tasks"]} == set(ALL_DIRECTIONS)
+    assert {item["direction_id"] for item in summary["subagent_tasks"]} == {
+        "product_marketing"
+    }
     assert {item["status"] for item in summary["subagent_tasks"]} <= {"completed", "partial_completed"}
 
     report = await client.get(f"/content-research/workflows/{workflow['workflow_run_id']}/lite-report")
     assert report.status_code == 200, report.text
     report_payload = report.json()
-    assert report_payload["publication"]["state"] in {"partial_verified_report", "evidence_only_report"}
+    assert report_payload["publication"]["state"] in {
+        "complete_verified_report",
+        "partial_verified_report",
+        "evidence_only_report",
+    }
     assert all(
         ref["quote"] and ref["field_path"] and ref["source_text_hash"] and ref["source_url"]
         for group in report_payload["citations"] for ref in group["evidence_refs"]
@@ -209,7 +236,7 @@ async def test_formal_workflow_public_api_e2e_is_packet_only_safe_and_replayable
         f"/content-research/workflows/{workflow['workflow_run_id']}/actions",
         json={"action": "retry_formal_research", "payload": {"provider": "xiaohongshu", "source_kind": "search_result", "limit": 20}},
     )
-    assert replay.status_code == 200, replay.text
+    assert replay.status_code == 422, replay.text
     assert adapter.calls == calls_before_replay
     rerun = (await client.get(f"/content-research/workflows/{workflow['workflow_run_id']}/lite-report")).json()
     assert rerun["citations"] == report_payload["citations"]
@@ -253,11 +280,43 @@ async def test_auth_required_retry_requeues_the_same_run_once_and_publishes_once
         await asyncio.sleep(0.01)
     else:
         pytest.fail("auth_required was not recorded as a recoverable formal task")
-    assert "auth_required" in (await client.get(f"/content-research/workflows/{workflow['workflow_run_id']}/trace")).text
+    for _ in range(100):
+        trace_after_failure = (
+            await client.get(f"/content-research/workflows/{workflow['workflow_run_id']}/trace")
+        ).json()
+        if trace_after_failure["run_status"] == "waiting_user":
+            break
+        await asyncio.sleep(0.01)
+    else:
+        pytest.fail("recoverable formal failure did not settle the parent run for user recovery")
+    assert trace_after_failure["run_status"] == "waiting_user"
+    assert next(
+        step for step in trace_after_failure["runtime_steps"]
+        if step["step_name"] == "formal_research"
+    )["status"] == "retrying"
+    assert "auth_required" in str(trace_after_failure)
     failed_messages = await thread_store.get_thread_messages(creator_thread["id"])
     assert not [item for item in failed_messages if item["message_type"] == "artifact_result"]
 
+    calls_before_unauthenticated_retry = list(adapter.calls)
+    unauthenticated_retry = await client.post(
+        f"/content-research/workflows/{workflow['workflow_run_id']}/actions",
+        json={
+            "action": "retry_formal_research",
+            "payload": {"provider": "xiaohongshu", "limit": 20},
+        },
+    )
+    assert unauthenticated_retry.status_code == 422
+    assert adapter.calls == calls_before_unauthenticated_retry
+    trace_before_authentication = (
+        await client.get(
+            f"/content-research/workflows/{workflow['workflow_run_id']}/trace"
+        )
+    ).json()
+    assert trace_before_authentication["runtime_child_tasks"][0]["attempt_count"] == 0
+
     adapter.discover_failure_reason = None
+    adapter.authenticated = True
     retry = await client.post(
         f"/content-research/workflows/{workflow['workflow_run_id']}/actions",
         json={"action": "retry_formal_research", "payload": {"provider": "xiaohongshu", "limit": 20}},
@@ -275,9 +334,229 @@ async def test_auth_required_retry_requeues_the_same_run_once_and_publishes_once
     else:
         pytest.fail("same-run auth retry did not publish")
     assert len(reports) == 1
+    recovered_trace = (
+        await client.get(
+            f"/content-research/workflows/{workflow['workflow_run_id']}/trace"
+        )
+    ).json()
+    recovered_child = recovered_trace["runtime_child_tasks"][0]
+    assert recovered_child["retry_counters"] == {
+        "specialist_user_recovery": {"used": 1, "limit": 2},
+        "workflow_child_attempt": {"used": 2, "limit": 3},
+    }
     report = await client.get(f"/content-research/workflows/{workflow['workflow_run_id']}/lite-report")
     assert report.status_code == 200, report.text
     assert report.json()["citations"]
+    await thread_store.close()
+
+
+@pytest.mark.asyncio
+async def test_third_same_run_recovery_is_rejected_without_replaying_provider(formal_client):
+    client, adapter, db_path = formal_client
+    adapter.discover_failure_reason = "transient_error"
+    thread_store = ThreadStore(db_path)
+    await thread_store.connect()
+    creator_thread = await thread_store.create_thread(title="recovery budget")
+    created = await client.post(
+        "/content-research/presearch",
+        json={"seed_text": "徒步短裤", "thread_id": creator_thread["id"]},
+    )
+    workflow = created.json()
+    confirmed = await client.post(
+        f"/content-research/briefs/{workflow['brief_id']}/confirm",
+        json={
+            "confirmed_subject": "徒步短裤",
+            "subject_type": "category",
+            "selected_competitors": [],
+            "custom_competitors": [],
+            "selected_directions": ["product_marketing"],
+            "custom_research_question": "",
+        },
+    )
+    assert confirmed.status_code == 200, confirmed.text
+    started = await client.post(
+        f"/content-research/workflows/{workflow['workflow_run_id']}/actions",
+        json={
+            "action": "start_formal_research",
+            "payload": {"provider": "xiaohongshu", "limit": 20},
+        },
+    )
+    assert started.status_code == 200, started.text
+
+    async def wait_for_recovery_count(expected: int) -> dict:
+        for _ in range(150):
+            trace = (
+                await client.get(
+                    f"/content-research/workflows/{workflow['workflow_run_id']}/trace"
+                )
+            ).json()
+            if (
+                trace["run_status"] == "waiting_user"
+                and trace["runtime_child_tasks"][0]["attempt_count"] == expected
+            ):
+                return trace
+            await asyncio.sleep(0.01)
+        pytest.fail(
+            f"workflow did not settle after recovery {expected}: "
+            f"status={trace.get('run_status')} child={trace.get('runtime_child_tasks')} "
+            f"operations={trace.get('provider_operations')}"
+        )
+
+    await wait_for_recovery_count(0)
+    for expected in (1, 2):
+        retry = await client.post(
+            f"/content-research/workflows/{workflow['workflow_run_id']}/actions",
+            json={
+                "action": "retry_formal_research",
+                "payload": {"provider": "xiaohongshu", "limit": 20},
+            },
+        )
+        assert retry.status_code == 200, retry.text
+        await wait_for_recovery_count(expected)
+
+    provider_calls_before_rejection = list(adapter.calls)
+    rejected = await client.post(
+        f"/content-research/workflows/{workflow['workflow_run_id']}/actions",
+        json={
+            "action": "retry_formal_research",
+            "payload": {"provider": "xiaohongshu", "limit": 20},
+        },
+    )
+
+    assert rejected.status_code == 422
+    assert "recovery budget is exhausted" in rejected.text
+    await asyncio.sleep(0.05)
+    assert adapter.calls == provider_calls_before_rejection
+    exhausted_trace = await wait_for_recovery_count(2)
+    assert exhausted_trace["runtime_child_tasks"][0]["retry_counters"] == {
+        "specialist_user_recovery": {"used": 2, "limit": 2},
+        "workflow_child_attempt": {"used": 3, "limit": 3},
+    }
+    await thread_store.close()
+
+
+@pytest.mark.asyncio
+async def test_detail_recovery_replays_failed_detail_without_repeating_discovery(formal_client):
+    client, adapter, db_path = formal_client
+    adapter.detail_failure_reason = "transient_error"
+    thread_store = ThreadStore(db_path)
+    await thread_store.connect()
+    creator_thread = await thread_store.create_thread(title="detail recovery")
+    created = await client.post(
+        "/content-research/presearch",
+        json={"seed_text": "徒步短裤", "thread_id": creator_thread["id"]},
+    )
+    workflow = created.json()
+    confirmed = await client.post(
+        f"/content-research/briefs/{workflow['brief_id']}/confirm",
+        json={
+            "confirmed_subject": "徒步短裤",
+            "subject_type": "category",
+            "selected_competitors": [],
+            "custom_competitors": [],
+            "selected_directions": ["product_marketing"],
+            "custom_research_question": "",
+        },
+    )
+    assert confirmed.status_code == 200, confirmed.text
+    await client.post(
+        f"/content-research/workflows/{workflow['workflow_run_id']}/actions",
+        json={
+            "action": "start_formal_research",
+            "payload": {"provider": "xiaohongshu", "limit": 20},
+        },
+    )
+    for _ in range(150):
+        trace = (
+            await client.get(
+                f"/content-research/workflows/{workflow['workflow_run_id']}/trace"
+            )
+        ).json()
+        if trace["run_status"] == "waiting_user":
+            break
+        await asyncio.sleep(0.01)
+    else:
+        pytest.fail("detail failure did not reach recovery boundary")
+
+    discovery_calls_before_retry = adapter.calls.count(
+        ("discover", "product_marketing")
+    )
+    assert discovery_calls_before_retry > 0
+    assert adapter.calls.count(("detail", "product_marketing")) == 1
+    adapter.detail_failure_reason = None
+    retried = await client.post(
+        f"/content-research/workflows/{workflow['workflow_run_id']}/actions",
+        json={
+            "action": "retry_formal_research",
+            "payload": {"provider": "xiaohongshu", "limit": 20},
+        },
+    )
+    assert retried.status_code == 200, retried.text
+    for _ in range(150):
+        report = await client.get(
+            f"/content-research/workflows/{workflow['workflow_run_id']}/lite-report"
+        )
+        if report.status_code == 200:
+            break
+        await asyncio.sleep(0.01)
+    else:
+        pytest.fail("detail recovery did not publish")
+
+    assert (
+        adapter.calls.count(("discover", "product_marketing"))
+        == discovery_calls_before_retry
+    )
+    assert adapter.calls.count(("detail", "product_marketing")) == 4
+    await thread_store.close()
+
+
+@pytest.mark.asyncio
+async def test_permanent_detail_failure_fails_run_without_publishing_report(formal_client):
+    client, adapter, db_path = formal_client
+    adapter.detail_failure_reason = "provider_permanent_error"
+    thread_store = ThreadStore(db_path)
+    await thread_store.connect()
+    creator_thread = await thread_store.create_thread(title="permanent failure")
+    created = await client.post(
+        "/content-research/presearch",
+        json={"seed_text": "徒步短裤", "thread_id": creator_thread["id"]},
+    )
+    workflow = created.json()
+    confirmed = await client.post(
+        f"/content-research/briefs/{workflow['brief_id']}/confirm",
+        json={
+            "confirmed_subject": "徒步短裤",
+            "subject_type": "category",
+            "selected_competitors": [],
+            "custom_competitors": [],
+            "selected_directions": ["product_marketing"],
+            "custom_research_question": "",
+        },
+    )
+    assert confirmed.status_code == 200, confirmed.text
+    await client.post(
+        f"/content-research/workflows/{workflow['workflow_run_id']}/actions",
+        json={
+            "action": "start_formal_research",
+            "payload": {"provider": "xiaohongshu", "limit": 20},
+        },
+    )
+    for _ in range(150):
+        trace = (
+            await client.get(
+                f"/content-research/workflows/{workflow['workflow_run_id']}/trace"
+            )
+        ).json()
+        if trace["run_status"] == "failed":
+            break
+        await asyncio.sleep(0.01)
+    else:
+        pytest.fail("permanent provider failure did not fail the workflow")
+
+    report = await client.get(
+        f"/content-research/workflows/{workflow['workflow_run_id']}/lite-report"
+    )
+    assert report.status_code == 404
     await thread_store.close()
 
 
@@ -329,13 +608,19 @@ async def test_single_direction_workflow_publishes_a_cited_report_with_frozen_sc
     assert payload["frozen_scope"] == {
         "direction_set_version": "formal_v1",
         "direction_ids": ["product_marketing"],
+        "report_compose_mode": "template_only",
     }
-    assert payload["run_direction_states"] == [{
+    direction_states = {item["direction"]: item for item in payload["run_direction_states"]}
+    assert direction_states["product_marketing"] == {
         "direction": "product_marketing",
         "state": "formal_directional_result",
         "reason_code": None,
         "recovery_action": None,
-    }]
+    }
+    assert {
+        direction for direction, state in direction_states.items()
+        if state["state"] == "not_requested"
+    } == {"competitor_discovery", "content_performance"}
     assert payload["citations"]
 
 
@@ -370,7 +655,7 @@ async def test_formal_action_returns_while_slow_collection_keeps_trace_readable(
         ),
         timeout=0.05,
     )
-    assert action.json()["status"] == "queued"
+    assert action.json()["status"] in {"queued", "running"}
     trace = await asyncio.wait_for(
         client.get(f"/content-research/workflows/{workflow_run_id}/trace"), timeout=0.05
     )

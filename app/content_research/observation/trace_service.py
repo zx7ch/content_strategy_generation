@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -45,7 +46,6 @@ class ContentResearchTraceService:
             workflow_events = await workflow_store.list_events(workflow_run_id)
 
         async with LLMUsageTracker(self._db_path, read_only=True) as usage_tracker:
-            usage_summary = await usage_tracker.summarize_job(workflow_run_id)
             usage_steps = await usage_tracker.summarize_job_steps(workflow_run_id)
             usage_events = await usage_tracker.list_job_events(workflow_run_id)
 
@@ -168,18 +168,56 @@ def _safe_runtime_step_dict(step: Any) -> dict:
 
 
 def _safe_runtime_child_task_dict(task: Any) -> dict:
-    return _select_safe_fields(_json_dict(task), {
+    value = _json_dict(task)
+    safe = _select_safe_fields(value, {
         "child_task_id", "step_id", "task_type", "status", "attempt_count",
         "max_attempts", "started_at", "completed_at", "error_code",
     })
+    recovery_count = max(int(value.get("attempt_count") or 0), 0)
+    max_attempts = max(int(value.get("max_attempts") or 3), 1)
+    safe["retry_counters"] = {
+        "specialist_user_recovery": {
+            "used": recovery_count,
+            "limit": max(max_attempts - 1, 0),
+        },
+        "workflow_child_attempt": {
+            "used": min(recovery_count + 1, max_attempts),
+            "limit": max_attempts,
+        },
+    }
+    return safe
 
 
 def _safe_provider_operation_dict(operation: dict) -> dict:
-    return _select_safe_fields(operation, {
-        "operation_fingerprint", "operation", "provider", "provider_operation",
+    safe = _select_safe_fields(operation, {
+        "operation_id", "operation_fingerprint", "operation", "provider", "provider_operation",
         "source_kind", "result_status", "status", "started_at", "finished_at",
-        "failure_code", "retryable",
+        "failure_code", "retryable", "candidate_dispositions",
     })
+    if not safe.get("candidate_dispositions"):
+        safe.pop("candidate_dispositions", None)
+    retry_count = operation.get("automatic_retry_count")
+    retry_limit = operation.get("automatic_retry_limit")
+    if (
+        isinstance(retry_count, int)
+        and retry_count >= 0
+        and isinstance(retry_limit, int)
+        and retry_limit >= 0
+    ):
+        safe["retry_counters"] = {
+            "provider_automatic": {"used": retry_count, "limit": retry_limit}
+        }
+    return safe
+
+
+def _safe_candidate_dispositions(value: Any) -> dict[str, int]:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        key: int(value[key])
+        for key in ("invalid_candidate", "eligible")
+        if isinstance(value.get(key), int) and value[key] >= 0
+    }
 
 
 def _select_safe_fields(value: dict, allowed: set[str]) -> dict:
@@ -225,13 +263,15 @@ def _provider_operations(store: SQLiteContentResearchStore, workflow_run_id: str
         item for item in store.list_typed_records(StageCheckpointRecord)
         if item.workflow_run_id == workflow_run_id and item.stage_name == "operation"
     ]
-    latest: dict[str, Any] = {}
+    latest: dict[tuple[str, str], Any] = {}
     for record in sorted(records, key=lambda item: (item.created_at, item.id)):
         fingerprint = str(record.payload.get("operation_fingerprint") or "")
         if fingerprint:
-            latest[fingerprint] = record
+            latest[(record.subagent_task_id, fingerprint)] = record
     return [
         {
+            "operation_id": "op_"
+            + hashlib.sha256(f"{task_id}:{fingerprint}".encode()).hexdigest()[:24],
             "operation_fingerprint": fingerprint,
             "operation": record.payload.get("operation"),
             "provider": (record.payload.get("completion") or {}).get("provider"),
@@ -248,8 +288,17 @@ def _provider_operations(store: SQLiteContentResearchStore, workflow_run_id: str
             "failure_reason": (record.payload.get("completion") or {}).get("failure_reason"),
             "retryable": bool((record.payload.get("completion") or {}).get("retryable")),
             "recovery_action": (record.payload.get("completion") or {}).get("recovery_action"),
+            "candidate_dispositions": _safe_candidate_dispositions(
+                (record.payload.get("completion") or {}).get("candidate_dispositions")
+            ),
+            "automatic_retry_count": (record.payload.get("completion") or {}).get(
+                "automatic_retry_count"
+            ),
+            "automatic_retry_limit": (record.payload.get("completion") or {}).get(
+                "automatic_retry_limit"
+            ),
         }
-        for fingerprint, record in sorted(latest.items())
+        for (task_id, fingerprint), record in sorted(latest.items())
     ]
 
 

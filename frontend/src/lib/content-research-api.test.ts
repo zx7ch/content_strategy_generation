@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  ContentResearchApiError,
   startContentResearchFormalResearch,
   confirmContentResearchBrief,
   createContentResearchPresearch,
@@ -9,10 +10,29 @@ import {
   getContentResearchDecisions,
   getContentResearchLiteReport,
   getContentResearchWorkflow,
+  retryContentResearchFormalResearch,
   resumeContentResearchFormalResearch,
   submitContentResearchBrandDecision,
   submitContentResearchContentDecision,
+  isContentResearchReportPending,
 } from "./content-research-api.ts";
+
+test("report publication gaps remain pending instead of becoming permanent failures", () => {
+  assert.equal(
+    isContentResearchReportPending(
+      new ContentResearchApiError("published report artifact is missing", 404)
+    ),
+    true
+  );
+  assert.equal(
+    isContentResearchReportPending(new ContentResearchApiError("published report not found", 404)),
+    true
+  );
+  assert.equal(
+    isContentResearchReportPending(new ContentResearchApiError("database unavailable", 500)),
+    false
+  );
+});
 
 test("createContentResearchPresearch posts seed to real P0 endpoint", async () => {
   let requestUrl = "";
@@ -120,6 +140,30 @@ test("formal research dispatch preserves failed specialist state", async () => {
 
   assert.equal(result.status, "failed");
   assert.equal(result.failed_tasks[0].error, "auth_required");
+});
+
+test("retry formal research invokes the same-run requeue action", async () => {
+  let requestBody = "";
+  globalThis.fetch = (async (_input, init) => {
+    requestBody = String(init?.body ?? "");
+    return jsonResponse({
+      schema_version: "content_research_workflow_action_response_v1",
+      workflow_run_id: "run_1",
+      action: "retry_formal_research",
+      status: "queued",
+      result: {
+        workflow_run_id: "run_1", provider: "xiaohongshu", source_kind: "search_result",
+        status: "queued", task_count: 2, completed_task_count: 1,
+        partial_completed_task_count: 0, failed_tasks: [], limit_per_specialist: 20,
+      },
+      execution_mode: "local", remote_run_id: null, local_cache_id: "rb_1", sync_status: "local_only",
+    });
+  }) as typeof fetch;
+
+  const result = await retryContentResearchFormalResearch("run_1", { limit: 20 });
+
+  assert.match(requestBody, /"action":"retry_formal_research"/);
+  assert.equal(result.workflow_run_id, "run_1");
 });
 
 test("getContentResearchLiteReport fetches the Lite report contract", async () => {

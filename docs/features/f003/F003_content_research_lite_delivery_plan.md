@@ -93,7 +93,7 @@ Lite 可舍弃的是：七方向统一覆盖、跨方向治理呈现、复杂版
 | QueryGroup 来源谱系 | `QueryGroup`、candidate manifest、`DirectionSourceProjection` | 每个 packet 保留其全部 frozen query/rank hits；多 query 命中不得缩成一个；comment packet 继承父 note 的完整 hit lineage | 仅保留最后一个 `query_group_id`；以 provider 返回顺序替代冻结 hit | 多 group 命中的 note/comment 可完整回放；伪造或非冻结 group 被拒绝 |
 | 相关性双层门槛 | `DirectionContract` + direction strategy + admission | source 必须有 frozen QueryGroup 命中；candidate 的直接允许字段引文必须命中冻结 subject/category anchor 或冻结同义词；`query_subject_not_supported` 是共享、稳定 reason code | 完整 query 字面匹配；前端／Lite-local 判断；仅凭 provider rank、URL、标题或 metrics 放行 | 不相关高指标材料拒绝；相关标题型 `message_angle` 保留；缺 relevance fail-closed |
 | 方向字段与 claim 类型 | direction strategy / shared quote-field policy | 允许 claim type、其直接字段与 card kind 由共享 policy/strategy 一处定义，并随 run policy version 冻结；`product_marketing.message_angle` 可由标题或正文支撑，其他产品营销类型遵循正式字段限制 | Lite reader 自建 allow-list；`accepted` 等 Lite-local admission 状态；标题自动升级为 finding | 每个 Lite 方向/claim type 的 allowed/disallowed field 参数化测试；卡片类型跨进程／跨版本稳定 |
-| stable author identity 与样本计数 | candidate manifest、`SamplePolicy`；正式计划 §4.4 | `author_id` 优先于 display author，且从 selection 到 packet、admission、comment 去重全程保留；分别记录 selected、relevance-qualified、eligible、independent-author 计数 | packet 丢弃 `author_id`；用显示名替代稳定身份；用不相关或 blocking-ineligible 来源凑样本门槛 | author-id-only、同名不同 ID、同 ID 改名、2 relevant + 1 unrelated、2 eligible + 1 缺字段等对抗组合 |
+| provider-real author identity 与样本计数 | candidate manifest、`SamplePolicy`；正式计划 §4.4 | 优先使用 `id:<author_id>`；Spider 未返回 ID 时使用 `name:<normalized author>` 作为保守 fallback，同名合并且不得写回／伪装成 `author_id`；两者都缺失才 author-ineligible。分别记录 selected、relevance-qualified、eligible、independent-author 计数与 identity kind | 强制要求 Spider 不提供的 `author_id`；把显示名复制到 `author_id`；把同名重复来源计成多人；用不相关或 blocking-ineligible 来源凑样本门槛 | author-id-only、author-name-only、规范化同名折叠、ID 优先于名称、两者均缺失、2 relevant + 1 unrelated、2 eligible + 1 缺字段等对抗组合 |
 | eligibility 与 admission 重放 | `ClaimAdmissionDecision`、`StageCheckpoint`、admission fingerprint | 样本门槛只由相关且 field/time/author eligible 的来源计算；admission fingerprint 包含 policy/relevance/algorithm 版本；只消费当前 run + 当前 policy 的 decision | 命中旧 checkpoint 直接跳过新 admission；旧 policy admitted decision 进入新 snapshot | 改 policy/relevance/version 后重新 admission；旧 admitted decision 无法形成新 governed card |
 | Fact、claim、citation 身份 | `ClaimCandidate`、`GovernedResearchSnapshot`、`citation_groups`；CL-06 | 每张 Lite finding/observation 必有 current admitted decision、frozen scope、claim type、quote/span/hash、canonical source/安全 URL 与一一匹配的 citation group/admission identity | 仅按 claim ID 关联 citation；缺 span/hash/source identity 时静默展示；前端重编号／重组 | citation collision、foreign ref、混合 URL/source、缺 span/hash 均不发布完整报告；编号和顺序稳定 |
 | 单笔记 citation 交互 | shared `navigation_state`；Lite §4.2.2 | 每个 Lite citation group 对应一篇小红书 canonical note；组内 refs 共享 source identity/URL；available 时 `[n] 查看原笔记` 一步直达，drawer 仅审计 quote/范围/时间 | 多笔记任取首个 URL；以 drawer 作为外链中转；用 `navigation_unavailable` 掩盖未实现 | available/missing/unavailable 三态；组内 identity/URL 不一致拒绝完整报告 |
@@ -317,6 +317,44 @@ Lite 的证据字段只允许 `content_text` 与 `title`（投影过滤）。评
 
 - 原子引入 `direction_catalog_v1 + requested_direction_ids`、`not_requested` 共享状态、用户非空多选 Brief、冻结 scope/read model/API schema 与后端 capability 投影；空选择被拒绝。
 - Creator 接入 `/lite-report`，并恢复只读安全 `/trace` 的正式 Trace Panel、认证恢复与同 run resume UI；citation drawer 通过 `/lite-report` 按需读取冻结 citation detail。继续删除 `/report`、`/results`、`/evidence-bundles` 与其所有消费者、旧 Creator report/二次深研/聚合建议 UI、EvidenceBundle service/store/schema/table/测试。Trace/retry UI 不再删除，但不得读取旧报告、EvidenceBundle、未冻结来源或 raw provider payload。
+
+#### Task 5G — Lite-safe formal Trace parity
+
+恢复正式 Trace Panel 的完整交互与可观察性：自动刷新、实时耗时、明确的 `running` / `waiting_retry` / `failed` / `completed` 状态、真实 retry/requeue、事件时间线、checkpoint 摘要、Provider 诊断和报告关联。Lite 仍只消费脱敏安全投影；不得返回原始采集内容、Cookie、Token、provider 原始请求/响应，也不得恢复 legacy `/report`、`/results` 或 EvidenceBundle 路径。后端的 durable state 为 `waiting_user`，前端将其渲染为 `waiting_retry`（“等待恢复”）；可恢复 specialist 失败必须先由父状态机收敛到该状态，不能继续伪装为 `running`。
+
+##### Task 5G-1 — Fresh state and basic elapsed-time compatibility（已完成）
+
+- 已完成 Trace 打开即刷新、非终态每三秒轮询、无时区 SQLite 时间按 UTC 解析，以及进入 `waiting_user` 后停止继续累加等待时间。
+- 当前耗时仍是基于旧事件边界的兼容估算，不代表真实 queue / active execution / backoff / waiting 分段；真实时间语义由 Task 5G-2B 接替，不能将 5G-1 描述为完整耗时修复。
+
+##### Task 5G-2A — Shared collection correctness（P0，实现与真实验收完成）
+
+- Lite 继续使用共享正式采集内核；不得在 Creator 增加 Lite-only 采集特判。详情调用前必须过滤非法 ID、URL fragment 和非笔记搜索卡；`invalid_candidate` / `note_unavailable` 是候选级结果，在冻结 `detail_fetch_cap=30` 内补位，只有最终证据门槛无法满足时才决定 direction 的 partial/unavailable/recovery 状态。
+- Provider 错误必须稳定分类；`笔记不存在` 映射为不可重试的 `note_unavailable`，`transient_error` 只表示真实临时传输故障。登录恢复只由 `auth_required` / `auth_expired` 触发，本 Task 不增加独立登录状态入口。
+- 当前冻结采样值保持不变：每 QueryGroup `candidate_cap=20`、`minimum_samples=3`、`minimum_independent_authors=2`、`author_cap=3`、`detail_fetch_cap=30`、`comment_limit=30`。预校验过滤不消耗详情调用额度，已经发出的详情请求消耗额度，补位不得突破冻结上限。
+- 重试语义必须分层并被实际计数：provider operation 最多 3 次自动重试，specialist 最多 2 次用户恢复，workflow child 最多 3 次执行（首次 + 2 次恢复）；非法候选、笔记不存在、parser/permanent failure 不重试，认证成功后才允许 auth failure 消耗一次用户恢复。
+- 本阶段只修改共享正式采集内核和安全错误投影，不增加 Lite-only 采集分支，也不改变 Trace 当前倒序展示。
+- 交付状态：
+  - `5G-2A.1` 候选预校验与稳定错误分类已完成：非法 ID、URL/ID 不一致、fragment、缺少详情安全参数和非 note 卡片在共享 Xiaohongshu source boundary 被拒绝；`笔记不存在` 为不可重试的 `note_unavailable`，未知永久错误不再降级成 `transient_error`。
+  - `5G-2A.2` 候选失败隔离与冻结预算内补位已完成并由 Pipeline 集成测试覆盖；候选级失败不产生 run-level 登录/网络恢复动作。
+  - `5G-2A.3` 分层重试计数已完成：单次 provider operation 为首次调用加最多 3 次自动重试；同一 run 的 specialist 最多 2 次用户恢复，workflow child 最多执行 3 次。三类计数均由真实执行边界消费并通过安全 Trace 分别投影；第三次用户恢复会在 provider 调用前拒绝。
+  - 恢复重放的稳定 checkpoint ID 现可从 `superseded` 原位更新为新执行事实，避免新一轮 Provider 失败被静默丢弃后误判成功。空队列 dispatcher 轮询不再获取 SQLite 写锁；E2E 使用与生产一致的提交后唤醒边界。
+  - Provider 级认证、访问拒绝、解析和永久错误会立即停止该方向后续外部调用，并按真实 blocking failure 收敛 direction/run；候选级失败仍隔离补位，已被足量证据补偿的临时失败不会误生成 run-level 恢复卡。
+  - 恢复不再只重启 workflow 元数据：discover/detail/comment 会按失败阶段真实重放，并保留已成功的 sibling evidence；认证恢复必须先通过服务端认证就绪门禁。workflow step 重启与 child attempt 增量在同一 manager 事务内完成，并发的同 run 恢复请求由互斥锁串行化。
+  - Trace 的 provider operation 以 `specialist + fingerprint` 区分并输出脱敏 operation ID，避免不同专家的相同调用互相覆盖；永久失败不会伪装成 partial/success 或可恢复中断，已发布/成功 run 的重试仍在 provider 调用前拒绝。
+  - 验收范围仍是共享正式采集内核下的 Lite 三方向目录；没有新增 Lite-only 数据源分支，也没有重新放开旧七方向合同。Task 5G-2B 的真实 queue / active / backoff / waiting 时间分段仍独立待做。
+- 2026-08-03 真实验收记录：
+  - 新 run `run_04a898dc71634c3fa7f49ddff3bc6a65` 经 Creator 正式路径发起 `product_marketing`，小红书安全 Trace 记录 2 次 discovery + 30 次 detail，共 32/32 completed，认证错误、自动重试和用户恢复均为 0；当前 Cookie 有效且 Spider 接口有返回。
+  - 初次 `evidence_only_report` 的根因是准入合同与 Spider 真实字段不一致：Spider 稳定返回作者名称，pipeline 却额外硬要求 `author_id`，使 15 个相关来源全部 author-ineligible。合同现改为 `id:<author_id>` 优先，否则使用 `name:<normalized author>` 保守计数；同名折叠、不伪造 `author_id`，两者均缺失才不可准入。
+  - 已对同一 run 执行 packet-only downstream replay：复用原 30 个 packet，重放 admission → direction result → governance → snapshot → audit → publication；重放前后 64 个 Provider operation checkpoint ID 差异为 0、packet ID 差异为 0，确认未再次调用 Spider。最新 admission checkpoint 为 15 relevant / 15 eligible / 15 independent authors，产生 24 admitted claim；报告 `rpp_43e3b0ad60ae91d91f759dbd` 为 `complete_verified_report`、24 个 citation，方向为 `formal_directional_result`，Creator 仍只有 1 条该 run 的 `artifact_result`。
+  - `published report artifact is missing` 现按 publication-pending 处理：Content Research API error 保留 HTTP status，404／artifact-missing 不再终止轮询或写入永久对话错误；报告可见后同一 run 原位显示最新 publication。
+  - 该 run 暴露了旧 `cheap_fast` 预检索路由的 Kimi Coding 会员权益 402。预检索现已切换到既有 `balanced` OpenAI 路由；最小真实调用确认 provider=`openai`、model=`gpt-4o-mini` 且返回非空。当前 persisted packets 已完成 admitted-evidence 验收，无需再次采集。
+
+##### Task 5G-2B — Recorded Trace timing semantics（P0，待开始）
+
+- Trace 保持当前倒序时间线：最近/当前阶段在最上面，最早阶段在最下面，阶段编号仍表示原始 workflow 顺序。
+- 在共享 workflow runtime 记录真实 queue、active execution、retry/backoff 和 waiting 边界；Lite `/trace` 只做安全投影。等待时间不得继续累加为执行耗时，历史秒级记录必须标记为 `estimated`。
+- 完整设计与验收矩阵见 `docs/superpowers/specs/2026-08-02-f003-lite-trace-collection-correctness-design.md`。
 - `F003_LITE_PREVIEW_ENABLED` 是唯一的整体验收隔离开关：默认 off；off 时 Creator 不显示入口且后端拒绝创建/确认新 Lite run；它不得控制单一方向。Gate 4B 发布时移除。
 - Gate 2 的已验证 workflow、run、checkpoint、canonical source、冻结 citation group、trace 和验收产物保留。删除 EvidenceBundle 表前，必须证明这些留存证据不依赖旧模型，并用迁移前后回归保护。
 - API/schema 覆盖全部 7 种非空选择组合和空选择拒绝；浏览器覆盖单选、双选、全选。真实采集复用 `product_marketing`；`partial`、`evidence_only`、恢复卡与 citation 跳转三态使用后端受控真实状态，浏览器不得 mock API payload。

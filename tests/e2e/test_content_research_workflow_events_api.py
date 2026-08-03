@@ -71,7 +71,7 @@ async def test_workflow_summary_and_events_expose_runtime_state(client):
             "subject_type": "brand",
             "selected_competitors": ["District Vision"],
             "custom_competitors": ["Salomon"],
-            "selected_directions": ["product_marketing", "brand_activity"],
+            "selected_directions": ["product_marketing", "content_performance"],
             "custom_research_question": "关注跑步社群活动",
         },
     )

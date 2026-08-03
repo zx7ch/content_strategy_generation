@@ -158,6 +158,7 @@ async def test_confirm_brief_creates_plan_directions_tasks_and_workflow_summary(
         "product_marketing",
         "competitor_discovery",
     ]
+    assert snapshot_payload["effective_policy"]["report_compose_mode"] == "template_only"
     assert len(snapshot_payload["direction_contracts"]) == 2
     assert len(snapshot_payload["sample_policies"]) == 2
     assert snapshot_payload["validation_result"]["schema_version"] == "content_research_admission_capability_preflight_v1"

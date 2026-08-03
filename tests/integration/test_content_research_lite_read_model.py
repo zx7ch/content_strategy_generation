@@ -152,6 +152,8 @@ async def test_lite_reader_projects_each_formal_publication_without_writing(
         assert first == second
         assert first["publication"]["state"] == publication_state
         assert expected_status_strip in first["status_strip"]
+        if publication_state != "evidence_only_report":
+            assert first["status_strip"]["completed_direction_count"] == 1
         assert [
             item["navigation_state"]
             for item in first["citations"][0]["evidence_refs"]
@@ -611,7 +613,7 @@ async def test_lite_reader_retains_only_weak_signals_with_matching_frozen_identi
         }
     ]
     assert report["status_strip"] == {
-        "completed_direction_count": 0,
+        "completed_direction_count": 2,
         "admitted_finding_count": 3,
         "observation_count": 0,
         "lead_count": 1,

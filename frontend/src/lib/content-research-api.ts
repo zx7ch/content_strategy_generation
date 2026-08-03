@@ -2,6 +2,24 @@ import { RUNTIME_BASE_URL } from "./api.ts";
 
 type JsonObject = Record<string, unknown>;
 
+export class ContentResearchApiError extends Error {
+  readonly status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = "ContentResearchApiError";
+    this.status = status;
+  }
+}
+
+export function isContentResearchReportPending(error: unknown): boolean {
+  return error instanceof Error
+    && (
+      (error instanceof ContentResearchApiError && error.status === 404)
+      || /published report artifact is missing|published report not found|\b404\b/i.test(error.message)
+    );
+}
+
 export interface ContentResearchPresearchRequest {
   seed_text: string;
   user_note?: string | null;
@@ -139,7 +157,7 @@ export interface ContentResearchFormalResearchResponse {
 
 export interface ContentResearchWorkflowActionRequest {
   schema_version?: string;
-  action: "confirm_brief" | "start_formal_research" | "resume_formal_research" | "end_content_research";
+  action: "confirm_brief" | "start_formal_research" | "retry_formal_research" | "resume_formal_research" | "end_content_research";
   payload?: JsonObject;
 }
 
@@ -329,6 +347,17 @@ export async function startContentResearchFormalResearch(
   return response.result;
 }
 
+export async function retryContentResearchFormalResearch(
+  workflowRunId: string,
+  payload: ContentResearchSourceCollectionRequest
+): Promise<ContentResearchFormalResearchResponse> {
+  const response = await runContentResearchWorkflowAction<ContentResearchFormalResearchResponse>(workflowRunId, {
+    action: "retry_formal_research",
+    payload: payload as unknown as JsonObject,
+  });
+  return response.result;
+}
+
 export async function resumeContentResearchFormalResearch(
   workflowRunId: string
 ): Promise<ContentResearchWorkflowActionResponse<{
@@ -387,7 +416,10 @@ async function contentResearchFetch<T>(
     cache: "no-store",
   });
   if (!response.ok) {
-    throw new Error(await contentResearchErrorText(response, `${options?.method ?? "GET"} ${path} failed`));
+    throw new ContentResearchApiError(
+      await contentResearchErrorText(response, `${options?.method ?? "GET"} ${path} failed`),
+      response.status
+    );
   }
   return response.json() as Promise<T>;
 }

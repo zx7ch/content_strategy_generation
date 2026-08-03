@@ -118,6 +118,45 @@ async def test_child_task_transition_rejects_illegal_state(seeded_manager):
 
 
 @pytest.mark.asyncio
+async def test_child_task_allows_only_two_recoveries_with_three_total_attempts(
+    seeded_manager,
+):
+    manager, run, step = seeded_manager
+    child = (
+        await manager.create_child_tasks(
+            run_id=run.run_id,
+            step_id=step.step_id,
+            tasks=[
+                {
+                    "task_type": "content_research.product_marketing",
+                    "slot_index": 0,
+                    "max_attempts": 3,
+                }
+            ],
+        )
+    )[0]
+
+    await manager.start_child_task(child.child_task_id)
+    await manager.fail_child_task(child.child_task_id, "first attempt failed")
+    first_recovery = await manager.retry_child_task(
+        child.child_task_id, "first user recovery"
+    )
+    await manager.start_child_task(child.child_task_id)
+    await manager.fail_child_task(child.child_task_id, "second attempt failed")
+    second_recovery = await manager.retry_child_task(
+        child.child_task_id, "second user recovery"
+    )
+    await manager.start_child_task(child.child_task_id)
+    await manager.fail_child_task(child.child_task_id, "third attempt failed")
+
+    with pytest.raises(WorkflowTransitionError, match="attempt budget exhausted"):
+        await manager.retry_child_task(child.child_task_id, "third user recovery")
+
+    assert first_recovery.attempt_count == 1
+    assert second_recovery.attempt_count == 2
+
+
+@pytest.mark.asyncio
 async def test_child_task_retry_event_failure_rolls_back_state(seeded_manager, monkeypatch):
     manager, run, step = seeded_manager
     child = (

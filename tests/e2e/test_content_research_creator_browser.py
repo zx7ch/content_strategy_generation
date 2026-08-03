@@ -83,6 +83,7 @@ def real_creator_stack(tmp_path, request):
     frontend_env = {
         **os.environ,
         "F003_LITE_PREVIEW_ENABLED": preview_value,
+        "NEXT_DIST_DIR": f".next/e2e-{frontend_port}",
         "NEXT_PUBLIC_XHS_API_BASE_URL": backend_url,
         "XHS_API_BASE_URL": backend_url,
         "NEXT_TELEMETRY_DISABLED": "1",
@@ -345,7 +346,13 @@ def test_creator_trace_prioritizes_auth_required_child_and_resumes_once_after_qr
     expect(sidebar.get_by_text("专家调研进行中", exact=True)).to_have_count(0)
     full_trace = sidebar.get_by_label("查看完整 workflow trace")
     expect(full_trace).to_be_visible()
-    full_trace.click()
+    with page.expect_response(
+        lambda response: response.url.endswith(
+            f"/content-research/workflows/{seeded['run_id']}/trace"
+        ) and response.request.method == "GET",
+        timeout=15000,
+    ):
+        full_trace.click()
 
     trace = page.locator('section[aria-label="Content Research Trace"]')
     expect(trace).to_be_visible()
@@ -630,7 +637,7 @@ def test_creator_evidence_only_report_shows_saved_evidence_and_reason_only(
         report.get_by_text("insufficient_admitted_evidence", exact=True)
     ).to_be_visible()
     expect(report.get_by_role("heading", name="已保存依据", exact=True)).to_be_visible()
-    report.get_by_role("button", name="打开引用 7").first.click()
+    report.get_by_role("button", name="证据详情").first.click()
     expect(
         report.locator('aside[aria-label="Content Research citation evidence"]').get_by_text(
             "可打开来源",
@@ -1226,6 +1233,7 @@ async def save_publication(
     base = governed_snapshot()
     governed = base.metadata["governed_snapshot"]
     citation_group = governed["citation_groups"][0]
+    include_admitted_cards = publication_state != "partial_verified_report"
     snapshot = replace(
         base,
         id=f"snapshot_{run_id}",
@@ -1248,7 +1256,7 @@ async def save_publication(
                         "admission_decision_id": governed["claim_cards"][0]["admission_decision_id"],
                         "evidence_refs": evidence_refs,
                     }
-                ],
+                ] if include_admitted_cards else [],
                 "claim_cards": [
                     {
                         **card,
@@ -1256,7 +1264,7 @@ async def save_publication(
                         "scope": {"sample": "selected_packets"},
                     }
                     for card in governed["claim_cards"]
-                ],
+                ] if include_admitted_cards else [],
                 "direction_results": [
                     {
                         "direction_id": direction_id,

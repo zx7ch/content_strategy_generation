@@ -441,6 +441,69 @@ class WorkflowRunManager:
 
         return await self._transaction(op)
 
+    async def wait_for_user_recovery(
+        self,
+        run_id: str,
+        *,
+        step_name: str,
+        reason: str | dict[str, Any],
+    ) -> WorkflowRun:
+        """Stop a recoverable step at a durable, user-resumable boundary.
+
+        A provider failure is not a successful completion and must not leave
+        the parent run marked ``running`` after its worker returns.  The step
+        becomes retryable while the run records that progress now depends on a
+        user action (for example, retrying after a transient provider error).
+        """
+
+        async def op() -> WorkflowRun:
+            assert self._conn is not None
+            run = await self._fetch_run_row(run_id)
+            if run["status"] != WorkflowRunStatus.RUNNING.value:
+                raise WorkflowTransitionError(
+                    f"wait_for_user_recovery requires running run, got {run['status']}"
+                )
+            step = await self._fetch_step_row(run_id, step_name)
+            if step["status"] != WorkflowStepStatus.RUNNING.value:
+                raise WorkflowTransitionError(
+                    f"wait_for_user_recovery not allowed from {step['status']}"
+                )
+            code, message = self._normalize_error(reason)
+            await self._conn.execute(
+                """
+                UPDATE workflow_steps
+                SET status='retrying', attempt_count=attempt_count + 1,
+                    next_retry_at=NULL, active_job_id=NULL,
+                    error_code=?, error_message=?, updated_at=CURRENT_TIMESTAMP
+                WHERE step_id=?
+                """,
+                (code, message, step["step_id"]),
+            )
+            await self._conn.execute(
+                """
+                UPDATE workflow_runs
+                SET status='waiting_user', active_job_id=NULL, updated_at=CURRENT_TIMESTAMP
+                WHERE run_id=?
+                """,
+                (run_id,),
+            )
+            await self._append_event(
+                run_id=run_id,
+                thread_id=run["thread_id"],
+                step_id=step["step_id"],
+                event_type="run_waiting_user",
+                event_level="warning",
+                payload={
+                    "step_name": step_name,
+                    "reason_code": code,
+                    "reason_message": message,
+                    "recovery_required": True,
+                },
+            )
+            return self._run(await self._fetch_run_row(run_id))
+
+        return await self._transaction(op)
+
     async def cancel_run(self, run_id: str, reason: str = "user_cancelled") -> WorkflowRun:
         async def op() -> WorkflowRun:
             assert self._conn is not None
@@ -1116,6 +1179,12 @@ class WorkflowRunManager:
                 raise WorkflowTransitionError(
                     f"retry_child_task not allowed from {child['status']}"
                 )
+            if int(child["attempt_count"]) >= max(int(child["max_attempts"]) - 1, 0):
+                raise WorkflowTransitionError(
+                    "retry_child_task attempt budget exhausted: "
+                    f"{child['attempt_count']} recoveries for "
+                    f"{child['max_attempts']} total attempts"
+                )
             code, message = self._normalize_error(error)
             await self._conn.execute(
                 """
@@ -1140,6 +1209,35 @@ class WorkflowRunManager:
                 },
             )
             return self._child_task(await self._fetch_child_task_row(child_task_id))
+
+        return await self._transaction(op)
+
+    async def restart_step_and_retry_children(
+        self,
+        run_id: str,
+        *,
+        step_name: str,
+        child_task_ids: list[str],
+        resume_parent: bool = True,
+    ) -> tuple[WorkflowRun | None, list[WorkflowChildTask]]:
+        """Atomically resume a retryable step and consume its child budgets."""
+
+        async def op() -> tuple[WorkflowRun | None, list[WorkflowChildTask]]:
+            run = None
+            if resume_parent:
+                run = await self.resume_run(run_id)
+                await self.start_step(run_id, step_name)
+            children = [
+                await self.retry_child_task(
+                    child_task_id,
+                    {
+                        "code": "user_recovery",
+                        "message": "User requested same-run specialist recovery.",
+                    },
+                )
+                for child_task_id in child_task_ids
+            ]
+            return run, children
 
         return await self._transaction(op)
 

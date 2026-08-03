@@ -188,6 +188,7 @@ class TestSearchWithRetry:
                 result = await client.search_with_retry("query")
                 
                 # Should retry 3 times total
+                assert len(result) == 1
                 assert call_count == 3
                 # Should sleep twice (not on last attempt)
                 assert mock_sleep.call_count == 2
@@ -217,17 +218,18 @@ class TestSearchWithRetry:
 
     @pytest.mark.asyncio
     async def test_max_retries_exceeded(self, client):
-        """Test error raised when max retries exceeded."""
+        """Exhausted automatic retries remain recoverable by the workflow."""
         with patch.object(client, 'search', side_effect=SpiderTransientError("always fails")):
             with patch('asyncio.sleep', new_callable=AsyncMock):
-                with pytest.raises(SpiderPermanentError) as exc_info:
+                with pytest.raises(SpiderTransientError) as exc_info:
                     await client.search_with_retry("query")
                 
                 assert "failed after 3 retries" in str(exc_info.value)
+                assert exc_info.value.retry_count == 3
 
     @pytest.mark.asyncio
-    async def test_retry_backoff_sequence_matches_3_plus_2_spec(self):
-        """Spec requires 3 auto + 2 user retries -> 5 retries with 2/4/8/16/32 backoff."""
+    async def test_provider_call_uses_only_automatic_retry_budget(self):
+        """User recoveries must not be consumed inside one provider call."""
         with patch("app.services.xhs_spider.settings") as mock_settings:
             mock_settings.XHS_SPIDER_COOKIES = "cookie"
             mock_settings.XHS_SPIDER_MAX_AUTO_RETRIES = 3
@@ -238,13 +240,31 @@ class TestSearchWithRetry:
 
         with patch.object(client, "search", side_effect=SpiderTransientError("timeout")):
             with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
-                with pytest.raises(SpiderPermanentError) as exc_info:
+                with pytest.raises(SpiderTransientError) as exc_info:
                     await client.search_with_retry("query")
 
-                assert "after 5 retries" in str(exc_info.value)
-                assert client.search.call_count == 6  # initial + 5 retries
+                assert "after 3 retries" in str(exc_info.value)
+                assert client.search.call_count == 4  # initial + 3 automatic retries
                 waits = [call.args[0] for call in mock_sleep.call_args_list]
-                assert waits == [2, 4, 8, 16, 32]
+                assert waits == [2, 4, 8]
+
+    @pytest.mark.asyncio
+    async def test_search_result_reports_actual_automatic_retry_count(self, client):
+        attempts = 0
+
+        async def search(*_args, **_kwargs):
+            nonlocal attempts
+            attempts += 1
+            if attempts < 3:
+                raise SpiderTransientError("timeout")
+            return True, "", [MagicMock()]
+
+        with patch.object(client, "search", side_effect=search):
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                posts, retry_count = await client.search_with_retry_result("query")
+
+        assert len(posts) == 1
+        assert retry_count == 2
 
     @pytest.mark.asyncio
     async def test_search_with_retry_passes_sort_parameter(self, client):

@@ -42,6 +42,25 @@ ADMISSION_REASON_CODES = (
     "query_subject_not_supported",
 )
 
+AUTHOR_IDENTITY_SCHEMA_VERSION = "provider_author_identity_v1"
+
+
+def admission_author_identity(projection: Mapping[str, Any]) -> str | None:
+    """Return a conservative provider-real identity for sample independence."""
+    author_id = str(projection.get("author_id") or "").strip()
+    if author_id:
+        return f"id:{author_id}"
+    author_name = unicodedata.normalize(
+        "NFKC", str(projection.get("author") or "")
+    ).casefold()
+    normalized_name = " ".join(author_name.split())
+    return f"name:{normalized_name}" if normalized_name else None
+
+
+def admission_author_identity_kind(projection: Mapping[str, Any]) -> str | None:
+    identity = admission_author_identity(projection)
+    return identity.split(":", 1)[0] if identity else None
+
 
 _DIRECTION_CONTRACT_SPECS: dict[str, dict[str, Any]] = {
     "product_marketing": {
@@ -510,6 +529,11 @@ def build_default_snapshot(
             metadata={
                 "contract_role": "admission",
                 "field_vocabulary": "content_research_normalized_fields_v1",
+                "author_identity": {
+                    "schema_version": AUTHOR_IDENTITY_SCHEMA_VERSION,
+                    "priority": ["author_id", "normalized_author_name"],
+                    "same_name_policy": "collapse",
+                },
                 **(
                     {"query_relevance": relevance_by_direction[item.id]}
                     if relevance_by_direction

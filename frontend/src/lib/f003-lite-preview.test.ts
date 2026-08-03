@@ -35,6 +35,23 @@ test("Next exposes an explicitly enabled canonical F003 preview flag", async () 
   }
 });
 
+test("Next honors an isolated build directory for browser test processes", async () => {
+  const original = process.env.NEXT_DIST_DIR;
+  process.env.NEXT_DIST_DIR = ".next-test-f003";
+  try {
+    const { default: config } = await import(
+      `../../next.config.mjs?f003-dist-dir-${Date.now()}`
+    );
+    assert.equal(config.distDir, ".next-test-f003");
+  } finally {
+    if (original === undefined) {
+      delete process.env.NEXT_DIST_DIR;
+    } else {
+      process.env.NEXT_DIST_DIR = original;
+    }
+  }
+});
+
 for (const enabledValue of ["TRUE", "1", "yes", "on"]) {
   test(`Next normalizes backend-supported ${enabledValue} to an enabled client flag`, async () => {
     const original = process.env.F003_LITE_PREVIEW_ENABLED;

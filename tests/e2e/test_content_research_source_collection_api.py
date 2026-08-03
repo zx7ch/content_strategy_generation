@@ -136,7 +136,7 @@ async def test_source_collection_api_returns_payload_and_records_observation(cli
     assert "source_collection_started" in event_names
     assert "source_collection_completed" in event_names
     started = next(event for event in trace_response.json()["observation_events"] if event["event_name"] == "source_collection_started")
-    assert started["payload"]["limit"] == 5
+    assert "payload" not in started
     assert trace_response.json()["external_api_summary"] == {
         "call_count": 1,
         "completed_count": 1,
@@ -179,6 +179,13 @@ async def test_source_collection_api_auth_failure_is_observable(client_factory):
     events = trace_response.json()["observation_events"]
     failed = [event for event in events if event["event_name"] == "source_collection_failed"]
     assert failed
-    assert failed[0]["payload"]["source_collection"]["failure_reason"] == "auth_required"
+    assert "payload" not in failed[0]
     started = next(event for event in events if event["event_name"] == "source_collection_started")
-    assert started["payload"]["limit"] == 50
+    assert "payload" not in started
+    assert trace_response.json()["external_api_summary"] == {
+        "call_count": 1,
+        "completed_count": 0,
+        "failed_count": 1,
+        "by_provider": {"xiaohongshu": 1},
+        "by_operation": {"discover_candidates": 1},
+    }

@@ -31,6 +31,7 @@ class CapturingRuntime:
     def __init__(self) -> None:
         self.completed: list[dict] = []
         self.events: list[dict] = []
+        self.failed: list[dict] = []
 
     async def get_runtime_snapshot(self, _workflow_run_id: str) -> dict:
         return {"run_status": "running"}
@@ -41,6 +42,10 @@ class CapturingRuntime:
 
     async def append_event(self, **kwargs) -> None:
         self.events.append(kwargs)
+
+    async def fail_formal_research(self, **kwargs) -> dict:
+        self.failed.append(kwargs)
+        return {"status": "failed", "recoverable": False}
 
 
 @pytest.mark.asyncio

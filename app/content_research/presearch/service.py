@@ -120,7 +120,7 @@ class PresearchService:
                 LLMRequest(
                     messages=build_presearch_messages(request.seed_text, request.user_note),
                     task_type="content_research.presearch",
-                    model_policy="cheap_fast",
+                    model_policy="balanced",
                     temperature=1.0,
                     max_tokens=700,
                     context=LLMCallContext(

@@ -98,6 +98,7 @@ async def test_presearch_success_creates_workflow_brief_trace_and_observation(st
     assert response.competitor_tags == ["迪卡侬", "凯乐石"]
     assert service._presearch._llm.requests[0].response_format is None
     assert service._presearch._llm.requests[0].temperature == 1.0
+    assert service._presearch._llm.requests[0].model_policy == "balanced"
     system_prompt = service._presearch._llm.requests[0].messages[0].content
     assert "只输出一个合法 JSON 对象" in system_prompt
     assert "不要输出 Markdown" in system_prompt

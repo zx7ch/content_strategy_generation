@@ -19,12 +19,16 @@ from app.content_research.admission.evaluator import (
 )
 from app.content_research.admission.registry import DEFAULT_ADMISSION_STRATEGIES
 from app.content_research.admission.relevance import query_relevance_reason
-from app.content_research.admission.results import build_direction_result
+from app.content_research.admission.results import (
+    DIRECTION_RESULT_ALGORITHM_VERSION,
+    build_direction_result,
+)
 from app.content_research.async_pipeline_store import AsyncDirectionalPersistenceSession
 from app.content_research.contracts import (
     DirectionContract,
     RunPolicySnapshot,
     SamplePolicy,
+    admission_author_identity,
     frozen_query_relevance,
 )
 from app.content_research.persistence_models import (
@@ -98,6 +102,7 @@ class DirectionEvidenceRun:
     replayed_collect: bool
     replayed_selection: bool
     replayed_packet: bool
+    blocking_failure_code: str | None = None
 
 
 def compile_query_groups(
@@ -504,6 +509,11 @@ class DirectionalExecutionPipeline:
                 else:
                     self._complete_operation(subagent_task_id, "detail", operation_fingerprint)
                 await self._flush()
+                if (
+                    isinstance(detail_result, SourceOperationResult)
+                    and _is_provider_wide_failure(detail_result)
+                ):
+                    break
                 if selection.status == "complete":
                     break
             selection = select_candidates(groups=groups, candidates=list(candidate_by_id.values()), author_cap=author_cap, minimum_samples=minimum_samples, minimum_independent_authors=minimum_independent_authors, detail_fetch_cap=detail_fetch_cap, require_detail=True, run_as_of_at=run_as_of_at)
@@ -561,7 +571,82 @@ class DirectionalExecutionPipeline:
             admission_packet_ids = (*packet_ids, *comment_packet_ids)
             self._run_admission(subagent_task_id, direction_id, selection, admission_packet_ids, admission_contract, admission_policy, policy_snapshot)
         await self._flush()
-        return DirectionEvidenceRun(selection, packet_ids, comment_packet_ids, replayed_collect, replayed_selection, replayed_packet)
+        return DirectionEvidenceRun(
+            selection,
+            packet_ids,
+            comment_packet_ids,
+            replayed_collect,
+            replayed_selection,
+            replayed_packet,
+            self._blocking_operation_failure(subagent_task_id, selection.status),
+        )
+
+    def replay_admission_from_persisted_packets(
+        self,
+        *,
+        workflow_run_id: str,
+        subagent_task_id: str,
+        direction_id: str,
+        contract: DirectionContract,
+        policy: SamplePolicy,
+        snapshot: RunPolicySnapshot,
+    ) -> tuple[str, ...]:
+        """Replay admission only; this boundary has no provider-call capability."""
+        checkpoints = [
+            item
+            for item in self._store.list_typed_records(StageCheckpointRecord)
+            if item.workflow_run_id == workflow_run_id
+            and item.subagent_task_id == subagent_task_id
+            and item.status == "completed"
+        ]
+        packet_checkpoint = next(
+            (item for item in reversed(checkpoints) if item.stage_name == "packet"),
+            None,
+        )
+        selection_checkpoint = next(
+            (
+                item
+                for item in reversed(checkpoints)
+                if item.stage_name == "detail" and item.payload.get("selection")
+            ),
+            None,
+        ) or next(
+            (
+                item
+                for item in reversed(checkpoints)
+                if item.stage_name == "selection" and item.payload.get("selection")
+            ),
+            None,
+        )
+        if packet_checkpoint is None or selection_checkpoint is None:
+            raise ValueError(
+                "packet-only admission replay requires completed selection and packet checkpoints"
+            )
+        if str(packet_checkpoint.payload.get("direction_id") or "") != direction_id:
+            raise ValueError("packet checkpoint direction does not match replay direction")
+        comment_checkpoint = next(
+            (item for item in reversed(checkpoints) if item.stage_name == "comments"),
+            None,
+        )
+        packet_ids = tuple(packet_checkpoint.payload.get("packet_ids") or ())
+        comment_packet_ids = tuple(
+            comment_checkpoint.payload.get("packet_ids") or ()
+        ) if comment_checkpoint else ()
+        if not packet_ids and not comment_packet_ids:
+            raise ValueError("packet-only admission replay requires persisted packets")
+        selection = _selection_from_payload(selection_checkpoint.payload["selection"])
+        self._workflow_run_id = workflow_run_id
+        self._checkpoint_started_at = {}
+        self._run_admission(
+            subagent_task_id,
+            direction_id,
+            selection,
+            (*packet_ids, *comment_packet_ids),
+            contract,
+            policy,
+            snapshot,
+        )
+        return packet_ids
 
     def _run_admission(self, task_id: str, direction_id: str, selection: DirectionSelection, packet_ids: tuple[str, ...], contract: DirectionContract, policy: SamplePolicy, snapshot: RunPolicySnapshot) -> None:
         relevance_contract = frozen_query_relevance(contract, snapshot)
@@ -620,9 +705,14 @@ class DirectionalExecutionPipeline:
             )
         ]
         sample_authors = {
-            str(packet.payload.get("field_projection", {}).get("author_id") or "")
+            identity
             for packet in eligible_packets
-        } - {""}
+            if (
+                identity := admission_author_identity(
+                    packet.payload.get("field_projection", {})
+                )
+            )
+        }
         selected_source_count = (
             len(candidate_packets)
             if comment_packets
@@ -670,6 +760,7 @@ class DirectionalExecutionPipeline:
                 else None
             ),
             "admission_algorithm_version": ALGORITHM_VERSION,
+            "direction_result_algorithm_version": DIRECTION_RESULT_ALGORITHM_VERSION,
         }
         fingerprint = canonical_fingerprint(checkpoint_identity)
         if self._checkpoint(task_id, "admission", fingerprint):
@@ -715,6 +806,7 @@ class DirectionalExecutionPipeline:
                 "policy_snapshot_hash": snapshot.effective_policy_hash,
                 "relevance_contract": relevance_contract,
                 "algorithm_version": ALGORITHM_VERSION,
+                "direction_result_algorithm_version": DIRECTION_RESULT_ALGORITHM_VERSION,
                 "sample_policy": checkpoint_identity["sample_policy"],
                 "computed_metrics": checkpoint_identity["metrics"],
                 "admission_packet_identities": checkpoint_identity[
@@ -733,7 +825,10 @@ class DirectionalExecutionPipeline:
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         candidates: list[dict[str, Any]] = []
         summaries: list[dict[str, Any]] = []
+        stop_provider_calls = False
         for group in groups:
+            if stop_provider_calls:
+                break
             pages = self._page_records(subagent_task_id, "collect_page", plan_hash, group.id)
             group_candidates = [item for page in pages for item in page.payload["items"]]
             latest = pages[-1] if pages else None
@@ -821,6 +916,9 @@ class DirectionalExecutionPipeline:
                 )
                 await self._flush()
                 cursor = result.next_cursor
+                if _is_provider_wide_failure(result):
+                    stop_provider_calls = True
+                    break
             candidates.extend(group_candidates)
             final_pages = self._page_records(subagent_task_id, "collect_page", plan_hash, group.id)
             final_page = final_pages[-1] if final_pages else None
@@ -870,7 +968,10 @@ class DirectionalExecutionPipeline:
             for item in items
         } - {""}
         stopped_by_direction_cap = False
+        stop_provider_calls = False
         for decision in selection.decisions:
+            if stop_provider_calls:
+                break
             if len(collected_comment_ids) >= comment_limit:
                 stopped_by_direction_cap = True
                 break
@@ -957,6 +1058,9 @@ class DirectionalExecutionPipeline:
                 )
                 await self._flush()
                 cursor = result.next_cursor
+                if _is_provider_wide_failure(result):
+                    stop_provider_calls = True
+                    break
             if len(collected_comment_ids) >= comment_limit and cursor:
                 stopped_by_direction_cap = True
                 break
@@ -1016,6 +1120,37 @@ class DirectionalExecutionPipeline:
             "packet_ids": packet_ids,
             "parents": parent_results,
         }
+
+    def _blocking_operation_failure(
+        self, task_id: str, selection_status: str
+    ) -> str | None:
+        failures = [
+            str((item.payload.get("completion") or {}).get("failure_code") or "")
+            for item in self._store.list_typed_records(StageCheckpointRecord)
+            if item.workflow_run_id == self._workflow_run_id
+            and item.subagent_task_id == task_id
+            and item.stage_name == "operation"
+            and item.status != "superseded"
+            and (item.payload.get("completion") or {}).get("failure_code")
+        ]
+        terminal_codes = {
+            "parser_error",
+            "provider_access_rejected",
+            "provider_permanent_error",
+        }
+        for code in failures:
+            if code in terminal_codes or code in {"auth_required", "auth_expired"}:
+                return code
+        if selection_status != "complete":
+            for code in failures:
+                if code in {
+                    "timeout",
+                    "transient_error",
+                    "rate_limited",
+                    "unavailable",
+                }:
+                    return code
+        return None
 
     def _persist_packets(self, direction_id: str, selection: DirectionSelection, candidate_by_id: Mapping[str, dict[str, Any]]) -> list[str]:
         packet_ids: list[str] = []
@@ -1272,7 +1407,8 @@ class DirectionalExecutionPipeline:
         completion: Mapping[str, Any] | None = None,
     ) -> None:
         record_id = _operation_checkpoint_id(self._workflow_run_id, task_id, operation_fingerprint, status)
-        if self._store.get_typed_record(StageCheckpointRecord, record_id) is not None:
+        existing = self._store.get_typed_record(StageCheckpointRecord, record_id)
+        if existing is not None and existing.status != "superseded":
             return
         payload: dict[str, Any] = {
             "workflow_run_id": self._workflow_run_id,
@@ -1353,6 +1489,16 @@ def _operation_terminal_status(failure_code: str | None) -> str:
     return "failed"
 
 
+def _is_provider_wide_failure(result: SourceOperationResult) -> bool:
+    if result.status in {"completed", "partial_completed", "empty"}:
+        return False
+    return result.failure_reason not in {
+        "invalid_candidate",
+        "note_unavailable",
+        "empty_result",
+    }
+
+
 def _recovery_action(failure_code: str | None, retryable: bool) -> str | None:
     if failure_code == "auth_required":
         return "更新小红书登录态后继续。"
@@ -1377,7 +1523,7 @@ def _safe_operation_request(request: Mapping[str, Any]) -> dict[str, Any]:
 
 def _safe_operation_outcome(result: SourceOperationResult) -> dict[str, Any]:
     """Persist the small provider outcome needed for diagnosis, never payloads."""
-    return {
+    outcome = {
         "provider": result.provider,
         "provider_operation": result.operation,
         "source_kind": result.source_kind,
@@ -1387,6 +1533,20 @@ def _safe_operation_outcome(result: SourceOperationResult) -> dict[str, Any]:
         "cookie_status": result.cookie_status,
         "has_next_cursor": bool(result.next_cursor),
     }
+    dispositions = result.metadata.get("candidate_dispositions")
+    if isinstance(dispositions, Mapping):
+        outcome["candidate_dispositions"] = {
+            key: int(dispositions[key])
+            for key in ("invalid_candidate", "eligible")
+            if isinstance(dispositions.get(key), int) and dispositions[key] >= 0
+        }
+    automatic_retry_count = result.metadata.get("automatic_retry_count")
+    automatic_retry_limit = result.metadata.get("automatic_retry_limit")
+    if isinstance(automatic_retry_count, int) and automatic_retry_count >= 0:
+        outcome["automatic_retry_count"] = automatic_retry_count
+    if isinstance(automatic_retry_limit, int) and automatic_retry_limit >= 0:
+        outcome["automatic_retry_limit"] = automatic_retry_limit
+    return outcome
 
 
 def _safe_operation_value(value: Any) -> Any:
@@ -1453,8 +1613,7 @@ def _packet_is_admission_eligible(
     snapshot: RunPolicySnapshot,
 ) -> bool:
     projection = dict(packet.payload.get("field_projection") or {})
-    author_id = str(projection.get("author_id") or "")
-    if not author_id:
+    if admission_author_identity(projection) is None:
         return False
     source_kind = packet.payload.get("retrieval_context", {}).get("source_kind")
     required_fields = (

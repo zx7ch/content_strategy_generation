@@ -12,7 +12,11 @@ from typing import TypeVar
 
 import aiosqlite
 
-from app.content_research.persistence_models import CanonicalSourceRecord, TypedPersistenceRecord
+from app.content_research.persistence_models import (
+    CanonicalSourceRecord,
+    StageCheckpointRecord,
+    TypedPersistenceRecord,
+)
 from app.content_research.stores.sqlite_store import (
     _TYPED_RECORD_TABLES,
     _dumps,
@@ -98,9 +102,19 @@ class AsyncDirectionalPersistenceSession:
 
     def _save(self, record: T) -> T:
         bucket = self._records[type(record)]
-        if record.id not in bucket:
-            bucket[record.id] = record
-            self._pending.append(record)
+        existing = bucket.get(record.id)
+        if existing == record:
+            return record
+        if existing is not None and not (
+            isinstance(existing, StageCheckpointRecord)
+            and isinstance(record, StageCheckpointRecord)
+            and existing.status == "superseded"
+        ):
+            # Governed evidence facts are immutable. Stable-ID replacement is
+            # reserved for a checkpoint explicitly retired for same-run replay.
+            return existing  # type: ignore[return-value]
+        bucket[record.id] = record
+        self._pending.append(record)
         return record
 
     async def flush(self) -> None:
@@ -118,8 +132,22 @@ class AsyncDirectionalPersistenceSession:
                         for field, value in zip(fields, values, strict=True)
                     ]
                     columns = ("id", "schema_version", *fields, "payload_json", "metadata_json", "created_at")
-                    await conn.execute(
-                        f"INSERT OR IGNORE INTO {table} ({', '.join(columns)}) VALUES ({', '.join('?' for _ in columns)})",
+                    if isinstance(record, StageCheckpointRecord):
+                        updates = ", ".join(
+                            f"{column}=excluded.{column}"
+                            for column in columns
+                            if column != "id"
+                        )
+                        conflict_clause = (
+                            f"DO UPDATE SET {updates} "
+                            f"WHERE {table}.status='superseded'"
+                        )
+                    else:
+                        conflict_clause = "DO NOTHING"
+                    result = await conn.execute(
+                        f"INSERT INTO {table} ({', '.join(columns)}) "
+                        f"VALUES ({', '.join('?' for _ in columns)}) "
+                        f"ON CONFLICT(id) {conflict_clause}",
                         (
                             record.id,
                             record.schema_version,
@@ -129,6 +157,10 @@ class AsyncDirectionalPersistenceSession:
                             _fmt_dt(record.created_at),
                         ),
                     )
+                    if result.rowcount != 1:
+                        raise RuntimeError(
+                            f"immutable persistence conflict for {table}:{record.id}"
+                        )
                 await conn.commit()
             except Exception:
                 await conn.rollback()

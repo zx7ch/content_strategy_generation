@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from app.content_research.service import WorkflowRunManagerRuntime
 from app.memory.thread_store import ThreadStore
 from app.memory.workflow_store import WorkflowStore
 from app.models.workflow import WorkflowConstraintType, WorkflowRunStatus
@@ -108,6 +109,82 @@ async def test_repeated_pause_does_not_duplicate_event(manager):
     assert second.status == WorkflowRunStatus.PAUSING
     event_types = await _event_types(manager.db_path, run.run_id)
     assert event_types.count("run_pause_requested") == 1
+
+
+@pytest.mark.asyncio
+async def test_recoverable_specialist_failure_waits_for_user_and_resumes(manager):
+    run = await manager.start_run(thread_id="thread-recovery", user_id="user-1")
+    step = (await manager.initialize_steps(
+        run.run_id,
+        [{"step_name": "formal_research", "phase": "retrieval", "max_attempts": 1}],
+    ))[0]
+    await manager.start_step(run.run_id, step.step_name)
+
+    waiting = await manager.wait_for_user_recovery(
+        run.run_id,
+        step_name="formal_research",
+        reason={"code": "transient_error", "message": "provider detail call failed"},
+    )
+
+    assert waiting.status == WorkflowRunStatus.WAITING_USER
+    resumed = await manager.resume_run(run.run_id)
+    assert resumed.status == WorkflowRunStatus.RUNNING
+    assert "run_waiting_user" in await _event_types(manager.db_path, run.run_id)
+
+
+@pytest.mark.asyncio
+async def test_formal_recovery_action_consumes_one_child_recovery_attempt(tmp_path):
+    db_path = str(tmp_path / "formal_recovery_attempt.db")
+    async with WorkflowRunManager(db_path) as manager:
+        run = await manager.start_run(thread_id="thread-recovery", user_id="user-1")
+        step = (
+            await manager.initialize_steps(
+                run.run_id,
+                [
+                    {
+                        "step_name": "formal_research",
+                        "phase": "retrieval",
+                        "max_attempts": 3,
+                    }
+                ],
+            )
+        )[0]
+        await manager.start_step(run.run_id, step.step_name)
+        child = (
+            await manager.create_child_tasks(
+                run_id=run.run_id,
+                step_id=step.step_id,
+                tasks=[
+                    {
+                        "task_type": "content_research.product_marketing",
+                        "max_attempts": 3,
+                    }
+                ],
+            )
+        )[0]
+        await manager.start_child_task(child.child_task_id)
+        await manager.fail_child_task(child.child_task_id, "provider failed")
+        await manager.wait_for_user_recovery(
+            run.run_id,
+            step_name="formal_research",
+            reason="provider recovery required",
+        )
+
+    await WorkflowRunManagerRuntime(db_path).restart_formal_research_step(
+        workflow_run_id=run.run_id,
+        child_task_ids=[child.child_task_id],
+    )
+
+    async with WorkflowStore(db_path) as store:
+        recovered_run = await store.get_run(run.run_id)
+        recovered_steps = await store.list_steps(run.run_id)
+        recovered_children = await store.list_child_tasks(run.run_id)
+
+    assert recovered_run is not None
+    assert recovered_run.status == WorkflowRunStatus.RUNNING
+    assert recovered_steps[0].status.value == "running"
+    assert recovered_children[0].status.value == "retrying"
+    assert recovered_children[0].attempt_count == 1
 
 
 @pytest.mark.asyncio

@@ -28,8 +28,10 @@ import {
   endContentResearchWorkflow,
   getContentResearchTrace,
   getCurrentXHSQRLogin,
+  isContentResearchReportPending,
   getContentResearchLiteReport,
   getContentResearchWorkflow,
+  retryContentResearchFormalResearch,
   resumeContentResearchFormalResearch,
   startXHSQRLogin,
   type ContentResearchFormalResearchResponse,
@@ -38,6 +40,7 @@ import {
   type ContentResearchTrace,
   type ContentResearchWorkflowSummary,
 } from "@/lib/content-research-api";
+import { traceExecutionDurationText } from "@/lib/content-research-trace";
 
 type TaskStatus = "running" | "paused" | "failed" | "cancelled" | "completed";
 type MessageRole = "assistant" | "user" | "system";
@@ -93,7 +96,7 @@ function litePublicationState(report: ContentResearchLiteReportResponse): LitePu
 }
 
 function isExpectedLiteReportAbsence(error: unknown) {
-  return error instanceof Error && /not found|404/i.test(error.message);
+  return isContentResearchReportPending(error);
 }
 
 const WELCOME_MESSAGE: ChatMessage = {
@@ -209,6 +212,8 @@ function workflowStatusLabel(status: string) {
   if (["completed", "succeeded", "success"].includes(status)) return "已完成";
   if (["running", "collecting"].includes(status)) return "进行中";
   if (status === "pending") return "等待开始";
+  if (status === "retrying") return "等待恢复";
+  if (status === "waiting_user") return "等待恢复";
   if (status === "failed") return "未完成";
   if (["cancelled", "cancelling"].includes(status)) return "已结束";
   return "等待处理";
@@ -683,6 +688,7 @@ function ContentResearchIntentCard({
   const [extraCompetitors, setExtraCompetitors] = useState(intent.presearch.custom_competitor_input ?? "");
   const [customQuestion, setCustomQuestion] = useState(intent.presearch.custom_research_question ?? "");
   const [isConfirming, setIsConfirming] = useState(false);
+  const confirmationInFlightRef = useRef(false);
 
   function toggleValue(value: string, selected: string[], setSelected: (next: string[]) => void) {
     setSelected(selected.includes(value) ? selected.filter((item) => item !== value) : [...selected, value]);
@@ -693,6 +699,8 @@ function ContentResearchIntentCard({
       onError("请先确认调研主体是否准确。");
       return;
     }
+    if (confirmationInFlightRef.current) return;
+    confirmationInFlightRef.current = true;
     setIsConfirming(true);
     try {
       const summary = await confirmContentResearchBrief(intent.presearch.workflow_run_id, {
@@ -707,6 +715,7 @@ function ContentResearchIntentCard({
     } catch {
       onError("确认调研 brief 失败，请检查 runtime 后重试。");
     } finally {
+      confirmationInFlightRef.current = false;
       setIsConfirming(false);
     }
   }
@@ -1183,15 +1192,8 @@ function traceStepGroup(stepName: string) {
   return "安全执行阶段";
 }
 
-function traceDurationText(step: Record<string, unknown>) {
-  const startedAt = Date.parse(stringField(step, "started_at"));
-  const finishedAt = Date.parse(stringField(step, "completed_at"));
-  return Number.isFinite(startedAt) && Number.isFinite(finishedAt)
-    ? `${Math.max(0, (finishedAt - startedAt) / 1000).toFixed(1)}s`
-    : "耗时未记录";
-}
-
 function contentResearchTraceTimeline(trace: ContentResearchTrace | null): TraceTimelineStep[] {
+  const workflowEvents = recordList(trace?.workflow_events);
   return recordList(trace?.runtime_steps).map((step, index) => {
     const stepName = stringField(step, "step_name", "执行阶段");
     const status = stringField(step, "status", "pending");
@@ -1200,7 +1202,7 @@ function contentResearchTraceTimeline(trace: ContentResearchTrace | null): Trace
       number: index + 1,
       stage: traceStepGroup(stepName),
       title: traceStepTitle(stepName),
-      durationText: traceDurationText(step),
+      durationText: traceExecutionDurationText(step, workflowEvents),
       status: workflowStatusLabel(status),
       output: `状态：${workflowStatusLabel(status)}\n尝试：${numberField(step, "attempt_count")} / ${numberField(step, "max_attempts")}`,
     };
@@ -1212,7 +1214,11 @@ function contentResearchRecoveryState(run: ContentResearchRunState): ContentRese
   const providerFailures = [...(run.trace?.provider_operations ?? [])]
     .reverse()
     .filter((operation) => !["completed", "running", "pending"].includes(operation.status));
-  const providerFailure = providerFailures[0] ?? null;
+  const providerFailure = (
+    !published && run.trace?.run_status !== "succeeded"
+      ? providerFailures[0] ?? null
+      : null
+  );
   const childFailures = [...recordList(run.trace?.runtime_child_tasks)]
     .reverse()
     .filter((task) => stringField(task, "status") === "failed");
@@ -1252,6 +1258,7 @@ function contentResearchContextStatus(run: ContentResearchRunState): string {
   if (run.formalResearchStatus === "failed") return "专家调研启动失败";
   if (run.trace?.run_status === "succeeded") return "专家调研已完成，等待正式报告";
   if (run.trace?.run_status === "paused") return "专家调研已暂停";
+  if (run.trace?.run_status === "waiting_user") return "专家调研等待恢复";
   if (run.formalResearchStatus === "collecting" || run.trace?.run_status === "running") return "专家调研进行中";
   if (run.formalResearchStatus === "completed") return "专家调研已完成，等待正式报告";
   return "等待启动";
@@ -1292,7 +1299,12 @@ function ContentResearchTraceInspector({
   const childTasks = recordList(run.trace?.runtime_child_tasks);
   const terminalPublished = run.report ? litePublicationState(run.report) !== null : false;
   const [expandedStepId, setExpandedStepId] = useState<string | null>(null);
+  const refreshTraceRef = useRef(onRefresh);
   const selectedStep = timeline.find((step) => step.id === expandedStepId) ?? timeline[timeline.length - 1] ?? null;
+
+  useEffect(() => {
+    refreshTraceRef.current = onRefresh;
+  }, [onRefresh]);
 
   useEffect(() => {
     setQrLogin(null);
@@ -1323,6 +1335,14 @@ function ContentResearchTraceInspector({
     window.addEventListener("keydown", closeOnEscape);
     return () => window.removeEventListener("keydown", closeOnEscape);
   }, [expanded, onExpandedChange]);
+
+  useEffect(() => {
+    if (!expanded || terminalPublished) return;
+    const refresh = () => void refreshTraceRef.current().catch(() => undefined);
+    refresh();
+    const timer = window.setInterval(refresh, 3000);
+    return () => window.clearInterval(timer);
+  }, [expanded, run.workflowRunId, terminalPublished]);
 
   if (!expanded) return null;
 
@@ -1968,7 +1988,16 @@ export default function CreatorPage() {
         : current
     );
     try {
-      await resumeContentResearchFormalResearch(workflowRunId);
+      if (contentResearchRun?.trace?.run_status === "waiting_user") {
+        const source = contentResearchRun.summary.plan?.payload ?? {};
+        await retryContentResearchFormalResearch(workflowRunId, {
+          provider: stringField(source, "provider", "xiaohongshu"),
+          source_kind: stringField(source, "source_kind", "search_result"),
+          limit: numberField(source, "limit") || 20,
+        });
+      } else {
+        await resumeContentResearchFormalResearch(workflowRunId);
+      }
       try {
         await refreshContentResearchTrace(workflowRunId);
       } catch {
@@ -2090,7 +2119,9 @@ export default function CreatorPage() {
         const reportResults = reports.filter((value): value is { messageId: string; report: ContentResearchLiteReportResponse } => value !== null && "report" in value);
         const reportByMessageId = new Map(reportResults.map((value) => [value.messageId, value.report]));
         const reportFailures = reports.filter((value): value is { messageId: string; workflowRunId: string; error: string } => value !== null && "error" in value);
-        const visibleFailures = reportFailures.filter((failure) => !/not found|404/i.test(failure.error));
+        const visibleFailures = reportFailures.filter(
+          (failure) => !isContentResearchReportPending(new Error(failure.error))
+        );
         setMessages([
           ...timelineMessages.map((message) => ({ ...message, report: reportByMessageId.get(message.id) })),
           ...visibleFailures.map((failure) => ({ id: `report-error-${failure.messageId}`, role: "system" as const, text: `正式报告暂不可读取：${failure.error}` })),

@@ -55,32 +55,59 @@ async def test_creator_timeline_api_exposes_one_materialized_report_result_and_r
                 **governed["citation_groups"][0],
                 "citation_group_id": "cg_1",
                 "display_index": 1,
+                "admission_decision_id": "cad_1",
+                "evidence_refs": [
+                    {
+                        **governed["citation_groups"][0]["evidence_refs"][0],
+                        "canonical_note_id": "note_1",
+                        "source_url": "https://www.xiaohongshu.com/explore/note_1",
+                    }
+                ],
             },
             {
                 **governed["citation_groups"][0],
                 "citation_group_id": "cg_2",
                 "display_index": 2,
+                "admission_decision_id": "cad_1",
+                "evidence_refs": [
+                    {
+                        **governed["citation_groups"][0]["evidence_refs"][0],
+                        "canonical_note_id": "note_1",
+                        "source_url": "https://www.xiaohongshu.com/explore/note_1",
+                    }
+                ],
             },
         ]
         snapshot = replace(
             _governed_snapshot(),
-                workflow_run_id=run.run_id,
-                metadata={
-                    "governed_snapshot": {
-                        **governed,
-                        "policy_scope": {
-                            **governed["policy_scope"],
-                            "direction_set_version": "direction_set_v1",
-                            "direction_ids": ["product_marketing"],
-                        },
-                        "citation_groups": frozen_citations,
+            workflow_run_id=run.run_id,
+            metadata={
+                "governed_snapshot": {
+                    **governed,
+                    "claim_cards": [
+                        {
+                            **governed["claim_cards"][0],
+                            "claim_type": "use_context",
+                            "scope": {"sample": "selected_packets"},
+                        }
+                    ],
+                    "policy_scope": {
+                        **governed["policy_scope"],
+                        "direction_set_version": "direction_set_v1",
+                        "direction_ids": ["product_marketing"],
+                        "report_compose_mode": "template_only",
                     },
-                    "governed_input_fingerprint": "timeline_frozen_citations",
+                    "citation_groups": frozen_citations,
                 },
-            )
+                "governed_input_fingerprint": "timeline_frozen_citations",
+            },
+        )
         draft = ResearchReportComposer().compose(snapshot)
         decision = replace(_decision(draft), workflow_run_id=run.run_id)
-        publication = replace(_publication(draft, decision), workflow_run_id=run.run_id)
+        publication = replace(
+            _publication(draft, decision, compose_mode="template_only"),
+            workflow_run_id=run.run_id,
+        )
         store.save_result_snapshot(snapshot)
         store.save_report_draft(draft.to_record())
         store.save_report_faithfulness_decision(decision.to_record())

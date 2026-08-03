@@ -99,7 +99,10 @@ from app.content_research.workflow import (
     ResearchPlanBuilder,
     SubagentTaskRouter,
 )
-from app.content_research.workflow.directional_pipeline import compile_query_groups
+from app.content_research.workflow.directional_pipeline import (
+    DirectionalExecutionPipeline,
+    compile_query_groups,
+)
 from app.memory.thread_store import ThreadStore
 from app.memory.workflow_store import WorkflowStore
 from app.models.workflow import WorkflowPhase
@@ -116,6 +119,10 @@ class ContentResearchNotFoundError(ContentResearchError):
 
 class ContentResearchValidationError(ContentResearchError):
     """Raised when a request payload is invalid."""
+
+
+class ContentResearchReportIntegrityError(RuntimeError):
+    """Raised when an existing published report cannot be safely projected."""
 
 
 class WorkflowRuntime(Protocol):
@@ -150,11 +157,27 @@ class WorkflowRuntime(Protocol):
 
     async def resume_content_research_run(self, *, workflow_run_id: str) -> dict: ...
 
+    async def restart_formal_research_step(
+        self,
+        *,
+        workflow_run_id: str,
+        child_task_ids: list[str],
+        resume_parent: bool = True,
+    ) -> dict: ...
+
     async def acknowledge_pause_at_safe_boundary(self, *, workflow_run_id: str) -> dict: ...
 
     async def complete_formal_research(
         self, *, workflow_run_id: str, task_outcomes: list[dict], artifact_refs: list[dict]
     ) -> bool: ...
+
+    async def wait_for_user_recovery(
+        self, *, workflow_run_id: str, reason: dict
+    ) -> dict: ...
+
+    async def fail_formal_research(
+        self, *, workflow_run_id: str, reason: dict
+    ) -> dict: ...
 
 
 class WorkflowRunManagerRuntime:
@@ -272,6 +295,35 @@ class WorkflowRunManagerRuntime:
             await manager.complete_run(workflow_run_id)
         return True
 
+    async def wait_for_user_recovery(
+        self,
+        *,
+        workflow_run_id: str,
+        reason: dict,
+    ) -> dict:
+        async with WorkflowRunManager(self._db_path) as manager:
+            run = await manager.wait_for_user_recovery(
+                workflow_run_id,
+                step_name="formal_research",
+                reason=reason,
+            )
+        return {"workflow_run_id": workflow_run_id, "status": run.status.value, "recoverable": True}
+
+    async def fail_formal_research(
+        self,
+        *,
+        workflow_run_id: str,
+        reason: dict,
+    ) -> dict:
+        async with WorkflowRunManager(self._db_path) as manager:
+            await manager.fail_step(workflow_run_id, "formal_research", reason)
+            run = await manager.fail_run(workflow_run_id, reason)
+        return {
+            "workflow_run_id": workflow_run_id,
+            "status": run.status.value,
+            "recoverable": False,
+        }
+
     async def list_events(self, workflow_run_id: str) -> list[dict]:
         async with WorkflowStore(self._db_path) as store:
             events = await store.list_events(workflow_run_id)
@@ -347,6 +399,31 @@ class WorkflowRunManagerRuntime:
             run = await manager.resume_run(workflow_run_id)
         return {"workflow_run_id": workflow_run_id, "status": run.status.value, "recoverable": True}
 
+    async def restart_formal_research_step(
+        self,
+        *,
+        workflow_run_id: str,
+        child_task_ids: list[str],
+        resume_parent: bool = True,
+    ) -> dict:
+        """Resume a waiting Content Research run and restart its retryable parent step."""
+        async with WorkflowRunManager(self._db_path) as manager:
+            run, recovered_children = await manager.restart_step_and_retry_children(
+                workflow_run_id,
+                step_name="formal_research",
+                child_task_ids=child_task_ids,
+                resume_parent=resume_parent,
+            )
+            run_status = run.status.value if run is not None else "running"
+        return {
+            "workflow_run_id": workflow_run_id,
+            "status": run_status,
+            "recoverable": True,
+            "recovered_child_task_ids": [
+                child.child_task_id for child in recovered_children
+            ],
+        }
+
     async def acknowledge_pause_at_safe_boundary(self, *, workflow_run_id: str) -> dict:
         async with WorkflowRunManager(self._db_path) as manager:
             run = await manager.ack_pause_at_boundary(workflow_run_id, "formal_research")
@@ -382,6 +459,7 @@ class ContentResearchService:
         self._report_execution = ReportExecutionService(store)
         self._dispatch = AsyncFormalResearchDispatchRepository(store._db_path)
         self._dispatch_wake_event = dispatch_wake_event
+        self._recovery_locks: dict[str, asyncio.Lock] = {}
         # A configured analysis LLM also supplies the bounded report reviewer.
         # Without one, publication remains safely non-complete.
         self._report_semantic_auditor = report_semantic_auditor or (
@@ -579,6 +657,9 @@ class ContentResearchService:
             run_as_of_at=run_as_of_at,
             direction_ids=tuple(selected_direction_ids),
             direction_catalog=DIRECTION_CATALOG_V1,
+            # Creator's F003 workflow is the Lite-safe report contract.  Do
+            # not inherit build_default_snapshot's formal-report default.
+            report_compose_mode="template_only",
             provider_capabilities=_freeze_adapter_capabilities(self._source_registry),
             confirmed_subject=confirmation.confirmed_subject,
             custom_research_question=confirmation.custom_research_question,
@@ -922,8 +1003,104 @@ class ContentResearchService:
                 citation_group_ids=citation_group_ids,
             )
         except PublishedReportNotFoundError as exc:
-            raise ContentResearchNotFoundError(str(exc)) from exc
+            message = str(exc)
+            if message in {
+                "published report not found",
+                "published report artifact is missing",
+            } or message.startswith("requested citation groups are absent"):
+                raise ContentResearchNotFoundError(message) from exc
+            raise ContentResearchReportIntegrityError(message) from exc
         return ContentResearchLiteReportResponse(**payload)
+
+    async def replay_downstream_from_persisted_packets(
+        self, workflow_run_id: str
+    ) -> dict[str, Any]:
+        """Replay admission through publication without any collection capability."""
+        brief = self._store.get_brief_by_workflow(workflow_run_id)
+        if brief is None:
+            raise ContentResearchNotFoundError(
+                f"Content research workflow not found: {workflow_run_id}"
+            )
+        snapshot = self._store.get_run_policy_snapshot_for_workflow(workflow_run_id)
+        if snapshot is None:
+            raise ContentResearchValidationError(
+                "Packet-only replay requires the frozen run policy snapshot"
+            )
+        tasks = self._store.list_subagent_tasks_for_workflow(workflow_run_id)
+        if not tasks or any(
+            task.status not in {"completed", "partial_completed"} for task in tasks
+        ):
+            raise ContentResearchValidationError(
+                "Packet-only replay requires terminal successful or partial specialist tasks"
+            )
+        contracts = {
+            item.direction_id: item
+            for item in self._store.list_direction_contracts(snapshot.id)
+        }
+        operation_ids_before = {
+            item.id
+            for item in self._store.list_typed_records(StageCheckpointRecord)
+            if item.workflow_run_id == workflow_run_id
+            and item.stage_name == "operation"
+        }
+        packet_ids_by_direction: dict[str, list[str]] = {}
+        pipeline = DirectionalExecutionPipeline(self._store)
+        for task in tasks:
+            direction_id = str(task.direction_id or "")
+            contract = contracts.get(direction_id)
+            if contract is None:
+                raise ContentResearchValidationError(
+                    f"Direction contract not found for packet-only replay: {direction_id}"
+                )
+            policy = self._store.get_sample_policy(contract.sample_policy_id)
+            if policy is None:
+                raise ContentResearchValidationError(
+                    f"Sample policy not found for packet-only replay: {contract.sample_policy_id}"
+                )
+            packet_ids_by_direction[direction_id] = list(
+                pipeline.replay_admission_from_persisted_packets(
+                    workflow_run_id=workflow_run_id,
+                    subagent_task_id=task.id,
+                    direction_id=direction_id,
+                    contract=contract,
+                    policy=policy,
+                    snapshot=snapshot,
+                )
+            )
+        operation_ids_after_admission = {
+            item.id
+            for item in self._store.list_typed_records(StageCheckpointRecord)
+            if item.workflow_run_id == workflow_run_id
+            and item.stage_name == "operation"
+        }
+        if operation_ids_after_admission != operation_ids_before:
+            raise RuntimeError("packet-only admission replay changed provider operations")
+
+        # All tasks were checked terminal above, so this method's executable-task
+        # set is empty. It runs only governance, snapshot/report composition, and
+        # immutable materialization for the same successful Creator run.
+        await self._execute_formal_research(
+            brief=brief,
+            provider="xiaohongshu",
+            source_kind="persisted_packets",
+            limit=0,
+        )
+        operation_ids_after_publication = {
+            item.id
+            for item in self._store.list_typed_records(StageCheckpointRecord)
+            if item.workflow_run_id == workflow_run_id
+            and item.stage_name == "operation"
+        }
+        if operation_ids_after_publication != operation_ids_before:
+            raise RuntimeError("downstream replay changed provider operations")
+        report = await self.get_lite_report(workflow_run_id=workflow_run_id)
+        return {
+            "workflow_run_id": workflow_run_id,
+            "packet_ids_by_direction": packet_ids_by_direction,
+            "provider_operation_count": len(operation_ids_before),
+            "publication_state": report.publication.get("state"),
+            "report": report.model_dump(mode="json"),
+        }
 
     def _build_governed_snapshot(
         self,
@@ -1419,11 +1596,49 @@ class ContentResearchService:
             )
         source_request = ContentResearchSourceCollectionRequest(**request.payload)
         retry = action == "retry_formal_research"
+        recovery_lock = self._recovery_locks.setdefault(workflow_run_id, asyncio.Lock())
         if retry:
-            self._requeue_recoverable_tasks(workflow_run_id)
-        formal_result = await self.dispatch_formal_research(
-            workflow_run_id=workflow_run_id, request=source_request, retry_completed=retry
-        )
+            await recovery_lock.acquire()
+        try:
+            if retry:
+                runtime_snapshot = await self._workflow_runtime.get_runtime_snapshot(workflow_run_id)
+                runtime_run = runtime_snapshot.get("run") or {}
+                runtime_status = str(
+                    runtime_run.get("status") or runtime_snapshot.get("run_status") or ""
+                )
+                if runtime_status == "succeeded":
+                    raise ContentResearchValidationError(
+                        "Completed Content Research runs cannot be retried."
+                    )
+                if runtime_status == "waiting_user":
+                    child_task_ids = self._requeue_recoverable_tasks(
+                        workflow_run_id,
+                        provider=source_request.provider,
+                        runtime_child_tasks=list(runtime_snapshot.get("child_tasks") or []),
+                    )
+                    await self._workflow_runtime.restart_formal_research_step(
+                        workflow_run_id=workflow_run_id,
+                        child_task_ids=child_task_ids,
+                    )
+                else:
+                    child_task_ids = self._requeue_recoverable_tasks(
+                        workflow_run_id,
+                        provider=source_request.provider,
+                        runtime_child_tasks=list(runtime_snapshot.get("child_tasks") or []),
+                    )
+                    await self._workflow_runtime.restart_formal_research_step(
+                        workflow_run_id=workflow_run_id,
+                        child_task_ids=child_task_ids,
+                        resume_parent=False,
+                    )
+            formal_result = await self.dispatch_formal_research(
+                workflow_run_id=workflow_run_id,
+                request=source_request,
+                retry_completed=retry,
+            )
+        finally:
+            if retry:
+                recovery_lock.release()
         return self._action_response(
             workflow_run_id=workflow_run_id,
             action=action,
@@ -1465,7 +1680,13 @@ class ContentResearchService:
             limit_per_specialist=request.limit,
         )
 
-    def _requeue_recoverable_tasks(self, workflow_run_id: str) -> None:
+    def _requeue_recoverable_tasks(
+        self,
+        workflow_run_id: str,
+        *,
+        provider: str,
+        runtime_child_tasks: list[dict] | None = None,
+    ) -> list[str]:
         """Make only explicitly recoverable provider failures eligible for a user retry.
 
         A completed dispatch can represent an evidence-only report, so its job
@@ -1474,7 +1695,7 @@ class ContentResearchService:
         """
         checkpoints = self._store.list_typed_records(StageCheckpointRecord)
         recoverable_codes = {"auth_required", "timeout", "transient_error", "rate_limited", "unavailable"}
-        requeued = False
+        recovery_plans: list[tuple[SubagentTaskRecord, list[StageCheckpointRecord], set[str], set[str]]] = []
         for task in self._store.list_subagent_tasks_for_workflow(workflow_run_id):
             operations = [
                 checkpoint
@@ -1482,6 +1703,7 @@ class ContentResearchService:
                 if checkpoint.workflow_run_id == workflow_run_id
                 and checkpoint.subagent_task_id == task.id
                 and checkpoint.stage_name == "operation"
+                and checkpoint.status != "superseded"
             ]
             if any(checkpoint.status == "outcome_unknown" for checkpoint in operations):
                 continue
@@ -1501,16 +1723,113 @@ class ContentResearchService:
                 for checkpoint in operations
                 if checkpoint.input_fingerprint in recoverable_operation_fingerprints
             }
+            recovery_plans.append(
+                (task, operations, recoverable_operation_fingerprints, recoverable_operations)
+            )
+
+        if not recovery_plans:
+            raise ContentResearchValidationError(
+                "No recoverable Content Research provider failure is available for retry."
+            )
+
+        has_auth_failure = any(
+            str((checkpoint.payload.get("completion") or {}).get("failure_code") or "")
+            in {"auth_required", "auth_expired"}
+            for _task, operations, _fingerprints, _operation_names in recovery_plans
+            for checkpoint in operations
+            if checkpoint.status != "superseded"
+        )
+        if has_auth_failure:
+            adapter = self._source_registry.get(provider)
+            authentication_ready = getattr(adapter, "authentication_ready", None)
+            if not callable(authentication_ready) or not authentication_ready():
+                raise ContentResearchValidationError(
+                    "Xiaohongshu authentication must succeed before retrying this run."
+                )
+
+        runtime_child_by_id = {
+            str(item.get("child_task_id") or ""): item
+            for item in runtime_child_tasks or []
+            if isinstance(item, dict)
+        }
+        recovery_child_ids: list[str] = []
+        for task, _operations, _fingerprints, _operation_names in recovery_plans:
+            child_task_id = str(task.payload.get("workflow_child_task_id") or "")
+            child = runtime_child_by_id.get(child_task_id)
+            if not child_task_id or child is None:
+                raise ContentResearchValidationError(
+                    "Recoverable specialist is missing its workflow child counter."
+                )
+            recovery_count = int(child.get("attempt_count") or 0)
+            max_attempts = int(child.get("max_attempts") or 3)
+            if recovery_count >= max(max_attempts - 1, 0):
+                raise ContentResearchValidationError(
+                    "Content Research specialist recovery budget is exhausted."
+                )
+            recovery_child_ids.append(child_task_id)
+
+        for task, operations, recoverable_operation_fingerprints, recoverable_operations in recovery_plans:
             # Search pages feed every following directional boundary.  A
             # failed discover attempt may have left an empty aggregate
             # ``collect`` checkpoint behind; replaying it would skip the
             # provider entirely.  Retire only the derived boundaries for this
             # direction, while completed provider operations remain intact.
-            reset_discover_derived_stages = (
-                {"collect", "selection", "selection_revision", "detail"}
-                if "discover" in recoverable_operations
-                else set()
-            )
+            reset_derived_stages: set[str] = set()
+            if "discover" in recoverable_operations:
+                reset_derived_stages.update(
+                    {
+                        "collect",
+                        "selection",
+                        "selection_revision",
+                        "detail",
+                        "comments",
+                        "packet",
+                        "facts",
+                        "admission",
+                    }
+                )
+            if "detail" in recoverable_operations:
+                reset_derived_stages.update(
+                    {"detail", "comments", "packet", "facts", "admission"}
+                )
+                failed_candidate_ids = {
+                    str((checkpoint.payload.get("request") or {}).get("canonical_source_id") or "")
+                    for checkpoint in operations
+                    if checkpoint.input_fingerprint in recoverable_operation_fingerprints
+                } - {""}
+                revisions = sorted(
+                    (
+                        checkpoint
+                        for checkpoint in checkpoints
+                        if checkpoint.workflow_run_id == workflow_run_id
+                        and checkpoint.subagent_task_id == task.id
+                        and checkpoint.stage_name == "selection_revision"
+                        and checkpoint.status == "completed"
+                    ),
+                    key=lambda checkpoint: (checkpoint.created_at, checkpoint.id),
+                )
+                if revisions and failed_candidate_ids:
+                    latest_revision = revisions[-1]
+                    revision_payload = dict(latest_revision.payload)
+                    revision_payload["candidates"] = [
+                        {
+                            key: value
+                            for key, value in dict(candidate).items()
+                            if not (
+                                str(candidate.get("canonical_id") or "")
+                                in failed_candidate_ids
+                                and key in {"detail_attempted", "blocking_unavailable"}
+                            )
+                        }
+                        for candidate in revision_payload.get("candidates") or []
+                    ]
+                    self._store.save_stage_checkpoint(
+                        replace(latest_revision, payload=revision_payload)
+                    )
+            if "comments" in recoverable_operations:
+                reset_derived_stages.update(
+                    {"comments", "packet", "facts", "admission"}
+                )
             # Retire the whole recoverable operation lifecycle, including its
             # earlier ``running`` checkpoint.  Otherwise the next pipeline
             # attempt sees that stale start record as an unknown outcome and
@@ -1524,12 +1843,12 @@ class ContentResearchService:
                     and checkpoint.input_fingerprint in recoverable_operation_fingerprints
                 )
                 is_recoverable_collect_page = (
-                    checkpoint.stage_name == "collect_page"
-                    and str(checkpoint.payload.get("failure_reason") or "")
-                    in recoverable_codes
+                    checkpoint.stage_name in {"collect_page", "comments_page"}
+                    and str(checkpoint.payload.get("operation_fingerprint") or "")
+                    in recoverable_operation_fingerprints
                 )
                 is_discover_derived_checkpoint = (
-                    checkpoint.stage_name in reset_discover_derived_stages
+                    checkpoint.stage_name in reset_derived_stages
                 )
                 if (
                     is_recoverable_operation
@@ -1545,11 +1864,7 @@ class ContentResearchService:
             self._store.save_subagent_task(
                 replace(task, status="queued", payload=payload, updated_at=utcnow())
             )
-            requeued = True
-        if not requeued:
-            raise ContentResearchValidationError(
-                "No recoverable Content Research provider failure is available for retry."
-            )
+        return recovery_child_ids
 
     async def start_formal_research(
         self,
@@ -1789,7 +2104,16 @@ class ContentResearchService:
             output = dict(terminal.payload.get("output_payload") or {})
             child_id = str(terminal.payload.get("workflow_child_task_id") or "")
             if child_id:
-                requires_recovery = terminal.id in recoverable_failure_by_task
+                blocking_failure_code = str(
+                    (output.get("metadata") or {}).get("blocking_failure_code")
+                    or output.get("failure_reason")
+                    or recoverable_failure_by_task.get(terminal.id)
+                    or ""
+                )
+                requires_recovery = (
+                    terminal.status == "failed"
+                    and terminal.id in recoverable_failure_by_task
+                )
                 outcomes.append(
                     {
                         "child_task_id": child_id,
@@ -1799,8 +2123,12 @@ class ContentResearchService:
                         "status": "failed"
                         if terminal.status == "outcome_unknown" or requires_recovery
                         else terminal.status,
-                        "error": output.get("error_message")
-                        or recoverable_failure_by_task.get(terminal.id),
+                        "error": {
+                            "code": blocking_failure_code or "formal_research_failed",
+                            "message": output.get("error_message")
+                            or blocking_failure_code
+                            or "Formal research specialist failed.",
+                        },
                         "artifact_refs": self._governed_artifact_refs(
                             workflow_run_id=brief.workflow_run_id,
                             direction_id=str(terminal.direction_id or ""),
@@ -1810,6 +2138,11 @@ class ContentResearchService:
                 )
         complete = getattr(self._workflow_runtime, "complete_formal_research", None)
         failed_outcomes = [outcome for outcome in outcomes if outcome["status"] == "failed"]
+        recoverable_failed_outcomes = [
+            outcome
+            for outcome in failed_outcomes
+            if str((outcome.get("error") or {}).get("code") or "") in recoverable_codes
+        ]
         if failed_outcomes:
             if complete is not None:
                 await complete(
@@ -1829,6 +2162,30 @@ class ContentResearchService:
                     "message": "One or more research specialists failed; retry is required before results can be finalized.",
                 },
             )
+            if recoverable_failed_outcomes:
+                await self._workflow_runtime.wait_for_user_recovery(
+                    workflow_run_id=brief.workflow_run_id,
+                    reason={
+                        "code": "recoverable_specialist_failure",
+                        "message": "A provider operation failed and requires a user retry.",
+                    },
+                )
+            else:
+                failure = next(
+                    (
+                        outcome["error"]
+                        for outcome in failed_outcomes
+                        if isinstance(outcome.get("error"), dict)
+                    ),
+                    {
+                        "code": "formal_research_failed",
+                        "message": "Formal research failed.",
+                    },
+                )
+                await self._workflow_runtime.fail_formal_research(
+                    workflow_run_id=brief.workflow_run_id,
+                    reason=failure,
+                )
             return
 
         plans = self._store.list_plans_for_brief(brief.id)

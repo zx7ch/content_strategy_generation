@@ -217,6 +217,19 @@ class AsyncFormalResearchDispatchRepository:
         expires = (now + timedelta(seconds=lease_seconds)).isoformat()
         token = uuid.uuid4().hex
         async with self._connect() as conn:
+            # Empty-queue polling is read-only. Taking BEGIN IMMEDIATE on every
+            # scan can starve unrelated workflow creation/confirmation writes,
+            # especially when a test or local worker uses a short scan period.
+            preflight = await conn.execute(
+                """SELECT 1 FROM content_research_dispatch_jobs
+                   WHERE status='queued'
+                      OR (status='running' AND lease_expires_at IS NOT NULL
+                          AND lease_expires_at < ?)
+                   LIMIT 1""",
+                (now.isoformat(),),
+            )
+            if await preflight.fetchone() is None:
+                return None
             await conn.execute("BEGIN IMMEDIATE")
             try:
                 await conn.execute(

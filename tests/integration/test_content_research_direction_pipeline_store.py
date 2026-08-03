@@ -275,6 +275,7 @@ async def test_failed_detail_persists_its_provider_outcome(tmp_path):
     )
 
     assert result.selection.status == "insufficient_evidence"
+    assert result.blocking_failure_code == "parser_error"
     terminal = [
         item for item in store.list_typed_records(StageCheckpointRecord)
         if item.stage_name == "operation" and item.payload.get("operation") == "detail"
@@ -999,7 +1000,7 @@ async def test_product_admission_counts_only_relevant_field_eligible_stable_auth
 
 
 @pytest.mark.asyncio
-async def test_display_names_cannot_substitute_for_stable_author_ids_at_threshold(
+async def test_provider_author_names_are_conservative_fallback_identities_at_threshold(
     tmp_path,
 ):
     store = SQLiteContentResearchStore(str(tmp_path / "display-author-only.db"))
@@ -1056,18 +1057,169 @@ async def test_display_names_cannot_substitute_for_stable_author_ids_at_threshol
 
     decisions = store.list_typed_records(ClaimAdmissionDecisionRecord)
     assert decisions
+    assert {item.decision for item in decisions} == {"admitted"}
+    assert {
+        item.payload["computed_metrics"]["eligible_source_count"]
+        for item in decisions
+    } == {3}
+    assert {
+        item.payload["computed_metrics"]["independent_author_count"]
+        for item in decisions
+    } == {3}
+    assert {
+        item.payload["computed_metrics"]["author_id"] for item in decisions
+    } == {""}
+
+
+@pytest.mark.asyncio
+async def test_provider_author_name_fallback_collapses_normalized_duplicates(tmp_path):
+    store = SQLiteContentResearchStore(str(tmp_path / "display-author-duplicates.db"))
+    snapshot, policies, contracts, _groups = _build_frozen_pipeline_snapshot(
+        snapshot_id="rps-display-author-duplicates",
+        workflow_run_id="run-display-author-duplicates",
+        direction_id="product_marketing",
+        subject="速干徒步短裤",
+        questions=("卖点",),
+    )
+    contract = contracts[0]
+    policy = policies[0]
+    store.save_run_policy_snapshot(snapshot)
+    store.save_sample_policy(policy)
+    store.save_direction_contract(contract)
+
+    async def discover(group):
+        return [
+            {
+                "provider": "xiaohongshu",
+                "source_kind": "note_detail",
+                "canonical_id": f"note-{index}",
+                "canonical_source_id": f"note-{index}",
+                "author": author,
+                "title": f"短裤夏日卖点 {index}",
+                "content_text": f"速干短裤适合轻量徒步 {index}",
+                "tags": [],
+                "note_type": "normal",
+                "metrics": {"like_count": index},
+                "metrics_observed_at": "2026-07-30T00:00:00+00:00",
+                "field_availability": {
+                    field: "present" for field in contract.required_note_fields
+                },
+                "query_group_id": group.id,
+            }
+            for index, author in enumerate(("同一作者", "  同一作者  ", "同一作者"))
+        ]
+
+    await DirectionalEvidencePipeline(store).execute(
+        workflow_run_id="run-display-author-duplicates",
+        subagent_task_id="sat-display-author-duplicates",
+        direction_id="product_marketing",
+        subject="速干徒步短裤",
+        questions=["卖点"],
+        competitors=[],
+        author_cap=policy.author_cap,
+        minimum_samples=policy.minimum_samples,
+        minimum_independent_authors=policy.minimum_independent_authors,
+        discover=discover,
+        admission_contract=contract,
+        admission_policy=policy,
+        policy_snapshot=snapshot,
+    )
+
+    decisions = store.list_typed_records(ClaimAdmissionDecisionRecord)
+    assert decisions
     assert {item.decision for item in decisions} == {"downgraded"}
     assert {
         item.payload["computed_metrics"]["eligible_source_count"]
         for item in decisions
-    } == {0}
+    } == {3}
     assert {
         item.payload["computed_metrics"]["independent_author_count"]
         for item in decisions
-    } == {0}
-    assert {
-        item.payload["computed_metrics"]["author_id"] for item in decisions
-    } == {""}
+    } == {1}
+
+
+@pytest.mark.asyncio
+async def test_packet_only_admission_replay_never_invokes_a_provider(tmp_path):
+    store = SQLiteContentResearchStore(str(tmp_path / "packet-only-replay.db"))
+    snapshot, policies, contracts, _groups = _build_frozen_pipeline_snapshot(
+        snapshot_id="rps-packet-only-replay",
+        workflow_run_id="run-packet-only-replay",
+        direction_id="product_marketing",
+        subject="速干徒步短裤",
+        questions=("卖点",),
+    )
+    contract = contracts[0]
+    policy = policies[0]
+    store.save_run_policy_snapshot(snapshot)
+    store.save_sample_policy(policy)
+    store.save_direction_contract(contract)
+    provider_calls = 0
+
+    async def discover(group):
+        nonlocal provider_calls
+        provider_calls += 1
+        return [
+            {
+                "provider": "xiaohongshu",
+                "source_kind": "note_detail",
+                "canonical_id": f"note-{index}",
+                "canonical_source_id": f"note-{index}",
+                "author": f"作者-{index}",
+                "title": f"短裤夏日卖点 {index}",
+                "content_text": f"速干短裤适合轻量徒步 {index}",
+                "tags": [],
+                "note_type": "normal",
+                "metrics": {"like_count": index},
+                "metrics_observed_at": "2026-07-30T00:00:00+00:00",
+                "field_availability": {
+                    field: "present" for field in contract.required_note_fields
+                },
+                "query_group_id": group.id,
+            }
+            for index in range(3)
+        ]
+
+    pipeline = DirectionalEvidencePipeline(store)
+    initial = await pipeline.execute(
+        workflow_run_id="run-packet-only-replay",
+        subagent_task_id="sat-packet-only-replay",
+        direction_id="product_marketing",
+        subject="速干徒步短裤",
+        questions=["卖点"],
+        competitors=[],
+        author_cap=policy.author_cap,
+        minimum_samples=policy.minimum_samples,
+        minimum_independent_authors=policy.minimum_independent_authors,
+        discover=discover,
+        policy_snapshot=snapshot,
+    )
+    calls_before_replay = provider_calls
+    operations_before_replay = [
+        item
+        for item in store.list_typed_records(StageCheckpointRecord)
+        if item.stage_name == "operation"
+    ]
+    assert not store.list_typed_records(ClaimAdmissionDecisionRecord)
+
+    replayed_packet_ids = pipeline.replay_admission_from_persisted_packets(
+        workflow_run_id="run-packet-only-replay",
+        subagent_task_id="sat-packet-only-replay",
+        direction_id="product_marketing",
+        contract=contract,
+        policy=policy,
+        snapshot=snapshot,
+    )
+
+    assert replayed_packet_ids == initial.packet_ids
+    assert provider_calls == calls_before_replay
+    assert [
+        item.id
+        for item in store.list_typed_records(StageCheckpointRecord)
+        if item.stage_name == "operation"
+    ] == [item.id for item in operations_before_replay]
+    decisions = store.list_typed_records(ClaimAdmissionDecisionRecord)
+    assert decisions
+    assert {item.decision for item in decisions} == {"admitted"}
 
 
 @pytest.mark.asyncio
@@ -1956,7 +2108,16 @@ async def test_detail_failure_backfills_in_frozen_order_and_appends_selection_re
     async def detail(candidate):
         calls.append(candidate["canonical_id"])
         if candidate["canonical_id"] == "note-1":
-            return None
+            return SourceOperationResult(
+                provider="xiaohongshu",
+                operation="collect_note_detail",
+                source_kind="note_detail",
+                status="failed",
+                items=[],
+                failure_reason="note_unavailable",
+                completeness="unavailable",
+                retryable=False,
+            )
         return {
             "canonical_id": candidate["canonical_id"],
             "source_kind": "note_detail",
@@ -1992,6 +2153,59 @@ async def test_detail_failure_backfills_in_frozen_order_and_appends_selection_re
     assert [item.payload["trigger"]["candidate_id"] for item in revisions] == calls
     assert "blocking_field_unavailable" in revisions[0].payload["trigger"]["reasons"]
     assert all(item.id != revisions[0].id for item in revisions[1:])
+    unavailable_operation = next(
+        item
+        for item in store.list_typed_records(StageCheckpointRecord)
+        if item.stage_name == "operation"
+        and (item.payload.get("completion") or {}).get("failure_code")
+        == "note_unavailable"
+    )
+    assert unavailable_operation.status == "failed"
+    assert unavailable_operation.payload["completion"]["retryable"] is False
+    assert unavailable_operation.payload["completion"]["recovery_action"] is None
+
+
+@pytest.mark.asyncio
+async def test_detail_auth_failure_stops_before_calling_later_candidates(tmp_path):
+    store = SQLiteContentResearchStore(str(tmp_path / "detail-auth-stop.db"))
+    pipeline = DirectionalEvidencePipeline(store)
+    calls: list[str] = []
+
+    async def discover(_group):
+        return [
+            {"canonical_id": "note-1", "source_kind": "search_result_minimal"},
+            {"canonical_id": "note-2", "source_kind": "search_result_minimal"},
+        ]
+
+    async def detail(candidate):
+        calls.append(candidate["canonical_id"])
+        return SourceOperationResult(
+            provider="xiaohongshu",
+            operation="collect_note_detail",
+            source_kind="note_detail",
+            status="failed",
+            items=[],
+            failure_reason="auth_required",
+            completeness="unavailable",
+            retryable=False,
+        )
+
+    result = await pipeline.execute(
+        subagent_task_id="sat-auth-stop",
+        direction_id="product_marketing",
+        subject="短裤",
+        questions=["卖点"],
+        competitors=[],
+        author_cap=2,
+        minimum_samples=2,
+        minimum_independent_authors=2,
+        detail_fetch_cap=2,
+        discover=discover,
+        collect_detail=detail,
+    )
+
+    assert calls == ["note-1"]
+    assert result.blocking_failure_code == "auth_required"
 
 
 @pytest.mark.asyncio

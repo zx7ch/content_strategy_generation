@@ -260,11 +260,22 @@ class SubagentTaskRouter:
             run_as_of_at=snapshot.run_as_of_at,
             admission_contract=contract, admission_policy=policy, policy_snapshot=snapshot,
         )
+        status = (
+            "failed"
+            if run.blocking_failure_code
+            else "completed" if run.selection.status == "complete" else "partial_completed"
+        )
         return SubagentExecutionResult(
-            status="completed" if run.selection.status == "complete" else "partial_completed",
+            status=status,
             findings=[], evidence_records=[],
             missing_evidence=[] if run.selection.status == "complete" else [{"reason": run.selection.status}],
-            metadata={"direction_id": direction_id, "packet_ids": list(run.packet_ids), "selection_status": run.selection.status},
+            failure_reason=run.blocking_failure_code,
+            metadata={
+                "direction_id": direction_id,
+                "packet_ids": list(run.packet_ids),
+                "selection_status": run.selection.status,
+                "blocking_failure_code": run.blocking_failure_code,
+            },
         )
 
     def _ensure_trace(self, task: SubagentTaskRecord, trace_id: str | None) -> TraceRecord:

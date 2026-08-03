@@ -7,7 +7,10 @@ import pytest
 
 from app.api.routes.router import app
 from app.content_research.models import ObservationEventRecord, TraceRecord, utcnow
-from app.content_research.observation.trace_service import _derive_current_stage
+from app.content_research.observation.trace_service import (
+    _derive_current_stage,
+    _provider_operations,
+)
 from app.content_research.presearch.service import PresearchService
 from app.content_research.persistence_models import StageCheckpointRecord
 from app.content_research.service import ContentResearchService, WorkflowRunManagerRuntime
@@ -76,6 +79,36 @@ async def _record_usage(db_path: str, workflow_run_id: str) -> None:
                 status="success",
             )
         )
+
+
+def test_provider_operations_do_not_merge_identical_calls_from_two_specialists(tmp_path):
+    store = SQLiteContentResearchStore(str(tmp_path / "trace-specialists.db"))
+    for task_id in ("specialist-a", "specialist-b"):
+        store.save_stage_checkpoint(
+            StageCheckpointRecord(
+                id=f"checkpoint-{task_id}",
+                schema_version="content_research_stage_checkpoint_v1",
+                workflow_run_id="run-specialists",
+                subagent_task_id=task_id,
+                stage_name="operation",
+                input_fingerprint="same-note-detail",
+                status="completed",
+                payload={
+                    "operation": "detail",
+                    "operation_fingerprint": "same-note-detail",
+                    "completion": {
+                        "provider": "xiaohongshu",
+                        "provider_operation": "collect_note_detail",
+                        "result_status": "completed",
+                    },
+                },
+            )
+        )
+
+    operations = _provider_operations(store, "run-specialists")
+
+    assert len(operations) == 2
+    assert len({operation["operation_id"] for operation in operations}) == 2
 
 
 @pytest.mark.asyncio
@@ -194,6 +227,12 @@ async def test_content_research_trace_api_keeps_running_parent_and_safe_auth_req
                     "failure_reason": "auth_required",
                     "retryable": False,
                     "recovery_action": "更新小红书登录态后继续。",
+                    "candidate_dispositions": {
+                        "invalid_candidate": 2,
+                        "eligible": 18,
+                    },
+                    "automatic_retry_count": 3,
+                    "automatic_retry_limit": 3,
                 },
             },
         )
@@ -213,7 +252,13 @@ async def test_content_research_trace_api_keeps_running_parent_and_safe_auth_req
     )
     assert failed_child["status"] == "failed"
     assert failed_child["error_code"] == "auth_required"
-    assert trace["provider_operations"] == [
+    assert failed_child["retry_counters"] == {
+        "specialist_user_recovery": {"used": 0, "limit": 2},
+        "workflow_child_attempt": {"used": 1, "limit": 3},
+    }
+    provider_operation = dict(trace["provider_operations"][0])
+    assert provider_operation.pop("operation_id").startswith("op_")
+    assert [provider_operation] == [
         {
             "operation_fingerprint": "trace-auth-required-operation",
             "operation": "discover_candidates",
@@ -226,6 +271,13 @@ async def test_content_research_trace_api_keeps_running_parent_and_safe_auth_req
             "finished_at": None,
             "failure_code": "auth_required",
             "retryable": False,
+            "candidate_dispositions": {
+                "invalid_candidate": 2,
+                "eligible": 18,
+            },
+            "retry_counters": {
+                "provider_automatic": {"used": 3, "limit": 3},
+            },
         }
     ]
     assert "RAW_PROVIDER_QUERY_MUST_NOT_ESCAPE" not in response.text

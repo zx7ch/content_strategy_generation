@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -170,3 +171,81 @@ async def test_async_pipeline_session_flushes_checkpoint_without_sync_store_io(t
 
     reloaded = await AsyncDirectionalPersistenceSession.open(db_path, workflow_run_id="run-async")
     assert reloaded.get_typed_record(StageCheckpointRecord, "scp-async") == checkpoint
+
+
+@pytest.mark.asyncio
+async def test_async_pipeline_session_replaces_superseded_checkpoint_on_same_run_recovery(tmp_path):
+    db_path = str(tmp_path / "dispatch.db")
+    store = SQLiteContentResearchStore(db_path)
+    original = StageCheckpointRecord(
+        id="scp-recovery",
+        schema_version="content_research_stage_checkpoint_v1",
+        payload={"workflow_run_id": "run-recovery", "failure_reason": "auth_required"},
+        workflow_run_id="run-recovery",
+        subagent_task_id="task-recovery",
+        stage_name="operation",
+        input_fingerprint="fingerprint-recovery",
+        status="superseded",
+    )
+    store.save_stage_checkpoint(original)
+
+    session = await AsyncDirectionalPersistenceSession.open(
+        db_path, workflow_run_id="run-recovery"
+    )
+    replacement = StageCheckpointRecord(
+        id=original.id,
+        schema_version=original.schema_version,
+        payload={"workflow_run_id": "run-recovery", "failure_reason": "auth_required"},
+        workflow_run_id=original.workflow_run_id,
+        subagent_task_id=original.subagent_task_id,
+        stage_name=original.stage_name,
+        input_fingerprint=original.input_fingerprint,
+        status="completed",
+    )
+    session.save_stage_checkpoint(replacement)
+    await session.flush()
+
+    reloaded = await AsyncDirectionalPersistenceSession.open(
+        db_path, workflow_run_id="run-recovery"
+    )
+    assert reloaded.get_typed_record(StageCheckpointRecord, original.id) == replacement
+
+
+@pytest.mark.asyncio
+async def test_stale_async_session_cannot_overwrite_recovered_checkpoint(tmp_path):
+    db_path = str(tmp_path / "dispatch.db")
+    store = SQLiteContentResearchStore(db_path)
+    original = StageCheckpointRecord(
+        id="scp-stale-recovery",
+        schema_version="content_research_stage_checkpoint_v1",
+        payload={"attempt": 0},
+        workflow_run_id="run-recovery",
+        subagent_task_id="task-recovery",
+        stage_name="operation",
+        input_fingerprint="fingerprint-recovery",
+        status="superseded",
+    )
+    store.save_stage_checkpoint(original)
+    first = await AsyncDirectionalPersistenceSession.open(
+        db_path, workflow_run_id="run-recovery"
+    )
+    stale = await AsyncDirectionalPersistenceSession.open(
+        db_path, workflow_run_id="run-recovery"
+    )
+    first.save_stage_checkpoint(
+        replace(original, status="completed", payload={"attempt": 1})
+    )
+    stale.save_stage_checkpoint(
+        replace(original, status="completed", payload={"attempt": 2})
+    )
+
+    await first.flush()
+    with pytest.raises(RuntimeError, match="immutable persistence conflict"):
+        await stale.flush()
+
+    reloaded = await AsyncDirectionalPersistenceSession.open(
+        db_path, workflow_run_id="run-recovery"
+    )
+    assert reloaded.get_typed_record(
+        StageCheckpointRecord, original.id
+    ).payload == {"attempt": 1}

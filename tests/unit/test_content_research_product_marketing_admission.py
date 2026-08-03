@@ -386,8 +386,9 @@ def test_admission_records_selected_relevant_eligible_and_stable_author_metrics(
         "relevance_qualified_source_count": 3,
         "eligible_source_count": 2,
         "independent_author_count": 2,
-        "author_id": "author-stable",
-        "missing_required_fields": [],
+            "author_id": "author-stable",
+            "author_identity_kind": "id",
+            "missing_required_fields": [],
     }
     assert decision.decision == "downgraded"
     assert decision.payload["reason_codes"] == ["sample_threshold_unmet"]

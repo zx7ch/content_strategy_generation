@@ -16,6 +16,7 @@ function normalizedF003LitePreviewFlag(value) {
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   reactStrictMode: true,
+  distDir: process.env.NEXT_DIST_DIR || ".next",
   env: {
     F003_LITE_PREVIEW_ENABLED:
       normalizedF003LitePreviewFlag(process.env.F003_LITE_PREVIEW_ENABLED),

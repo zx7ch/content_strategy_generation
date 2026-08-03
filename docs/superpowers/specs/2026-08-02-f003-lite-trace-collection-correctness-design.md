@@ -105,6 +105,12 @@ ID and URL shape are hard eligibility rules. Missing display fields such as
 author or title are not independently sufficient to reject a candidate,
 because valid notes can omit optional presentation fields.
 
+For admission sample independence, the provider-real author identity contract
+is `id:<author_id>` when Spider returns a stable ID, otherwise
+`name:<normalized author>`. The fallback is deliberately conservative:
+identical normalized display names collapse to one author, the name is never
+copied into `author_id`, and packets missing both fields remain author-ineligible.
+
 Rejected candidates receive an `invalid_candidate` disposition and never
 reach `collect_note_detail`. They remain auditable through safe counts and
 reason codes, not raw provider payloads or sensitive URLs.
@@ -322,4 +328,3 @@ network-retry problem.
 5. Creator timing/recovery presentation while preserving newest-first order.
 6. Focused API/browser verification plus one bounded real canary and Task 5G
    acceptance record.
-
