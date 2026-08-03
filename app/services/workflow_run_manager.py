@@ -39,6 +39,14 @@ class WorkflowTransitionError(ValueError):
 
 T = TypeVar("T")
 
+_TIMING_INTERVAL_KEYS = (
+    "queue_spans",
+    "execution_spans",
+    "retry_backoff_spans",
+    "waiting_spans",
+    "pause_spans",
+)
+
 
 def _utc_timestamp() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -88,12 +96,20 @@ def _start_timing_execution(timing: dict[str, Any], at: str) -> dict[str, Any]:
     _close_interval(timing, "retry_backoff_spans", at)
     _close_interval(timing, "waiting_spans", at)
     _close_interval(timing, "pause_spans", at)
+    timing.pop("waiting_started_at", None)
+    timing.pop("retry_backoff_started_at", None)
     _open_interval(timing, "execution_spans", at)
     return timing
 
 
 def _stop_timing_execution(timing: dict[str, Any], at: str) -> dict[str, Any]:
     _close_interval(timing, "execution_spans", at)
+    return timing
+
+
+def _close_all_timing_intervals(timing: dict[str, Any], at: str) -> dict[str, Any]:
+    for key in _TIMING_INTERVAL_KEYS:
+        _close_interval(timing, key, at)
     return timing
 
 
@@ -589,22 +605,42 @@ class WorkflowRunManager:
                 "UPDATE workflow_runs SET status='cancelling', updated_at=CURRENT_TIMESTAMP WHERE run_id=?",
                 (run_id,),
             )
-            await self._conn.execute(
-                """
-                UPDATE workflow_steps
-                SET status='cancelled', completed_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP
-                WHERE run_id=? AND status IN ('pending', 'retrying')
-                """,
+            cancelled_at = _utc_timestamp()
+            async with self._conn.execute(
+                "SELECT * FROM workflow_steps WHERE run_id=? AND status IN ('pending', 'retrying')",
                 (run_id,),
-            )
-            await self._conn.execute(
+            ) as cursor:
+                cancellable_steps = await cursor.fetchall()
+            for step in cancellable_steps:
+                timing = _close_all_timing_intervals(_timing_from_row(step), cancelled_at)
+                await self._conn.execute(
+                    """
+                    UPDATE workflow_steps
+                    SET status='cancelled', timing_json=?, completed_at=CURRENT_TIMESTAMP,
+                        updated_at=CURRENT_TIMESTAMP
+                    WHERE step_id=?
+                    """,
+                    (_timing_json(timing), step["step_id"]),
+                )
+            async with self._conn.execute(
                 """
-                UPDATE workflow_child_tasks
-                SET status='cancelled', completed_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP
+                SELECT * FROM workflow_child_tasks
                 WHERE run_id=? AND status IN ('pending', 'running', 'retrying')
                 """,
                 (run_id,),
-            )
+            ) as cursor:
+                cancellable_children = await cursor.fetchall()
+            for child in cancellable_children:
+                timing = _close_all_timing_intervals(_timing_from_row(child), cancelled_at)
+                await self._conn.execute(
+                    """
+                    UPDATE workflow_child_tasks
+                    SET status='cancelled', timing_json=?, completed_at=CURRENT_TIMESTAMP,
+                        updated_at=CURRENT_TIMESTAMP
+                    WHERE child_task_id=?
+                    """,
+                    (_timing_json(timing), child["child_task_id"]),
+                )
             await self._append_event(
                 run_id=run_id,
                 thread_id=row["thread_id"],
@@ -647,6 +683,29 @@ class WorkflowRunManager:
                     """,
                     (_timing_json(timing), step["step_id"]),
                 )
+                async with self._conn.execute(
+                    """
+                    SELECT * FROM workflow_child_tasks
+                    WHERE run_id=? AND step_id=? AND status='running'
+                    """,
+                    (run_id, step["step_id"]),
+                ) as cursor:
+                    running_children = await cursor.fetchall()
+                for child in running_children:
+                    child_timing = _stop_timing_execution(
+                        _timing_from_row(child), paused_at
+                    )
+                    _open_interval(child_timing, "pause_spans", paused_at)
+                    await self._conn.execute(
+                        """
+                        UPDATE workflow_child_tasks
+                        SET status='retrying', error_code='RUN_PAUSED',
+                            error_message='run paused at safe boundary', timing_json=?,
+                            updated_at=CURRENT_TIMESTAMP
+                        WHERE child_task_id=?
+                        """,
+                        (_timing_json(child_timing), child["child_task_id"]),
+                    )
             await self._pause_job_if_present(job_id or run["active_job_id"])
             await self._conn.execute(
                 """
@@ -686,14 +745,17 @@ class WorkflowRunManager:
                 )
             step = await self._fetch_step_row(run_id, step_name)
             if step["status"] in {"pending", "running", "retrying"}:
+                timing = _close_all_timing_intervals(
+                    _timing_from_row(step), _utc_timestamp()
+                )
                 await self._conn.execute(
                     """
                     UPDATE workflow_steps
-                    SET status='cancelled', active_job_id=NULL,
+                    SET status='cancelled', active_job_id=NULL, timing_json=?,
                         completed_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP
                     WHERE step_id=?
                     """,
-                    (step["step_id"],),
+                    (_timing_json(timing), step["step_id"]),
                 )
             await self._conn.execute(
                 """
@@ -914,13 +976,17 @@ class WorkflowRunManager:
             run = await self._fetch_run_row(run_id)
             step = await self._fetch_step_row(run_id, step_name)
             if run["status"] in {"cancelling", "cancelled"}:
+                timing = _close_all_timing_intervals(
+                    _timing_from_row(step), _utc_timestamp()
+                )
                 await self._conn.execute(
                     """
                     UPDATE workflow_steps
-                    SET status='cancelled', completed_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP
+                    SET status='cancelled', timing_json=?, completed_at=CURRENT_TIMESTAMP,
+                        updated_at=CURRENT_TIMESTAMP
                     WHERE step_id=? AND status='running'
                     """,
-                    (step["step_id"],),
+                    (_timing_json(timing), step["step_id"]),
                 )
                 await self._conn.execute(
                     """
@@ -945,7 +1011,7 @@ class WorkflowRunManager:
                 )
             if step["status"] != "running":
                 raise WorkflowTransitionError(f"complete_step not allowed from {step['status']}")
-            timing = _stop_timing_execution(_timing_from_row(step), _utc_timestamp())
+            timing = _close_all_timing_intervals(_timing_from_row(step), _utc_timestamp())
             await self._conn.execute(
                 """
                 UPDATE workflow_steps
@@ -1020,7 +1086,7 @@ class WorkflowRunManager:
             if step["status"] not in {"running", "retrying"}:
                 raise WorkflowTransitionError(f"fail_step not allowed from {step['status']}")
             code, message = self._normalize_error(error)
-            timing = _stop_timing_execution(_timing_from_row(step), _utc_timestamp())
+            timing = _close_all_timing_intervals(_timing_from_row(step), _utc_timestamp())
             await self._conn.execute(
                 """
                 UPDATE workflow_steps
@@ -1081,13 +1147,15 @@ class WorkflowRunManager:
             step = await self._fetch_step_row(run_id, step_name)
             if step["status"] != "pending":
                 raise WorkflowTransitionError(f"skip_step not allowed from {step['status']}")
+            timing = _close_all_timing_intervals(_timing_from_row(step), _utc_timestamp())
             await self._conn.execute(
                 """
                 UPDATE workflow_steps
-                SET status='skipped', completed_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP
+                SET status='skipped', timing_json=?, completed_at=CURRENT_TIMESTAMP,
+                    updated_at=CURRENT_TIMESTAMP
                 WHERE step_id=?
                 """,
-                (step["step_id"],),
+                (_timing_json(timing), step["step_id"]),
             )
             await self._append_event(
                 run_id=run_id,
@@ -1256,7 +1324,7 @@ class WorkflowRunManager:
                 raise WorkflowTransitionError(
                     f"complete_child_task not allowed from {child['status']}"
                 )
-            timing = _stop_timing_execution(_timing_from_row(child), _utc_timestamp())
+            timing = _close_all_timing_intervals(_timing_from_row(child), _utc_timestamp())
             await self._conn.execute(
                 """
                 UPDATE workflow_child_tasks
@@ -1373,7 +1441,7 @@ class WorkflowRunManager:
             if child["status"] not in {"running", "retrying"}:
                 raise WorkflowTransitionError(f"fail_child_task not allowed from {child['status']}")
             code, message = self._normalize_error(error)
-            timing = _stop_timing_execution(_timing_from_row(child), _utc_timestamp())
+            timing = _close_all_timing_intervals(_timing_from_row(child), _utc_timestamp())
             await self._conn.execute(
                 """
                 UPDATE workflow_child_tasks
@@ -1413,14 +1481,17 @@ class WorkflowRunManager:
                 raise WorkflowTransitionError(
                     f"cancel_child_task not allowed from {child['status']}"
                 )
+            timing = _close_all_timing_intervals(
+                _timing_from_row(child), _utc_timestamp()
+            )
             await self._conn.execute(
                 """
                 UPDATE workflow_child_tasks
-                SET status='cancelled', completed_at=CURRENT_TIMESTAMP,
+                SET status='cancelled', timing_json=?, completed_at=CURRENT_TIMESTAMP,
                     updated_at=CURRENT_TIMESTAMP
                 WHERE child_task_id=?
                 """,
-                (child_task_id,),
+                (_timing_json(timing), child_task_id),
             )
             await self._append_event(
                 run_id=child["run_id"],

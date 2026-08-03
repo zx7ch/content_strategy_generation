@@ -138,6 +138,71 @@ async def test_pause_boundary_closes_active_span(manager):
 
 
 @pytest.mark.asyncio
+async def test_pause_boundary_atomically_freezes_all_running_child_spans(manager):
+    run = await manager.start_run(thread_id="thread-paused-children", user_id="user-paused")
+    step = (
+        await manager.initialize_steps(
+            run.run_id,
+            [{"step_name": "formal_research", "phase": "retrieval", "max_attempts": 3}],
+        )
+    )[0]
+    await manager.start_step(run.run_id, step.step_name)
+    children = await manager.create_child_tasks(
+        run_id=run.run_id,
+        step_id=step.step_id,
+        tasks=[{"task_type": "source_collect", "slot_index": index} for index in range(2)],
+    )
+    for child in children:
+        await manager.start_child_task(child.child_task_id)
+
+    await manager.pause_run(run.run_id)
+    await manager.ack_pause_at_boundary(run.run_id, step.step_name)
+
+    async with WorkflowStore(manager.db_path) as store:
+        paused_children = await store.list_child_tasks(run.run_id)
+    assert [child.status.value for child in paused_children] == ["retrying", "retrying"]
+    for child in paused_children:
+        assert child.timing_json is not None
+        assert child.timing_json["execution_spans"][-1]["finished_at"] is not None
+        assert child.timing_json["pause_spans"][-1]["finished_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_cancel_run_closes_child_active_backoff_and_queue_spans(manager):
+    run = await manager.start_run(thread_id="thread-cancel-timing", user_id="user-cancel")
+    step = (
+        await manager.initialize_steps(
+            run.run_id,
+            [{"step_name": "formal_research", "phase": "retrieval", "max_attempts": 3}],
+        )
+    )[0]
+    await manager.start_step(run.run_id, step.step_name)
+    pending_child, running_child, retrying_child = await manager.create_child_tasks(
+        run_id=run.run_id,
+        step_id=step.step_id,
+        tasks=[{"task_type": "source_collect", "slot_index": index} for index in range(3)],
+    )
+    await manager.start_child_task(running_child.child_task_id)
+    await manager.start_child_task(retrying_child.child_task_id)
+    await manager.retry_child_task(retrying_child.child_task_id, "temporary")
+
+    await manager.cancel_run(run.run_id)
+
+    async with WorkflowStore(manager.db_path) as store:
+        cancelled_children = await store.list_child_tasks(run.run_id)
+    assert [child.status.value for child in cancelled_children] == [
+        "cancelled",
+        "cancelled",
+        "cancelled",
+    ]
+    for child in cancelled_children:
+        assert child.timing_json is not None
+        for intervals in child.timing_json.values():
+            if isinstance(intervals, list):
+                assert all(span.get("finished_at") for span in intervals)
+
+
+@pytest.mark.asyncio
 async def test_legal_run_transitions(manager):
     run = await manager.start_run(thread_id="thread-1", user_id="user-1")
 

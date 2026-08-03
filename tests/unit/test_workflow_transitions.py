@@ -114,6 +114,8 @@ async def test_complete_step_commit_guard_makes_cancel_win(manager):
     event_types = [event.event_type for event in events]
     assert "step_completed" not in event_types
     assert "step_cancelled" in event_types
+    assert guarded.timing_json is not None
+    assert guarded.timing_json["execution_spans"][-1]["finished_at"] is not None
 
 
 @pytest.mark.asyncio

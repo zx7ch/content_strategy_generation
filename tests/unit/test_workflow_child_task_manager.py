@@ -128,6 +128,24 @@ async def test_fail_and_cancel_child_task(seeded_manager):
 
 
 @pytest.mark.asyncio
+async def test_cancel_child_task_closes_running_execution_span(seeded_manager):
+    manager, run, step = seeded_manager
+    child = (
+        await manager.create_child_tasks(
+            run_id=run.run_id,
+            step_id=step.step_id,
+            tasks=[{"task_type": "note_generation", "slot_index": 0}],
+        )
+    )[0]
+    await manager.start_child_task(child.child_task_id)
+
+    cancelled = await manager.cancel_child_task(child.child_task_id)
+
+    assert cancelled.timing_json is not None
+    assert cancelled.timing_json["execution_spans"][-1]["finished_at"] is not None
+
+
+@pytest.mark.asyncio
 async def test_child_task_transition_rejects_illegal_state(seeded_manager):
     manager, run, step = seeded_manager
     child = (
