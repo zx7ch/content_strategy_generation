@@ -239,8 +239,20 @@ def _project_timing(value: dict, *, as_of: datetime | str) -> dict:
     """Return a Lite-safe timing view without leaking the durable JSON record."""
     recorded = value.get("timing_json")
     as_of_at = _parse_dt(as_of)
-    if isinstance(recorded, dict) and isinstance(recorded.get("execution_spans"), list):
-        execution_spans = recorded["execution_spans"]
+    recorded_keys = {
+        "queued_at",
+        "queue_spans",
+        "execution_spans",
+        "waiting_spans",
+        "retry_backoff_spans",
+        "pause_spans",
+        "waiting_started_at",
+        "retry_backoff_started_at",
+    }
+    if isinstance(recorded, dict) and any(key in recorded for key in recorded_keys):
+        execution_spans = recorded.get("execution_spans")
+        if not isinstance(execution_spans, list):
+            execution_spans = []
         active_duration_ms = 0
         first_execution_at: datetime | None = None
         last_finished_at: datetime | None = None
@@ -259,20 +271,40 @@ def _project_timing(value: dict, *, as_of: datetime | str) -> dict:
             active_duration_ms += max(0, int((finished_at - started_at).total_seconds() * 1000))
             last_finished_at = finished_at
 
-        queue_duration_ms = _interval_duration_ms(recorded.get("queue_spans"), as_of=None)
-        timing: dict[str, Any] = {
-            "active_duration_ms": active_duration_ms,
-            "queue_duration_ms": queue_duration_ms,
-            "timing_source": "recorded",
-        }
-        for source_key, target_key in (
-            ("queued_at", "queued_at"),
-            ("waiting_started_at", "waiting_started_at"),
-            ("retry_backoff_started_at", "retry_backoff_started_at"),
-        ):
-            timestamp = _parse_dt(recorded.get(source_key))
-            if timestamp is not None:
-                timing[target_key] = timestamp.isoformat()
+        status = str(value.get("status") or "")
+        queue_as_of = as_of_at if status == "pending" else None
+        queue_duration_ms = _interval_duration_ms(
+            recorded.get("queue_spans"), as_of=queue_as_of
+        )
+        timing: dict[str, Any] = {"timing_source": "recorded"}
+        if execution_spans:
+            timing["active_duration_ms"] = active_duration_ms
+        if isinstance(recorded.get("queue_spans"), list):
+            timing["queue_duration_ms"] = queue_duration_ms
+        queued_at = _parse_dt(recorded.get("queued_at"))
+        if queued_at is not None:
+            timing["queued_at"] = queued_at.isoformat()
+        if status == "retrying":
+            for source_key, interval_key in (
+                ("waiting_started_at", "waiting_spans"),
+                ("retry_backoff_started_at", "retry_backoff_spans"),
+            ):
+                intervals = recorded.get(interval_key)
+                has_open_interval = (
+                    isinstance(intervals, list)
+                    and any(
+                        isinstance(interval, dict)
+                        and interval.get("finished_at") is None
+                        for interval in intervals
+                    )
+                )
+                # Early recorded rows had only the scalar boundary. Preserve
+                # those while using interval state whenever it is available.
+                if intervals is not None and not has_open_interval:
+                    continue
+                timestamp = _parse_dt(recorded.get(source_key))
+                if timestamp is not None:
+                    timing[source_key] = timestamp.isoformat()
         if first_execution_at is not None:
             timing["execution_started_at"] = first_execution_at.isoformat()
         if last_finished_at is not None:

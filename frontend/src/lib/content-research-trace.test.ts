@@ -74,3 +74,46 @@ test("estimated timing labels the legacy duration as approximate", () => {
 
   assert.equal(value, "执行约 3.0s");
 });
+
+test("recorded queue-only timing renders the pending execution wording", () => {
+  const value = traceExecutionDurationText(
+    {
+      status: "pending",
+      timing: { queue_duration_ms: 1_500, timing_source: "recorded" },
+    },
+    []
+  );
+
+  assert.equal(value, "排队 1.5s · 等待执行");
+});
+
+test("recorded timing ignores stale waiting and backoff markers outside retrying", () => {
+  assert.equal(
+    traceExecutionDurationText(
+      {
+        status: "succeeded",
+        timing: {
+          active_duration_ms: 800,
+          waiting_started_at: "2026-08-03T01:00:00.900001+00:00",
+          timing_source: "recorded",
+        },
+      },
+      []
+    ),
+    "执行 0.8s"
+  );
+  assert.equal(
+    traceExecutionDurationText(
+      {
+        status: "running",
+        timing: {
+          active_duration_ms: 800,
+          retry_backoff_started_at: "2026-08-03T01:00:00.900001+00:00",
+          timing_source: "recorded",
+        },
+      },
+      []
+    ),
+    "执行 0.8s"
+  );
+});

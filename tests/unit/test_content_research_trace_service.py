@@ -233,6 +233,59 @@ def test_trace_timing_marks_legacy_step_estimated_without_precision_invention():
     }
 
 
+def test_trace_timing_projects_open_queue_only_record_as_recorded_at_server_as_of():
+    timing = _project_timing(
+        {
+            "status": "pending",
+            "timing_json": {
+                "queued_at": "2026-08-03T01:00:00.000001+00:00",
+                "queue_spans": [
+                    {
+                        "started_at": "2026-08-03T01:00:00.000001+00:00",
+                        "finished_at": None,
+                    }
+                ],
+            },
+        },
+        as_of="2026-08-03T01:00:01.500001+00:00",
+    )
+
+    assert timing == {
+        "queued_at": "2026-08-03T01:00:00.000001+00:00",
+        "queue_duration_ms": 1500,
+        "timing_source": "recorded",
+    }
+
+
+@pytest.mark.parametrize(
+    ("status", "stale_key"),
+    [
+        ("succeeded", "waiting_started_at"),
+        ("running", "retry_backoff_started_at"),
+    ],
+)
+def test_trace_timing_does_not_project_stale_inactive_boundaries(status, stale_key):
+    timing = _project_timing(
+        {
+            "status": status,
+            "timing_json": {
+                "queued_at": "2026-08-03T01:00:00.000001+00:00",
+                "execution_spans": [
+                    {
+                        "started_at": "2026-08-03T01:00:00.100001+00:00",
+                        "finished_at": "2026-08-03T01:00:00.900001+00:00",
+                    }
+                ],
+                stale_key: "2026-08-03T01:00:00.900001+00:00",
+            },
+        },
+        as_of="2026-08-03T01:00:10.000001+00:00",
+    )
+
+    assert timing["timing_source"] == "recorded"
+    assert stale_key not in timing
+
+
 @pytest.mark.asyncio
 async def test_trace_missing_workflow_raises_content_research_not_found(service):
     with pytest.raises(ContentResearchNotFoundError):

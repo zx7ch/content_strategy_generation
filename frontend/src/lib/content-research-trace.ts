@@ -23,18 +23,23 @@ function durationText(durationMs: number): string {
 
 function recordedDurationText(timing: TraceRecord, status: string): string | null {
   const activeDurationMs = numberValue(timing, "active_duration_ms");
-  if (activeDurationMs === null) return null;
-
   const source = stringValue(timing, "timing_source");
+  const queueDurationMs = numberValue(timing, "queue_duration_ms");
+  if (activeDurationMs === null) {
+    if (source === "recorded" && status === "pending" && queueDurationMs !== null) {
+      return `排队 ${durationText(queueDurationMs)} · 等待执行`;
+    }
+    return null;
+  }
+
   const prefix = source === "estimated" ? "执行约 " : "执行 ";
   const segments = [`${prefix}${durationText(activeDurationMs)}`];
-  const queueDurationMs = numberValue(timing, "queue_duration_ms");
   if (source === "recorded" && queueDurationMs !== null && queueDurationMs > 0) {
     segments.push(`排队 ${durationText(queueDurationMs)}`);
   }
-  if (source === "recorded" && stringValue(timing, "waiting_started_at")) {
+  if (source === "recorded" && status === "retrying" && stringValue(timing, "waiting_started_at")) {
     segments.push("等待恢复中");
-  } else if (source === "recorded" && (stringValue(timing, "retry_backoff_started_at") || status === "retrying")) {
+  } else if (source === "recorded" && status === "retrying" && stringValue(timing, "retry_backoff_started_at")) {
     segments.push("重试退避中");
   }
   return segments.join(" · ");
