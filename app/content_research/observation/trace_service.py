@@ -70,6 +70,7 @@ class ContentResearchTraceService:
         provider_operations = _provider_operations(self._store, workflow_run_id)
         observation_event_dicts = [_safe_observation_event_dict(event) for event in observation_events]
         source_operation_events = [_source_operation_event_dict(event) for event in observation_events]
+        trace_as_of = datetime.now(timezone.utc)
 
         return ContentResearchTraceResponse(
             workflow_run_id=workflow_run_id,
@@ -87,8 +88,11 @@ class ContentResearchTraceService:
             traces=[_safe_trace_dict(trace) for trace in traces],
             observation_events=observation_event_dicts,
             workflow_events=[_safe_workflow_event_dict(event) for event in workflow_event_dicts],
-            runtime_steps=[_safe_runtime_step_dict(step) for step in runtime_steps],
-            runtime_child_tasks=[_safe_runtime_child_task_dict(task) for task in runtime_child_tasks],
+            runtime_steps=[_safe_runtime_step_dict(step, as_of=trace_as_of) for step in runtime_steps],
+            runtime_child_tasks=[
+                _safe_runtime_child_task_dict(task, as_of=trace_as_of)
+                for task in runtime_child_tasks
+            ],
             usage_summary={},
             external_api_summary=_external_api_summary(
                 source_operation_events, provider_operations
@@ -96,6 +100,12 @@ class ContentResearchTraceService:
             provider_operations=[_safe_provider_operation_dict(item) for item in provider_operations],
             usage_steps=[],
             usage_events=[],
+            llm_recovery=_llm_recovery_projection(
+                run_status=run_status, current_stage=current_stage,
+                runtime_steps=[_json_dict(step) for step in runtime_steps],
+                workflow_events=workflow_event_dicts,
+                brief=brief,
+            ),
         )
 
 
@@ -160,14 +170,17 @@ def _safe_workflow_event_dict(event: dict) -> dict:
     })
 
 
-def _safe_runtime_step_dict(step: Any) -> dict:
-    return _select_safe_fields(_json_dict(step), {
+def _safe_runtime_step_dict(step: Any, *, as_of: datetime) -> dict:
+    value = _json_dict(step)
+    safe = _select_safe_fields(value, {
         "step_id", "step_name", "phase", "status", "attempt_count",
-        "max_attempts", "started_at", "completed_at",
+        "max_attempts", "started_at", "completed_at", "error_code",
     })
+    safe["timing"] = _project_timing(value, as_of=as_of)
+    return safe
 
 
-def _safe_runtime_child_task_dict(task: Any) -> dict:
+def _safe_runtime_child_task_dict(task: Any, *, as_of: datetime) -> dict:
     value = _json_dict(task)
     safe = _select_safe_fields(value, {
         "child_task_id", "step_id", "task_type", "status", "attempt_count",
@@ -185,7 +198,150 @@ def _safe_runtime_child_task_dict(task: Any) -> dict:
             "limit": max_attempts,
         },
     }
+    safe["timing"] = _project_timing(value, as_of=as_of)
     return safe
+
+
+def _llm_recovery_projection(
+    *,
+    run_status: str,
+    current_stage: str | None,
+    runtime_steps: list[dict],
+    workflow_events: list[dict],
+    brief: ResearchBriefRecord,
+) -> dict:
+    presearch_step = next((step for step in runtime_steps if step.get("step_name") == "presearch"), {})
+    required = run_status == "waiting_user" and current_stage == "presearch"
+    error_code = presearch_step.get("error_code")
+    if not isinstance(error_code, str) or not error_code.startswith("llm_"):
+        error_code = None
+    payload = brief.payload
+    recovery_event = next(
+        (
+            event
+            for event in reversed(workflow_events)
+            if event.get("event_type") == "run_waiting_user"
+            and (event.get("payload_json") or {}).get("step_name") == "presearch"
+            and (event.get("payload_json") or {}).get("recovery_required") is True
+        ),
+        None,
+    )
+    return {
+        "required": required,
+        "required_since": recovery_event.get("created_at") if recovery_event else None,
+        "error_code": error_code,
+        "configuration_source": payload.get("configuration_source")
+        if payload.get("configuration_source") in {"user", "system_default"} else None,
+        "model": payload.get("model") if isinstance(payload.get("model"), str) else None,
+    }
+
+
+def _project_timing(value: dict, *, as_of: datetime | str) -> dict:
+    """Return a Lite-safe timing view without leaking the durable JSON record."""
+    recorded = value.get("timing_json")
+    as_of_at = _parse_dt(as_of)
+    recorded_keys = {
+        "queued_at",
+        "queue_spans",
+        "execution_spans",
+        "waiting_spans",
+        "retry_backoff_spans",
+        "pause_spans",
+        "waiting_started_at",
+        "retry_backoff_started_at",
+    }
+    if isinstance(recorded, dict) and any(key in recorded for key in recorded_keys):
+        execution_spans = recorded.get("execution_spans")
+        if not isinstance(execution_spans, list):
+            execution_spans = []
+        active_duration_ms = 0
+        first_execution_at: datetime | None = None
+        last_finished_at: datetime | None = None
+        for span in execution_spans:
+            if not isinstance(span, dict):
+                continue
+            started_at = _parse_dt(span.get("started_at"))
+            if started_at is None:
+                continue
+            first_execution_at = first_execution_at or started_at
+            finished_at = _parse_dt(span.get("finished_at"))
+            if finished_at is None and str(value.get("status") or "") == "running":
+                finished_at = as_of_at
+            if finished_at is None:
+                continue
+            active_duration_ms += max(0, int((finished_at - started_at).total_seconds() * 1000))
+            last_finished_at = finished_at
+
+        status = str(value.get("status") or "")
+        queue_as_of = as_of_at if status == "pending" else None
+        queue_duration_ms = _interval_duration_ms(
+            recorded.get("queue_spans"), as_of=queue_as_of
+        )
+        timing: dict[str, Any] = {"timing_source": "recorded"}
+        if execution_spans:
+            timing["active_duration_ms"] = active_duration_ms
+        if isinstance(recorded.get("queue_spans"), list):
+            timing["queue_duration_ms"] = queue_duration_ms
+        queued_at = _parse_dt(recorded.get("queued_at"))
+        if queued_at is not None:
+            timing["queued_at"] = queued_at.isoformat()
+        if status == "retrying":
+            for source_key, interval_key in (
+                ("waiting_started_at", "waiting_spans"),
+                ("retry_backoff_started_at", "retry_backoff_spans"),
+            ):
+                intervals = recorded.get(interval_key)
+                has_open_interval = (
+                    isinstance(intervals, list)
+                    and any(
+                        isinstance(interval, dict)
+                        and interval.get("finished_at") is None
+                        for interval in intervals
+                    )
+                )
+                # Early recorded rows had only the scalar boundary. Preserve
+                # those while using interval state whenever it is available.
+                if intervals is not None and not has_open_interval:
+                    continue
+                timestamp = _parse_dt(recorded.get(source_key))
+                if timestamp is not None:
+                    timing[source_key] = timestamp.isoformat()
+        if first_execution_at is not None:
+            timing["execution_started_at"] = first_execution_at.isoformat()
+        if last_finished_at is not None:
+            timing["execution_finished_at"] = last_finished_at.isoformat()
+        return timing
+
+    started_at = _parse_dt(value.get("started_at"))
+    finished_at = _parse_dt(value.get("completed_at"))
+    timing = {"timing_source": "estimated"}
+    if started_at is None:
+        return timing
+    effective_end = finished_at or (as_of_at if str(value.get("status") or "") == "running" else None)
+    if effective_end is None:
+        return timing
+    timing.update(
+        {
+            "execution_started_at": started_at.isoformat(),
+            "execution_finished_at": effective_end.isoformat(),
+            "active_duration_ms": max(0, int((effective_end - started_at).total_seconds() * 1000)),
+        }
+    )
+    return timing
+
+
+def _interval_duration_ms(value: Any, *, as_of: datetime | None) -> int:
+    if not isinstance(value, list):
+        return 0
+    total = 0
+    for interval in value:
+        if not isinstance(interval, dict):
+            continue
+        started_at = _parse_dt(interval.get("started_at"))
+        finished_at = _parse_dt(interval.get("finished_at")) or as_of
+        if started_at is not None and finished_at is not None:
+            total += max(0, int((finished_at - started_at).total_seconds() * 1000))
+    return total
 
 
 def _safe_provider_operation_dict(operation: dict) -> dict:
@@ -346,7 +502,13 @@ def _duration_ms(
     if len(times) < 2:
         return 0
     start = min(times)
-    end = max(times)
+    terminal_key = {
+        "succeeded": "completed_at",
+        "failed": "failed_at",
+        "cancelled": "cancelled_at",
+    }.get(str(run.get("status") or ""))
+    terminal_end = _parse_dt(run.get(terminal_key)) if terminal_key else None
+    end = terminal_end or max(times)
     return max(0, int((end - start).total_seconds() * 1000))
 
 

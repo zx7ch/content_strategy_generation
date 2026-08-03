@@ -68,6 +68,7 @@ class LLMResponse:
     usage: TokenUsage
     latency_ms: int
     raw_response_id: str | None = None
+    configuration_source: str = "system_default"
 
 
 @dataclass(frozen=True)

@@ -9,6 +9,7 @@ import re
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
@@ -28,6 +29,7 @@ from app.content_research.reporting.publication_materializer import (
 )
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
 from app.memory.thread_store import ThreadStore
+from app.models.workflow import WorkflowPhase
 from app.services.workflow_run_manager import WorkflowRunManager
 from tests.browser_process import (
     chrome_executable,
@@ -245,6 +247,124 @@ def test_creator_hides_lite_entry_when_preview_is_disabled(browser_page):
     expect(page.get_by_role("button", name=re.compile("内容调研"))).to_have_count(0)
 
 
+def test_creator_model_service_card_masks_saved_key(browser_page):
+    page, stack = browser_page
+    page.goto(stack["frontend_url"] + "/creator", wait_until="networkidle")
+    card = page.get_by_role("region", name="模型服务")
+    expect(card).to_be_visible(timeout=15000)
+    expect(card).to_have_count(1)
+    summary = page.locator('section[aria-label="内容调研研究摘要"]')
+    expect(summary).to_be_visible()
+    assert summary.evaluate(
+        "(summary) => Boolean(summary.compareDocumentPosition(document.querySelector('[aria-label=\"模型服务\"]')) & Node.DOCUMENT_POSITION_FOLLOWING)"
+    )
+    page.get_by_role("button", name=re.compile("内容调研")).click(timeout=15000)
+    expect(page.get_by_role("region", name="模型服务")).to_have_count(1)
+    card.get_by_role("button", name="配置模型").click()
+    card.get_by_label("Base URL", exact=True).fill("https://proxy.example/v1")
+    card.get_by_label("模型", exact=True).fill("model-x")
+    card.get_by_label("API Key", exact=True).fill("secret-1234")
+    page.get_by_role("button", name="测试连接").click()
+    expect(page.get_by_text("连接验证成功")).to_be_visible()
+    page.get_by_role("button", name="保存").click()
+    expect(page.get_by_text("API Key：••••1234")).to_be_visible()
+    expect(page.get_by_text("secret-1234", exact=True)).not_to_be_visible()
+
+
+def test_creator_model_failure_edit_save_and_continue_same_presearch(browser_page):
+    page, stack = browser_page
+    retry_requests: list[dict] = []
+
+    brand_id = default_brand_id(stack["backend_url"])
+    first = run_async_in_thread(
+        seed_model_presearch_recovery(
+            stack["db_path"], brand_id=brand_id, title="模型失败恢复"
+        )
+    )
+
+    def record_request(request) -> None:
+        if request.url.endswith("/actions") and '"action":"retry_presearch"' in (request.post_data or ""):
+            retry_requests.append(request.post_data_json)
+
+    page.on("request", record_request)
+    open_creator_with_restored_run(
+        page, stack["frontend_url"], first["workflow_run_id"]
+    )
+
+    card = page.get_by_role("region", name="模型服务")
+    expect(card.get_by_text("模型配置需要更新后才能继续调研。", exact=True)).to_be_visible(timeout=20000)
+    expect(page.get_by_role("heading", name="在开始前，请确认几个关键点")).to_have_count(0)
+    expect(card.get_by_role("button", name="继续调研")).to_have_count(0)
+    page.reload(wait_until="networkidle")
+    card = page.get_by_role("region", name="模型服务")
+    expect(card.get_by_text("模型配置需要更新后才能继续调研。", exact=True)).to_be_visible(timeout=20000)
+    expect(page.get_by_role("region", name="模型服务")).to_have_count(1)
+
+    with sqlite3.connect(stack["db_path"]) as connection:
+        before = (
+            connection.execute(
+                "SELECT COUNT(*) FROM content_research_stage_checkpoints WHERE workflow_run_id=?",
+                (first["workflow_run_id"],),
+            ).fetchone()[0],
+            connection.execute(
+                "SELECT COUNT(*) FROM content_research_directional_evidence_packets WHERE workflow_run_id=?",
+                (first["workflow_run_id"],),
+            ).fetchone()[0],
+        )
+
+    card.get_by_role("button", name="配置模型").click(force=True)
+    card.get_by_label("Base URL", exact=True).fill("https://proxy.example/v1")
+    card.get_by_label("模型", exact=True).fill("model-x")
+    card.get_by_label("API Key", exact=True).fill("secret-1234")
+    card.get_by_role("button", name="测试连接").click()
+    expect(card.get_by_text("连接验证成功", exact=True)).to_be_visible()
+    card.get_by_role("button", name="保存").click()
+    continue_button = card.get_by_role("button", name="继续调研")
+    expect(continue_button).to_be_enabled()
+
+    def fail_continue(route) -> None:
+        route.fulfill(
+            status=503,
+            content_type="application/json",
+            body=json.dumps({"error_message": "deterministic retry failure"}),
+        )
+
+    page.route("**/content-research/workflows/*/actions", fail_continue)
+    continue_button.click()
+    expect(card.get_by_text("继续调研失败，请重试。", exact=True)).to_be_visible()
+    page.unroute("**/content-research/workflows/*/actions", fail_continue)
+
+    with page.expect_response(
+        lambda response: response.url.endswith("/actions")
+        and '"action":"retry_presearch"' in (response.request.post_data or ""),
+        timeout=15000,
+    ) as retried_response:
+        continue_button.evaluate("(button) => { button.click(); button.click(); }")
+    retried = retried_response.value.json()["result"]
+
+    assert retry_requests == [
+        {"action": "retry_presearch", "payload": {}},
+        {"action": "retry_presearch", "payload": {}},
+    ]
+    assert retried["workflow_run_id"] == first["workflow_run_id"]
+    assert retried["attempt_id"] == first["attempt_id"]
+    assert retried["brief_id"] == first["brief_id"]
+    expect(page.get_by_role("heading", name="在开始前，请确认几个关键点")).to_be_visible()
+
+    with sqlite3.connect(stack["db_path"]) as connection:
+        after = (
+            connection.execute(
+                "SELECT COUNT(*) FROM content_research_stage_checkpoints WHERE workflow_run_id=?",
+                (first["workflow_run_id"],),
+            ).fetchone()[0],
+            connection.execute(
+                "SELECT COUNT(*) FROM content_research_directional_evidence_packets WHERE workflow_run_id=?",
+                (first["workflow_run_id"],),
+            ).fetchone()[0],
+        )
+    assert after == before
+
+
 def test_creator_complete_report_uses_lite_with_direct_source_navigation(
     browser_page,
 ):
@@ -310,6 +430,67 @@ def test_creator_complete_report_uses_lite_with_direct_source_navigation(
         url.endswith(f"/content-research/workflows/{seeded['run_id']}/report")
         for url in requested_urls
     )
+
+
+def test_creator_api_trace_keeps_newest_first_numbers_and_recorded_timing_copy(
+    browser_page,
+):
+    page, stack = browser_page
+    brand_id = default_brand_id(stack["backend_url"])
+    seeded = run_async_in_thread(
+        seed_recorded_trace_timeline(
+            stack["db_path"],
+            brand_id=brand_id,
+            title="Recorded timing timeline",
+        )
+    )
+    trace_payloads: list[dict] = []
+
+    def capture_trace(response) -> None:
+        if response.url.endswith(f"/content-research/workflows/{seeded['run_id']}/trace"):
+            trace_payloads.append(response.json())
+
+    page.on("response", capture_trace)
+    open_creator_with_restored_run(page, stack["frontend_url"], seeded["run_id"])
+    sidebar = page.locator('aside[aria-label="内容调研上下文"]')
+    sidebar.get_by_label("查看完整 workflow trace").click()
+    trace = page.locator('section[aria-label="Content Research Trace"]')
+    expect(trace).to_be_visible()
+    timeline = trace.locator('section[aria-label="Content Research Trace timeline"]')
+    rows = timeline.locator("article")
+    expect(rows).to_have_count(4)
+
+    expected_rows = [
+        (
+            "并行执行专家调研",
+            "4",
+            re.compile(r"排队 (?:<0\.1|\d+\.\d)s · 等待执行"),
+        ),
+        ("拆解调研计划", "3", "执行 2.3s · 排队 0.1s"),
+        ("确认调研 Brief", "2", "执行 1.2s · 排队 0.1s"),
+        ("识别调研主体与候选方向", "1", "执行 0.8s · 排队 0.1s"),
+    ]
+    for index, (title, number, timing_copy) in enumerate(expected_rows):
+        row = rows.nth(index)
+        expect(row.get_by_text(title, exact=True)).to_be_visible()
+        expect(row.get_by_text(number, exact=True)).to_be_visible()
+        expect(row.get_by_text(timing_copy, exact=True)).to_be_visible()
+
+    assert trace_payloads
+    assert [step["step_name"] for step in trace_payloads[-1]["runtime_steps"]] == [
+        "presearch",
+        "brief_confirm",
+        "plan_build",
+        "formal_research",
+    ]
+    assert trace_payloads[-1]["runtime_steps"][0]["timing"] == {
+        "active_duration_ms": 800,
+        "execution_finished_at": "2026-08-03T01:00:00.900001+00:00",
+        "execution_started_at": "2026-08-03T01:00:00.100001+00:00",
+        "queue_duration_ms": 100,
+        "queued_at": "2026-08-03T01:00:00.000001+00:00",
+        "timing_source": "recorded",
+    }
 
 
 def test_creator_trace_prioritizes_auth_required_child_and_resumes_once_after_qr(
@@ -1031,6 +1212,93 @@ async def seed_recovery(
     }
 
 
+async def seed_model_presearch_recovery(
+    db_path: str,
+    *,
+    brand_id: str,
+    title: str,
+) -> dict[str, str]:
+    async with ThreadStore(db_path) as thread_store:
+        thread = await thread_store.create_thread(
+            title=title,
+            workspace_id=WORKSPACE_ID,
+            brand_id=brand_id,
+        )
+    async with WorkflowRunManager(db_path) as manager:
+        run = await manager.start_run(
+            thread_id=thread["id"],
+            user_id="operator",
+            initial_request=title,
+        )
+        await manager.initialize_steps(
+            run.run_id,
+            [
+                {
+                    "step_name": "presearch",
+                    "phase": WorkflowPhase.INTAKE,
+                    "max_attempts": 3,
+                },
+                {
+                    "step_name": "brief_confirm",
+                    "phase": WorkflowPhase.INTAKE,
+                    "max_attempts": 1,
+                },
+                {
+                    "step_name": "plan_build",
+                    "phase": WorkflowPhase.INTAKE,
+                    "max_attempts": 1,
+                },
+                {
+                    "step_name": "formal_research",
+                    "phase": WorkflowPhase.RETRIEVAL,
+                    "max_attempts": 1,
+                },
+            ],
+        )
+        await manager.start_step(run.run_id, "presearch")
+        await manager.wait_for_user_recovery(
+            run.run_id,
+            step_name="presearch",
+            reason={"code": "llm_auth_invalid", "message": "API Key 无效"},
+        )
+    brief = ResearchBriefRecord(
+        id=f"brief_{run.run_id}",
+        workflow_run_id=run.run_id,
+        thread_id=thread["id"],
+        schema_version="content_research_brief_v1",
+        status="draft",
+        payload={
+            "schema_version": "content_research_brief_v1",
+            "attempt_id": f"attempt_{run.run_id}",
+            "seed_text": title,
+            "user_note": None,
+            "workspace_id": WORKSPACE_ID,
+            "user_id": "operator",
+            "status": "waiting_model_config",
+            "subject_confirmation": title,
+            "competitor_tags": [],
+            "research_directions": [],
+            "direction_catalog": list(DIRECTION_CATALOG_V1),
+            "custom_research_question": "",
+            "custom_competitor_input": "",
+            "timeout_status": "none",
+            "fallback_used": False,
+            "error_code": "llm_auth_invalid",
+            "error_message": "API Key 无效",
+            "recoverable": True,
+            "configuration_source": "user",
+            "model": "deterministic-e2e",
+        },
+    )
+    SQLiteContentResearchStore(db_path).save_brief(brief)
+    return {
+        "workflow_run_id": run.run_id,
+        "attempt_id": str(brief.payload["attempt_id"]),
+        "brief_id": brief.id,
+        "thread_id": thread["id"],
+    }
+
+
 async def seed_auth_required_trace(
     db_path: str,
     *,
@@ -1170,6 +1438,127 @@ async def seed_auth_required_trace(
         "brief_id": brief.id,
         "child_task_id": children[0].child_task_id,
     }
+
+
+async def seed_recorded_trace_timeline(
+    db_path: str,
+    *,
+    brand_id: str,
+    title: str,
+) -> dict[str, str]:
+    async with ThreadStore(db_path) as thread_store:
+        thread = await thread_store.create_thread(
+            title=title,
+            workspace_id=WORKSPACE_ID,
+            brand_id=brand_id,
+        )
+    async with WorkflowRunManager(db_path) as manager:
+        run = await manager.start_run(thread_id=thread["id"], user_id="browser-e2e")
+        steps = await manager.initialize_steps(
+            run.run_id,
+            [
+                {"step_name": "presearch", "phase": "intake", "max_attempts": 1},
+                {"step_name": "brief_confirm", "phase": "intake", "max_attempts": 1},
+                {"step_name": "plan_build", "phase": "intake", "max_attempts": 1},
+                {"step_name": "formal_research", "phase": "retrieval", "max_attempts": 1},
+            ],
+        )
+        assert manager._conn is not None
+        fixed_timings = {
+            "presearch": {
+                "queued_at": "2026-08-03T01:00:00.000001+00:00",
+                "queue_spans": [
+                    {
+                        "started_at": "2026-08-03T01:00:00.000001+00:00",
+                        "finished_at": "2026-08-03T01:00:00.100001+00:00",
+                    }
+                ],
+                "execution_spans": [
+                    {
+                        "started_at": "2026-08-03T01:00:00.100001+00:00",
+                        "finished_at": "2026-08-03T01:00:00.900001+00:00",
+                    }
+                ],
+            },
+            "brief_confirm": {
+                "queued_at": "2026-08-03T01:00:00.900001+00:00",
+                "queue_spans": [
+                    {
+                        "started_at": "2026-08-03T01:00:00.900001+00:00",
+                        "finished_at": "2026-08-03T01:00:01.000001+00:00",
+                    }
+                ],
+                "execution_spans": [
+                    {
+                        "started_at": "2026-08-03T01:00:01.000001+00:00",
+                        "finished_at": "2026-08-03T01:00:02.200001+00:00",
+                    }
+                ],
+            },
+            "plan_build": {
+                "queued_at": "2026-08-03T01:00:02.200001+00:00",
+                "queue_spans": [
+                    {
+                        "started_at": "2026-08-03T01:00:02.200001+00:00",
+                        "finished_at": "2026-08-03T01:00:02.300001+00:00",
+                    }
+                ],
+                "execution_spans": [
+                    {
+                        "started_at": "2026-08-03T01:00:02.300001+00:00",
+                        "finished_at": "2026-08-03T01:00:04.600001+00:00",
+                    }
+                ],
+            },
+            "formal_research": {
+                "queued_at": datetime.now(timezone.utc).isoformat(),
+            },
+        }
+        fixed_timings["formal_research"]["queue_spans"] = [
+            {
+                "started_at": fixed_timings["formal_research"]["queued_at"],
+                "finished_at": None,
+            }
+        ]
+        for step in steps:
+            terminal = step.step_name != "formal_research"
+            await manager._conn.execute(
+                """
+                UPDATE workflow_steps
+                SET status=?, timing_json=?, started_at=?, completed_at=?
+                WHERE step_id=?
+                """,
+                (
+                    "succeeded" if terminal else "pending",
+                    json.dumps(fixed_timings[step.step_name]),
+                    "2026-08-03 01:00:00" if terminal else None,
+                    "2026-08-03 01:00:05" if terminal else None,
+                    step.step_id,
+                ),
+            )
+        await manager._conn.execute(
+            "UPDATE workflow_runs SET current_step='formal_research', phase='retrieval' WHERE run_id=?",
+            (run.run_id,),
+        )
+        await manager._conn.commit()
+
+    SQLiteContentResearchStore(db_path).save_brief(
+        ResearchBriefRecord(
+            id=f"brief_{run.run_id}",
+            workflow_run_id=run.run_id,
+            thread_id=thread["id"],
+            schema_version="content_research_brief_v1",
+            status="ready",
+            payload={
+                "schema_version": "content_research_brief_payload_v1",
+                "confirmed_subject": title,
+                "selected_directions": ["product_marketing"],
+                "requested_direction_ids": ["product_marketing"],
+                "direction_catalog": list(DIRECTION_CATALOG_V1),
+            },
+        )
+    )
+    return {"run_id": run.run_id, "thread_id": thread["id"]}
 
 
 async def seed_historical_message(

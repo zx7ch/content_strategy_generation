@@ -8,6 +8,7 @@ import type {
   V2BrandListResponse
 } from "./api";
 import type { Brand, DataImportPreviewState, ExtensionCaptureSessionState } from "./types";
+import { getRuntimeAuthorizationHeader } from "./api.ts";
 
 const cacheFn: <T extends (...args: never[]) => unknown>(fn: T) => T =
   typeof React.cache === "function"
@@ -101,11 +102,9 @@ async function serverRequestJson<T>(path: string, options?: RequestJsonOptions):
     "X-User-Id": workspace.user_id
   });
 
-  const authToken =
-    process.env.NEXT_PUBLIC_XHS_AUTH_TOKEN?.trim() ||
-    process.env.XHS_AUTH_TOKEN?.trim();
-  if (authToken) {
-    headers.set("Authorization", `Bearer ${authToken}`);
+  const authorization = getRuntimeAuthorizationHeader();
+  if (authorization) {
+    headers.set("Authorization", authorization);
   }
 
   const response = await fetch(`${getApiBaseUrl()}${path}`, {

@@ -183,6 +183,7 @@ class WorkflowStore:
                 checkpoint_json TEXT,
                 output_artifact_refs_json TEXT,
                 active_job_id TEXT,
+                timing_json TEXT,
                 started_at TIMESTAMP,
                 completed_at TIMESTAMP,
                 next_retry_at TIMESTAMP,
@@ -212,6 +213,7 @@ class WorkflowStore:
                 checkpoint_json TEXT,
                 output_artifact_refs_json TEXT,
                 note_id TEXT,
+                timing_json TEXT,
                 started_at TIMESTAMP,
                 completed_at TIMESTAMP,
                 error_code TEXT,
@@ -223,6 +225,18 @@ class WorkflowStore:
         )
         await self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_workflow_child_tasks_step ON workflow_child_tasks(step_id, slot_index)"
+        )
+        await ensure_column(
+            self._conn,
+            table_name="workflow_steps",
+            column_name="timing_json",
+            column_sql="timing_json TEXT",
+        )
+        await ensure_column(
+            self._conn,
+            table_name="workflow_child_tasks",
+            column_name="timing_json",
+            column_sql="timing_json TEXT",
         )
         await self._conn.execute(
             """
@@ -338,6 +352,7 @@ class WorkflowStore:
             checkpoint_json=_json_load(row["checkpoint_json"], None),
             output_artifact_refs_json=_json_load(row["output_artifact_refs_json"], None),
             active_job_id=row["active_job_id"],
+            timing_json=_json_load(row["timing_json"], None),
             started_at=_parse_dt(row["started_at"]),
             completed_at=_parse_dt(row["completed_at"]),
             next_retry_at=_parse_dt(row["next_retry_at"]),
@@ -363,6 +378,7 @@ class WorkflowStore:
             checkpoint_json=_json_load(row["checkpoint_json"], None),
             output_artifact_refs_json=_json_load(row["output_artifact_refs_json"], None),
             note_id=row["note_id"],
+            timing_json=_json_load(row["timing_json"], None),
             started_at=_parse_dt(row["started_at"]),
             completed_at=_parse_dt(row["completed_at"]),
             error_code=row["error_code"],

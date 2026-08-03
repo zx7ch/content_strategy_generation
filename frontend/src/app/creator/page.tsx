@@ -32,6 +32,7 @@ import {
   getContentResearchLiteReport,
   getContentResearchWorkflow,
   retryContentResearchFormalResearch,
+  retryContentResearchPresearch,
   resumeContentResearchFormalResearch,
   startXHSQRLogin,
   type ContentResearchFormalResearchResponse,
@@ -40,7 +41,9 @@ import {
   type ContentResearchTrace,
   type ContentResearchWorkflowSummary,
 } from "@/lib/content-research-api";
+import { ModelServiceCard } from "@/components/content-research/ModelServiceCard";
 import { traceExecutionDurationText } from "@/lib/content-research-trace";
+import { resolveContentResearchModelRecovery } from "@/lib/content-research-recovery";
 
 type TaskStatus = "running" | "paused" | "failed" | "cancelled" | "completed";
 type MessageRole = "assistant" | "user" | "system";
@@ -718,6 +721,16 @@ function ContentResearchIntentCard({
       confirmationInFlightRef.current = false;
       setIsConfirming(false);
     }
+  }
+
+  if (intent.presearch.status === "waiting_model_config") {
+    return (
+      <div className="flex justify-start">
+        <div className="w-full max-w-[92%] rounded-2xl border border-amber-200 bg-amber-50 px-5 py-4 text-sm text-amber-900">
+          模型服务配置需要更新。请在右侧保存并验证新配置后继续本次预检索。
+        </div>
+      </div>
+    );
   }
 
   return (
@@ -1555,10 +1568,16 @@ function ContentResearchContextSidebar({
   run,
   onExpandedChange,
   onModifyDirections,
+  recoveryPending = false,
+  recoveryRequiredSince = null,
+  onContinuePresearch = async () => {},
 }: {
   run: ContentResearchRunState;
   onExpandedChange: (expanded: boolean) => void;
   onModifyDirections: () => void;
+  recoveryPending?: boolean;
+  recoveryRequiredSince?: string | null;
+  onContinuePresearch?: () => void | Promise<void>;
 }) {
   const report = run.report;
   const published = report ? litePublicationState(report) !== null : false;
@@ -1611,6 +1630,7 @@ function ContentResearchContextSidebar({
           {!evidenceOnly && <li>{numberField(report.status_strip, "lead_count")} 条初步信号</li>}
         </ul> : <p className="text-xs leading-5 text-quiet">暂无已发布报告；此处不会显示未冻结的来源、结论或指标。</p>}
       </section>
+      <ModelServiceCard recoveryPending={recoveryPending} recoveryRequiredSince={recoveryRequiredSince} onContinue={onContinuePresearch} onConfigurationChanged={() => undefined} />
     </aside>
   );
 }
@@ -1654,6 +1674,20 @@ export default function CreatorPage() {
   const isTaskRunning = task?.status === "running" || task?.status === "paused";
   const showTaskCard = task?.status === "running" || task?.status === "paused" || task?.status === "failed";
   const allArtifactRefs = collectArtifactRefs(messages);
+  const modelRecovery = resolveContentResearchModelRecovery({
+    transientPresearch: contentResearchIntent
+      ? {
+          workflowRunId: contentResearchIntent.presearch.workflow_run_id,
+          status: contentResearchIntent.presearch.status,
+        }
+      : null,
+    durableRun: contentResearchRun
+      ? {
+          workflowRunId: contentResearchRun.workflowRunId,
+          llmRecovery: contentResearchRun.trace?.llm_recovery,
+        }
+      : null,
+  });
 
   useEffect(() => { taskRef.current = task; }, [task]);
   useEffect(() => { activeThreadIdRef.current = activeThreadId; }, [activeThreadId]);
@@ -1693,6 +1727,9 @@ export default function CreatorPage() {
         const items = await listThreads(selectedBrandId);
         if (cancelled) return;
         setThreads(items);
+        // A user can create/send while the initial list is still in flight.
+        // Never let late hydration reset that live presearch interaction.
+        if (activeThreadIdRef.current) return;
         if (restoredThreadId) {
           const restoredThread = items.find((item) => item.thread_id === restoredThreadId);
           if (restoredThread) {
@@ -2090,6 +2127,20 @@ export default function CreatorPage() {
     void startContentResearchForRun(summary.workflow_run_id);
   }
 
+  async function continueModelRecovery() {
+    const workflowRunId = modelRecovery.workflowRunId;
+    if (!workflowRunId) return;
+    const presearch = await retryContentResearchPresearch(workflowRunId);
+    const durablePayload = contentResearchRun?.summary.brief.payload ?? {};
+    const seed = contentResearchIntent?.seed
+      || stringField(durablePayload, "seed_text")
+      || stringField(durablePayload, "subject_confirmation")
+      || "本轮调研";
+    setContentResearchIntent({ seed, presearch });
+    setContentResearchRun(null);
+    setTraceExpanded(false);
+  }
+
   async function selectThread(threadId: string) {
     setActiveThreadId(threadId);
     setActiveMenuId(null);
@@ -2130,7 +2181,14 @@ export default function CreatorPage() {
         latestFailure = visibleFailures[visibleFailures.length - 1];
         restoredRunId = latestReport?.workflow_run_id ?? artifactRunIds[artifactRunIds.length - 1] ?? null;
       }
-      const runIdForThread = restoredRunId ?? contentResearchRunForThread(threadId);
+      // The workflow API is the authority for classifying this durable run.
+      // A legacy Creator run simply returns the documented Content Research
+      // 404 and is hydrated by the legacy snapshot path below.
+      const durableContentResearchRunId = thread.active_run_id ?? null;
+      const runIdForThread =
+        restoredRunId
+        ?? contentResearchRunForThread(threadId)
+        ?? durableContentResearchRunId;
       if (runIdForThread) {
         try {
           const workflow = await getContentResearchWorkflow(runIdForThread);
@@ -2216,6 +2274,7 @@ export default function CreatorPage() {
     try {
       const created = await createThread(undefined, selectedBrandId);
       addThreadToState(created.thread_id, created.title);
+      activeThreadIdRef.current = created.thread_id;
       setActiveThreadId(created.thread_id);
       resetConversation();
     } catch {
@@ -2246,6 +2305,7 @@ export default function CreatorPage() {
         : firstMessage;
       const created = await createThread(title, selectedBrandId);
       addThreadToState(created.thread_id, created.title);
+      activeThreadIdRef.current = created.thread_id;
       setActiveThreadId(created.thread_id);
       return created.thread_id;
     } catch {
@@ -2868,7 +2928,21 @@ export default function CreatorPage() {
         run={contentResearchRun}
         onExpandedChange={setTraceExpanded}
         onModifyDirections={() => void modifyContentResearchDirections()}
+        recoveryPending={modelRecovery.recoveryPending}
+        recoveryRequiredSince={modelRecovery.requiredSince}
+        onContinuePresearch={continueModelRecovery}
       />}
+      {!contentResearchRun && <aside className="hidden w-[300px] shrink-0 overflow-y-auto border-l border-line bg-slate-50 p-4 lg:block" aria-label="内容调研上下文">
+        <h2 className="mb-3 text-sm font-semibold text-ink">本次研究摘要</h2>
+        <section className="mb-4 rounded-xl border border-line bg-white p-4" aria-label="内容调研研究摘要">
+          <p className="text-xs leading-5 text-quiet">
+            {contentResearchIntent
+              ? "调研范围尚未确认；正式报告发布后将在此显示冻结摘要。"
+              : "暂无进行中的内容调研。发起调研后，此处会显示冻结范围与研究摘要。"}
+          </p>
+        </section>
+        <ModelServiceCard recoveryPending={modelRecovery.recoveryPending} recoveryRequiredSince={modelRecovery.requiredSince} onContinue={continueModelRecovery} onConfigurationChanged={() => undefined} />
+      </aside>}
       {contentResearchRun && <ContentResearchTraceInspector
         run={contentResearchRun}
         expanded={traceExpanded}

@@ -1,6 +1,14 @@
 """LLM abstraction layer public API."""
 
 from app.services.llm.credentials import CredentialResolver
+from app.services.llm.configuration import (
+    LLMConfigurationCandidate,
+    LLMConfigurationReader,
+    LLMConfigurationSummary,
+    UserLLMConfiguration,
+)
+from app.services.llm.configuration_store import SQLiteLLMConfigurationStore
+from app.services.llm.failures import LLMProviderFailure
 from app.services.llm.pricing import DEFAULT_PRICING, ModelPricing, PricingCalculator, UsageCost
 from app.services.llm.providers.openai_compatible import OpenAICompatibleAdapter
 from app.services.llm.router import ModelRouter, build_default_policy_map
@@ -28,6 +36,10 @@ from app.services.llm.types import (
 __all__ = [
     "CredentialResolutionError",
     "CredentialResolver",
+    "LLMConfigurationCandidate",
+    "LLMConfigurationReader",
+    "LLMConfigurationSummary",
+    "LLMProviderFailure",
     "DEFAULT_PRICING",
     "LLMCallContext",
     "LLMRequest",
@@ -48,6 +60,8 @@ __all__ = [
     "ProviderNotRegisteredError",
     "ResolvedModel",
     "TokenUsage",
+    "UserLLMConfiguration",
+    "SQLiteLLMConfigurationStore",
     "UsageCost",
     "build_default_policy_map",
 ]

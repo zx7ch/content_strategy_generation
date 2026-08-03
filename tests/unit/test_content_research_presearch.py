@@ -6,15 +6,25 @@ import sqlite3
 
 import pytest
 
+from app.content_research.api_schemas import (
+    ContentResearchBriefConfirmRequest,
+    ContentResearchWorkflowActionRequest,
+)
 from app.content_research.presearch.service import PresearchService
-from app.content_research.service import ContentResearchService
+from app.content_research.service import (
+    ContentResearchService,
+    ContentResearchValidationError,
+    WorkflowRunManagerRuntime,
+)
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
+from app.services.llm.failures import LLMProviderFailure
 from app.services.llm.types import LLMResponse, TokenUsage
 
 
 class FakeRuntime:
     def __init__(self) -> None:
         self.calls: list[dict] = []
+        self.waiting = False
 
     async def start_presearch_run(self, *, thread_id: str, user_id: str, seed_text: str) -> str:
         self.calls.append({"thread_id": thread_id, "user_id": user_id, "seed_text": seed_text})
@@ -23,8 +33,22 @@ class FakeRuntime:
     async def mark_presearch_ready(self, workflow_run_id: str) -> None:
         self.calls.append({"workflow_run_id": workflow_run_id, "event": "presearch_ready"})
 
+    async def wait_for_presearch_recovery(self, workflow_run_id: str, reason: dict) -> dict:
+        self.waiting = True
+        self.calls.append({"workflow_run_id": workflow_run_id, "event": "wait_for_presearch_recovery", "reason": reason})
+        return {"workflow_run_id": workflow_run_id, "status": "waiting_user"}
+
+    async def restart_presearch_step(self, workflow_run_id: str) -> dict:
+        self.waiting = False
+        self.calls.append({"workflow_run_id": workflow_run_id, "event": "restart_presearch_step"})
+        return {"workflow_run_id": workflow_run_id, "status": "running"}
+
     async def get_runtime_snapshot(self, workflow_run_id: str) -> dict:
-        return {"run": {"run_id": workflow_run_id}, "steps": [], "child_tasks": []}
+        return {
+            "run": {"run_id": workflow_run_id, "status": "waiting_user" if self.waiting else "running"},
+            "steps": [{"step_name": "presearch", "status": "retrying", "attempt_count": 1, "max_attempts": 3}],
+            "child_tasks": [],
+        }
 
     async def list_events(self, workflow_run_id: str) -> list[dict]:
         return []
@@ -66,7 +90,7 @@ def store(tmp_path):
     return SQLiteContentResearchStore(str(tmp_path / "content_research.db"))
 
 
-def _service(store, llm=None, *, first_timeout=0.05, hard_cutoff=0.1):
+def _service(store, llm=None, *, first_timeout=0.05, hard_cutoff=0.1, runtime=None):
     return ContentResearchService(
         store=store,
         presearch=PresearchService(
@@ -74,7 +98,7 @@ def _service(store, llm=None, *, first_timeout=0.05, hard_cutoff=0.1):
             first_feedback_timeout_seconds=first_timeout,
             hard_cutoff_seconds=hard_cutoff,
         ),
-        workflow_runtime=FakeRuntime(),
+        workflow_runtime=runtime or FakeRuntime(),
     )
 
 
@@ -115,7 +139,7 @@ async def test_presearch_success_creates_workflow_brief_trace_and_observation(st
 
 
 @pytest.mark.asyncio
-async def test_presearch_llm_failure_uses_fallback(store):
+async def test_presearch_llm_failure_waits_for_model_configuration(store):
     service = _service(store, FakeLLM(fail=True))
 
     response = await service.submit_presearch(
@@ -125,13 +149,13 @@ async def test_presearch_llm_failure_uses_fallback(store):
         user_id="user_1",
     )
 
-    assert response.status == "fallback"
-    assert response.fallback_used is True
-    assert "Satisfy Running" in response.subject_confirmation
+    assert response.status == "waiting_model_config"
+    assert response.fallback_used is False
+    assert response.error_code == "llm_service_unavailable"
 
 
 @pytest.mark.asyncio
-async def test_presearch_malformed_llm_response_uses_fallback(store):
+async def test_presearch_malformed_llm_response_waits_for_configuration(store):
     service = _service(store, FakeLLM(content="not json"))
 
     response = await service.submit_presearch(
@@ -141,8 +165,134 @@ async def test_presearch_malformed_llm_response_uses_fallback(store):
         user_id="user_1",
     )
 
-    assert response.status == "fallback"
-    assert response.fallback_used is True
+    assert response.status == "waiting_model_config"
+    assert response.fallback_used is False
+    assert response.error_code == "llm_structured_output_invalid"
+
+
+class FailingLLM:
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+
+    async def generate(self, _request):
+        raise self.error
+
+
+class FailOnceThenSucceedLLM(FakeLLM):
+    def __init__(self) -> None:
+        super().__init__()
+        self.call_count = 0
+
+    async def generate(self, request):
+        self.call_count += 1
+        if self.call_count == 1:
+            raise LLMProviderFailure("llm_auth_invalid", "API Key 无效", True, 401,
+                provider="openai_compatible", model="model-x", configuration_source="user")
+        return await super().generate(request)
+
+
+class DelayedProviderFailureLLM:
+    async def generate(self, _request):
+        await asyncio.sleep(0.02)
+        raise LLMProviderFailure(
+            "llm_auth_invalid",
+            "API Key 无效",
+            True,
+            401,
+            provider="openai_compatible",
+            model="model-x",
+            configuration_source="user",
+        )
+
+
+class FailThenDelayedProviderFailureLLM:
+    def __init__(self) -> None:
+        self.call_count = 0
+
+    async def generate(self, _request):
+        self.call_count += 1
+        if self.call_count == 1:
+            raise LLMProviderFailure(
+                "llm_auth_invalid", "API Key 无效", True, 401,
+                provider="openai_compatible", model="model-x", configuration_source="user",
+            )
+        await asyncio.sleep(0.02)
+        raise LLMProviderFailure(
+            "llm_auth_invalid", "API Key 无效", True, 401,
+            provider="openai_compatible", model="model-x", configuration_source="user",
+        )
+
+
+class ControlledSuccessLLM(FakeLLM):
+    def __init__(self) -> None:
+        super().__init__()
+        self.release = asyncio.Event()
+
+    async def generate(self, request):
+        await self.release.wait()
+        return await super().generate(request)
+
+
+class BlockingReadyRuntime(WorkflowRunManagerRuntime):
+    def __init__(self, db_path: str) -> None:
+        super().__init__(db_path)
+        self.ready_transition_started = asyncio.Event()
+        self.allow_ready_transition = asyncio.Event()
+
+    async def mark_presearch_ready(self, workflow_run_id: str) -> None:
+        self.ready_transition_started.set()
+        await self.allow_ready_transition.wait()
+        await super().mark_presearch_ready(workflow_run_id)
+
+
+@pytest.mark.asyncio
+async def test_provider_failure_waits_for_configuration_without_completing_presearch(store):
+    runtime = FakeRuntime()
+    service = _service(store, FailingLLM(
+        LLMProviderFailure("llm_account_unavailable", "模型账户不可用", True, 402)
+    ), runtime=runtime)
+
+    response = await service.submit_presearch(
+        seed_text="夏季通勤短裤", user_note=None, thread_id="thread_1", workspace_id="ws_1", user_id="user_1",
+    )
+
+    assert response.status == "waiting_model_config"
+    assert response.error_code == "llm_account_unavailable"
+    assert runtime.calls[-1]["event"] == "wait_for_presearch_recovery"
+    assert all(call.get("event") != "presearch_ready" for call in runtime.calls)
+
+
+@pytest.mark.asyncio
+async def test_submit_presearch_propagates_real_workspace_scope_to_llm(store):
+    llm = FakeLLM()
+    service = _service(store, llm)
+
+    await service.submit_presearch(
+        seed_text="夏季通勤短裤",
+        user_note=None,
+        thread_id="thread_1",
+        workspace_id="workspace_from_router",
+        user_id="user_1",
+    )
+
+    assert llm.requests[0].context is not None
+    assert llm.requests[0].context.tenant_id == "workspace_from_router"
+    assert llm.requests[0].context.user_id == "user_1"
+
+
+@pytest.mark.asyncio
+async def test_retry_presearch_reuses_attempt_brief_and_run(store):
+    runtime = FakeRuntime()
+    service = _service(store, FailOnceThenSucceedLLM(), runtime=runtime)
+    first = await service.submit_presearch(
+        seed_text="夏季通勤短裤", user_note=None, thread_id="thread_1", workspace_id="ws_1", user_id="user_1",
+    )
+    retried = await service.retry_presearch(first.workflow_run_id)
+
+    assert retried.attempt_id == first.attempt_id
+    assert retried.brief_id == first.brief_id
+    assert retried.workflow_run_id == first.workflow_run_id
+    assert retried.status == "completed"
 
 
 @pytest.mark.asyncio
@@ -168,3 +318,172 @@ async def test_presearch_first_timeout_returns_fallback_then_hard_cutoff_updates
     trace = store.list_traces_for_workflow(response.workflow_run_id)[0]
     event_names = [event.event_name for event in store.list_observation_events(trace.id)]
     assert event_names == ["presearch_started", "presearch_first_timeout", "presearch_final_timeout"]
+
+
+@pytest.mark.asyncio
+async def test_late_provider_failure_after_first_timeout_atomically_waits_for_user(store):
+    service = _service(
+        store,
+        DelayedProviderFailureLLM(),
+        first_timeout=0.005,
+        hard_cutoff=0.1,
+        runtime=WorkflowRunManagerRuntime(store._db_path),
+    )
+
+    first = await service.submit_presearch(
+        seed_text="夏季通勤短裤",
+        user_note=None,
+        thread_id="thread_late_failure",
+        workspace_id="ws_1",
+        user_id="user_1",
+    )
+    assert first.status == "fallback"
+    assert first.timeout_status == "first_timeout"
+
+    for _ in range(20):
+        await asyncio.sleep(0.01)
+        settled = service.get_presearch(first.attempt_id)
+        snapshot = await service._workflow_runtime.get_runtime_snapshot(first.workflow_run_id)
+        if settled.status == "waiting_model_config" and snapshot["run"]["status"] == "waiting_user":
+            break
+    else:
+        pytest.fail("late provider failure did not converge to waiting_user")
+
+    assert settled.error_code == "llm_auth_invalid"
+    assert snapshot["steps"][0]["status"] == "retrying"
+
+
+@pytest.mark.asyncio
+async def test_retry_first_timeout_keeps_task_until_late_auth_failure_waits_for_user(store):
+    llm = FailThenDelayedProviderFailureLLM()
+    service = _service(
+        store,
+        llm,
+        first_timeout=0.005,
+        hard_cutoff=0.1,
+        runtime=WorkflowRunManagerRuntime(store._db_path),
+    )
+    first = await service.submit_presearch(
+        seed_text="夏季通勤短裤",
+        user_note=None,
+        thread_id="thread_retry_late_failure",
+        workspace_id="ws_1",
+        user_id="user_1",
+    )
+    assert first.status == "waiting_model_config"
+
+    retried = await service.retry_presearch(first.workflow_run_id)
+    assert retried.status == "fallback"
+    assert retried.timeout_status == "first_timeout"
+
+    for _ in range(20):
+        await asyncio.sleep(0.01)
+        settled = service.get_presearch(first.attempt_id)
+        snapshot = await service._workflow_runtime.get_runtime_snapshot(first.workflow_run_id)
+        if settled.status == "waiting_model_config" and snapshot["run"]["status"] == "waiting_user":
+            break
+    else:
+        pytest.fail("retry late provider failure did not converge to waiting_user")
+
+    assert llm.call_count == 2
+    assert settled.error_code == "llm_auth_invalid"
+    assert snapshot["steps"][0]["status"] == "retrying"
+    assert not any(step["status"] == "succeeded" for step in snapshot["steps"] if step["step_name"] == "presearch")
+
+
+@pytest.mark.asyncio
+async def test_confirmation_waits_for_brief_and_runtime_presearch_to_settle(store):
+    llm = ControlledSuccessLLM()
+    runtime = BlockingReadyRuntime(store._db_path)
+    service = _service(
+        store,
+        llm,
+        first_timeout=0.005,
+        hard_cutoff=0.1,
+        runtime=runtime,
+    )
+    first = await service.submit_presearch(
+        seed_text="夏季通勤短裤",
+        user_note=None,
+        thread_id="thread_confirmation_race",
+        workspace_id="ws_1",
+        user_id="user_1",
+    )
+    assert first.timeout_status == "first_timeout"
+
+    confirmation = ContentResearchBriefConfirmRequest(
+        confirmed_subject="夏季通勤短裤",
+        subject_type="category",
+        selected_competitors=[],
+        custom_competitors=[],
+        selected_directions=["product_marketing"],
+        custom_research_question="",
+    )
+    with pytest.raises(ContentResearchValidationError, match="Presearch final outcome is not ready"):
+        await service.confirm_brief(brief_id=first.brief_id, confirmation_request=confirmation)
+
+    llm.release.set()
+    await asyncio.wait_for(runtime.ready_transition_started.wait(), timeout=0.1)
+    assert service.get_presearch(first.attempt_id).status == "completed"
+    snapshot = await runtime.get_runtime_snapshot(first.workflow_run_id)
+    presearch_step = next(step for step in snapshot["steps"] if step["step_name"] == "presearch")
+    assert presearch_step["status"] == "running"
+    with pytest.raises(ContentResearchValidationError, match="Presearch final outcome is not ready"):
+        await service.confirm_brief(brief_id=first.brief_id, confirmation_request=confirmation)
+
+    runtime.allow_ready_transition.set()
+    for _ in range(20):
+        await asyncio.sleep(0.005)
+        snapshot = await runtime.get_runtime_snapshot(first.workflow_run_id)
+        presearch_step = next(step for step in snapshot["steps"] if step["step_name"] == "presearch")
+        if presearch_step["status"] == "succeeded":
+            break
+    else:
+        pytest.fail("presearch runtime transition did not settle")
+
+    summary = await service.confirm_brief(brief_id=first.brief_id, confirmation_request=confirmation)
+    assert summary.brief.status == "ready"
+    with sqlite3.connect(store._db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM content_research_dispatch_jobs").fetchone()[0] == 0
+
+    dispatched = await service.run_workflow_action(
+        workflow_run_id=first.workflow_run_id,
+        request=ContentResearchWorkflowActionRequest(
+            action="start_formal_research",
+            payload={"provider": "xiaohongshu", "source_kind": "search_result", "limit": 20},
+        ),
+    )
+    assert dispatched.status == "queued"
+    with sqlite3.connect(store._db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM content_research_dispatch_jobs").fetchone()[0] == 1
+
+
+@pytest.mark.asyncio
+async def test_start_formal_research_rejects_unconfirmed_first_timeout_without_dispatch(store):
+    service = _service(
+        store,
+        FakeLLM(delay=0.2),
+        first_timeout=0.005,
+        hard_cutoff=0.1,
+        runtime=WorkflowRunManagerRuntime(store._db_path),
+    )
+    first = await service.submit_presearch(
+        seed_text="夏季通勤短裤",
+        user_note=None,
+        thread_id="thread_no_early_dispatch",
+        workspace_id="ws_1",
+        user_id="user_1",
+    )
+    assert first.timeout_status == "first_timeout"
+
+    with pytest.raises(ContentResearchValidationError, match="Formal research is not ready to dispatch"):
+        await service.run_workflow_action(
+            workflow_run_id=first.workflow_run_id,
+            request=ContentResearchWorkflowActionRequest(
+                action="start_formal_research",
+                payload={"provider": "xiaohongshu", "source_kind": "search_result", "limit": 20},
+            ),
+        )
+
+    with sqlite3.connect(store._db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM content_research_dispatch_jobs").fetchone()[0] == 0

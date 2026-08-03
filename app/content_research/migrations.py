@@ -388,6 +388,27 @@ def _apply_0014(conn: sqlite3.Connection) -> None:
         conn.execute(f"DELETE FROM {table}")
 
 
+_V15_LLM_CONFIGURATION_SQL = """
+CREATE TABLE content_research_llm_configurations (
+    workspace_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    base_url TEXT NOT NULL,
+    model TEXT NOT NULL,
+    api_key TEXT NOT NULL,
+    validation_status TEXT NOT NULL,
+    validated_at TEXT NOT NULL,
+    last_validation_error_code TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, user_id)
+)
+"""
+
+
+def _apply_0015(conn: sqlite3.Connection) -> None:
+    conn.execute(_V15_LLM_CONFIGURATION_SQL)
+
+
 def _apply_0010(conn: sqlite3.Connection) -> None:
     _add_columns(conn, _V10_COLUMNS)
 
@@ -433,6 +454,7 @@ def _expected_checksums(migration_0002_sql: str, legacy_checksum: str) -> dict[s
         "0012": _checksum(_V12_DISPATCH_LEASE_COLUMNS),
         "0013": _checksum((_V13_LEGACY_TABLES, _V13_LEGACY_SNAPSHOT_COLUMN)),
         "0014": _checksum(_V14_REPORT_TABLES),
+        "0015": hashlib.sha256(_V15_LLM_CONFIGURATION_SQL.encode("utf-8")).hexdigest(),
     }
 
 
@@ -610,6 +632,13 @@ def apply_content_research_migrations(
                 name="purge_pre_cutover_report_artifacts",
                 checksum=expected_checksums["0014"],
                 apply=lambda: _apply_0014(conn),
+            )
+            _apply_migration(
+                conn,
+                version="0015",
+                name="workspace_scoped_llm_configurations",
+                checksum=expected_checksums["0015"],
+                apply=lambda: _apply_0015(conn),
             )
         except Exception:
             conn.rollback()

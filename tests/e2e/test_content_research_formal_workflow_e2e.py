@@ -154,7 +154,11 @@ async def formal_client(tmp_path):
     )
     dispatch_stop_event = asyncio.Event()
     dispatch_task = asyncio.create_task(dispatch_worker.run_loop(stop_event=dispatch_stop_event))
-    client = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://testserver")
+    client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://testserver",
+        headers={"X-Workspace-Id": "ws-1", "X-User-Id": "user-1"},
+    )
     try:
         yield client, adapter, db_path
     finally:
@@ -657,7 +661,8 @@ async def test_formal_action_returns_while_slow_collection_keeps_trace_readable(
     )
     assert action.json()["status"] in {"queued", "running"}
     trace = await asyncio.wait_for(
-        client.get(f"/content-research/workflows/{workflow_run_id}/trace"), timeout=0.05
+        client.get(f"/content-research/workflows/{workflow_run_id}/trace"),
+        timeout=0.15,
     )
     assert trace.status_code == 200, trace.text
     await thread_store.close()

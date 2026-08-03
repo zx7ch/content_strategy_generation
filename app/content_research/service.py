@@ -121,6 +121,15 @@ class ContentResearchValidationError(ContentResearchError):
     """Raised when a request payload is invalid."""
 
 
+class ContentResearchStateConflictError(ContentResearchValidationError):
+    """Raised when a valid action is unsafe for the current durable state."""
+
+    def __init__(self, message: str, *, error_code: str, suggested_action: str) -> None:
+        super().__init__(message)
+        self.error_code = error_code
+        self.suggested_action = suggested_action
+
+
 class ContentResearchReportIntegrityError(RuntimeError):
     """Raised when an existing published report cannot be safely projected."""
 
@@ -129,6 +138,29 @@ class WorkflowRuntime(Protocol):
     async def start_presearch_run(self, *, thread_id: str, user_id: str, seed_text: str) -> str: ...
 
     async def mark_presearch_ready(self, workflow_run_id: str) -> None: ...
+
+    async def wait_for_presearch_recovery(self, workflow_run_id: str, reason: dict) -> dict: ...
+
+    async def wait_for_presearch_recovery_atomically(
+        self,
+        workflow_run_id: str,
+        reason: dict,
+        state_writer: Callable[[aiosqlite.Connection], Awaitable[None]],
+    ) -> dict: ...
+
+    async def restart_presearch_step(self, workflow_run_id: str) -> dict: ...
+
+    async def record_step_execution_started(
+        self, workflow_run_id: str, step_name: str
+    ) -> None: ...
+
+    async def record_step_execution_finished(
+        self, workflow_run_id: str, step_name: str
+    ) -> None: ...
+
+    async def abort_step_execution(
+        self, workflow_run_id: str, step_name: str
+    ) -> None: ...
 
     async def complete_brief_and_plan_atomically(
         self,
@@ -194,7 +226,7 @@ class WorkflowRunManagerRuntime:
             await manager.initialize_steps(
                 run.run_id,
                 [
-                    {"step_name": "presearch", "phase": WorkflowPhase.INTAKE, "max_attempts": 1},
+                    {"step_name": "presearch", "phase": WorkflowPhase.INTAKE, "max_attempts": 3},
                     {
                         "step_name": "brief_confirm",
                         "phase": WorkflowPhase.INTAKE,
@@ -219,6 +251,51 @@ class WorkflowRunManagerRuntime:
                 artifact_refs=[{"type": "content_research_brief_draft"}],
             )
             await manager.advance_to_next_step(workflow_run_id)
+
+    async def wait_for_presearch_recovery(self, workflow_run_id: str, reason: dict) -> dict:
+        async with WorkflowRunManager(self._db_path) as manager:
+            run = await manager.wait_for_user_recovery(workflow_run_id, step_name="presearch", reason=reason)
+        return {"workflow_run_id": workflow_run_id, "status": run.status.value, "recoverable": True}
+
+    async def wait_for_presearch_recovery_atomically(
+        self,
+        workflow_run_id: str,
+        reason: dict,
+        state_writer: Callable[[aiosqlite.Connection], Awaitable[None]],
+    ) -> dict:
+        async with WorkflowRunManager(self._db_path) as manager:
+            run = await manager.wait_for_user_recovery(
+                workflow_run_id,
+                step_name="presearch",
+                reason=reason,
+                state_writer=state_writer,
+            )
+        return {"workflow_run_id": workflow_run_id, "status": run.status.value, "recoverable": True}
+
+    async def restart_presearch_step(self, workflow_run_id: str) -> dict:
+        async with WorkflowRunManager(self._db_path) as manager:
+            run, _ = await manager.restart_step_and_retry_children(
+                workflow_run_id, step_name="presearch", child_task_ids=[]
+            )
+        return {"workflow_run_id": workflow_run_id, "status": run.status.value if run else "running", "recoverable": True}
+
+    async def record_step_execution_started(
+        self, workflow_run_id: str, step_name: str
+    ) -> None:
+        async with WorkflowRunManager(self._db_path) as manager:
+            await manager.record_step_execution_started(workflow_run_id, step_name)
+
+    async def record_step_execution_finished(
+        self, workflow_run_id: str, step_name: str
+    ) -> None:
+        async with WorkflowRunManager(self._db_path) as manager:
+            await manager.record_step_execution_finished(workflow_run_id, step_name)
+
+    async def abort_step_execution(
+        self, workflow_run_id: str, step_name: str
+    ) -> None:
+        async with WorkflowRunManager(self._db_path) as manager:
+            await manager.abort_step_execution(workflow_run_id, step_name)
 
     async def complete_brief_and_plan_atomically(
         self,
@@ -475,6 +552,7 @@ class ContentResearchService:
         user_note: str | None,
         thread_id: str,
         user_id: str,
+        workspace_id: str = "default",
     ) -> ContentResearchPresearchResponse:
         normalized_seed = seed_text.strip()
         if not normalized_seed:
@@ -495,6 +573,7 @@ class ContentResearchService:
             thread_id=thread_id,
             workflow_run_id=workflow_run_id,
             user_id=user_id,
+            workspace_id=workspace_id,
         )
 
         llm_task = await self._presearch.create_llm_task(request)
@@ -521,6 +600,8 @@ class ContentResearchService:
             thread_id=thread_id,
             seed_text=normalized_seed,
             user_note=user_note,
+            workspace_id=workspace_id,
+            user_id=user_id,
             outcome=outcome,
         )
         self._append_presearch_outcome_event(
@@ -531,13 +612,14 @@ class ContentResearchService:
             outcome=outcome,
             attempt_id=attempt_id,
         )
-        await self._workflow_runtime.mark_presearch_ready(workflow_run_id)
+        if outcome.status == "waiting_model_config":
+            await self._workflow_runtime.wait_for_presearch_recovery(
+                workflow_run_id, reason={"code": outcome.error_code, "message": outcome.error_message}
+            )
+        elif outcome.timeout_status != "first_timeout":
+            await self._workflow_runtime.mark_presearch_ready(workflow_run_id)
 
-        if (
-            llm_task is not None
-            and not llm_task.done()
-            and outcome.timeout_status == "first_timeout"
-        ):
+        if llm_task is not None and outcome.timeout_status == "first_timeout":
             asyncio.create_task(
                 self._finalize_hard_cutoff(
                     request=request,
@@ -556,6 +638,48 @@ class ContentResearchService:
             raise ContentResearchNotFoundError(f"Presearch attempt not found: {attempt_id}")
         return self._response_from_brief(brief)
 
+    async def retry_presearch(self, workflow_run_id: str) -> ContentResearchPresearchResponse:
+        brief = self._store.get_brief_by_workflow(workflow_run_id)
+        if brief is None:
+            raise ContentResearchNotFoundError(f"Content research workflow not found: {workflow_run_id}")
+        snapshot = await self._workflow_runtime.get_runtime_snapshot(workflow_run_id)
+        run = snapshot.get("run") or {}
+        steps = list(snapshot.get("steps") or [])
+        presearch_step = next((step for step in steps if step.get("step_name") == "presearch"), {})
+        if run.get("status") != "waiting_user" or presearch_step.get("status") not in {"retrying", "running", ""}:
+            raise ContentResearchValidationError("Presearch recovery is not available for this run")
+        if int(presearch_step.get("attempt_count") or 0) >= int(presearch_step.get("max_attempts") or 3):
+            raise ContentResearchValidationError("recovery budget exhausted")
+        await self._workflow_runtime.restart_presearch_step(workflow_run_id)
+        payload = brief.payload
+        request = PresearchInput(seed_text=str(payload["seed_text"]), user_note=payload.get("user_note"),
+            thread_id=brief.thread_id, workflow_run_id=workflow_run_id,
+            user_id=str(payload.get("user_id") or "default"), workspace_id=str(payload.get("workspace_id") or "default"))
+        llm_task = await self._presearch.create_llm_task(request)
+        outcome = await self._presearch.wait_for_first_feedback(
+            request=request, task=llm_task
+        )
+        updated = self._save_brief(attempt_id=str(payload["attempt_id"]), brief_id=brief.id,
+            workflow_run_id=workflow_run_id, thread_id=brief.thread_id, seed_text=request.seed_text,
+            user_note=request.user_note, workspace_id=request.workspace_id, user_id=request.user_id, outcome=outcome)
+        if outcome.status == "waiting_model_config":
+            await self._workflow_runtime.wait_for_presearch_recovery(workflow_run_id, reason={"code": outcome.error_code, "message": outcome.error_message})
+        elif outcome.timeout_status != "first_timeout":
+            await self._workflow_runtime.mark_presearch_ready(workflow_run_id)
+        if llm_task is not None and outcome.timeout_status == "first_timeout":
+            traces = self._store.list_traces_for_workflow(workflow_run_id)
+            trace = traces[0] if traces else self._ensure_source_trace(updated)
+            asyncio.create_task(
+                self._finalize_hard_cutoff(
+                    request=request,
+                    task=llm_task,
+                    attempt_id=str(payload["attempt_id"]),
+                    trace_id=trace.id,
+                    sequence_no=self._next_observation_sequence(trace.id),
+                )
+            )
+        return self._response_from_brief(updated)
+
     async def confirm_brief(
         self,
         *,
@@ -565,24 +689,64 @@ class ContentResearchService:
         brief = self._store.get_brief(brief_id)
         if brief is None:
             raise ContentResearchNotFoundError(f"Research brief not found: {brief_id}")
-        if brief.status == "final_timeout":
-            raise ContentResearchValidationError("Cannot confirm a final-timeout brief")
-        selected_direction_ids = self._direction_registry.canonicalize_many(
-            confirmation_request.selected_directions
+        await self._require_presearch_ready_for_confirmation(brief)
+        record_boundary = getattr(
+            self._workflow_runtime, "record_step_execution_started", None
         )
-        if not set(selected_direction_ids).issubset(DIRECTION_CATALOG_V1):
-            raise ContentResearchValidationError(
-                "Selected directions must belong to the Lite direction catalog"
+        finish_boundary = getattr(
+            self._workflow_runtime, "record_step_execution_finished", None
+        )
+        abort_boundary = getattr(self._workflow_runtime, "abort_step_execution", None)
+        if record_boundary is not None:
+            await record_boundary(brief.workflow_run_id, "brief_confirm")
+        try:
+            selected_direction_ids = self._direction_registry.canonicalize_many(
+                confirmation_request.selected_directions
             )
-        directions = self._direction_registry.require_many(selected_direction_ids)
-        confirmation = BriefConfirmation(
-            confirmed_subject=confirmation_request.confirmed_subject.strip(),
-            subject_type=confirmation_request.subject_type.strip() or "unknown",
-            selected_competitors=_dedupe(confirmation_request.selected_competitors),
-            custom_competitors=_dedupe(confirmation_request.custom_competitors),
-            selected_directions=selected_direction_ids,
-            custom_research_question=confirmation_request.custom_research_question.strip(),
-        )
+            if not set(selected_direction_ids).issubset(DIRECTION_CATALOG_V1):
+                raise ContentResearchValidationError(
+                    "Selected directions must belong to the Lite direction catalog"
+                )
+            directions = self._direction_registry.require_many(selected_direction_ids)
+            confirmation = BriefConfirmation(
+                confirmed_subject=confirmation_request.confirmed_subject.strip(),
+                subject_type=confirmation_request.subject_type.strip() or "unknown",
+                selected_competitors=_dedupe(confirmation_request.selected_competitors),
+                custom_competitors=_dedupe(confirmation_request.custom_competitors),
+                selected_directions=selected_direction_ids,
+                custom_research_question=confirmation_request.custom_research_question.strip(),
+            )
+        except BaseException:
+            if abort_boundary is not None:
+                await abort_boundary(brief.workflow_run_id, "brief_confirm")
+            raise
+        if finish_boundary is not None:
+            await finish_boundary(brief.workflow_run_id, "brief_confirm")
+        if record_boundary is not None:
+            await record_boundary(brief.workflow_run_id, "plan_build")
+        try:
+            response = await self._build_and_persist_confirmed_plan(
+                brief=brief,
+                confirmation=confirmation,
+                directions=directions,
+                selected_direction_ids=selected_direction_ids,
+            )
+        except BaseException:
+            if abort_boundary is not None:
+                await abort_boundary(brief.workflow_run_id, "plan_build")
+            raise
+        if finish_boundary is not None:
+            await finish_boundary(brief.workflow_run_id, "plan_build")
+        return response
+
+    async def _build_and_persist_confirmed_plan(
+        self,
+        *,
+        brief: ResearchBriefRecord,
+        confirmation: BriefConfirmation,
+        directions: list[Any],
+        selected_direction_ids: list[str],
+    ) -> ContentResearchWorkflowSummaryResponse:
         plan_id = _new_id("rp")
         task_specs = self._task_router.build_task_specs(
             workflow_run_id=brief.workflow_run_id,
@@ -593,6 +757,8 @@ class ContentResearchService:
             custom_competitors=confirmation.custom_competitors,
             custom_research_question=confirmation.custom_research_question,
             directions=directions,
+            workspace_id=str(brief.payload.get("workspace_id") or ""),
+            user_id=str(brief.payload.get("user_id") or ""),
         )
         plan_payload = self._plan_builder.build(
             brief=brief,
@@ -736,8 +902,6 @@ class ContentResearchService:
             task_specs=[task.payload for task in saved_tasks],
             confirmation_writer=persist_confirmation,
         )
-        if self._dispatch_wake_event is not None:
-            self._dispatch_wake_event.set()
 
         return await self.get_workflow_summary(brief.workflow_run_id)
 
@@ -982,6 +1146,10 @@ class ContentResearchService:
                 "schema_version": "content_research_governed_snapshot_metadata_v2",
                 "governed_snapshot": governed,
                 "governed_input_fingerprint": governed_input_fingerprint,
+                "llm_scope": {
+                    "workspace_id": str(brief.payload.get("workspace_id") or ""),
+                    "user_id": str(brief.payload.get("user_id") or ""),
+                },
             },
         )
         saved = self._store.save_result_snapshot(snapshot)
@@ -1553,6 +1721,11 @@ class ContentResearchService:
                 local_cache_id=brief.id,
             )
 
+        if action == "retry_presearch":
+            response = await self.retry_presearch(workflow_run_id)
+            return self._action_response(workflow_run_id=workflow_run_id, action=action,
+                status=response.status, result=response.model_dump(mode="json"), local_cache_id=response.brief_id)
+
         if action == "end_content_research":
             result = await self._workflow_runtime.end_content_research_run(
                 workflow_run_id=workflow_run_id,
@@ -1659,6 +1832,21 @@ class ContentResearchService:
         A provider request may take tens of seconds. Keeping it attached to the
         Creator action fetch starves the user-visible Trace/recovery flow.
         """
+        brief = self._store.get_brief_by_workflow(workflow_run_id)
+        if brief is None:
+            raise ContentResearchNotFoundError(
+                f"Content research workflow not found: {workflow_run_id}"
+            )
+        if (
+            brief.status != "ready"
+            or not self._store.list_plans_for_brief(brief.id)
+            or not self._store.list_subagent_tasks_for_workflow(workflow_run_id)
+        ):
+            raise ContentResearchStateConflictError(
+                "Formal research is not ready to dispatch",
+                error_code="CONTENT_RESEARCH_FORMAL_RESEARCH_NOT_READY",
+                suggested_action="先确认最终版调研 brief，再开始正式调研",
+            )
         dispatch = await self._dispatch.enqueue(
             workflow_run_id=workflow_run_id,
             provider=request.provider,
@@ -1679,6 +1867,40 @@ class ContentResearchService:
             source_kind=request.source_kind,
             limit_per_specialist=request.limit,
         )
+
+    async def _require_presearch_ready_for_confirmation(
+        self, brief: ResearchBriefRecord
+    ) -> None:
+        payload_status = str(brief.payload.get("status") or brief.status)
+        timeout_status = str(brief.payload.get("timeout_status") or "none")
+        if (
+            timeout_status == "first_timeout"
+            or payload_status not in {"completed", "fallback"}
+            or brief.status == "final_timeout"
+        ):
+            raise ContentResearchStateConflictError(
+                "Presearch final outcome is not ready",
+                error_code="CONTENT_RESEARCH_PRESEARCH_NOT_READY",
+                suggested_action="等待预检索最终完成或完成模型配置后重试",
+            )
+
+        snapshot = await self._workflow_runtime.get_runtime_snapshot(
+            brief.workflow_run_id
+        )
+        presearch_step = next(
+            (
+                step
+                for step in list(snapshot.get("steps") or [])
+                if step.get("step_name") == "presearch"
+            ),
+            None,
+        )
+        if presearch_step is not None and presearch_step.get("status") != "succeeded":
+            raise ContentResearchStateConflictError(
+                "Presearch final outcome is not ready",
+                error_code="CONTENT_RESEARCH_PRESEARCH_NOT_READY",
+                suggested_action="等待预检索最终完成或完成模型配置后重试",
+            )
 
     def _requeue_recoverable_tasks(
         self,
@@ -2074,6 +2296,12 @@ class ContentResearchService:
             "transient_error",
             "rate_limited",
             "unavailable",
+            "llm_auth_invalid",
+            "llm_account_unavailable",
+            "llm_model_unavailable",
+            "llm_rate_limited",
+            "llm_service_unavailable",
+            "llm_protocol_incompatible",
         }
         recoverable_failure_by_task = {
             checkpoint.subagent_task_id: str(
@@ -2361,15 +2589,37 @@ class ContentResearchService:
         brief = self._store.get_brief_by_presearch_attempt(attempt_id)
         if brief is None:
             return
-        if outcome.timeout_status != "final_timeout":
-            return
         updated = replace(
             brief,
-            status="final_timeout",
-            payload={**brief.payload, **self._outcome_payload(outcome), "status": "final_timeout"},
+            status="final_timeout" if outcome.timeout_status == "final_timeout" else "draft",
+            payload={**brief.payload, **self._outcome_payload(outcome)},
             updated_at=utcnow(),
         )
-        self._store.save_brief(updated)
+        if outcome.status in {"waiting_model_config", "final_timeout"}:
+            reason = {"code": outcome.error_code, "message": outcome.error_message}
+            atomic_wait = getattr(
+                self._workflow_runtime,
+                "wait_for_presearch_recovery_atomically",
+                None,
+            )
+            if callable(atomic_wait):
+                async def persist_brief(conn: aiosqlite.Connection) -> None:
+                    await self._dispatch.persist_brief(conn, updated)
+
+                await atomic_wait(
+                    request.workflow_run_id,
+                    reason=reason,
+                    state_writer=persist_brief,
+                )
+            else:
+                self._store.save_brief(updated)
+                await self._workflow_runtime.wait_for_presearch_recovery(
+                    request.workflow_run_id,
+                    reason=reason,
+                )
+        else:
+            self._store.save_brief(updated)
+            await self._workflow_runtime.mark_presearch_ready(request.workflow_run_id)
         self._append_presearch_outcome_event(
             trace_id=trace_id,
             workflow_run_id=request.workflow_run_id,
@@ -2440,6 +2690,8 @@ class ContentResearchService:
         thread_id: str,
         seed_text: str,
         user_note: str | None,
+        workspace_id: str,
+        user_id: str,
         outcome: PresearchOutcome,
     ) -> ResearchBriefRecord:
         payload = {
@@ -2447,6 +2699,8 @@ class ContentResearchService:
             "attempt_id": attempt_id,
             "seed_text": seed_text,
             "user_note": user_note,
+            "workspace_id": workspace_id,
+            "user_id": user_id,
             **self._outcome_payload(outcome),
         }
         brief = ResearchBriefRecord(
@@ -2537,6 +2791,10 @@ class ContentResearchService:
             "fallback_used": outcome.fallback_used,
             "error_code": outcome.error_code,
             "error_message": outcome.error_message,
+            "recoverable": outcome.recoverable,
+            "provider": outcome.provider,
+            "model": outcome.model,
+            "configuration_source": outcome.configuration_source,
         }
 
     @staticmethod
@@ -2573,6 +2831,9 @@ class ContentResearchService:
             custom_competitor_input=str(payload.get("custom_competitor_input") or ""),
             timeout_status=str(payload.get("timeout_status") or "none"),
             fallback_used=bool(payload.get("fallback_used")),
+            error_code=payload.get("error_code"), error_message=payload.get("error_message"),
+            recoverable=bool(payload.get("recoverable")),
+            configuration_source=payload.get("configuration_source"), model=payload.get("model"),
             local_cache_id=brief.id,
         )
 

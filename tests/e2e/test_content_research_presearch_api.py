@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 
 import httpx
 import pytest
@@ -11,6 +12,14 @@ from app.content_research.presearch.service import PresearchService
 from app.content_research.service import ContentResearchService
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
 from app.services.llm.types import LLMResponse, TokenUsage
+from app.services.llm import (
+    CredentialResolver,
+    LLMService,
+    ModelRouter,
+    ResolvedModel,
+    UserLLMConfiguration,
+)
+from app.services.llm.configuration_store import SQLiteLLMConfigurationStore
 
 
 class FakeRuntime:
@@ -47,6 +56,21 @@ class FakeLLM:
         )
 
 
+class CapturingOpenAICompatibleAdapter(FakeLLM):
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    async def generate(self, request, api_key, model, base_url=None):
+        self.calls.append({
+            "workspace_id": request.context.tenant_id if request.context else None,
+            "user_id": request.context.user_id if request.context else None,
+            "api_key": api_key,
+            "model": model,
+            "base_url": base_url,
+        })
+        return await super().generate(request)
+
+
 @pytest.fixture()
 async def client(tmp_path):
     original = getattr(app.state, "content_research_service", None)
@@ -68,7 +92,7 @@ async def client(tmp_path):
 async def test_content_research_presearch_post_and_get(client):
     created = await client.post(
         "/content-research/presearch",
-        headers={"X-User-Id": "user-1"},
+        headers={"X-Workspace-Id": "ws-1", "X-User-Id": "user-1"},
         json={
             "seed_text": "Satisfy Running",
             "user_note": "关注竞品",
@@ -96,6 +120,50 @@ async def test_content_research_presearch_get_missing_attempt_returns_404(client
 
     assert response.status_code == 404
     assert response.json()["error_code"] == "CONTENT_RESEARCH_PRESEARCH_NOT_FOUND"
+
+
+@pytest.mark.asyncio
+async def test_router_scope_selects_atomic_user_target_through_service_and_adapter(
+    client, tmp_path
+):
+    db_path = str(tmp_path / "scoped-target.db")
+    configuration_store = SQLiteLLMConfigurationStore(db_path)
+    configuration_store.upsert(UserLLMConfiguration(
+        workspace_id="workspace-real",
+        user_id="user-real",
+        base_url="https://proxy.example/v1",
+        model="model-real",
+        api_key="key-real",
+        validation_status="validated",
+        validated_at=datetime.now(timezone.utc),
+    ))
+    adapter = CapturingOpenAICompatibleAdapter()
+    llm = LLMService(
+        router=ModelRouter({"balanced": ResolvedModel("openai", "env-model")}),
+        credential_resolver=CredentialResolver(),
+        providers={"openai_compatible": adapter},
+        configuration_reader=configuration_store,
+    )
+    app.state.content_research_service = ContentResearchService(
+        store=SQLiteContentResearchStore(db_path),
+        presearch=PresearchService(llm),
+        workflow_runtime=FakeRuntime(),
+    )
+
+    response = await client.post(
+        "/content-research/presearch",
+        headers={"X-Workspace-Id": "workspace-real", "X-User-Id": "user-real"},
+        json={"seed_text": "Satisfy Running", "thread_id": "thread-real"},
+    )
+
+    assert response.status_code == 201
+    assert adapter.calls == [{
+        "workspace_id": "workspace-real",
+        "user_id": "user-real",
+        "api_key": "key-real",
+        "model": "model-real",
+        "base_url": "https://proxy.example/v1",
+    }]
 
 
 @pytest.mark.asyncio

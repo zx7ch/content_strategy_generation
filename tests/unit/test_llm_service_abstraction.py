@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 import pytest
 
 from app.services.llm import (
     CredentialResolutionError,
     CredentialResolver,
+    LLMConfigurationReader,
     LLMCallContext,
     LLMRequest,
     LLMResponse,
@@ -17,7 +19,27 @@ from app.services.llm import (
     ProviderNotRegisteredError,
     ResolvedModel,
     TokenUsage,
+    UserLLMConfiguration,
 )
+from app.services.llm.failures import LLMProviderFailure
+
+
+NOW = datetime(2026, 8, 3, tzinfo=timezone.utc)
+
+
+class FakeConfigurationReader:
+    def __init__(self, configuration: UserLLMConfiguration | None) -> None:
+        self.configuration = configuration
+
+    def get(self, workspace_id: str, user_id: str) -> UserLLMConfiguration | None:
+        if self.configuration is None:
+            return None
+        if (workspace_id, user_id) != (
+            self.configuration.workspace_id,
+            self.configuration.user_id,
+        ):
+            return None
+        return self.configuration
 
 
 @dataclass
@@ -33,11 +55,14 @@ class FakeSettings:
 
 
 class FakeProvider:
-    def __init__(self) -> None:
-        self.calls: list[tuple[LLMRequest, str, str]] = []
+    def __init__(self, error: Exception | None = None) -> None:
+        self.error = error
+        self.calls: list[tuple[LLMRequest, str, str, str | None]] = []
 
-    async def generate(self, request: LLMRequest, api_key: str, model: str) -> LLMResponse:
-        self.calls.append((request, api_key, model))
+    async def generate(self, request: LLMRequest, api_key: str, model: str, base_url=None) -> LLMResponse:
+        self.calls.append((request, api_key, model, base_url))
+        if self.error is not None:
+            raise self.error
         return LLMResponse(
             content="normalized output",
             provider=request.provider or "openai",
@@ -131,7 +156,56 @@ async def test_service_generate_routes_to_fake_provider() -> None:
 
     assert response.content == "normalized output"
     assert response.usage.total_tokens == 15
-    assert provider.calls == [(request, "openai-key", "gpt-test")]
+    assert provider.calls == [(request, "openai-key", "gpt-test", None)]
+
+
+@pytest.mark.asyncio
+async def test_user_configuration_overrides_policy_as_one_atomic_target():
+    reader = FakeConfigurationReader(UserLLMConfiguration(
+        workspace_id="ws_1", user_id="user_1", base_url="https://custom.example/v1",
+        model="model-x", api_key="user-key", validation_status="validated", validated_at=NOW,
+    ))
+    provider = FakeProvider()
+    service = LLMService(
+        router=ModelRouter({"balanced": ResolvedModel("openai", "env-model")}),
+        credential_resolver=CredentialResolver(FakeSettings()),
+        providers={"openai_compatible": provider, "openai": FakeProvider()},
+        configuration_reader=reader,
+    )
+    request = LLMRequest(
+        messages=[Message(role="user", content="hi")], task_type="chat", model_policy="balanced",
+        context=LLMCallContext(tenant_id="ws_1", user_id="user_1"),
+    )
+
+    response = await service.generate(request)
+
+    assert provider.calls[0][1:] == ("user-key", "model-x", "https://custom.example/v1")
+    assert response.configuration_source == "user"
+
+
+@pytest.mark.asyncio
+async def test_user_configuration_failure_never_calls_env_provider():
+    custom = FakeProvider(error=LLMProviderFailure("llm_auth_invalid", "API Key 无效", True, 401))
+    env_provider = FakeProvider()
+    reader = FakeConfigurationReader(UserLLMConfiguration(
+        workspace_id="ws_1", user_id="user_1", base_url="https://custom.example/v1",
+        model="model-x", api_key="user-key", validation_status="validated", validated_at=NOW,
+    ))
+    service = LLMService(
+        router=ModelRouter({"balanced": ResolvedModel("openai", "env-model")}),
+        credential_resolver=CredentialResolver(FakeSettings()),
+        providers={"openai_compatible": custom, "openai": env_provider}, configuration_reader=reader,
+    )
+    request = LLMRequest(
+        messages=[Message(role="user", content="hi")], task_type="chat", model_policy="balanced",
+        context=LLMCallContext(tenant_id="ws_1", user_id="user_1"),
+    )
+
+    with pytest.raises(LLMProviderFailure) as error:
+        await service.generate(request)
+
+    assert error.value.code == "llm_auth_invalid"
+    assert env_provider.calls == []
 
 
 @pytest.mark.asyncio
@@ -143,5 +217,50 @@ async def test_service_missing_provider_raises() -> None:
     )
     request = LLMRequest(messages=[Message(role="user", content="hi")], task_type="topic", model_policy="balanced")
 
-    with pytest.raises(ProviderNotRegisteredError, match="openai"):
+    with pytest.raises(LLMProviderFailure) as error:
         await service.generate(request)
+
+    assert (error.value.code, error.value.public_message, error.value.configuration_source) == (
+        "llm_service_unavailable", "模型服务暂时不可用", "system_default"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("service", "expected_code", "expected_message"),
+    [
+        (
+            LLMService(
+                router=ModelRouter({"balanced": ResolvedModel("openai", "gpt-test")}),
+                credential_resolver=CredentialResolver(FakeSettings(OPENAI_API_KEY="")),
+                providers={"openai": FakeProvider()},
+            ),
+            "llm_auth_invalid",
+            "API Key 未配置",
+        ),
+        (
+            LLMService(
+                router=ModelRouter({"known": ResolvedModel("openai", "gpt-test")}),
+                credential_resolver=CredentialResolver(FakeSettings()),
+                providers={"openai": FakeProvider()},
+            ),
+            "llm_model_unavailable",
+            "模型配置不可用",
+        ),
+    ],
+)
+async def test_service_configuration_failures_are_stable_provider_failures(
+    service, expected_code, expected_message
+) -> None:
+    request = LLMRequest(
+        messages=[Message(role="user", content="hi")],
+        task_type="topic",
+        model_policy="balanced",
+    )
+
+    with pytest.raises(LLMProviderFailure) as error:
+        await service.generate(request)
+
+    assert error.value.code == expected_code
+    assert error.value.public_message == expected_message
+    assert error.value.configuration_source == "system_default"

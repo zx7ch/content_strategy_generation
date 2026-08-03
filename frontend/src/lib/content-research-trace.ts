@@ -5,6 +5,46 @@ function stringValue(record: TraceRecord, key: string): string {
   return typeof value === "string" ? value : "";
 }
 
+function objectValue(record: TraceRecord, key: string): TraceRecord | null {
+  const value = record[key];
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as TraceRecord
+    : null;
+}
+
+function numberValue(record: TraceRecord | null, key: string): number | null {
+  const value = record?.[key];
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
+}
+
+function durationText(durationMs: number): string {
+  return durationMs > 0 && durationMs < 100 ? "<0.1s" : `${(durationMs / 1000).toFixed(1)}s`;
+}
+
+function recordedDurationText(timing: TraceRecord, status: string): string | null {
+  const activeDurationMs = numberValue(timing, "active_duration_ms");
+  const source = stringValue(timing, "timing_source");
+  const queueDurationMs = numberValue(timing, "queue_duration_ms");
+  if (activeDurationMs === null) {
+    if (source === "recorded" && status === "pending" && queueDurationMs !== null) {
+      return `排队 ${durationText(queueDurationMs)} · 等待执行`;
+    }
+    return null;
+  }
+
+  const prefix = source === "estimated" ? "执行约 " : "执行 ";
+  const segments = [`${prefix}${durationText(activeDurationMs)}`];
+  if (source === "recorded" && queueDurationMs !== null && queueDurationMs > 0) {
+    segments.push(`排队 ${durationText(queueDurationMs)}`);
+  }
+  if (source === "recorded" && status === "retrying" && stringValue(timing, "waiting_started_at")) {
+    segments.push("等待恢复中");
+  } else if (source === "recorded" && status === "retrying" && stringValue(timing, "retry_backoff_started_at")) {
+    segments.push("重试退避中");
+  }
+  return segments.join(" · ");
+}
+
 function parseTraceTimestamp(value: string): number {
   if (!value) return Number.NaN;
   // SQLite stores UTC timestamps without an offset.  JavaScript otherwise
@@ -33,12 +73,16 @@ export function traceExecutionDurationText(
   events: TraceRecord[],
   now = Date.now()
 ): string {
+  const status = stringValue(step, "status");
+  const projectedTiming = objectValue(step, "timing");
+  const projectedText = projectedTiming ? recordedDurationText(projectedTiming, status) : null;
+  if (projectedText) return projectedText;
+
   const stepId = stringValue(step, "step_id");
   const startedAt = latestEventTime(events, stepId, ["step_started"])
     || parseTraceTimestamp(stringValue(step, "started_at"));
   if (!Number.isFinite(startedAt)) return "执行耗时未记录";
 
-  const status = stringValue(step, "status");
   const completedAt = latestEventTime(events, stepId, ["step_completed", "step_failed"])
     || parseTraceTimestamp(stringValue(step, "completed_at"));
   const waitingAt = latestEventTime(events, stepId, ["run_waiting_user", "step_retry_scheduled"]);

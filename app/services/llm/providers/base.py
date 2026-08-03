@@ -13,6 +13,7 @@ class BaseLLMProvider(Protocol):
         request: LLMRequest,
         api_key: str,
         model: str,
+        base_url: str | None = None,
     ) -> LLMResponse:
         """Generate a normalized LLM response with the given provider credential."""
         ...

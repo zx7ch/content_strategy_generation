@@ -165,6 +165,13 @@ def test_audit_accepts_the_composer_scope_card_when_no_limitations_exist():
 
 def test_llm_semantic_auditor_uses_strict_safe_protocol_and_never_passes_unknown_cost():
     snapshot = _snapshot()
+    snapshot = replace(
+        snapshot,
+        metadata={
+            **snapshot.metadata,
+            "llm_scope": {"workspace_id": "workspace-1", "user_id": "user-1"},
+        },
+    )
     draft = ResearchReportComposer().compose(snapshot)
 
     passed = asyncio.run(LLMReportSemanticAuditor(SemanticLLM()).audit(snapshot, draft))

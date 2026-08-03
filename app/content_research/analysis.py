@@ -6,8 +6,10 @@ import json
 from typing import Any, Protocol
 
 from app.content_research.runtime import LLMCostLedger
+from app.content_research.llm_scope import content_research_llm_context
 from app.services.llm.pricing import PricingCalculator, UsageCost
-from app.services.llm.types import LLMCallContext, LLMRequest, LLMResponse, Message, TokenUsage
+from app.services.llm.failures import LLMProviderFailure
+from app.services.llm.types import LLMRequest, LLMResponse, Message, TokenUsage
 from app.services.llm.usage_tracker import LLMUsageEventInput, LLMUsageTracker
 
 
@@ -41,9 +43,10 @@ class DirectionalAnalysisService:
             model_policy="quality",
             temperature=0.2,
             max_tokens=900,
-            context=LLMCallContext(
+            context=content_research_llm_context(
+                task.payload,
                 session_id=task.thread_id,
-                job_id=task.workflow_run_id,
+                workflow_run_id=task.workflow_run_id,
                 step_name="formal_research",
                 agent_name=str(task.payload.get("agent_name") or "directional_research"),
             ),
@@ -61,6 +64,18 @@ class DirectionalAnalysisService:
                 "evidence_refs": refs,
                 "missing_evidence": list(payload.get("missing_evidence") or []),
             }
+        except LLMProviderFailure as exc:
+            await self._record(
+                task,
+                request.context,
+                exc.provider or "unknown",
+                exc.model or "unknown",
+                TokenUsage(),
+                None,
+                "failed",
+                exc.code,
+            )
+            raise
         except Exception as exc:  # analysis failure must remain an explicit evidence boundary.
             await self._record(task, request.context, "unknown", "unknown", TokenUsage(), None, "failed", str(exc))
             return None

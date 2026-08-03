@@ -12,6 +12,9 @@ from time import monotonic
 from typing import Any
 
 from fastapi import FastAPI, Header, Query, Request, status
+from fastapi.encoders import jsonable_encoder
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
@@ -21,6 +24,8 @@ from app.content_research.api_schemas import (
     ContentResearchDirectionEvidenceResponse,
     ContentResearchGovernanceResponse,
     ContentResearchLiteReportResponse,
+    ContentResearchLLMConfigurationRequest,
+    ContentResearchLLMConfigurationResponse,
     ContentResearchPresearchRequest,
     ContentResearchPresearchResponse,
     ContentResearchSourceCollectionRequest,
@@ -39,6 +44,7 @@ from app.content_research.presearch.service import PresearchService
 from app.content_research.service import (
     ContentResearchNotFoundError,
     ContentResearchService,
+    ContentResearchStateConflictError,
     ContentResearchValidationError,
     WorkflowRunManagerRuntime,
 )
@@ -139,6 +145,10 @@ from app.models.workflow import WorkflowArtifactType
 from app.services.conversation_orchestrator import ConversationOrchestrator
 from app.services.creator_intent_router import ACTIVE_JOB_STATUSES, IntentContext, classify_intent
 from app.services.llm.tracked_client import build_default_llm_service
+from app.services.llm.configuration import LLMConfigurationCandidate
+from app.services.llm.configuration_service import LiteLLMConfigurationService
+from app.services.llm.configuration_store import SQLiteLLMConfigurationStore
+from app.services.llm.providers.openai_compatible import OpenAICompatibleAdapter
 from app.services.llm.usage_tracker import (
     LLMUsageEvent,
     LLMUsageStepSummary,
@@ -212,7 +222,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_allowed_origins,
     allow_credentials=False,
-    allow_methods=["GET", "POST", "PATCH", "DELETE", "HEAD", "OPTIONS"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"],
     allow_headers=[
         "Authorization",
         "Content-Type",
@@ -267,6 +277,23 @@ async def add_private_network_access_header(request: Request, call_next):
 @app.exception_handler(APIError)
 async def handle_api_error(_request: Request, exc: APIError) -> JSONResponse:
     return JSONResponse(status_code=exc.status_code, content=exc.payload.model_dump(mode="json"))
+
+
+@app.exception_handler(RequestValidationError)
+async def handle_request_validation_error(request: Request, exc: RequestValidationError):
+    if request.url.path in {
+        "/content-research/llm-config",
+        "/content-research/llm-config/validate",
+    }:
+        errors = [
+            {key: value for key, value in error.items() if key != "input"}
+            for error in exc.errors()
+        ]
+        return JSONResponse(
+            status_code=422,
+            content={"detail": jsonable_encoder(errors)},
+        )
+    return await request_validation_exception_handler(request, exc)
 
 
 def _iso(value: datetime | None) -> str | None:
@@ -820,6 +847,17 @@ def _get_content_research_service(request: Request) -> ContentResearchService:
     )
 
 
+def _get_llm_configuration_service(request: Request) -> LiteLLMConfigurationService:
+    service = getattr(request.app.state, "llm_configuration_service", None)
+    if service is None:
+        service = LiteLLMConfigurationService(
+            store=SQLiteLLMConfigurationStore(settings.SQLITE_DB_PATH),
+            probe_adapter=OpenAICompatibleAdapter(provider="openai_compatible"),
+        )
+        request.app.state.llm_configuration_service = service
+    return service
+
+
 def _require_f003_lite_preview() -> None:
     if settings.F003_LITE_PREVIEW_ENABLED:
         return
@@ -836,6 +874,14 @@ def _content_research_error(exc: Exception) -> APIError:
             status_code=404,
             error_code="CONTENT_RESEARCH_PRESEARCH_NOT_FOUND",
             error_message=str(exc),
+        )
+    if isinstance(exc, ContentResearchStateConflictError):
+        return APIError(
+            status_code=409,
+            error_code=exc.error_code,
+            error_message=str(exc),
+            retryable=True,
+            suggested_action=exc.suggested_action,
         )
     if isinstance(exc, (ContentResearchValidationError, ValueError)):
         error_code = "INVALID_CONTENT_RESEARCH_PAYLOAD"
@@ -888,19 +934,67 @@ async def _generate_thread_title(user_message: str) -> str:
 async def create_content_research_presearch(
     payload: ContentResearchPresearchRequest,
     request: Request,
-    x_user_id: str = Header(default=DEFAULT_USER_ID, alias="X-User-Id"),
 ) -> ContentResearchPresearchResponse:
     _require_f003_lite_preview()
+    principal = _resolve_workspace_principal_or_error(request)
+    assert principal.user_id is not None
     service = _get_content_research_service(request)
     try:
         return await service.submit_presearch(
             seed_text=payload.seed_text,
             user_note=payload.user_note,
             thread_id=payload.thread_id,
-            user_id=x_user_id,
+            workspace_id=principal.workspace_id,
+            user_id=principal.user_id,
         )
     except Exception as exc:  # noqa: BLE001
         raise _content_research_error(exc) from exc
+
+
+@app.get("/content-research/llm-config", response_model=ContentResearchLLMConfigurationResponse)
+async def get_content_research_llm_configuration(request: Request) -> ContentResearchLLMConfigurationResponse:
+    principal = _resolve_workspace_principal_or_error(request)
+    assert principal.user_id is not None
+    return ContentResearchLLMConfigurationResponse(**_get_llm_configuration_service(request).get_summary(
+        principal.workspace_id, principal.user_id
+    ).__dict__)
+
+
+@app.post("/content-research/llm-config/validate", response_model=ContentResearchLLMConfigurationResponse)
+async def validate_content_research_llm_configuration(
+    payload: ContentResearchLLMConfigurationRequest, request: Request
+) -> ContentResearchLLMConfigurationResponse:
+    principal = _resolve_workspace_principal_or_error(request)
+    assert principal.user_id is not None
+    summary = await _get_llm_configuration_service(request).validate(
+        workspace_id=principal.workspace_id, user_id=principal.user_id,
+        candidate=LLMConfigurationCandidate(payload.base_url, payload.model, payload.api_key),
+    )
+    return ContentResearchLLMConfigurationResponse(**summary.__dict__)
+
+
+@app.put("/content-research/llm-config", response_model=ContentResearchLLMConfigurationResponse)
+async def save_content_research_llm_configuration(
+    payload: ContentResearchLLMConfigurationRequest, request: Request
+) -> ContentResearchLLMConfigurationResponse:
+    principal = _resolve_workspace_principal_or_error(request)
+    assert principal.user_id is not None
+    summary = await _get_llm_configuration_service(request).save(
+        workspace_id=principal.workspace_id, user_id=principal.user_id,
+        candidate=LLMConfigurationCandidate(payload.base_url, payload.model, payload.api_key),
+    )
+    if summary.status != "validated":
+        raise APIError(status_code=422, error_code=summary.error_code or "llm_protocol_incompatible", error_message="模型配置验证失败")
+    return ContentResearchLLMConfigurationResponse(**summary.__dict__)
+
+
+@app.delete("/content-research/llm-config", response_model=ContentResearchLLMConfigurationResponse)
+async def delete_content_research_llm_configuration(request: Request) -> ContentResearchLLMConfigurationResponse:
+    principal = _resolve_workspace_principal_or_error(request)
+    assert principal.user_id is not None
+    return ContentResearchLLMConfigurationResponse(**_get_llm_configuration_service(request).delete(
+        principal.workspace_id, principal.user_id
+    ).__dict__)
 
 
 @app.post("/content-research/providers/xiaohongshu/login/qr", response_model=XHSQRLoginResponse)

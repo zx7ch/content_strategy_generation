@@ -54,6 +54,8 @@ class SubagentTaskRouter:
         custom_competitors: list[str],
         custom_research_question: str,
         directions: list[ResearchDirectionDefinition],
+        workspace_id: str,
+        user_id: str,
     ) -> list[dict]:
         competitors = [*selected_competitors, *custom_competitors]
         return [
@@ -66,6 +68,10 @@ class SubagentTaskRouter:
                 "agent_name": direction.agent_name,
                 "agent_version": "p0_spec_v1",
                 "task_type": direction.task_type,
+                "llm_scope": {
+                    "workspace_id": workspace_id,
+                    "user_id": user_id,
+                },
                 "input_payload": {
                     "schema_version": "content_research_subagent_input_v1",
                     "confirmed_subject": confirmed_subject,
