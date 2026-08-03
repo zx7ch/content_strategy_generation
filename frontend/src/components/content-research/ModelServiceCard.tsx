@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   deleteLLMConfiguration,
   getLLMConfiguration,
@@ -29,6 +29,8 @@ export function ModelServiceCard({
   const [apiKey, setApiKey] = useState("");
   const [message, setMessage] = useState("");
   const [busy, setBusy] = useState(false);
+  const [recoveryReady, setRecoveryReady] = useState(false);
+  const busyRef = useRef(false);
 
   useEffect(() => {
     void getLLMConfiguration().then((value) => {
@@ -36,33 +38,51 @@ export function ModelServiceCard({
     }).catch(() => setMessage("无法读取模型配置"));
   }, []);
 
+  useEffect(() => {
+    setRecoveryReady(false);
+  }, [recoveryPending]);
+
   const apply = (value: LLMConfiguration) => {
     setConfiguration(value); setBaseUrl(value.base_url); setModel(value.model); setApiKey("");
     onConfigurationChanged(value);
   };
 
   const validate = async () => {
-    setBusy(true); setMessage("");
+    if (busyRef.current) return;
+    busyRef.current = true; setBusy(true); setMessage("");
     try {
       const value = await validateLLMConfiguration({ base_url: baseUrl, model, api_key: apiKey || null });
       if (value.status === "validated") setMessage("连接验证成功");
       else setMessage("连接验证失败，请检查模型服务配置");
     } catch { setMessage("连接验证失败，请检查模型服务配置"); }
-    finally { setBusy(false); }
+    finally { busyRef.current = false; setBusy(false); }
   };
 
   const save = async () => {
-    setBusy(true); setMessage("");
-    try { apply(await saveLLMConfiguration({ base_url: baseUrl, model, api_key: apiKey || null })); setEditing(false); }
+    if (busyRef.current) return;
+    busyRef.current = true; setBusy(true); setMessage("");
+    try {
+      const saved = await saveLLMConfiguration({ base_url: baseUrl, model, api_key: apiKey || null });
+      apply(saved); setEditing(false); setRecoveryReady(recoveryPending && saved.status === "validated");
+    }
     catch { setMessage("保存失败，请先验证模型服务配置"); }
-    finally { setBusy(false); }
+    finally { busyRef.current = false; setBusy(false); }
   };
 
   const remove = async () => {
-    setBusy(true); setMessage("");
-    try { apply(await deleteLLMConfiguration()); setEditing(false); }
+    if (busyRef.current) return;
+    busyRef.current = true; setBusy(true); setMessage("");
+    try { apply(await deleteLLMConfiguration()); setEditing(false); setRecoveryReady(false); }
     catch { setMessage("删除配置失败"); }
-    finally { setBusy(false); }
+    finally { busyRef.current = false; setBusy(false); }
+  };
+
+  const continueRecovery = async () => {
+    if (busyRef.current || !recoveryReady) return;
+    busyRef.current = true; setBusy(true); setMessage("");
+    try { await onContinue(); }
+    catch { setMessage("继续调研失败，请重试。"); }
+    finally { busyRef.current = false; setBusy(false); }
   };
 
   const display = configuration ?? { source: "system_default", status: "not_configured", base_url: "", model: "", api_key_configured: false };
@@ -73,13 +93,13 @@ export function ModelServiceCard({
     <p className="mt-1 text-xs text-quiet">来源：{display.source === "user" ? "用户配置" : "系统默认"}</p>
     {display.api_key_suffix && <p className="mt-1 text-xs text-quiet">API Key：••••{display.api_key_suffix}</p>}
     {recoveryPending && <p className="mt-3 rounded-lg bg-amber-50 px-2 py-1.5 text-xs text-amber-900">模型配置需要更新后才能继续调研。</p>}
+    {message && <p className="mt-2 text-xs text-quiet">{message}</p>}
     {!editing ? <div className="mt-3 flex gap-2"><button type="button" onClick={() => setEditing(true)} className="rounded-lg border border-line px-3 py-1.5 text-xs">配置模型</button>
-      {recoveryPending && display.status === "validated" && <button type="button" onClick={() => void onContinue()} className="rounded-lg bg-blue-600 px-3 py-1.5 text-xs text-white">继续调研</button>}
+      {recoveryPending && recoveryReady && <button type="button" disabled={busy} onClick={() => void continueRecovery()} className="rounded-lg bg-blue-600 px-3 py-1.5 text-xs text-white disabled:opacity-40">{busy ? "继续中" : "继续调研"}</button>}
     </div> : <div className="mt-3 space-y-2 border-t border-line pt-3">
-      <label className="block text-xs">Base URL<input aria-label="Base URL" value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} className="mt-1 w-full rounded border border-line px-2 py-1" /></label>
-      <label className="block text-xs">模型<input aria-label="模型" value={model} onChange={(event) => setModel(event.target.value)} className="mt-1 w-full rounded border border-line px-2 py-1" /></label>
-      <label className="block text-xs">API Key<input aria-label="API Key" type="password" value={apiKey} onChange={(event) => setApiKey(event.target.value)} className="mt-1 w-full rounded border border-line px-2 py-1" /></label>
-      {message && <p className="text-xs text-quiet">{message}</p>}
+      <label className="block text-xs">Base URL<input aria-label="Base URL" value={baseUrl} onChange={(event) => { setBaseUrl(event.target.value); setRecoveryReady(false); }} className="mt-1 w-full rounded border border-line px-2 py-1" /></label>
+      <label className="block text-xs">模型<input aria-label="模型" value={model} onChange={(event) => { setModel(event.target.value); setRecoveryReady(false); }} className="mt-1 w-full rounded border border-line px-2 py-1" /></label>
+      <label className="block text-xs">API Key<input aria-label="API Key" type="password" value={apiKey} onChange={(event) => { setApiKey(event.target.value); setRecoveryReady(false); }} className="mt-1 w-full rounded border border-line px-2 py-1" /></label>
       <div className="flex flex-wrap gap-2"><button type="button" disabled={busy} onClick={() => void validate()} className="rounded border border-line px-2 py-1 text-xs">测试连接</button><button type="button" disabled={busy} onClick={() => void save()} className="rounded bg-blue-600 px-2 py-1 text-xs text-white">保存</button><button type="button" disabled={busy} onClick={() => void remove()} className="rounded border border-red-200 px-2 py-1 text-xs text-red-700">删除配置，恢复系统默认</button></div>
     </div>}
   </section>;

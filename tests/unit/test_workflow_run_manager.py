@@ -133,6 +133,36 @@ async def test_recoverable_specialist_failure_waits_for_user_and_resumes(manager
 
 
 @pytest.mark.asyncio
+async def test_recovery_state_writer_and_workflow_transition_roll_back_together(manager):
+    run = await manager.start_run(thread_id="thread-atomic-recovery", user_id="user-1")
+    await manager.initialize_steps(
+        run.run_id,
+        [{"step_name": "presearch", "phase": "intake", "max_attempts": 3}],
+    )
+    await manager.start_step(run.run_id, "presearch")
+    assert manager._conn is not None
+    await manager._conn.execute("CREATE TABLE recovery_marker (value TEXT NOT NULL)")
+    await manager._conn.commit()
+
+    async def failing_writer(conn):
+        await conn.execute("INSERT INTO recovery_marker (value) VALUES ('brief-updated')")
+        raise RuntimeError("abort shared recovery transaction")
+
+    with pytest.raises(RuntimeError, match="abort shared recovery transaction"):
+        await manager.wait_for_user_recovery(
+            run.run_id,
+            step_name="presearch",
+            reason={"code": "llm_auth_invalid", "message": "API Key 无效"},
+            state_writer=failing_writer,
+        )
+
+    async with manager._conn.execute("SELECT COUNT(*) FROM recovery_marker") as cursor:
+        assert (await cursor.fetchone())[0] == 0
+    assert (await manager._fetch_run_row(run.run_id))["status"] == "running"
+    assert (await manager._fetch_step_row(run.run_id, "presearch"))["status"] == "running"
+
+
+@pytest.mark.asyncio
 async def test_formal_recovery_action_consumes_one_child_recovery_attempt(tmp_path):
     db_path = str(tmp_path / "formal_recovery_attempt.db")
     async with WorkflowRunManager(db_path) as manager:

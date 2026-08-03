@@ -7,7 +7,7 @@ import sqlite3
 import pytest
 
 from app.content_research.presearch.service import PresearchService
-from app.content_research.service import ContentResearchService
+from app.content_research.service import ContentResearchService, WorkflowRunManagerRuntime
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
 from app.services.llm.types import LLMResponse, TokenUsage
 from app.services.llm.failures import LLMProviderFailure
@@ -183,6 +183,20 @@ class FailOnceThenSucceedLLM(FakeLLM):
         return await super().generate(request)
 
 
+class DelayedProviderFailureLLM:
+    async def generate(self, _request):
+        await asyncio.sleep(0.02)
+        raise LLMProviderFailure(
+            "llm_auth_invalid",
+            "API Key 无效",
+            True,
+            401,
+            provider="openai_compatible",
+            model="model-x",
+            configuration_source="user",
+        )
+
+
 @pytest.mark.asyncio
 async def test_provider_failure_waits_for_configuration_without_completing_presearch(store):
     runtime = FakeRuntime()
@@ -256,3 +270,36 @@ async def test_presearch_first_timeout_returns_fallback_then_hard_cutoff_updates
     trace = store.list_traces_for_workflow(response.workflow_run_id)[0]
     event_names = [event.event_name for event in store.list_observation_events(trace.id)]
     assert event_names == ["presearch_started", "presearch_first_timeout", "presearch_final_timeout"]
+
+
+@pytest.mark.asyncio
+async def test_late_provider_failure_after_first_timeout_atomically_waits_for_user(store):
+    service = _service(
+        store,
+        DelayedProviderFailureLLM(),
+        first_timeout=0.005,
+        hard_cutoff=0.1,
+        runtime=WorkflowRunManagerRuntime(store._db_path),
+    )
+
+    first = await service.submit_presearch(
+        seed_text="夏季通勤短裤",
+        user_note=None,
+        thread_id="thread_late_failure",
+        workspace_id="ws_1",
+        user_id="user_1",
+    )
+    assert first.status == "fallback"
+    assert first.timeout_status == "first_timeout"
+
+    for _ in range(20):
+        await asyncio.sleep(0.01)
+        settled = service.get_presearch(first.attempt_id)
+        snapshot = await service._workflow_runtime.get_runtime_snapshot(first.workflow_run_id)
+        if settled.status == "waiting_model_config" and snapshot["run"]["status"] == "waiting_user":
+            break
+    else:
+        pytest.fail("late provider failure did not converge to waiting_user")
+
+    assert settled.error_code == "llm_auth_invalid"
+    assert snapshot["steps"][0]["status"] == "retrying"

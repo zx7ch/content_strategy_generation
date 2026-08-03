@@ -13,10 +13,30 @@ from app.content_research.sources.base import ProviderCapability, SourceOperatio
 from app.services.llm.types import LLMResponse, TokenUsage
 from app.services.llm.configuration_service import LiteLLMConfigurationService
 from app.services.llm.configuration_store import SQLiteLLMConfigurationStore
+from app.services.llm.failures import LLMProviderFailure
 
 
 class DeterministicPresearchLLM:
-    async def generate(self, _request):
+    def __init__(self, configuration_store: SQLiteLLMConfigurationStore) -> None:
+        self._configuration_store = configuration_store
+
+    async def generate(self, request):
+        is_recovery_probe = any("模型失败恢复" in message.content for message in request.messages)
+        context = request.context
+        if (
+            is_recovery_probe
+            and context is not None
+            and self._configuration_store.get(context.tenant_id or "", context.user_id or "") is None
+        ):
+            raise LLMProviderFailure(
+                "llm_auth_invalid",
+                "API Key 无效",
+                True,
+                401,
+                provider="openai_compatible",
+                model="deterministic-e2e",
+                configuration_source="user",
+            )
         return LLMResponse(
             content=json.dumps(
                 {
@@ -137,18 +157,19 @@ async def deterministic_lifespan(application):
     production.schedule_embedding_prewarm = lambda: None
     async with _production_lifespan(application):
         service = application.state.content_research_service
+        configuration_store = SQLiteLLMConfigurationStore(os.environ["SQLITE_DB_PATH"])
         registry = SourceAdapterRegistry(
             {"xiaohongshu": DeterministicAuthRequiredSource()}
         )
         service._presearch = PresearchService(
-            DeterministicPresearchLLM(),
+            DeterministicPresearchLLM(configuration_store),
             first_feedback_timeout_seconds=0.05,
             hard_cutoff_seconds=0.1,
         )
         service._source_registry = registry
         service._task_router._source_registry = registry
         application.state.llm_configuration_service = LiteLLMConfigurationService(
-            store=SQLiteLLMConfigurationStore(os.environ["SQLITE_DB_PATH"]),
+            store=configuration_store,
             probe_adapter=DeterministicConfigurationProbe(),
         )
         application.state.xhs_qr_login_session = DeterministicQRLoginSession()

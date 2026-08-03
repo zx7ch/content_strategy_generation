@@ -447,6 +447,7 @@ class WorkflowRunManager:
         *,
         step_name: str,
         reason: str | dict[str, Any],
+        state_writer: Callable[[aiosqlite.Connection], Awaitable[None]] | None = None,
     ) -> WorkflowRun:
         """Stop a recoverable step at a durable, user-resumable boundary.
 
@@ -468,6 +469,8 @@ class WorkflowRunManager:
                 raise WorkflowTransitionError(
                     f"wait_for_user_recovery not allowed from {step['status']}"
                 )
+            if state_writer is not None:
+                await state_writer(self._conn)
             code, message = self._normalize_error(reason)
             await self._conn.execute(
                 """

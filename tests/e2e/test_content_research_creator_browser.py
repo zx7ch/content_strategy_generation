@@ -251,14 +251,106 @@ def test_creator_model_service_card_masks_saved_key(browser_page):
     page.get_by_role("button", name=re.compile("内容调研")).click(timeout=15000)
     card = page.get_by_role("region", name="模型服务")
     card.get_by_role("button", name="配置模型").click()
-    page.get_by_label("Base URL").fill("https://proxy.example/v1")
-    page.get_by_label("模型").fill("model-x")
-    page.get_by_label("API Key").fill("secret-1234")
+    card.get_by_label("Base URL", exact=True).fill("https://proxy.example/v1")
+    card.get_by_label("模型", exact=True).fill("model-x")
+    card.get_by_label("API Key", exact=True).fill("secret-1234")
     page.get_by_role("button", name="测试连接").click()
     expect(page.get_by_text("连接验证成功")).to_be_visible()
     page.get_by_role("button", name="保存").click()
     expect(page.get_by_text("API Key：••••1234")).to_be_visible()
     expect(page.get_by_text("secret-1234", exact=True)).not_to_be_visible()
+
+
+def test_creator_model_failure_edit_save_and_continue_same_presearch(browser_page):
+    page, stack = browser_page
+    responses: list[dict] = []
+    retry_requests: list[dict] = []
+
+    def record_response(response) -> None:
+        if response.url.endswith("/content-research/presearch") and response.status == 201:
+            responses.append(response.json())
+
+    def record_request(request) -> None:
+        if request.url.endswith("/actions") and '"action":"retry_presearch"' in (request.post_data or ""):
+            retry_requests.append(request.post_data_json)
+
+    page.on("response", record_response)
+    page.on("request", record_request)
+    page.goto(stack["frontend_url"] + "/creator", wait_until="domcontentloaded")
+    page.get_by_role("button", name=re.compile("内容调研")).click(timeout=15000)
+    page.locator("textarea").fill("模型失败恢复")
+    page.locator("textarea").press("Enter")
+
+    card = page.get_by_role("region", name="模型服务")
+    expect(card.get_by_text("模型配置需要更新后才能继续调研。", exact=True)).to_be_visible(timeout=20000)
+    expect(page.get_by_role("heading", name="在开始前，请确认几个关键点")).to_have_count(0)
+    expect(card.get_by_role("button", name="继续调研")).to_have_count(0)
+    assert len(responses) == 1
+    first = responses[0]
+
+    with sqlite3.connect(stack["db_path"]) as connection:
+        before = (
+            connection.execute(
+                "SELECT COUNT(*) FROM content_research_stage_checkpoints WHERE workflow_run_id=?",
+                (first["workflow_run_id"],),
+            ).fetchone()[0],
+            connection.execute(
+                "SELECT COUNT(*) FROM content_research_directional_evidence_packets WHERE workflow_run_id=?",
+                (first["workflow_run_id"],),
+            ).fetchone()[0],
+        )
+
+    card.get_by_role("button", name="配置模型").click(force=True)
+    card.get_by_label("Base URL", exact=True).fill("https://proxy.example/v1")
+    card.get_by_label("模型", exact=True).fill("model-x")
+    card.get_by_label("API Key", exact=True).fill("secret-1234")
+    card.get_by_role("button", name="测试连接").click()
+    expect(card.get_by_text("连接验证成功", exact=True)).to_be_visible()
+    card.get_by_role("button", name="保存").click()
+    continue_button = card.get_by_role("button", name="继续调研")
+    expect(continue_button).to_be_enabled()
+
+    def fail_continue(route) -> None:
+        route.fulfill(
+            status=503,
+            content_type="application/json",
+            body=json.dumps({"error_message": "deterministic retry failure"}),
+        )
+
+    page.route("**/content-research/workflows/*/actions", fail_continue)
+    continue_button.click()
+    expect(card.get_by_text("继续调研失败，请重试。", exact=True)).to_be_visible()
+    page.unroute("**/content-research/workflows/*/actions", fail_continue)
+
+    with page.expect_response(
+        lambda response: response.url.endswith("/actions")
+        and '"action":"retry_presearch"' in (response.request.post_data or ""),
+        timeout=15000,
+    ) as retried_response:
+        continue_button.evaluate("(button) => { button.click(); button.click(); }")
+    retried = retried_response.value.json()["result"]
+
+    assert retry_requests == [
+        {"action": "retry_presearch", "payload": {}},
+        {"action": "retry_presearch", "payload": {}},
+    ]
+    assert retried["workflow_run_id"] == first["workflow_run_id"]
+    assert retried["attempt_id"] == first["attempt_id"]
+    assert retried["brief_id"] == first["brief_id"]
+    expect(page.get_by_role("heading", name="在开始前，请确认几个关键点")).to_be_visible()
+
+    with sqlite3.connect(stack["db_path"]) as connection:
+        after = (
+            connection.execute(
+                "SELECT COUNT(*) FROM content_research_stage_checkpoints WHERE workflow_run_id=?",
+                (first["workflow_run_id"],),
+            ).fetchone()[0],
+            connection.execute(
+                "SELECT COUNT(*) FROM content_research_directional_evidence_packets WHERE workflow_run_id=?",
+                (first["workflow_run_id"],),
+            ).fetchone()[0],
+        )
+    assert after == before
 
 
 def test_creator_complete_report_uses_lite_with_direct_source_navigation(

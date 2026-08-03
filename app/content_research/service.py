@@ -132,6 +132,13 @@ class WorkflowRuntime(Protocol):
 
     async def wait_for_presearch_recovery(self, workflow_run_id: str, reason: dict) -> dict: ...
 
+    async def wait_for_presearch_recovery_atomically(
+        self,
+        workflow_run_id: str,
+        reason: dict,
+        state_writer: Callable[[aiosqlite.Connection], Awaitable[None]],
+    ) -> dict: ...
+
     async def restart_presearch_step(self, workflow_run_id: str) -> dict: ...
 
     async def complete_brief_and_plan_atomically(
@@ -227,6 +234,21 @@ class WorkflowRunManagerRuntime:
     async def wait_for_presearch_recovery(self, workflow_run_id: str, reason: dict) -> dict:
         async with WorkflowRunManager(self._db_path) as manager:
             run = await manager.wait_for_user_recovery(workflow_run_id, step_name="presearch", reason=reason)
+        return {"workflow_run_id": workflow_run_id, "status": run.status.value, "recoverable": True}
+
+    async def wait_for_presearch_recovery_atomically(
+        self,
+        workflow_run_id: str,
+        reason: dict,
+        state_writer: Callable[[aiosqlite.Connection], Awaitable[None]],
+    ) -> dict:
+        async with WorkflowRunManager(self._db_path) as manager:
+            run = await manager.wait_for_user_recovery(
+                workflow_run_id,
+                step_name="presearch",
+                reason=reason,
+                state_writer=state_writer,
+            )
         return {"workflow_run_id": workflow_run_id, "status": run.status.value, "recoverable": True}
 
     async def restart_presearch_step(self, workflow_run_id: str) -> dict:
@@ -555,7 +577,7 @@ class ContentResearchService:
             await self._workflow_runtime.wait_for_presearch_recovery(
                 workflow_run_id, reason={"code": outcome.error_code, "message": outcome.error_message}
             )
-        else:
+        elif outcome.timeout_status != "first_timeout":
             await self._workflow_runtime.mark_presearch_ready(workflow_run_id)
 
         if (
@@ -2420,15 +2442,37 @@ class ContentResearchService:
         brief = self._store.get_brief_by_presearch_attempt(attempt_id)
         if brief is None:
             return
-        if outcome.timeout_status != "final_timeout":
-            return
         updated = replace(
             brief,
-            status="final_timeout",
-            payload={**brief.payload, **self._outcome_payload(outcome), "status": "final_timeout"},
+            status="final_timeout" if outcome.timeout_status == "final_timeout" else "draft",
+            payload={**brief.payload, **self._outcome_payload(outcome)},
             updated_at=utcnow(),
         )
-        self._store.save_brief(updated)
+        if outcome.status in {"waiting_model_config", "final_timeout"}:
+            reason = {"code": outcome.error_code, "message": outcome.error_message}
+            atomic_wait = getattr(
+                self._workflow_runtime,
+                "wait_for_presearch_recovery_atomically",
+                None,
+            )
+            if callable(atomic_wait):
+                async def persist_brief(conn: aiosqlite.Connection) -> None:
+                    await self._dispatch.persist_brief(conn, updated)
+
+                await atomic_wait(
+                    request.workflow_run_id,
+                    reason=reason,
+                    state_writer=persist_brief,
+                )
+            else:
+                self._store.save_brief(updated)
+                await self._workflow_runtime.wait_for_presearch_recovery(
+                    request.workflow_run_id,
+                    reason=reason,
+                )
+        else:
+            self._store.save_brief(updated)
+            await self._workflow_runtime.mark_presearch_ready(request.workflow_run_id)
         self._append_presearch_outcome_event(
             trace_id=trace_id,
             workflow_run_id=request.workflow_run_id,

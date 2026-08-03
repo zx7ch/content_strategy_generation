@@ -722,6 +722,16 @@ function ContentResearchIntentCard({
     }
   }
 
+  if (intent.presearch.status === "waiting_model_config") {
+    return (
+      <div className="flex justify-start">
+        <div className="w-full max-w-[92%] rounded-2xl border border-amber-200 bg-amber-50 px-5 py-4 text-sm text-amber-900">
+          模型服务配置需要更新。请在右侧保存并验证新配置后继续本次预检索。
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="flex justify-start">
       <div className="w-full max-w-[92%] space-y-4">
@@ -2882,7 +2892,7 @@ export default function CreatorPage() {
           setContentResearchIntent({ ...contentResearchIntent, presearch });
         }}
       />}
-      {contentResearchMode && !contentResearchRun && <aside className="hidden w-[300px] shrink-0 overflow-y-auto border-l border-line bg-slate-50 p-4 lg:block" aria-label="内容调研上下文">
+      {(contentResearchMode || contentResearchIntent) && !contentResearchRun && <aside className="hidden w-[300px] shrink-0 overflow-y-auto border-l border-line bg-slate-50 p-4 lg:block" aria-label="内容调研上下文">
         <ModelServiceCard recoveryPending={contentResearchIntent?.presearch.status === "waiting_model_config"} onContinue={async () => {
           if (!contentResearchIntent) return;
           const presearch = await retryContentResearchPresearch(contentResearchIntent.presearch.workflow_run_id);
