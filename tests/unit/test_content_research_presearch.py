@@ -131,7 +131,7 @@ async def test_presearch_success_creates_workflow_brief_trace_and_observation(st
 
 
 @pytest.mark.asyncio
-async def test_presearch_llm_failure_uses_fallback(store):
+async def test_presearch_llm_failure_waits_for_model_configuration(store):
     service = _service(store, FakeLLM(fail=True))
 
     response = await service.submit_presearch(
@@ -141,9 +141,9 @@ async def test_presearch_llm_failure_uses_fallback(store):
         user_id="user_1",
     )
 
-    assert response.status == "fallback"
-    assert response.fallback_used is True
-    assert "Satisfy Running" in response.subject_confirmation
+    assert response.status == "waiting_model_config"
+    assert response.fallback_used is False
+    assert response.error_code == "llm_service_unavailable"
 
 
 @pytest.mark.asyncio
@@ -198,6 +198,24 @@ async def test_provider_failure_waits_for_configuration_without_completing_prese
     assert response.error_code == "llm_account_unavailable"
     assert runtime.calls[-1]["event"] == "wait_for_presearch_recovery"
     assert all(call.get("event") != "presearch_ready" for call in runtime.calls)
+
+
+@pytest.mark.asyncio
+async def test_submit_presearch_propagates_real_workspace_scope_to_llm(store):
+    llm = FakeLLM()
+    service = _service(store, llm)
+
+    await service.submit_presearch(
+        seed_text="夏季通勤短裤",
+        user_note=None,
+        thread_id="thread_1",
+        workspace_id="workspace_from_router",
+        user_id="user_1",
+    )
+
+    assert llm.requests[0].context is not None
+    assert llm.requests[0].context.tenant_id == "workspace_from_router"
+    assert llm.requests[0].context.user_id == "user_1"
 
 
 @pytest.mark.asyncio

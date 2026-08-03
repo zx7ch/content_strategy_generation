@@ -12,6 +12,9 @@ from time import monotonic
 from typing import Any
 
 from fastapi import FastAPI, Header, Query, Request, status
+from fastapi.encoders import jsonable_encoder
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
@@ -273,6 +276,23 @@ async def add_private_network_access_header(request: Request, call_next):
 @app.exception_handler(APIError)
 async def handle_api_error(_request: Request, exc: APIError) -> JSONResponse:
     return JSONResponse(status_code=exc.status_code, content=exc.payload.model_dump(mode="json"))
+
+
+@app.exception_handler(RequestValidationError)
+async def handle_request_validation_error(request: Request, exc: RequestValidationError):
+    if request.url.path in {
+        "/content-research/llm-config",
+        "/content-research/llm-config/validate",
+    }:
+        errors = [
+            {key: value for key, value in error.items() if key != "input"}
+            for error in exc.errors()
+        ]
+        return JSONResponse(
+            status_code=422,
+            content={"detail": jsonable_encoder(errors)},
+        )
+    return await request_validation_exception_handler(request, exc)
 
 
 def _iso(value: datetime | None) -> str | None:

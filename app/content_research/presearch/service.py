@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from app.services.llm.types import LLMCallContext, LLMRequest, LLMResponse
-from app.services.llm.failures import LLMProviderFailure
+from app.services.llm.failures import LLMProviderFailure, classify_provider_exception
 
 from app.content_research.presearch.prompts import build_presearch_messages
 
@@ -182,11 +182,19 @@ class PresearchService:
                 recoverable=exc.recoverable, provider=exc.provider, model=exc.model,
                 configuration_source=exc.configuration_source,
             )
-        except Exception as exc:  # noqa: BLE001 - presearch must fall back instead of blocking UX.
-            return self.fallback(
-                request,
-                error_code="PRESEARCH_LLM_FAILED",
-                error_message=str(exc),
+        except Exception as exc:  # noqa: BLE001 - normalize the model boundary to a safe wait.
+            failure = classify_provider_exception(exc)
+            from app.content_research.presearch.fallback_templates import build_fallback_checklist
+            return PresearchOutcome(
+                status="waiting_model_config",
+                checklist=build_fallback_checklist(request.seed_text, request.user_note),
+                fallback_used=False,
+                error_code=failure.code,
+                error_message=failure.public_message,
+                recoverable=failure.recoverable,
+                provider=failure.provider,
+                model=failure.model,
+                configuration_source=failure.configuration_source,
             )
 
     def _parse_checklist(self, content: str) -> PresearchChecklist:

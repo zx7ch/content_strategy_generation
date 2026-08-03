@@ -512,6 +512,7 @@ class ContentResearchService:
             thread_id=thread_id,
             workflow_run_id=workflow_run_id,
             user_id=user_id,
+            workspace_id=workspace_id,
         )
 
         llm_task = await self._presearch.create_llm_task(request)

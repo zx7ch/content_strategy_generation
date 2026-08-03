@@ -51,3 +51,22 @@ async def test_configuration_api_requires_principal_and_delete_restores_default(
     deleted = await client.delete("/content-research/llm-config", headers=headers)
     assert deleted.status_code == 200
     assert deleted.json()["source"] == "system_default"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path,method", [
+    ("/content-research/llm-config/validate", "POST"),
+    ("/content-research/llm-config", "PUT"),
+])
+async def test_configuration_validation_error_never_echoes_api_key(client, path, method):
+    secret = "secret-that-must-never-be-returned"
+
+    response = await client.request(
+        method,
+        path,
+        headers={"X-Workspace-Id": "ws_1", "X-User-Id": "user_1"},
+        json={"base_url": "https://proxy.example/v1", "api_key": secret},
+    )
+
+    assert response.status_code == 422
+    assert secret not in response.text

@@ -217,5 +217,50 @@ async def test_service_missing_provider_raises() -> None:
     )
     request = LLMRequest(messages=[Message(role="user", content="hi")], task_type="topic", model_policy="balanced")
 
-    with pytest.raises(ProviderNotRegisteredError, match="openai"):
+    with pytest.raises(LLMProviderFailure) as error:
         await service.generate(request)
+
+    assert (error.value.code, error.value.public_message, error.value.configuration_source) == (
+        "llm_service_unavailable", "模型服务暂时不可用", "system_default"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("service", "expected_code", "expected_message"),
+    [
+        (
+            LLMService(
+                router=ModelRouter({"balanced": ResolvedModel("openai", "gpt-test")}),
+                credential_resolver=CredentialResolver(FakeSettings(OPENAI_API_KEY="")),
+                providers={"openai": FakeProvider()},
+            ),
+            "llm_auth_invalid",
+            "API Key 未配置",
+        ),
+        (
+            LLMService(
+                router=ModelRouter({"known": ResolvedModel("openai", "gpt-test")}),
+                credential_resolver=CredentialResolver(FakeSettings()),
+                providers={"openai": FakeProvider()},
+            ),
+            "llm_model_unavailable",
+            "模型配置不可用",
+        ),
+    ],
+)
+async def test_service_configuration_failures_are_stable_provider_failures(
+    service, expected_code, expected_message
+) -> None:
+    request = LLMRequest(
+        messages=[Message(role="user", content="hi")],
+        task_type="topic",
+        model_policy="balanced",
+    )
+
+    with pytest.raises(LLMProviderFailure) as error:
+        await service.generate(request)
+
+    assert error.value.code == expected_code
+    assert error.value.public_message == expected_message
+    assert error.value.configuration_source == "system_default"
