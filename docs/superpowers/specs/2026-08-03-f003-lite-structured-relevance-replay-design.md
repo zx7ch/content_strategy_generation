@@ -111,6 +111,29 @@ converges to the existing model-recovery or Brief-confirmation boundary. The
 system must not substitute a hard-coded category list or silently fall back to
 matching the complete user sentence.
 
+### Conversational clarification
+
+`needs_confirmation` is a product state, not an LLM failure. Creator keeps the
+existing bottom composer and does not add an input field to the Pre-research
+card. While a run is in `subject_needs_confirmation`, the composer placeholder
+asks the user to clarify the research object and the submitted message is routed
+to the same run as:
+
+```json
+{
+  "action": "clarify_subject",
+  "payload": {"clarification_text": "苹果品牌，关注年轻人的内容偏好"}
+}
+```
+
+The message remains in the normal conversation timeline. The backend appends
+the clarification to the Pre-research input, generates a new structure with a
+new input fingerprint, and supersedes the prior unconfirmed structure for
+execution without deleting its audit record. Clarification does not consume an
+LLM failure-recovery attempt and cannot call Spider. A valid structure updates
+the existing card in place with the compact confirmation line. A subject change
+after formal collection starts requires a new run.
+
 ## Deterministic Query Compilation
 
 After confirmation, a versioned compiler creates the complete query plan before
@@ -138,6 +161,13 @@ per-QueryGroup `candidate_cap=20`. The normal discovery ceiling is therefore
 40 candidates per direction and the fallback ceiling is 60, before canonical
 source deduplication. Existing direction sample and detail limits remain the
 single source of truth; specialist retries do not reset or multiply them.
+
+The existing per-direction `detail_fetch_cap=30` is clarified as the
+**direction detail evaluation cap**: the number of distinct note details a
+direction may evaluate, whether a detail was fetched for that direction or
+reused from the same run. Trace separately counts physical detail calls. A note
+shared by two directions therefore consumes one physical call and one logical
+evaluation slot in each direction.
 
 ## Coverage Fallback and Stopping
 
@@ -179,6 +209,70 @@ Within one run:
 A retry resumes the same operation/checkpoint and never creates a fresh query
 or detail budget. Existing persisted candidates and details are always consumed
 before Q3 or another provider call is considered.
+
+### Single-flight ownership and reusable artifacts
+
+Deduplication is transactional rather than a check-then-call cache. A run-level
+collection ledger owns each physical operation through
+`reserved -> running -> completed | failed | outcome_unknown`. The first
+consumer atomically reserves the operation; concurrent consumers bind to it and
+wait for or reuse its terminal result. Ownership belongs to the run, not to the
+specialist that first requested it.
+
+Provider operation checkpoints store only lifecycle and a safe summary. The
+reusable data is stored separately as a run-scoped collection artifact:
+
+- search artifacts reference the persisted candidate manifest/pages;
+- detail artifacts reference the canonical source and normalized detail packet;
+- `collection_binding` records which direction and QueryGroup consume an
+  artifact and whether it used a direction evaluation slot.
+
+Shared failures are one physical fact. `auth_required` pauses the run once;
+`outcome_unknown` blocks every consumer from a blind retry; provider automatic
+retry runs once for the physical operation; `note_unavailable` marks the shared
+candidate unavailable while each direction independently selects a replacement.
+Cancellation of the whole run owns cancellation of physical work; completion or
+failure of one child does not delete a shared artifact required by siblings.
+
+## Observability and Checkpoint Contract
+
+The existing newest-first workflow timeline remains unchanged. The new design
+adds durable logical checkpoints without turning them into extra workflow
+stages:
+
+| Stage | Purpose | Safe Trace projection |
+| --- | --- | --- |
+| `subject_structure` | generation identity and deterministic validation | resolution state, type, reason codes, short structure hash |
+| `query_plan` | frozen Q1/Q2/Q3 roles and normalized deduplication | primary/fallback counts, merged count, short plan hash |
+| `collection_binding` | logical consumer to physical artifact | direction, QueryGroup role, reused boolean |
+| `coverage_decision` | staged eligibility and focus coverage | discovered/deduplicated/relevant/detail-eligible/admitted counts |
+| `fallback_decision` | durable Q3 activation | activated/exhausted and stable reason codes |
+| `relevance_revision` | historical packet-only v2 repair | revision state and zero-provider-call replay marker |
+
+Physical provider calls remain `operation` checkpoints but use a run-scoped
+physical identity derived from run, provider, operation, and safe request
+identity rather than subagent ownership. A physical operation exposes a stable
+safe ID, consumer count, reuse count, status, retry counters, and real
+start/finish time. It never exposes full query text, raw user input, provider
+note ID, prompt, credentials, request headers, or raw provider payload.
+
+Trace reports both:
+
+- `physical_detail_call_count`: unique Spider detail calls in the run;
+- `direction_detail_evaluated_count`: distinct details evaluated by the
+  direction against its frozen cap of 30.
+
+Q3 activation and collection reuse are normal control flow, not errors or
+retries. `fallback_exhausted`, an actual provider failure, or an invalid subject
+may produce a visible reason code. Refresh and resume must preserve structure,
+plan, fallback, physical operation, artifact, and binding identities.
+
+The contract versions `subject_structure_schema_version`,
+`query_compiler_version`, `coverage_policy_version`,
+`collection_ledger_schema_version`, and `query_relevance_version`. Old Trace
+records remain readable and are not rewritten to pretend these checkpoints
+existed. New runs use the new versions; eligible history only appends
+`relevance_revision` and downstream replay records.
 
 ## Structured Relevance Contract
 
@@ -293,6 +387,19 @@ TDD coverage must prove:
     deterministic fallback and partial-result behavior;
 14. a refresh, user recovery, or specialist retry cannot reset candidate/detail
     budgets or create a different Q3.
+15. concurrent consumers reserve one physical operation and persist separate
+    logical bindings without duplicate Spider calls;
+16. a reused detail consumes one evaluation slot per consuming direction while
+    physical call count remains one;
+17. shared auth, outcome-unknown, transient, and note-unavailable failures are
+    projected once and propagate to all consumers with the specified scope;
+18. subject clarification uses the existing composer, stays in the same
+    Pre-research run, and does not consume model-recovery budget;
+19. Trace exposes safe plan, coverage, fallback, binding, physical-call, and
+    direction-evaluation summaries without query, note ID, prompt, or secret
+    leakage;
+20. old runs remain readable without fabricated new checkpoints, while an
+    eligible historical replay adds `relevance_revision` and zero operations.
 
 ## Acceptance
 

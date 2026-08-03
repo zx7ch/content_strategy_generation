@@ -331,7 +331,7 @@ Lite 的证据字段只允许 `content_text` 与 `title`（投影过滤）。评
 
 - Lite 继续使用共享正式采集内核；不得在 Creator 增加 Lite-only 采集特判。详情调用前必须过滤非法 ID、URL fragment 和非笔记搜索卡；`invalid_candidate` / `note_unavailable` 是候选级结果，在冻结 `detail_fetch_cap=30` 内补位，只有最终证据门槛无法满足时才决定 direction 的 partial/unavailable/recovery 状态。
 - Provider 错误必须稳定分类；`笔记不存在` 映射为不可重试的 `note_unavailable`，`transient_error` 只表示真实临时传输故障。登录恢复只由 `auth_required` / `auth_expired` 触发，本 Task 不增加独立登录状态入口。
-- 当前冻结采样值保持不变：每 QueryGroup `candidate_cap=20`、`minimum_samples=3`、`minimum_independent_authors=2`、`author_cap=3`、`detail_fetch_cap=30`、`comment_limit=30`。预校验过滤不消耗详情调用额度，已经发出的详情请求消耗额度，补位不得突破冻结上限。
+- 当前冻结采样值保持不变：每 QueryGroup `candidate_cap=20`、`minimum_samples=3`、`minimum_independent_authors=2`、`author_cap=3`、`detail_fetch_cap=30`、`comment_limit=30`。预校验过滤不消耗额度；候选一旦被某方向纳入详情评估便消耗该方向一个 `detail_fetch_cap` slot，即使底层详情来自同 run 复用。物理 Provider 调用另行去重计数，补位不得突破方向冻结上限。
 - 重试语义必须分层并被实际计数：provider operation 最多 3 次自动重试，specialist 最多 2 次用户恢复，workflow child 最多 3 次执行（首次 + 2 次恢复）；非法候选、笔记不存在、parser/permanent failure 不重试，认证成功后才允许 auth failure 消耗一次用户恢复。
 - 本阶段只修改共享正式采集内核和安全错误投影，不增加 Lite-only 采集分支，也不改变 Trace 当前倒序展示。
 - 交付状态：
@@ -387,8 +387,13 @@ Lite 只交付结构化主题到可信采集的核心闭环，不扩展为通用
 - 同义词不作为默认独立 QueryGroup，仅作为确定性准入等价词和最多一个预编译补位 Q3。Q3 只有在相关 eligible 样本、独立作者、核心对象、用户明确重点或详情失败补位仍有缺口时激活；刷新、恢复和重试不得生成不同 Q3。
 - 冻结 `primary_query_group_cap=2`、`coverage_fallback_query_group_cap=1`、每 QueryGroup `candidate_cap=20`；正常搜索候选上限为每方向 40，触发补位后最多 60。既有 `detail_fetch_cap=30`、样本、作者和重试预算继续由共享 `RunPolicySnapshot` 唯一定义，重试不能重置或放大预算。
 - 搜索与笔记详情按 run 级物理去重：等价 normalized query 只请求一次，同一 provider note ID 只拉取一次；每个方向、QueryGroup、rank hit 的完整 lineage 仍保留。多方向继续分别执行冻结门槛，但本 Task 不新增自适应全局预算。
+- run 级去重必须是原子 single-flight：物理 operation 按 `reserved -> running -> completed|failed|outcome_unknown` 持久化，所有权属于 run。Provider lifecycle checkpoint、可复用 collection artifact 与方向级 `collection_binding` 分离；并发专家不能 check-then-call 重复请求。
+- 既有 `detail_fetch_cap=30` 明确为每方向“详情样本评估上限”：复用详情不增加物理 Spider 调用，但在每个消费方向各计一个 evaluation slot。Trace 分别显示 run 级 physical detail call count 与方向级 evaluated count，复用不得绕过冻结样本范围。
+- 新增安全逻辑 checkpoint：`subject_structure`、`query_plan`、`collection_binding`、`coverage_decision`、`fallback_decision`、`relevance_revision`。它们在现有倒序 Trace 内作为专家/预检索细节展示，不增加伪 workflow 阶段；Q3 和复用不计为错误/重试。物理 operation 只计一次并显示消费者/复用数量。
+- `needs_confirmation` 是独立产品状态而非模型失败。Creator 复用底部正常对话输入框，将消息以同 run `clarify_subject` action 提交；Pre-research 卡片只显示澄清问题、结构摘要与确认状态，不增加输入框。澄清不消耗模型故障恢复预算、不调用 Spider；采集开始后修改主题必须新建 run。
+- 共享物理失败只产生一次事实：auth 暂停整个 run，outcome-unknown 阻止所有消费者盲重试，自动重试只由物理 operation 消费，note-unavailable 由各方向独立补位。公开 Trace 不返回完整 query、原始主题、note ID、Prompt、凭据、请求头或 provider 原始 payload。
 - Spider 返回数量不等于可用证据，必须分别记录 discovered、deduplicated、relevant、detail-eligible、admitted。现有候选和 packet 必须先耗尽/重放，再允许 Q3；任何下游修复不得为了重做 admission/report 重跑 Spider。
-- 最小验收覆盖：可信主题、歧义/空主体、Q1/Q2 去重、Q3 确定性激活、多方向 query/note 物理去重、显式重点未覆盖的 partial 语义，以及刷新/恢复不增加既有 provider operation。
+- 最小验收覆盖：可信主题、对话澄清歧义/空主体、Q1/Q2 去重、Q3 确定性激活、并发 single-flight、多方向 query/note 物理去重、共享失败、逻辑/物理双计数、Trace 脱敏、显式重点未覆盖的 partial 语义，以及刷新/恢复不增加既有 provider operation。
 - 明确延期：多核心对象自动拆分、可视化主题编辑器、embedding 相关性、动态全局预算、多语言 query expansion、复杂否定规划和多轮 LLM query 改写。
 
 **通过条件**：预发布环境中新合同为唯一 Creator/report 合同；选择、scope、报告三态、恢复卡、citation drawer、模型配置与模型故障后的同 run 恢复均通过上述 API/浏览器验收。Gate 4A 不对正式用户发布，也不代表所有目录方向的采集能力已完成。
