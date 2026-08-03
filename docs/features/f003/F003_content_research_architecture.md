@@ -900,12 +900,27 @@ Presearch 输出:
 
 ```text
 subject_confirmation
+subject_structure:
+  canonical_subject
+  subject_type
+  core_entities[]
+  research_intents[]
+  context_modifiers[]
+  synonym_groups{}
 competitor_tags
 custom_competitor_input
 research_directions
 custom_research_question
 timeout_status
 ```
+
+`subject_structure` 由 PresearchService 通过受 schema 约束的 LLM 输出生成，
+适配不可预测的品牌、品类、SKU、场景、趋势与混合输入，不使用固定业务词表。
+后端负责规范化、数量/长度限制、空核心对象拒绝和结构一致性校验。Brief 以
+“核心对象｜意图｜场景”的紧凑行让用户确认；用户修改后必须重新结构化。
+确认后的结构、Provider、模型、Prompt/Schema 版本和输入指纹一起冻结到
+Research Brief 与 RunPolicySnapshot。正式采集和 admission 不再调用 LLM
+解释主题，只确定性消费该冻结结构。
 
 Presearch 不写:
 

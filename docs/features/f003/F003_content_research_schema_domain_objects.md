@@ -155,6 +155,7 @@ time_window
 constraints
 success_criteria
 input_payload
+subject_structure
 status
 created_by_type
 created_by_id
@@ -162,6 +163,31 @@ created_at
 updated_at
 metadata
 ```
+
+`subject_structure` is a versioned, user-confirmed value object produced by
+Pre-research rather than a fixed business vocabulary lookup:
+
+```text
+schema_version
+canonical_subject
+subject_type
+core_entities[]
+research_intents[]
+context_modifiers[]
+synonym_groups{}
+generation:
+  provider
+  model
+  prompt_version
+  output_schema_version
+  input_fingerprint
+confirmed_at
+```
+
+Each synonym group belongs to one core entity. Intent and context values may
+constrain planning but cannot substitute for a core entity during evidence
+admission. A changed subject or structure creates a new confirmed Brief/version;
+formal collection never mutates the confirmed value in place.
 
 Status:
 

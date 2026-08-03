@@ -209,15 +209,34 @@ Checklist 包含:
 
 ```text
 subject_confirmation
+subject_structure
 competitor_tags
 custom_competitor_input
 research_directions
 custom_research_question
 ```
 
+`subject_structure` 是 Pre-research LLM 对任意用户主题的通用结构化结果，
+不是固定业务词表映射。它至少包含：
+
+```text
+canonical_subject
+subject_type              品牌/品类/SKU/场景/趋势/未知
+core_entities             必须命中的核心对象
+research_intents          用户希望研究的动作或问题
+context_modifiers         季节、人群、渠道、场景等限定
+synonym_groups            核心对象的别称、中英文名称和同义表达
+```
+
+Brief 以紧凑行展示结构，例如“核心对象：防晒服饰｜意图：穿搭｜场景：夏季”。
+用户必须能够在正式采集前确认或修改结构；修改后重新生成并确认结构化结果。
+
 要求:
 
 - 主体识别必须可确认或修改。
+- 主题结构不得依赖预置品类词表；未知输入由 Pre-research LLM 生成受 schema
+  约束的结构化结果，并在用户确认后冻结。
+- 核心对象、意图和场景修饰必须分开；意图或场景词不得代替核心对象。
 - 竞品 tag 可以多选。
 - 用户可以自行输入竞品 tag。
 - 调研方向可以多选。
