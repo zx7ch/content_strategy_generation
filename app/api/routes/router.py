@@ -44,6 +44,7 @@ from app.content_research.presearch.service import PresearchService
 from app.content_research.service import (
     ContentResearchNotFoundError,
     ContentResearchService,
+    ContentResearchStateConflictError,
     ContentResearchValidationError,
     WorkflowRunManagerRuntime,
 )
@@ -873,6 +874,14 @@ def _content_research_error(exc: Exception) -> APIError:
             status_code=404,
             error_code="CONTENT_RESEARCH_PRESEARCH_NOT_FOUND",
             error_message=str(exc),
+        )
+    if isinstance(exc, ContentResearchStateConflictError):
+        return APIError(
+            status_code=409,
+            error_code=exc.error_code,
+            error_message=str(exc),
+            retryable=True,
+            suggested_action=exc.suggested_action,
         )
     if isinstance(exc, (ContentResearchValidationError, ValueError)):
         error_code = "INVALID_CONTENT_RESEARCH_PAYLOAD"

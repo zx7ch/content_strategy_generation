@@ -97,14 +97,12 @@ class AsyncFormalResearchDispatchRepository:
         directions: list[ResearchDirectionRecord],
         tasks: list[SubagentTaskRecord],
         workflow_child_task_ids: list[str],
-        provider: str = "xiaohongshu",
-        source_kind: str = "search_result",
-        limit: int = 50,
     ) -> None:
-        """Write the complete dispatchable confirmation scope on a shared UoW.
+        """Write the confirmed research scope on a shared unit of work.
 
         This method intentionally never commits: its caller owns the workflow
-        transaction and decides whether the complete run becomes visible.
+        transaction and decides whether the complete run becomes visible. The
+        explicit start-formal-research action creates the dispatch job later.
         """
         await conn.execute(
             """INSERT INTO content_research_briefs
@@ -229,13 +227,6 @@ class AsyncFormalResearchDispatchRepository:
                     _dumps(task.metadata),
                 ),
             )
-        now = _now().isoformat()
-        await conn.execute(
-            """INSERT INTO content_research_dispatch_jobs
-               (workflow_run_id, provider, source_kind, limit_per_specialist, status, attempt_count, created_at, updated_at)
-               VALUES (?, ?, ?, ?, 'queued', 0, ?, ?)""",
-            (brief.workflow_run_id, provider, source_kind, limit, now, now),
-        )
 
     async def claim_next(self, *, owner: str, lease_seconds: int = 120) -> dict[str, Any] | None:
         now = _now()

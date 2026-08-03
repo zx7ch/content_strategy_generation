@@ -121,6 +121,15 @@ class ContentResearchValidationError(ContentResearchError):
     """Raised when a request payload is invalid."""
 
 
+class ContentResearchStateConflictError(ContentResearchValidationError):
+    """Raised when a valid action is unsafe for the current durable state."""
+
+    def __init__(self, message: str, *, error_code: str, suggested_action: str) -> None:
+        super().__init__(message)
+        self.error_code = error_code
+        self.suggested_action = suggested_action
+
+
 class ContentResearchReportIntegrityError(RuntimeError):
     """Raised when an existing published report cannot be safely projected."""
 
@@ -580,11 +589,7 @@ class ContentResearchService:
         elif outcome.timeout_status != "first_timeout":
             await self._workflow_runtime.mark_presearch_ready(workflow_run_id)
 
-        if (
-            llm_task is not None
-            and not llm_task.done()
-            and outcome.timeout_status == "first_timeout"
-        ):
+        if llm_task is not None and outcome.timeout_status == "first_timeout":
             asyncio.create_task(
                 self._finalize_hard_cutoff(
                     request=request,
@@ -620,16 +625,29 @@ class ContentResearchService:
         request = PresearchInput(seed_text=str(payload["seed_text"]), user_note=payload.get("user_note"),
             thread_id=brief.thread_id, workflow_run_id=workflow_run_id,
             user_id=str(payload.get("user_id") or "default"), workspace_id=str(payload.get("workspace_id") or "default"))
+        llm_task = await self._presearch.create_llm_task(request)
         outcome = await self._presearch.wait_for_first_feedback(
-            request=request, task=await self._presearch.create_llm_task(request)
+            request=request, task=llm_task
         )
         updated = self._save_brief(attempt_id=str(payload["attempt_id"]), brief_id=brief.id,
             workflow_run_id=workflow_run_id, thread_id=brief.thread_id, seed_text=request.seed_text,
             user_note=request.user_note, workspace_id=request.workspace_id, user_id=request.user_id, outcome=outcome)
         if outcome.status == "waiting_model_config":
             await self._workflow_runtime.wait_for_presearch_recovery(workflow_run_id, reason={"code": outcome.error_code, "message": outcome.error_message})
-        else:
+        elif outcome.timeout_status != "first_timeout":
             await self._workflow_runtime.mark_presearch_ready(workflow_run_id)
+        if llm_task is not None and outcome.timeout_status == "first_timeout":
+            traces = self._store.list_traces_for_workflow(workflow_run_id)
+            trace = traces[0] if traces else self._ensure_source_trace(updated)
+            asyncio.create_task(
+                self._finalize_hard_cutoff(
+                    request=request,
+                    task=llm_task,
+                    attempt_id=str(payload["attempt_id"]),
+                    trace_id=trace.id,
+                    sequence_no=self._next_observation_sequence(trace.id),
+                )
+            )
         return self._response_from_brief(updated)
 
     async def confirm_brief(
@@ -641,8 +659,7 @@ class ContentResearchService:
         brief = self._store.get_brief(brief_id)
         if brief is None:
             raise ContentResearchNotFoundError(f"Research brief not found: {brief_id}")
-        if brief.status == "final_timeout":
-            raise ContentResearchValidationError("Cannot confirm a final-timeout brief")
+        await self._require_presearch_ready_for_confirmation(brief)
         selected_direction_ids = self._direction_registry.canonicalize_many(
             confirmation_request.selected_directions
         )
@@ -812,8 +829,6 @@ class ContentResearchService:
             task_specs=[task.payload for task in saved_tasks],
             confirmation_writer=persist_confirmation,
         )
-        if self._dispatch_wake_event is not None:
-            self._dispatch_wake_event.set()
 
         return await self.get_workflow_summary(brief.workflow_run_id)
 
@@ -1740,6 +1755,21 @@ class ContentResearchService:
         A provider request may take tens of seconds. Keeping it attached to the
         Creator action fetch starves the user-visible Trace/recovery flow.
         """
+        brief = self._store.get_brief_by_workflow(workflow_run_id)
+        if brief is None:
+            raise ContentResearchNotFoundError(
+                f"Content research workflow not found: {workflow_run_id}"
+            )
+        if (
+            brief.status != "ready"
+            or not self._store.list_plans_for_brief(brief.id)
+            or not self._store.list_subagent_tasks_for_workflow(workflow_run_id)
+        ):
+            raise ContentResearchStateConflictError(
+                "Formal research is not ready to dispatch",
+                error_code="CONTENT_RESEARCH_FORMAL_RESEARCH_NOT_READY",
+                suggested_action="先确认最终版调研 brief，再开始正式调研",
+            )
         dispatch = await self._dispatch.enqueue(
             workflow_run_id=workflow_run_id,
             provider=request.provider,
@@ -1760,6 +1790,40 @@ class ContentResearchService:
             source_kind=request.source_kind,
             limit_per_specialist=request.limit,
         )
+
+    async def _require_presearch_ready_for_confirmation(
+        self, brief: ResearchBriefRecord
+    ) -> None:
+        payload_status = str(brief.payload.get("status") or brief.status)
+        timeout_status = str(brief.payload.get("timeout_status") or "none")
+        if (
+            timeout_status == "first_timeout"
+            or payload_status not in {"completed", "fallback"}
+            or brief.status == "final_timeout"
+        ):
+            raise ContentResearchStateConflictError(
+                "Presearch final outcome is not ready",
+                error_code="CONTENT_RESEARCH_PRESEARCH_NOT_READY",
+                suggested_action="等待预检索最终完成或完成模型配置后重试",
+            )
+
+        snapshot = await self._workflow_runtime.get_runtime_snapshot(
+            brief.workflow_run_id
+        )
+        presearch_step = next(
+            (
+                step
+                for step in list(snapshot.get("steps") or [])
+                if step.get("step_name") == "presearch"
+            ),
+            None,
+        )
+        if presearch_step is not None and presearch_step.get("status") != "succeeded":
+            raise ContentResearchStateConflictError(
+                "Presearch final outcome is not ready",
+                error_code="CONTENT_RESEARCH_PRESEARCH_NOT_READY",
+                suggested_action="等待预检索最终完成或完成模型配置后重试",
+            )
 
     def _requeue_recoverable_tasks(
         self,

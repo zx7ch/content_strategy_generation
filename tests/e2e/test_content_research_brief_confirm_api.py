@@ -13,6 +13,8 @@ from app.content_research.service import ContentResearchService
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
 from app.services.llm.types import LLMResponse, TokenUsage
 
+WORKSPACE_HEADERS = {"X-Workspace-Id": "ws-1", "X-User-Id": "user-1"}
+
 
 class FakeRuntime:
     def __init__(self, db_path: str) -> None:
@@ -78,7 +80,11 @@ async def client(tmp_path):
         workflow_runtime=FakeRuntime(str(tmp_path / "content_research.db")),
     )
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as c:
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://testserver",
+        headers=WORKSPACE_HEADERS,
+    ) as c:
         yield c
     if original is None:
         delattr(app.state, "content_research_service")

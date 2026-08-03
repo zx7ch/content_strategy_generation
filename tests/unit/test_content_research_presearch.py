@@ -6,11 +6,19 @@ import sqlite3
 
 import pytest
 
+from app.content_research.api_schemas import (
+    ContentResearchBriefConfirmRequest,
+    ContentResearchWorkflowActionRequest,
+)
 from app.content_research.presearch.service import PresearchService
-from app.content_research.service import ContentResearchService, WorkflowRunManagerRuntime
+from app.content_research.service import (
+    ContentResearchService,
+    ContentResearchValidationError,
+    WorkflowRunManagerRuntime,
+)
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
-from app.services.llm.types import LLMResponse, TokenUsage
 from app.services.llm.failures import LLMProviderFailure
+from app.services.llm.types import LLMResponse, TokenUsage
 
 
 class FakeRuntime:
@@ -197,6 +205,46 @@ class DelayedProviderFailureLLM:
         )
 
 
+class FailThenDelayedProviderFailureLLM:
+    def __init__(self) -> None:
+        self.call_count = 0
+
+    async def generate(self, _request):
+        self.call_count += 1
+        if self.call_count == 1:
+            raise LLMProviderFailure(
+                "llm_auth_invalid", "API Key 无效", True, 401,
+                provider="openai_compatible", model="model-x", configuration_source="user",
+            )
+        await asyncio.sleep(0.02)
+        raise LLMProviderFailure(
+            "llm_auth_invalid", "API Key 无效", True, 401,
+            provider="openai_compatible", model="model-x", configuration_source="user",
+        )
+
+
+class ControlledSuccessLLM(FakeLLM):
+    def __init__(self) -> None:
+        super().__init__()
+        self.release = asyncio.Event()
+
+    async def generate(self, request):
+        await self.release.wait()
+        return await super().generate(request)
+
+
+class BlockingReadyRuntime(WorkflowRunManagerRuntime):
+    def __init__(self, db_path: str) -> None:
+        super().__init__(db_path)
+        self.ready_transition_started = asyncio.Event()
+        self.allow_ready_transition = asyncio.Event()
+
+    async def mark_presearch_ready(self, workflow_run_id: str) -> None:
+        self.ready_transition_started.set()
+        await self.allow_ready_transition.wait()
+        await super().mark_presearch_ready(workflow_run_id)
+
+
 @pytest.mark.asyncio
 async def test_provider_failure_waits_for_configuration_without_completing_presearch(store):
     runtime = FakeRuntime()
@@ -303,3 +351,139 @@ async def test_late_provider_failure_after_first_timeout_atomically_waits_for_us
 
     assert settled.error_code == "llm_auth_invalid"
     assert snapshot["steps"][0]["status"] == "retrying"
+
+
+@pytest.mark.asyncio
+async def test_retry_first_timeout_keeps_task_until_late_auth_failure_waits_for_user(store):
+    llm = FailThenDelayedProviderFailureLLM()
+    service = _service(
+        store,
+        llm,
+        first_timeout=0.005,
+        hard_cutoff=0.1,
+        runtime=WorkflowRunManagerRuntime(store._db_path),
+    )
+    first = await service.submit_presearch(
+        seed_text="夏季通勤短裤",
+        user_note=None,
+        thread_id="thread_retry_late_failure",
+        workspace_id="ws_1",
+        user_id="user_1",
+    )
+    assert first.status == "waiting_model_config"
+
+    retried = await service.retry_presearch(first.workflow_run_id)
+    assert retried.status == "fallback"
+    assert retried.timeout_status == "first_timeout"
+
+    for _ in range(20):
+        await asyncio.sleep(0.01)
+        settled = service.get_presearch(first.attempt_id)
+        snapshot = await service._workflow_runtime.get_runtime_snapshot(first.workflow_run_id)
+        if settled.status == "waiting_model_config" and snapshot["run"]["status"] == "waiting_user":
+            break
+    else:
+        pytest.fail("retry late provider failure did not converge to waiting_user")
+
+    assert llm.call_count == 2
+    assert settled.error_code == "llm_auth_invalid"
+    assert snapshot["steps"][0]["status"] == "retrying"
+    assert not any(step["status"] == "succeeded" for step in snapshot["steps"] if step["step_name"] == "presearch")
+
+
+@pytest.mark.asyncio
+async def test_confirmation_waits_for_brief_and_runtime_presearch_to_settle(store):
+    llm = ControlledSuccessLLM()
+    runtime = BlockingReadyRuntime(store._db_path)
+    service = _service(
+        store,
+        llm,
+        first_timeout=0.005,
+        hard_cutoff=0.1,
+        runtime=runtime,
+    )
+    first = await service.submit_presearch(
+        seed_text="夏季通勤短裤",
+        user_note=None,
+        thread_id="thread_confirmation_race",
+        workspace_id="ws_1",
+        user_id="user_1",
+    )
+    assert first.timeout_status == "first_timeout"
+
+    confirmation = ContentResearchBriefConfirmRequest(
+        confirmed_subject="夏季通勤短裤",
+        subject_type="category",
+        selected_competitors=[],
+        custom_competitors=[],
+        selected_directions=["product_marketing"],
+        custom_research_question="",
+    )
+    with pytest.raises(ContentResearchValidationError, match="Presearch final outcome is not ready"):
+        await service.confirm_brief(brief_id=first.brief_id, confirmation_request=confirmation)
+
+    llm.release.set()
+    await asyncio.wait_for(runtime.ready_transition_started.wait(), timeout=0.1)
+    assert service.get_presearch(first.attempt_id).status == "completed"
+    snapshot = await runtime.get_runtime_snapshot(first.workflow_run_id)
+    presearch_step = next(step for step in snapshot["steps"] if step["step_name"] == "presearch")
+    assert presearch_step["status"] == "running"
+    with pytest.raises(ContentResearchValidationError, match="Presearch final outcome is not ready"):
+        await service.confirm_brief(brief_id=first.brief_id, confirmation_request=confirmation)
+
+    runtime.allow_ready_transition.set()
+    for _ in range(20):
+        await asyncio.sleep(0.005)
+        snapshot = await runtime.get_runtime_snapshot(first.workflow_run_id)
+        presearch_step = next(step for step in snapshot["steps"] if step["step_name"] == "presearch")
+        if presearch_step["status"] == "succeeded":
+            break
+    else:
+        pytest.fail("presearch runtime transition did not settle")
+
+    summary = await service.confirm_brief(brief_id=first.brief_id, confirmation_request=confirmation)
+    assert summary.brief.status == "ready"
+    with sqlite3.connect(store._db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM content_research_dispatch_jobs").fetchone()[0] == 0
+
+    dispatched = await service.run_workflow_action(
+        workflow_run_id=first.workflow_run_id,
+        request=ContentResearchWorkflowActionRequest(
+            action="start_formal_research",
+            payload={"provider": "xiaohongshu", "source_kind": "search_result", "limit": 20},
+        ),
+    )
+    assert dispatched.status == "queued"
+    with sqlite3.connect(store._db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM content_research_dispatch_jobs").fetchone()[0] == 1
+
+
+@pytest.mark.asyncio
+async def test_start_formal_research_rejects_unconfirmed_first_timeout_without_dispatch(store):
+    service = _service(
+        store,
+        FakeLLM(delay=0.2),
+        first_timeout=0.005,
+        hard_cutoff=0.1,
+        runtime=WorkflowRunManagerRuntime(store._db_path),
+    )
+    first = await service.submit_presearch(
+        seed_text="夏季通勤短裤",
+        user_note=None,
+        thread_id="thread_no_early_dispatch",
+        workspace_id="ws_1",
+        user_id="user_1",
+    )
+    assert first.timeout_status == "first_timeout"
+
+    with pytest.raises(ContentResearchValidationError, match="Formal research is not ready to dispatch"):
+        await service.run_workflow_action(
+            workflow_run_id=first.workflow_run_id,
+            request=ContentResearchWorkflowActionRequest(
+                action="start_formal_research",
+                payload={"provider": "xiaohongshu", "source_kind": "search_result", "limit": 20},
+            ),
+        )
+
+    with sqlite3.connect(store._db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM content_research_dispatch_jobs").fetchone()[0] == 0
