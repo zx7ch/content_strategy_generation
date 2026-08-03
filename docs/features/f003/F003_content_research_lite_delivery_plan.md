@@ -378,6 +378,19 @@ Lite 的证据字段只允许 `content_text` 与 `title`（投影过滤）。评
 - Creator 空闲时即在“本次研究摘要”下显示模型卡。LLM 故障进入同一 run 的 `waiting_user`；刷新后从 durable `llm_recovery` 恢复，只有故障后重新验证保存的配置才能继续，且复用原 workflow/attempt/brief，不重复已完成采集。
 - 组合验收通过 150 项后端/API、53 项前端、production build，以及 Key 遮罩、reload 同 run 恢复和 Trace timing 三项真实浏览器回归。
 
+#### Task 5I — Lite structured subject and deterministic query plan（P0，方案已确认，待实现）
+
+Lite 只交付结构化主题到可信采集的核心闭环，不扩展为通用语义规划平台。完整设计见 `docs/superpowers/specs/2026-08-03-f003-lite-structured-relevance-replay-design.md`。
+
+- Pre-research LLM 输出受 schema 约束的 `subject_structure`；代码而非 LLM 自报置信分数决定能否开始采集。核心对象、grounded raw mention、结构一致性和歧义状态不满足时回到 Brief/模型恢复边界，不调用 Spider。Lite 只自动执行单一明确核心对象，多对象要求用户确认主对象。
+- Brief 显示“核心对象｜意图｜场景”。确认后由版本化编译器冻结最多两个主 QueryGroup：Q1 为核心对象 + 主研究意图，Q2 为核心对象 + 用户明确重点／尚未覆盖场景；规范化后相同则合并，不为凑数执行重复搜索。
+- 同义词不作为默认独立 QueryGroup，仅作为确定性准入等价词和最多一个预编译补位 Q3。Q3 只有在相关 eligible 样本、独立作者、核心对象、用户明确重点或详情失败补位仍有缺口时激活；刷新、恢复和重试不得生成不同 Q3。
+- 冻结 `primary_query_group_cap=2`、`coverage_fallback_query_group_cap=1`、每 QueryGroup `candidate_cap=20`；正常搜索候选上限为每方向 40，触发补位后最多 60。既有 `detail_fetch_cap=30`、样本、作者和重试预算继续由共享 `RunPolicySnapshot` 唯一定义，重试不能重置或放大预算。
+- 搜索与笔记详情按 run 级物理去重：等价 normalized query 只请求一次，同一 provider note ID 只拉取一次；每个方向、QueryGroup、rank hit 的完整 lineage 仍保留。多方向继续分别执行冻结门槛，但本 Task 不新增自适应全局预算。
+- Spider 返回数量不等于可用证据，必须分别记录 discovered、deduplicated、relevant、detail-eligible、admitted。现有候选和 packet 必须先耗尽/重放，再允许 Q3；任何下游修复不得为了重做 admission/report 重跑 Spider。
+- 最小验收覆盖：可信主题、歧义/空主体、Q1/Q2 去重、Q3 确定性激活、多方向 query/note 物理去重、显式重点未覆盖的 partial 语义，以及刷新/恢复不增加既有 provider operation。
+- 明确延期：多核心对象自动拆分、可视化主题编辑器、embedding 相关性、动态全局预算、多语言 query expansion、复杂否定规划和多轮 LLM query 改写。
+
 **通过条件**：预发布环境中新合同为唯一 Creator/report 合同；选择、scope、报告三态、恢复卡、citation drawer、模型配置与模型故障后的同 run 恢复均通过上述 API/浏览器验收。Gate 4A 不对正式用户发布，也不代表所有目录方向的采集能力已完成。
 
 ### Task 5：Lite 报告质量合同收口
