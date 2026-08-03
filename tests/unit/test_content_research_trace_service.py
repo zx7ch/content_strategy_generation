@@ -60,7 +60,12 @@ def test_llm_recovery_exposes_only_the_durable_failure_boundary():
             {
                 "event_type": "run_waiting_user",
                 "created_at": "2026-08-03T01:02:03+00:00",
-                "payload_json": {"reason_code": "llm_auth_invalid", "reason_message": "secret"},
+                "payload_json": {
+                    "step_name": "presearch",
+                    "reason_code": "llm_auth_invalid",
+                    "reason_message": "secret",
+                    "recovery_required": True,
+                },
             }
         ],
         brief=brief,
@@ -74,6 +79,41 @@ def test_llm_recovery_exposes_only_the_durable_failure_boundary():
         "model": "model-x",
     }
     assert "secret" not in str(recovery)
+
+
+def test_final_timeout_recovery_keeps_a_safe_reload_boundary():
+    brief = ResearchBriefRecord(
+        id="brief_timeout",
+        workflow_run_id="run_timeout",
+        thread_id="thread_timeout",
+        schema_version="content_research_brief_v1",
+        status="final_timeout",
+        payload={"configuration_source": "system_default", "model": "model-x"},
+    )
+
+    recovery = _llm_recovery_projection(
+        run_status="waiting_user",
+        current_stage="presearch",
+        runtime_steps=[{"step_name": "presearch", "error_code": "PRESEARCH_FINAL_TIMEOUT"}],
+        workflow_events=[
+            {
+                "event_type": "run_waiting_user",
+                "created_at": "2026-08-03T02:03:04+00:00",
+                "payload_json": {
+                    "step_name": "presearch",
+                    "reason_code": "PRESEARCH_FINAL_TIMEOUT",
+                    "reason_message": "private timeout detail",
+                    "recovery_required": True,
+                },
+            }
+        ],
+        brief=brief,
+    )
+
+    assert recovery["required"] is True
+    assert recovery["required_since"] == "2026-08-03T02:03:04+00:00"
+    assert recovery["error_code"] is None
+    assert "private timeout detail" not in str(recovery)
 
 
 @pytest.fixture()

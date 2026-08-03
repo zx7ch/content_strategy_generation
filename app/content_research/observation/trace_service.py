@@ -221,7 +221,8 @@ def _llm_recovery_projection(
             event
             for event in reversed(workflow_events)
             if event.get("event_type") == "run_waiting_user"
-            and str((event.get("payload_json") or {}).get("reason_code") or "").startswith("llm_")
+            and (event.get("payload_json") or {}).get("step_name") == "presearch"
+            and (event.get("payload_json") or {}).get("recovery_required") is True
         ),
         None,
     )
