@@ -32,6 +32,7 @@ import {
   getContentResearchLiteReport,
   getContentResearchWorkflow,
   retryContentResearchFormalResearch,
+  retryContentResearchPresearch,
   resumeContentResearchFormalResearch,
   startXHSQRLogin,
   type ContentResearchFormalResearchResponse,
@@ -40,6 +41,7 @@ import {
   type ContentResearchTrace,
   type ContentResearchWorkflowSummary,
 } from "@/lib/content-research-api";
+import { ModelServiceCard } from "@/components/content-research/ModelServiceCard";
 import { traceExecutionDurationText } from "@/lib/content-research-trace";
 
 type TaskStatus = "running" | "paused" | "failed" | "cancelled" | "completed";
@@ -1555,10 +1557,14 @@ function ContentResearchContextSidebar({
   run,
   onExpandedChange,
   onModifyDirections,
+  recoveryPending = false,
+  onContinuePresearch = async () => {},
 }: {
   run: ContentResearchRunState;
   onExpandedChange: (expanded: boolean) => void;
   onModifyDirections: () => void;
+  recoveryPending?: boolean;
+  onContinuePresearch?: () => void | Promise<void>;
 }) {
   const report = run.report;
   const published = report ? litePublicationState(report) !== null : false;
@@ -1611,6 +1617,7 @@ function ContentResearchContextSidebar({
           {!evidenceOnly && <li>{numberField(report.status_strip, "lead_count")} 条初步信号</li>}
         </ul> : <p className="text-xs leading-5 text-quiet">暂无已发布报告；此处不会显示未冻结的来源、结论或指标。</p>}
       </section>
+      <ModelServiceCard recoveryPending={recoveryPending} onContinue={onContinuePresearch} onConfigurationChanged={() => undefined} />
     </aside>
   );
 }
@@ -2868,7 +2875,20 @@ export default function CreatorPage() {
         run={contentResearchRun}
         onExpandedChange={setTraceExpanded}
         onModifyDirections={() => void modifyContentResearchDirections()}
+        recoveryPending={contentResearchIntent?.presearch.status === "waiting_model_config"}
+        onContinuePresearch={async () => {
+          if (!contentResearchIntent) return;
+          const presearch = await retryContentResearchPresearch(contentResearchIntent.presearch.workflow_run_id);
+          setContentResearchIntent({ ...contentResearchIntent, presearch });
+        }}
       />}
+      {contentResearchMode && !contentResearchRun && <aside className="hidden w-[300px] shrink-0 overflow-y-auto border-l border-line bg-slate-50 p-4 lg:block" aria-label="内容调研上下文">
+        <ModelServiceCard recoveryPending={contentResearchIntent?.presearch.status === "waiting_model_config"} onContinue={async () => {
+          if (!contentResearchIntent) return;
+          const presearch = await retryContentResearchPresearch(contentResearchIntent.presearch.workflow_run_id);
+          setContentResearchIntent({ ...contentResearchIntent, presearch });
+        }} onConfigurationChanged={() => undefined} />
+      </aside>}
       {contentResearchRun && <ContentResearchTraceInspector
         run={contentResearchRun}
         expanded={traceExpanded}

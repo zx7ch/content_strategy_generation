@@ -15,7 +15,12 @@ import {
   submitContentResearchBrandDecision,
   submitContentResearchContentDecision,
   isContentResearchReportPending,
+  retryContentResearchPresearch,
+  saveLLMConfiguration,
 } from "./content-research-api.ts";
+import { setWorkspaceContext } from "./api.ts";
+
+setWorkspaceContext("ws_test", "user_test");
 
 test("report publication gaps remain pending instead of becoming permanent failures", () => {
   assert.equal(
@@ -70,6 +75,36 @@ test("createContentResearchPresearch posts seed to real P0 endpoint", async () =
     "competitor_discovery",
     "content_performance",
   ]);
+});
+
+test("model configuration requests are Workspace scoped and never expect a returned key", async () => {
+  setWorkspaceContext("ws_1", "user_1");
+  let requestHeaders = new Headers();
+  globalThis.fetch = (async (_input, init) => {
+    requestHeaders = new Headers(init?.headers);
+    return jsonResponse({
+      source: "user", status: "validated", base_url: "https://proxy.example/v1", model: "model-x",
+      api_key_configured: true, api_key_suffix: "1234", validated_at: "2026-08-03T00:00:00Z", error_code: null,
+    });
+  }) as typeof fetch;
+  const result = await saveLLMConfiguration({ base_url: "https://proxy.example/v1", model: "model-x", api_key: "secret-1234" });
+  assert.equal(requestHeaders.get("X-Workspace-Id"), "ws_1");
+  assert.equal(requestHeaders.get("X-User-Id"), "user_1");
+  assert.equal("api_key" in result, false);
+});
+
+test("retry presearch returns the same persisted identifiers", async () => {
+  let requestBody = "";
+  globalThis.fetch = (async (_input, init) => {
+    requestBody = String(init?.body ?? "");
+    return jsonResponse({ schema_version: "content_research_workflow_action_response_v1", workflow_run_id: "run_1", action: "retry_presearch", status: "completed", execution_mode: "local", sync_status: "local_only", result: {
+      attempt_id: "att_1", workflow_run_id: "run_1", brief_id: "rb_1", status: "completed", subject_confirmation: "短裤", competitor_tags: [], research_directions: [], direction_catalog: [], custom_research_question: "", timeout_status: "none", fallback_used: false,
+    }});
+  }) as typeof fetch;
+  const result = await retryContentResearchPresearch("run_1");
+  assert.match(requestBody, /"action":"retry_presearch"/);
+  assert.equal(result.attempt_id, "att_1");
+  assert.equal(result.brief_id, "rb_1");
 });
 
 test("confirmContentResearchBrief posts selected directions", async () => {

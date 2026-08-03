@@ -11,6 +11,8 @@ from app.content_research.presearch.service import PresearchService
 from app.content_research.sources import SourceAdapterRegistry
 from app.content_research.sources.base import ProviderCapability, SourceOperationResult
 from app.services.llm.types import LLMResponse, TokenUsage
+from app.services.llm.configuration_service import LiteLLMConfigurationService
+from app.services.llm.configuration_store import SQLiteLLMConfigurationStore
 
 
 class DeterministicPresearchLLM:
@@ -35,6 +37,11 @@ class DeterministicPresearchLLM:
             usage=TokenUsage(total_tokens=1),
             latency_ms=1,
         )
+
+
+class DeterministicConfigurationProbe:
+    async def generate(self, _request, _api_key, model, _base_url=None):
+        return LLMResponse(content='{"ok":true}', provider="openai_compatible", model=model, usage=TokenUsage(), latency_ms=1)
 
 
 class DeterministicAuthRequiredSource:
@@ -140,6 +147,10 @@ async def deterministic_lifespan(application):
         )
         service._source_registry = registry
         service._task_router._source_registry = registry
+        application.state.llm_configuration_service = LiteLLMConfigurationService(
+            store=SQLiteLLMConfigurationStore(os.environ["SQLITE_DB_PATH"]),
+            probe_adapter=DeterministicConfigurationProbe(),
+        )
         application.state.xhs_qr_login_session = DeterministicQRLoginSession()
         if os.getenv("CREATOR_E2E_FAIL_WORKFLOW_RESTORE") == "1":
             service._workflow_runtime = DeterministicWorkflowRestoreFailure(

@@ -245,6 +245,22 @@ def test_creator_hides_lite_entry_when_preview_is_disabled(browser_page):
     expect(page.get_by_role("button", name=re.compile("内容调研"))).to_have_count(0)
 
 
+def test_creator_model_service_card_masks_saved_key(browser_page):
+    page, stack = browser_page
+    page.goto(stack["frontend_url"] + "/creator", wait_until="domcontentloaded")
+    page.get_by_role("button", name=re.compile("内容调研")).click(timeout=15000)
+    card = page.get_by_role("region", name="模型服务")
+    card.get_by_role("button", name="配置模型").click()
+    page.get_by_label("Base URL").fill("https://proxy.example/v1")
+    page.get_by_label("模型").fill("model-x")
+    page.get_by_label("API Key").fill("secret-1234")
+    page.get_by_role("button", name="测试连接").click()
+    expect(page.get_by_text("连接验证成功")).to_be_visible()
+    page.get_by_role("button", name="保存").click()
+    expect(page.get_by_text("API Key：••••1234")).to_be_visible()
+    expect(page.get_by_text("secret-1234", exact=True)).not_to_be_visible()
+
+
 def test_creator_complete_report_uses_lite_with_direct_source_navigation(
     browser_page,
 ):

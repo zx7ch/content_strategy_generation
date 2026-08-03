@@ -1,4 +1,4 @@
-import { RUNTIME_BASE_URL } from "./api.ts";
+import { getWorkspaceContext, RUNTIME_BASE_URL } from "./api.ts";
 
 type JsonObject = Record<string, unknown>;
 
@@ -39,7 +39,15 @@ export interface ContentResearchPresearchResponse {
   custom_competitor_input?: string;
   timeout_status: string;
   fallback_used: boolean;
+  error_code?: string | null;
+  error_message?: string | null;
+  recoverable?: boolean;
+  configuration_source?: string | null;
+  model?: string | null;
 }
+
+export interface LLMConfigurationInput { base_url: string; model: string; api_key?: string | null; }
+export interface LLMConfiguration { source: string; status: string; base_url: string; model: string; api_key_configured: boolean; api_key_suffix?: string | null; validated_at?: string | null; error_code?: string | null; }
 
 export interface ContentResearchBriefConfirmRequest {
   confirmed_subject: string;
@@ -157,7 +165,7 @@ export interface ContentResearchFormalResearchResponse {
 
 export interface ContentResearchWorkflowActionRequest {
   schema_version?: string;
-  action: "confirm_brief" | "start_formal_research" | "retry_formal_research" | "resume_formal_research" | "end_content_research";
+  action: "confirm_brief" | "start_formal_research" | "retry_formal_research" | "resume_formal_research" | "end_content_research" | "retry_presearch";
   payload?: JsonObject;
 }
 
@@ -261,6 +269,29 @@ export async function createContentResearchPresearch(
     method: "POST",
     body: input,
   });
+}
+
+export async function getLLMConfiguration(): Promise<LLMConfiguration> {
+  return contentResearchFetch("/content-research/llm-config");
+}
+
+export async function validateLLMConfiguration(input: LLMConfigurationInput): Promise<LLMConfiguration> {
+  return contentResearchFetch("/content-research/llm-config/validate", { method: "POST", body: input });
+}
+
+export async function saveLLMConfiguration(input: LLMConfigurationInput): Promise<LLMConfiguration> {
+  return contentResearchFetch("/content-research/llm-config", { method: "PUT", body: input });
+}
+
+export async function deleteLLMConfiguration(): Promise<LLMConfiguration> {
+  return contentResearchFetch("/content-research/llm-config", { method: "DELETE" });
+}
+
+export async function retryContentResearchPresearch(workflowRunId: string): Promise<ContentResearchPresearchResponse> {
+  const response = await runContentResearchWorkflowAction<ContentResearchPresearchResponse>(workflowRunId, {
+    action: "retry_presearch", payload: {},
+  });
+  return response.result;
 }
 
 export async function getContentResearchPresearch(attemptId: string): Promise<ContentResearchPresearchResponse> {
@@ -406,6 +437,12 @@ async function contentResearchFetch<T>(
   }
 ): Promise<T> {
   const headers = new Headers();
+  const { workspaceId, userId } = getWorkspaceContext();
+  if (!workspaceId || !userId) {
+    throw new ContentResearchApiError("Workspace context is required", 401);
+  }
+  headers.set("X-Workspace-Id", workspaceId);
+  headers.set("X-User-Id", userId);
   if (options?.body !== undefined) {
     headers.set("Content-Type", "application/json");
   }
