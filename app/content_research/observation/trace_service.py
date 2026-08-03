@@ -501,7 +501,13 @@ def _duration_ms(
     if len(times) < 2:
         return 0
     start = min(times)
-    end = max(times)
+    terminal_key = {
+        "succeeded": "completed_at",
+        "failed": "failed_at",
+        "cancelled": "cancelled_at",
+    }.get(str(run.get("status") or ""))
+    terminal_end = _parse_dt(run.get(terminal_key)) if terminal_key else None
+    end = terminal_end or max(times)
     return max(0, int((end - start).total_seconds() * 1000))
 
 

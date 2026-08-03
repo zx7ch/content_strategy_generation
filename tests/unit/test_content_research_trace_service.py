@@ -15,7 +15,7 @@ from app.content_research.service import (
     WorkflowRunManagerRuntime,
 )
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
-from app.content_research.observation.trace_service import _project_timing
+from app.content_research.observation.trace_service import _duration_ms, _project_timing
 from app.memory.workflow_store import WorkflowStore
 from app.services.llm.pricing import UsageCost
 from app.services.llm.types import LLMCallContext, LLMResponse, TokenUsage
@@ -275,6 +275,22 @@ def test_trace_timing_projects_open_queue_only_record_as_recorded_at_server_as_o
         "queue_duration_ms": 1500,
         "timing_source": "recorded",
     }
+
+
+def test_terminal_trace_duration_ignores_later_metadata_timestamps():
+    duration_ms = _duration_ms(
+        traces=[],
+        observation_events=[],
+        workflow_events=[{"created_at": "2026-08-03T01:00:05+00:00"}],
+        run={
+            "status": "succeeded",
+            "started_at": "2026-08-03T01:00:00+00:00",
+            "completed_at": "2026-08-03T01:00:01+00:00",
+            "updated_at": "2026-08-03T01:00:06+00:00",
+        },
+    )
+
+    assert duration_ms == 1_000
 
 
 @pytest.mark.parametrize(
