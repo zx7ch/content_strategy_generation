@@ -84,7 +84,7 @@ Test that the Pre-research card has no input, the normal composer placeholder be
 
 Run: `pytest -q tests/unit/test_content_research_subject_structure.py tests/unit/test_content_research_presearch.py tests/e2e/test_content_research_presearch_api.py tests/e2e/test_content_research_brief_confirm_api.py tests/acceptance/test_content_research_creator_ui_contract.py`
 
-- [ ] **Step 8: Commit Task 1**
+- [x] **Step 8: Commit Task 1**
 
 ```bash
 git add app/content_research/subject_structure.py app/content_research/presearch/prompts.py app/content_research/presearch/service.py app/content_research/api_schemas.py app/content_research/persistence_models.py app/content_research/service.py app/content_research/workflow/plan_builder.py frontend/src/lib/content-research-api.ts frontend/src/app/creator/page.tsx tests/unit/test_content_research_subject_structure.py tests/unit/test_content_research_presearch.py tests/e2e/test_content_research_presearch_api.py tests/e2e/test_content_research_brief_confirm_api.py tests/acceptance/test_content_research_creator_ui_contract.py
@@ -106,25 +106,25 @@ git commit -m "feat(content-research): confirm structured Lite subjects"
 **Interfaces:**
 - Produces `PlannedQueryGroup(role, activation, normalized_identity, query_group)` and `CompiledQueryPlan(primary_groups, fallback_group, plan_hash)` from the confirmed structure and direction definition.
 
-- [ ] **Step 1: Write failing compiler tests**
+- [x] **Step 1: Write failing compiler tests**
 
 Assert Q1 is core entity + primary intent; Q2 is core entity + explicit focus or second direction facet; normalized duplicates merge while retaining both roles; Q2 may be absent; exactly one synonym-based Q3 is frozen inactive; ordering/hash are stable; every group has candidate cap 20 and frozen time window.
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 Run: `pytest -q tests/unit/test_content_research_query_planner.py`
 
 Expected: missing compiler and activation metadata.
 
-- [ ] **Step 3: Implement the minimal compiler**
+- [x] **Step 3: Implement the minimal compiler**
 
 Normalize Unicode/case/whitespace/punctuation and confirmed aliases for identity. Do not build a Cartesian product. Q3 uses the next frozen alias plus uncovered focus and has `activation="coverage_fallback"`.
 
-- [ ] **Step 4: Freeze and validate the plan**
+- [x] **Step 4: Freeze and validate the plan**
 
 Allow `query_plan` in `StageCheckpointRecord`. Add structure/hash, `query_compiler_version`, `coverage_policy_version`, primary/fallback caps, group role/activation, and full stable group payload to `locked_query_plan`. Update `_frozen_query_groups`, policy validation, plan hash, and direction relevance QueryGroup IDs. New runs use v2; history remains unchanged.
 
-- [ ] **Step 5: Run GREEN**
+- [x] **Step 5: Run GREEN**
 
 Run: `pytest -q tests/unit/test_content_research_query_planner.py tests/unit/test_content_research_contracts.py tests/e2e/test_content_research_brief_confirm_api.py`
 

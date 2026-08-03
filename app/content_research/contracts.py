@@ -50,9 +50,7 @@ def admission_author_identity(projection: Mapping[str, Any]) -> str | None:
     author_id = str(projection.get("author_id") or "").strip()
     if author_id:
         return f"id:{author_id}"
-    author_name = unicodedata.normalize(
-        "NFKC", str(projection.get("author") or "")
-    ).casefold()
+    author_name = unicodedata.normalize("NFKC", str(projection.get("author") or "")).casefold()
     normalized_name = " ".join(author_name.split())
     return f"name:{normalized_name}" if normalized_name else None
 
@@ -64,39 +62,96 @@ def admission_author_identity_kind(projection: Mapping[str, Any]) -> str | None:
 
 _DIRECTION_CONTRACT_SPECS: dict[str, dict[str, Any]] = {
     "product_marketing": {
-        "blocking_note_fields": ("title", "content_text", "tags", "note_type", "metrics", "metrics_observed_at"),
+        "blocking_note_fields": (
+            "title",
+            "content_text",
+            "tags",
+            "note_type",
+            "metrics",
+            "metrics_observed_at",
+        ),
         "warning_note_fields": ("source_published_at", "ip_location", "media"),
-        "claim_rules": ("product_value_expression", "use_context", "target_audience_framing", "message_angle"),
+        "claim_rules": (
+            "product_value_expression",
+            "use_context",
+            "target_audience_framing",
+            "message_angle",
+        ),
     },
     "content_performance": {
-        "blocking_note_fields": ("title", "content_text", "note_type", "source_published_at", "metrics", "metrics_observed_at", "media"),
+        "blocking_note_fields": (
+            "title",
+            "content_text",
+            "note_type",
+            "source_published_at",
+            "metrics",
+            "metrics_observed_at",
+            "media",
+        ),
         "warning_note_fields": ("tags", "ip_location"),
         "claim_rules": ("observed_high_engagement_sample", "visible_content_format"),
     },
     "competitor_discovery": {
-        "blocking_note_fields": ("title", "content_text", "author", "tags", "metrics", "metrics_observed_at"),
+        "blocking_note_fields": (
+            "title",
+            "content_text",
+            "author",
+            "tags",
+            "metrics",
+            "metrics_observed_at",
+        ),
         "warning_note_fields": ("source_published_at", "ip_location"),
         "claim_rules": ("named_competitor", "visible_content_expression"),
     },
     "ugc_community": {
         "blocking_note_fields": ("title", "content_text", "author", "source_published_at"),
         "warning_note_fields": ("metrics", "tags"),
-        "blocking_comment_fields": ("comment_text", "source_published_at", "like_count", "reply_depth"),
+        "blocking_comment_fields": (
+            "comment_text",
+            "source_published_at",
+            "like_count",
+            "reply_depth",
+        ),
         "claim_rules": ("observed_discussion_scenario", "interaction_pattern", "sampled_language"),
     },
     "comment_insight": {
         "blocking_note_fields": ("title", "content_text"),
         "warning_note_fields": ("metrics",),
-        "blocking_comment_fields": ("comment_text", "source_published_at", "like_count", "reply_depth"),
+        "blocking_comment_fields": (
+            "comment_text",
+            "source_published_at",
+            "like_count",
+            "reply_depth",
+        ),
         "claim_rules": ("explicit_question", "objection_or_failure", "repeated_need_language"),
     },
     "brand_activity": {
-        "blocking_note_fields": ("title", "content_text", "source_published_at", "tags", "note_type", "metrics", "metrics_observed_at"),
+        "blocking_note_fields": (
+            "title",
+            "content_text",
+            "source_published_at",
+            "tags",
+            "note_type",
+            "metrics",
+            "metrics_observed_at",
+        ),
         "warning_note_fields": ("ip_location", "media"),
-        "claim_rules": ("campaign_signal", "launch_signal", "collaboration_signal", "dissemination_signal"),
+        "claim_rules": (
+            "campaign_signal",
+            "launch_signal",
+            "collaboration_signal",
+            "dissemination_signal",
+        ),
     },
     "keyword_growth": {
-        "blocking_note_fields": ("title", "content_text", "tags", "source_published_at", "metrics", "metrics_observed_at"),
+        "blocking_note_fields": (
+            "title",
+            "content_text",
+            "tags",
+            "source_published_at",
+            "metrics",
+            "metrics_observed_at",
+        ),
         "warning_note_fields": ("author", "ip_location"),
         "claim_rules": ("sampled_keyword_pattern", "keyword_growth_with_comparable_baseline"),
     },
@@ -106,7 +161,7 @@ QUERY_RELEVANCE_SCHEMA_VERSION = "content_research_query_relevance_v1"
 QUERY_RELEVANCE_MATCHING_MODE = "normalized_substring_any_anchor_v1"
 QUERY_RELEVANCE_ALGORITHM_VERSION = "query_relevance_v1"
 QUERY_SUBJECT_NOT_SUPPORTED = "query_subject_not_supported"
-LOCKED_QUERY_PLAN_SCHEMA_VERSION = "content_research_locked_query_plan_v1"
+LOCKED_QUERY_PLAN_SCHEMA_VERSION = "content_research_locked_query_plan_v2"
 ADMISSION_ALGORITHM_VERSION = "claim_admission_v2"
 
 _CATEGORY_SYNONYM_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -159,14 +214,11 @@ def build_query_relevance_contract(
         "algorithm_version": QUERY_RELEVANCE_ALGORITHM_VERSION,
         "subject_anchors": sorted({subject_anchor}),
         "category_anchors": sorted(set(category_anchors)),
-        "allowed_synonyms": {
-            key: allowed_synonyms[key] for key in sorted(allowed_synonyms)
-        },
+        "allowed_synonyms": {key: allowed_synonyms[key] for key in sorted(allowed_synonyms)},
         "matching_mode": QUERY_RELEVANCE_MATCHING_MODE,
         "query_group_ids": list(frozen_query_group_ids),
         "claim_quote_fields": {
-            claim_type: sorted(fields)
-            for claim_type, fields in sorted(quote_fields.items())
+            claim_type: sorted(fields) for claim_type, fields in sorted(quote_fields.items())
         },
         "reason_code": QUERY_SUBJECT_NOT_SUPPORTED,
     }
@@ -178,9 +230,9 @@ def frozen_query_relevance(
 ) -> dict[str, Any] | None:
     """Return the run-frozen contract after checking both persisted copies agree."""
     contract_value = contract.metadata.get("query_relevance")
-    policy_value = (
-        policy_snapshot.effective_policy.get("query_relevance") or {}
-    ).get(contract.direction_id)
+    policy_value = (policy_snapshot.effective_policy.get("query_relevance") or {}).get(
+        contract.direction_id
+    )
     if contract_value is None and policy_value is None:
         return None
     if not isinstance(contract_value, dict) or contract_value != policy_value:
@@ -204,9 +256,7 @@ def policy_hash(value: dict[str, Any]) -> str:
 def _locked_query_plan(
     *,
     requested_ids: tuple[str, ...],
-    query_groups_by_direction: Mapping[
-        str, tuple[Mapping[str, Any], ...]
-    ],
+    query_groups_by_direction: Mapping[str, tuple[Mapping[str, Any], ...]],
     custom_research_question: str,
 ) -> dict[str, Any]:
     if set(query_groups_by_direction) != set(requested_ids):
@@ -218,14 +268,26 @@ def _locked_query_plan(
             group = {
                 "id": str(value.get("id") or "").strip(),
                 "direction_id": str(value.get("direction_id") or "").strip(),
-                "normalized_query": " ".join(
-                    str(value.get("normalized_query") or "").split()
-                ),
+                "normalized_query": " ".join(str(value.get("normalized_query") or "").split()),
                 "priority": int(value.get("priority", 0)),
                 "sort": str(value.get("sort") or "").strip(),
                 "time_window": dict(value.get("time_window") or {}),
                 "candidate_cap": int(value.get("candidate_cap", 0)),
+                "activation": str(value.get("activation") or "primary").strip(),
+                "normalized_identity": str(value.get("normalized_identity") or "").strip(),
             }
+            group["roles"] = sorted(
+                {str(item).strip() for item in value.get("roles", ()) if str(item).strip()}
+            ) or [f"legacy_group_{group['priority']}"]
+            if not group["normalized_identity"]:
+                group["normalized_identity"] = policy_hash(
+                    {
+                        "query": group["normalized_query"].casefold(),
+                        "sort": group["sort"].casefold(),
+                        "time_window": group["time_window"],
+                        "candidate_cap": group["candidate_cap"],
+                    }
+                )
             if (
                 not group["id"]
                 or group["direction_id"] != direction_id
@@ -233,25 +295,42 @@ def _locked_query_plan(
                 or not group["sort"]
                 or not group["time_window"].get("end_at")
                 or group["candidate_cap"] < 1
+                or not group["roles"]
+                or group["activation"] not in {"primary", "coverage_fallback"}
+                or not group["normalized_identity"]
             ):
                 raise ValueError("locked query group is incomplete")
             groups.append(group)
         groups.sort(key=lambda item: (item["priority"], item["id"]))
         if not groups or len({item["id"] for item in groups}) != len(groups):
             raise ValueError("locked query groups must be non-empty and unique")
+        primary_count = sum(item["activation"] == "primary" for item in groups)
+        fallback_count = sum(item["activation"] == "coverage_fallback" for item in groups)
+        if primary_count not in {1, 2} or fallback_count > 1:
+            raise ValueError("locked query plan exceeds the Lite 2 plus 1 cap")
+        if any(item["candidate_cap"] != 20 for item in groups):
+            raise ValueError("Lite query groups require candidate_cap=20")
         directions[direction_id] = {
             "query_groups": groups,
             "query_plan_hash": policy_hash({"query_groups": groups}),
         }
     return {
         "schema_version": LOCKED_QUERY_PLAN_SCHEMA_VERSION,
+        "query_compiler_version": "content_research_query_compiler_v2",
+        "coverage_policy_version": "content_research_coverage_policy_v1",
+        "primary_query_group_cap": 2,
+        "coverage_fallback_query_group_cap": 1,
+        "candidate_cap_per_group": 20,
         "custom_research_question": " ".join(custom_research_question.split()),
         "directions": directions,
     }
 
 
 def evaluate_capability_preflight(
-    *, contracts: list[DirectionContract], provider_capabilities: dict[str, dict[str, Any]], provider: str = "xiaohongshu",
+    *,
+    contracts: list[DirectionContract],
+    provider_capabilities: dict[str, dict[str, Any]],
+    provider: str = "xiaohongshu",
 ) -> dict[str, Any]:
     """Freeze admission eligibility from contract requirements and adapter capabilities."""
     capabilities = provider_capabilities.get(provider, {})
@@ -266,17 +345,39 @@ def evaluate_capability_preflight(
         comment_fields = set(comments.get("fields") or ())
         detail_supported = detail.get("status") == "supported"
         comments_supported = comments.get("status") == "supported"
-        missing_note = tuple(field for field in blocking_note if not detail_supported or field not in detail_fields)
-        missing_warning = tuple(field for field in warning_note if not detail_supported or field not in detail_fields)
-        missing_comment = tuple(field for field in blocking_comment if not comments_supported or field not in comment_fields)
+        missing_note = tuple(
+            field for field in blocking_note if not detail_supported or field not in detail_fields
+        )
+        missing_warning = tuple(
+            field for field in warning_note if not detail_supported or field not in detail_fields
+        )
+        missing_comment = tuple(
+            field
+            for field in blocking_comment
+            if not comments_supported or field not in comment_fields
+        )
         reasons: list[str] = []
         if missing_note:
-            reasons.append("capability_unavailable" if not detail_supported else "missing_blocking_field")
+            reasons.append(
+                "capability_unavailable" if not detail_supported else "missing_blocking_field"
+            )
         if missing_comment:
-            reasons.append("comment_operation_unavailable" if not comments_supported else "missing_comment_field")
+            reasons.append(
+                "comment_operation_unavailable"
+                if not comments_supported
+                else "missing_comment_field"
+            )
         if missing_warning:
             reasons.append("warning_field_unavailable")
-        status = "formal_directional_result" if not missing_note and not missing_comment else ("unavailable" if not detail_supported or (blocking_comment and not comments_supported) else "incomplete")
+        status = (
+            "formal_directional_result"
+            if not missing_note and not missing_comment
+            else (
+                "unavailable"
+                if not detail_supported or (blocking_comment and not comments_supported)
+                else "incomplete"
+            )
+        )
         directions[contract.direction_id] = {
             "status": status,
             "formal_eligible": status == "formal_directional_result",
@@ -310,7 +411,9 @@ class SamplePolicy:
             raise ValueError("SamplePolicy thresholds must be positive")
         detail_fetch_cap = self.metadata.get("detail_fetch_cap", self.minimum_samples)
         if not isinstance(detail_fetch_cap, int) or detail_fetch_cap < self.minimum_samples:
-            raise ValueError("SamplePolicy detail_fetch_cap must be an integer at least minimum_samples")
+            raise ValueError(
+                "SamplePolicy detail_fetch_cap must be an integer at least minimum_samples"
+            )
         comment_limit = self.metadata.get("comment_limit", 30)
         if not isinstance(comment_limit, int) or comment_limit < 1:
             raise ValueError("SamplePolicy comment_limit must be a positive integer")
@@ -319,7 +422,9 @@ class SamplePolicy:
             raise ValueError("SamplePolicy comment_top_level_only must be a boolean")
         reply_depth_limit = self.metadata.get("comment_reply_depth_limit", 0)
         if not isinstance(reply_depth_limit, int) or reply_depth_limit < 0:
-            raise ValueError("SamplePolicy comment_reply_depth_limit must be a non-negative integer")
+            raise ValueError(
+                "SamplePolicy comment_reply_depth_limit must be a non-negative integer"
+            )
         if top_level_only and reply_depth_limit != 0:
             raise ValueError("SamplePolicy top-level comment collection requires reply depth 0")
 
@@ -356,9 +461,17 @@ class DirectionContract:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        required = (self.id, self.snapshot_id, self.direction_id, self.schema_version, self.sample_policy_id)
+        required = (
+            self.id,
+            self.snapshot_id,
+            self.direction_id,
+            self.schema_version,
+            self.sample_policy_id,
+        )
         if not all(required):
-            raise ValueError("DirectionContract requires identity, snapshot, version, and sample policy")
+            raise ValueError(
+                "DirectionContract requires identity, snapshot, version, and sample policy"
+            )
         if not self.required_note_fields:
             raise ValueError("DirectionContract requires at least one required note field")
         relevance = self.metadata.get("query_relevance")
@@ -366,8 +479,7 @@ class DirectionContract:
             if (
                 not isinstance(relevance, dict)
                 or relevance.get("schema_version") != QUERY_RELEVANCE_SCHEMA_VERSION
-                or relevance.get("algorithm_version")
-                != QUERY_RELEVANCE_ALGORITHM_VERSION
+                or relevance.get("algorithm_version") != QUERY_RELEVANCE_ALGORITHM_VERSION
                 or relevance.get("matching_mode") != QUERY_RELEVANCE_MATCHING_MODE
                 or relevance.get("reason_code") != QUERY_SUBJECT_NOT_SUPPORTED
                 or not relevance.get("subject_anchors")
@@ -393,12 +505,22 @@ class RunPolicySnapshot:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        if not all((self.id, self.workflow_run_id, self.research_brief_id, self.research_plan_id, self.schema_version)):
+        if not all(
+            (
+                self.id,
+                self.workflow_run_id,
+                self.research_brief_id,
+                self.research_plan_id,
+                self.schema_version,
+            )
+        ):
             raise ValueError("RunPolicySnapshot requires identity and run relationships")
         _require_aware(self.run_as_of_at, "run_as_of_at")
         _require_aware(self.created_at, "created_at")
         if self.effective_policy_hash != policy_hash(self.effective_policy):
-            raise ValueError("RunPolicySnapshot effective_policy_hash does not match effective_policy")
+            raise ValueError(
+                "RunPolicySnapshot effective_policy_hash does not match effective_policy"
+            )
 
 
 def build_default_snapshot(
@@ -415,10 +537,7 @@ def build_default_snapshot(
     report_compose_mode: str = "prose",
     confirmed_subject: str | None = None,
     query_group_ids_by_direction: Mapping[str, tuple[str, ...]] | None = None,
-    query_groups_by_direction: Mapping[
-        str, tuple[Mapping[str, Any], ...]
-    ]
-    | None = None,
+    query_groups_by_direction: Mapping[str, tuple[Mapping[str, Any], ...]] | None = None,
     custom_research_question: str = "",
     subject_structure: Mapping[str, Any] | None = None,
     subject_structure_hash: str | None = None,
@@ -455,22 +574,13 @@ def build_default_snapshot(
         frozen_group_ids = {
             direction_id: tuple(
                 group["id"]
-                for group in locked_query_plan["directions"][direction_id][
-                    "query_groups"
-                ]
+                for group in locked_query_plan["directions"][direction_id]["query_groups"]
             )
             for direction_id in requested_ids
         }
-        if (
-            query_group_ids_by_direction is not None
-            and {
-                key: tuple(sorted(value))
-                for key, value in query_group_ids_by_direction.items()
-            }
-            != {
-                key: tuple(sorted(value)) for key, value in frozen_group_ids.items()
-            }
-        ):
+        if query_group_ids_by_direction is not None and {
+            key: tuple(sorted(value)) for key, value in query_group_ids_by_direction.items()
+        } != {key: tuple(sorted(value)) for key, value in frozen_group_ids.items()}:
             raise ValueError("query group ids differ from the locked query plan")
         query_group_ids_by_direction = frozen_group_ids
     relevance_by_direction: dict[str, dict[str, Any]] = {}
@@ -501,12 +611,27 @@ def build_default_snapshot(
             "max_report_rewrites": 1,
         },
         "governance": GOVERNANCE_POLICY_V1,
-        "provider_capabilities": provider_capabilities or {
+        "provider_capabilities": provider_capabilities
+        or {
             "xiaohongshu": {
                 "adapter_version": "xhs_adapter_v1",
-                "discover_candidates": {"status": "supported", "fields": ["title", "author", "metrics"]},
+                "discover_candidates": {
+                    "status": "supported",
+                    "fields": ["title", "author", "metrics"],
+                },
                 "collect_note_detail": {"status": "unavailable", "fields": []},
-                "collect_comments": {"status": "supported", "fields": ["comment_text", "source_published_at", "like_count", "reply_depth", "author", "parent_note_id"], "top_level_only": True},
+                "collect_comments": {
+                    "status": "supported",
+                    "fields": [
+                        "comment_text",
+                        "source_published_at",
+                        "like_count",
+                        "reply_depth",
+                        "author",
+                        "parent_note_id",
+                    ],
+                    "top_level_only": True,
+                },
             }
         },
     }
@@ -516,9 +641,7 @@ def build_default_snapshot(
         policy["locked_query_plan"] = locked_query_plan
     if subject_structure is not None or subject_structure_hash is not None:
         if not subject_structure or not subject_structure_hash:
-            raise ValueError(
-                "subject_structure and subject_structure_hash must be frozen together"
-            )
+            raise ValueError("subject_structure and subject_structure_hash must be frozen together")
         policy["subject_structure"] = dict(subject_structure)
         policy["subject_structure_hash"] = subject_structure_hash
     if direction_catalog is not None:
@@ -526,14 +649,35 @@ def build_default_snapshot(
             "direction_catalog_version": DIRECTION_CATALOG_VERSION,
             "requested_direction_ids": list(requested_ids),
         }
-    policies = [SamplePolicy(id=f"sp_{snapshot_id}_{item.id}", schema_version="content_research_sample_policy_v1", direction_id=item.id, minimum_samples=30 if item.id in {"ugc_community", "comment_insight"} else 3, minimum_independent_authors=5 if item.id in {"ugc_community", "comment_insight"} else 2, author_cap=3, metadata={"detail_fetch_cap": 30, "comment_limit": 30, "comment_top_level_only": True, "comment_reply_depth_limit": 0}) for item in definitions]
+    policies = [
+        SamplePolicy(
+            id=f"sp_{snapshot_id}_{item.id}",
+            schema_version="content_research_sample_policy_v1",
+            direction_id=item.id,
+            minimum_samples=30 if item.id in {"ugc_community", "comment_insight"} else 3,
+            minimum_independent_authors=5 if item.id in {"ugc_community", "comment_insight"} else 2,
+            author_cap=3,
+            metadata={
+                "detail_fetch_cap": 30,
+                "comment_limit": 30,
+                "comment_top_level_only": True,
+                "comment_reply_depth_limit": 0,
+            },
+        )
+        for item in definitions
+    ]
     contracts = [
         DirectionContract(
-            id=f"dc_{snapshot_id}_{item.id}", snapshot_id=snapshot_id, direction_id=item.id,
-            schema_version="content_research_direction_contract_v2", sample_policy_id=sample_policy.id,
+            id=f"dc_{snapshot_id}_{item.id}",
+            snapshot_id=snapshot_id,
+            direction_id=item.id,
+            schema_version="content_research_direction_contract_v2",
+            sample_policy_id=sample_policy.id,
             required_note_fields=_DIRECTION_CONTRACT_SPECS[item.id]["blocking_note_fields"],
             optional_note_fields=_DIRECTION_CONTRACT_SPECS[item.id]["warning_note_fields"],
-            required_comment_fields=_DIRECTION_CONTRACT_SPECS[item.id].get("blocking_comment_fields", ()),
+            required_comment_fields=_DIRECTION_CONTRACT_SPECS[item.id].get(
+                "blocking_comment_fields", ()
+            ),
             claim_rules=_DIRECTION_CONTRACT_SPECS[item.id]["claim_rules"],
             metadata={
                 "contract_role": "admission",
@@ -552,6 +696,18 @@ def build_default_snapshot(
         )
         for item, sample_policy in zip(definitions, policies, strict=True)
     ]
-    preflight = evaluate_capability_preflight(contracts=contracts, provider_capabilities=policy["provider_capabilities"])
-    snapshot = RunPolicySnapshot(id=snapshot_id, workflow_run_id=workflow_run_id, research_brief_id=brief_id, research_plan_id=plan_id, schema_version="content_research_run_policy_snapshot_v1", effective_policy=policy, effective_policy_hash=policy_hash(policy), run_as_of_at=as_of, validation_result=preflight)
+    preflight = evaluate_capability_preflight(
+        contracts=contracts, provider_capabilities=policy["provider_capabilities"]
+    )
+    snapshot = RunPolicySnapshot(
+        id=snapshot_id,
+        workflow_run_id=workflow_run_id,
+        research_brief_id=brief_id,
+        research_plan_id=plan_id,
+        schema_version="content_research_run_policy_snapshot_v1",
+        effective_policy=policy,
+        effective_policy_hash=policy_hash(policy),
+        run_as_of_at=as_of,
+        validation_result=preflight,
+    )
     return snapshot, policies, contracts

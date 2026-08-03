@@ -42,14 +42,29 @@ from app.content_research.sources.base import SourceOperationResult
 from app.content_research.sources.canonical_registry import CanonicalSourceRegistry
 from app.content_research.stores.base import ContentResearchStore
 
-PACKET_FIELD_NAMES = frozenset({
-    "title", "content_text", "author_id", "author", "tags", "metrics", "media", "source_url",
-    "source_published_at", "source_collected_at", "metrics_observed_at",
-    "parent_note_id", "comment_text", "reply_depth", "quote",
-    "competitor_names",
-    "activity_signals",
-    "keyword_patterns", "reference_window",
-})
+PACKET_FIELD_NAMES = frozenset(
+    {
+        "title",
+        "content_text",
+        "author_id",
+        "author",
+        "tags",
+        "metrics",
+        "media",
+        "source_url",
+        "source_published_at",
+        "source_collected_at",
+        "metrics_observed_at",
+        "parent_note_id",
+        "comment_text",
+        "reply_depth",
+        "quote",
+        "competitor_names",
+        "activity_signals",
+        "keyword_patterns",
+        "reference_window",
+    }
+)
 
 
 class OperationOutcomeUnknownError(RuntimeError):
@@ -71,6 +86,9 @@ class QueryGroup:
     candidate_limit: int = 20
     time_window: dict[str, str] | None = None
     cursor: str | None = None
+    roles: tuple[str, ...] = ()
+    activation: str = "primary"
+    normalized_identity: str = ""
 
 
 @dataclass(frozen=True)
@@ -122,7 +140,9 @@ def compile_query_groups(
     for index, question in enumerate(questions or [direction_id]):
         query = " ".join([*terms, question.strip()]).strip()
         normalized = " ".join(query.split())
-        group_id = f"qg_{canonical_fingerprint({'direction': direction_id, 'query': normalized})[:16]}"
+        group_id = (
+            f"qg_{canonical_fingerprint({'direction': direction_id, 'query': normalized})[:16]}"
+        )
         groups.append(
             QueryGroup(
                 group_id,
@@ -130,11 +150,7 @@ def compile_query_groups(
                 normalized,
                 index,
                 candidate_limit=candidate_limit,
-                time_window={
-                    "end_at": run_as_of_at.isoformat()
-                }
-                if run_as_of_at
-                else None,
+                time_window={"end_at": run_as_of_at.isoformat()} if run_as_of_at else None,
             )
         )
     return tuple(groups)
@@ -147,7 +163,7 @@ def query_plan_hash(groups: tuple[QueryGroup, ...]) -> str:
 
 
 def _frozen_query_group_payload(group: QueryGroup) -> dict[str, Any]:
-    return {
+    payload = {
         "id": group.id,
         "direction_id": group.direction_id,
         "normalized_query": group.query,
@@ -156,6 +172,15 @@ def _frozen_query_group_payload(group: QueryGroup) -> dict[str, Any]:
         "time_window": dict(group.time_window or {}),
         "candidate_cap": group.candidate_limit,
     }
+    if group.roles:
+        payload["roles"] = list(group.roles)
+    if group.activation != "primary":
+        payload["activation"] = group.activation
+    elif group.roles or group.normalized_identity:
+        payload["activation"] = "primary"
+    if group.normalized_identity:
+        payload["normalized_identity"] = group.normalized_identity
+    return payload
 
 
 def _frozen_query_groups(
@@ -169,7 +194,7 @@ def _frozen_query_groups(
     values = direction.get("query_groups")
     if not isinstance(values, list) or not values:
         raise ValueError("frozen query plan is missing the requested direction")
-    groups = tuple(
+    all_groups = tuple(
         QueryGroup(
             id=str(value["id"]),
             direction_id=str(value["direction_id"]),
@@ -178,20 +203,31 @@ def _frozen_query_groups(
             sort=str(value["sort"]),
             candidate_limit=int(value["candidate_cap"]),
             time_window=dict(value["time_window"]),
+            roles=tuple(value.get("roles") or ()),
+            activation=str(value.get("activation") or "primary"),
+            normalized_identity=str(value.get("normalized_identity") or ""),
         )
         for value in values
     )
-    if query_plan_hash(groups) != direction.get("query_plan_hash"):
+    if query_plan_hash(all_groups) != direction.get("query_plan_hash"):
         raise ValueError("frozen query plan hash does not match its query groups")
+    groups = tuple(group for group in all_groups if group.activation == "primary")
+    if not groups:
+        raise ValueError("frozen query plan has no active primary groups")
     return groups
 
 
 def select_candidates(
-    *, groups: tuple[QueryGroup, ...], candidates: list[dict[str, Any]], author_cap: int,
-    minimum_samples: int = 1_000_000, minimum_independent_authors: int = 1_000_000,
+    *,
+    groups: tuple[QueryGroup, ...],
+    candidates: list[dict[str, Any]],
+    author_cap: int,
+    minimum_samples: int = 1_000_000,
+    minimum_independent_authors: int = 1_000_000,
     detail_fetch_cap: int | None = None,
     require_detail: bool = False,
     run_as_of_at: datetime | None = None,
+    frozen_query_plan_hash: str | None = None,
 ) -> DirectionSelection:
     """Deduplicate before applying the author cap; never trade the cap for coverage."""
     by_id: dict[str, dict[str, Any]] = {}
@@ -245,7 +281,11 @@ def select_candidates(
             reasons.append("out_of_time_window")
         if item.get("blocking_unavailable"):
             reasons.append("blocking_field_unavailable")
-        if require_detail and item.get("source_kind") in {"search_result", "search_result_minimal"} and not item.get("blocking_unavailable"):
+        if (
+            require_detail
+            and item.get("source_kind") in {"search_result", "search_result_minimal"}
+            and not item.get("blocking_unavailable")
+        ):
             reasons.append("detail_not_collected")
         author = str(item.get("author_id") or "")
         if author and author_counts.get(author, 0) >= author_cap:
@@ -289,7 +329,9 @@ def select_candidates(
     coverage_unmet = tuple(group.id for group in groups if group.id not in selected_groups)
     if coverage_unmet:
         incomplete = True
-    requirements_met = selected >= minimum_samples and len(independent_authors) >= minimum_independent_authors
+    requirements_met = (
+        selected >= minimum_samples and len(independent_authors) >= minimum_independent_authors
+    )
     if not requirements_met:
         incomplete = True
     manifest = [
@@ -306,17 +348,36 @@ def select_candidates(
         }
         for key, value in sorted(by_id.items())
     ]
-    status = "insufficient_evidence" if not selected else ("incomplete" if incomplete else "complete")
+    status = (
+        "insufficient_evidence" if not selected else ("incomplete" if incomplete else "complete")
+    )
     return DirectionSelection(
-        query_plan_hash(groups), canonical_fingerprint({"candidates": manifest}), tuple(decisions),
-        selected, selected, len(independent_authors), status, coverage_unmet,
+        frozen_query_plan_hash or query_plan_hash(groups),
+        canonical_fingerprint({"candidates": manifest}),
+        tuple(decisions),
+        selected,
+        selected,
+        len(independent_authors),
+        status,
+        coverage_unmet,
     )
 
 
-def build_packet(*, direction_id: str, canonical_source_id: str, fields: dict[str, Any], availability: dict[str, str], retrieval_context: dict[str, Any]) -> dict[str, Any]:
+def build_packet(
+    *,
+    direction_id: str,
+    canonical_source_id: str,
+    fields: dict[str, Any],
+    availability: dict[str, str],
+    retrieval_context: dict[str, Any],
+) -> dict[str, Any]:
     """Return the minimal immutable packet projection, excluding raw/token data."""
     projection = {key: fields.get(key) for key in sorted(fields) if key in PACKET_FIELD_NAMES}
-    safe_context = {key: value for key, value in retrieval_context.items() if key not in {"raw_payload", "access_token", "token", "cookie"}}
+    safe_context = {
+        key: value
+        for key, value in retrieval_context.items()
+        if key not in {"raw_payload", "access_token", "token", "cookie"}
+    }
     value = {
         "direction_id": direction_id,
         "canonical_source_id": canonical_source_id,
@@ -340,9 +401,7 @@ class DirectionalExecutionPipeline:
         cls, db_path: str, *, workflow_run_id: str
     ) -> DirectionalExecutionPipeline:
         return cls(
-            await AsyncDirectionalPersistenceSession.open(
-                db_path, workflow_run_id=workflow_run_id
-            )
+            await AsyncDirectionalPersistenceSession.open(db_path, workflow_run_id=workflow_run_id)
         )  # type: ignore[arg-type]
 
     async def _flush(self) -> None:
@@ -366,8 +425,12 @@ class DirectionalExecutionPipeline:
         candidate_limit_per_query: int = 20,
         snapshot_id: str | None = None,
         discover: Callable[[QueryGroup], Awaitable[SourceOperationResult | list[dict[str, Any]]]],
-        collect_detail: Callable[[dict[str, Any]], Awaitable[SourceOperationResult | dict[str, Any] | None]] | None = None,
-        collect_comments: Callable[[dict[str, Any]], Awaitable[SourceOperationResult]] | None = None,
+        collect_detail: Callable[
+            [dict[str, Any]], Awaitable[SourceOperationResult | dict[str, Any] | None]
+        ]
+        | None = None,
+        collect_comments: Callable[[dict[str, Any]], Awaitable[SourceOperationResult]]
+        | None = None,
         required_comment_fields: tuple[str, ...] = (),
         comment_limit: int = 30,
         comment_top_level_only: bool = True,
@@ -388,9 +451,7 @@ class DirectionalExecutionPipeline:
             else None
         )
         if policy_snapshot is not None and frozen_groups is None:
-            raise ValueError(
-                "formal collection requires a full locked query plan"
-            )
+            raise ValueError("formal collection requires a full locked query plan")
         groups = frozen_groups or compile_query_groups(
             direction_id=direction_id,
             subject=subject,
@@ -399,8 +460,28 @@ class DirectionalExecutionPipeline:
             candidate_limit=candidate_limit_per_query,
             run_as_of_at=run_as_of_at,
         )
-        plan_hash = query_plan_hash(groups)
-        collect_record = self._checkpoint(subagent_task_id, "collect", plan_hash)
+        active_plan_hash = query_plan_hash(groups)
+        locked_direction = (
+            dict(
+                (
+                    policy_snapshot.effective_policy.get("locked_query_plan", {})
+                    .get("directions", {})
+                    .get(direction_id, {})
+                )
+                or {}
+            )
+            if policy_snapshot is not None
+            else {}
+        )
+        plan_hash = str(locked_direction.get("query_plan_hash") or active_plan_hash)
+        collect_fingerprint = (
+            canonical_fingerprint(
+                {"frozen_plan_hash": plan_hash, "active_plan_hash": active_plan_hash}
+            )
+            if plan_hash != active_plan_hash
+            else plan_hash
+        )
+        collect_record = self._checkpoint(subagent_task_id, "collect", collect_fingerprint)
         replayed_collect = collect_record is not None
         if collect_record:
             candidates = list(collect_record.payload["candidates"])
@@ -412,35 +493,72 @@ class DirectionalExecutionPipeline:
                 groups=groups,
                 discover=discover,
             )
-            self._save_checkpoint(subagent_task_id, "collect", plan_hash, {
-                "direction_id": direction_id,
-                "query_groups": [asdict(group) for group in groups],
-                "query_plan_hash": plan_hash,
-                "selection_policy": {
-                    "snapshot_id": snapshot_id,
-                    "author_cap": author_cap,
-                    "minimum_samples": minimum_samples,
-                    "minimum_independent_authors": minimum_independent_authors,
-                    "detail_fetch_cap": detail_fetch_cap,
-                    "run_as_of_at": run_as_of_at.isoformat() if run_as_of_at else None,
+            self._save_checkpoint(
+                subagent_task_id,
+                "collect",
+                collect_fingerprint,
+                {
+                    "direction_id": direction_id,
+                    "query_groups": [asdict(group) for group in groups],
+                    "query_plan_hash": plan_hash,
+                    "active_query_plan_hash": active_plan_hash,
+                    "selection_policy": {
+                        "snapshot_id": snapshot_id,
+                        "author_cap": author_cap,
+                        "minimum_samples": minimum_samples,
+                        "minimum_independent_authors": minimum_independent_authors,
+                        "detail_fetch_cap": detail_fetch_cap,
+                        "run_as_of_at": run_as_of_at.isoformat() if run_as_of_at else None,
+                    },
+                    "candidates": candidates,
+                    "pagination": pagination,
                 },
-                "candidates": candidates,
-                "pagination": pagination,
-            })
+            )
 
         self._start_checkpoint(subagent_task_id, "selection")
-        selection = select_candidates(groups=groups, candidates=candidates, author_cap=author_cap, minimum_samples=minimum_samples, minimum_independent_authors=minimum_independent_authors, detail_fetch_cap=detail_fetch_cap, run_as_of_at=run_as_of_at)
-        selection_fp = canonical_fingerprint({"plan": plan_hash, "manifest": selection.candidate_manifest_hash, "author_cap": author_cap, "minimum_samples": minimum_samples, "minimum_independent_authors": minimum_independent_authors, "detail_fetch_cap": detail_fetch_cap, "run_as_of_at": run_as_of_at.isoformat() if run_as_of_at else None})
+        selection = select_candidates(
+            groups=groups,
+            candidates=candidates,
+            author_cap=author_cap,
+            minimum_samples=minimum_samples,
+            minimum_independent_authors=minimum_independent_authors,
+            detail_fetch_cap=detail_fetch_cap,
+            run_as_of_at=run_as_of_at,
+            frozen_query_plan_hash=plan_hash,
+        )
+        selection_fp = canonical_fingerprint(
+            {
+                "plan": plan_hash,
+                "manifest": selection.candidate_manifest_hash,
+                "author_cap": author_cap,
+                "minimum_samples": minimum_samples,
+                "minimum_independent_authors": minimum_independent_authors,
+                "detail_fetch_cap": detail_fetch_cap,
+                "run_as_of_at": run_as_of_at.isoformat() if run_as_of_at else None,
+            }
+        )
         selection_record = self._checkpoint(subagent_task_id, "selection", selection_fp)
         replayed_selection = selection_record is not None
         if selection_record:
             selection = _selection_from_payload(selection_record.payload["selection"])
         else:
-            self._save_checkpoint(subagent_task_id, "selection", selection_fp, {
-                "direction_id": direction_id,
-                "selection_policy": {"snapshot_id": snapshot_id, "author_cap": author_cap, "minimum_samples": minimum_samples, "minimum_independent_authors": minimum_independent_authors, "detail_fetch_cap": detail_fetch_cap, "run_as_of_at": run_as_of_at.isoformat() if run_as_of_at else None},
-                "selection": _selection_payload(selection),
-            })
+            self._save_checkpoint(
+                subagent_task_id,
+                "selection",
+                selection_fp,
+                {
+                    "direction_id": direction_id,
+                    "selection_policy": {
+                        "snapshot_id": snapshot_id,
+                        "author_cap": author_cap,
+                        "minimum_samples": minimum_samples,
+                        "minimum_independent_authors": minimum_independent_authors,
+                        "detail_fetch_cap": detail_fetch_cap,
+                        "run_as_of_at": run_as_of_at.isoformat() if run_as_of_at else None,
+                    },
+                    "selection": _selection_payload(selection),
+                },
+            )
 
         candidate_by_id = _candidate_map(candidates)
         detail_record = self._checkpoint(subagent_task_id, "detail", selection_fp)
@@ -455,8 +573,13 @@ class DirectionalExecutionPipeline:
                 candidate_by_id = _candidate_map(latest["candidates"])
                 selection = _selection_from_payload(latest["selection"])
             revision_no = len(revisions)
-            for candidate_id, candidate in sorted(candidate_by_id.items(), key=lambda pair: _sort_key(pair[1])):
-                if candidate.get("source_kind") not in {"search_result", "search_result_minimal"} or candidate.get("detail_attempted"):
+            for candidate_id, candidate in sorted(
+                candidate_by_id.items(), key=lambda pair: _sort_key(pair[1])
+            ):
+                if candidate.get("source_kind") not in {
+                    "search_result",
+                    "search_result_minimal",
+                } or candidate.get("detail_attempted"):
                     continue
                 if detail_fetch_cap is not None and revision_no >= detail_fetch_cap:
                     break
@@ -470,8 +593,11 @@ class DirectionalExecutionPipeline:
                     detail_result = await collect_detail(candidate)
                 except Exception:
                     self._terminal_operation(
-                        subagent_task_id, "detail", operation_fingerprint,
-                        status="outcome_unknown", failure_code="provider_call_interrupted",
+                        subagent_task_id,
+                        "detail",
+                        operation_fingerprint,
+                        status="outcome_unknown",
+                        failure_code="provider_call_interrupted",
                         recovery_action="确认外部调用结果后再恢复；系统不会自动重放。",
                     )
                     await self._flush()
@@ -479,7 +605,8 @@ class DirectionalExecutionPipeline:
                 if isinstance(detail_result, SourceOperationResult):
                     detail = (
                         dict(detail_result.items[0])
-                        if detail_result.status in {"completed", "partial_completed"} and detail_result.items
+                        if detail_result.status in {"completed", "partial_completed"}
+                        and detail_result.items
                         else None
                     )
                 else:
@@ -488,20 +615,52 @@ class DirectionalExecutionPipeline:
                 if detail is None:
                     candidate["blocking_unavailable"] = True
                 else:
-                    candidate_by_id[candidate_id] = {**candidate, **detail, "canonical_source_id": candidate_id, "detail_attempted": True}
+                    candidate_by_id[candidate_id] = {
+                        **candidate,
+                        **detail,
+                        "canonical_source_id": candidate_id,
+                        "detail_attempted": True,
+                    }
                 self._start_checkpoint(subagent_task_id, "selection_revision")
-                selection = select_candidates(groups=groups, candidates=list(candidate_by_id.values()), author_cap=author_cap, minimum_samples=minimum_samples, minimum_independent_authors=minimum_independent_authors, detail_fetch_cap=detail_fetch_cap, require_detail=True, run_as_of_at=run_as_of_at)
+                selection = select_candidates(
+                    groups=groups,
+                    candidates=list(candidate_by_id.values()),
+                    author_cap=author_cap,
+                    minimum_samples=minimum_samples,
+                    minimum_independent_authors=minimum_independent_authors,
+                    detail_fetch_cap=detail_fetch_cap,
+                    require_detail=True,
+                    run_as_of_at=run_as_of_at,
+                    frozen_query_plan_hash=plan_hash,
+                )
                 revision_no += 1
-                decision = next(item for item in selection.decisions if item.canonical_source_id == candidate_id)
-                revision_fp = canonical_fingerprint({"selection": selection_fp, "revision": revision_no, "candidate": candidate_id, "manifest": selection.candidate_manifest_hash})
-                self._save_checkpoint(subagent_task_id, "selection_revision", revision_fp, {
-                    "direction_id": direction_id,
-                    "base_selection_fingerprint": selection_fp,
-                    "revision": revision_no,
-                    "trigger": {"candidate_id": candidate_id, "reasons": list(decision.reasons)},
-                    "candidates": list(candidate_by_id.values()),
-                    "selection": _selection_payload(selection),
-                })
+                decision = next(
+                    item for item in selection.decisions if item.canonical_source_id == candidate_id
+                )
+                revision_fp = canonical_fingerprint(
+                    {
+                        "selection": selection_fp,
+                        "revision": revision_no,
+                        "candidate": candidate_id,
+                        "manifest": selection.candidate_manifest_hash,
+                    }
+                )
+                self._save_checkpoint(
+                    subagent_task_id,
+                    "selection_revision",
+                    revision_fp,
+                    {
+                        "direction_id": direction_id,
+                        "base_selection_fingerprint": selection_fp,
+                        "revision": revision_no,
+                        "trigger": {
+                            "candidate_id": candidate_id,
+                            "reasons": list(decision.reasons),
+                        },
+                        "candidates": list(candidate_by_id.values()),
+                        "selection": _selection_payload(selection),
+                    },
+                )
                 if isinstance(detail_result, SourceOperationResult):
                     self._terminal_operation_from_result(
                         subagent_task_id, "detail", operation_fingerprint, detail_result
@@ -509,26 +668,46 @@ class DirectionalExecutionPipeline:
                 else:
                     self._complete_operation(subagent_task_id, "detail", operation_fingerprint)
                 await self._flush()
-                if (
-                    isinstance(detail_result, SourceOperationResult)
-                    and _is_provider_wide_failure(detail_result)
+                if isinstance(detail_result, SourceOperationResult) and _is_provider_wide_failure(
+                    detail_result
                 ):
                     break
                 if selection.status == "complete":
                     break
-            selection = select_candidates(groups=groups, candidates=list(candidate_by_id.values()), author_cap=author_cap, minimum_samples=minimum_samples, minimum_independent_authors=minimum_independent_authors, detail_fetch_cap=detail_fetch_cap, require_detail=True, run_as_of_at=run_as_of_at)
-            self._save_checkpoint(subagent_task_id, "detail", selection_fp, {"direction_id": direction_id, "candidates": list(candidate_by_id.values()), "selection": _selection_payload(selection)})
+            selection = select_candidates(
+                groups=groups,
+                candidates=list(candidate_by_id.values()),
+                author_cap=author_cap,
+                minimum_samples=minimum_samples,
+                minimum_independent_authors=minimum_independent_authors,
+                detail_fetch_cap=detail_fetch_cap,
+                require_detail=True,
+                run_as_of_at=run_as_of_at,
+                frozen_query_plan_hash=plan_hash,
+            )
+            self._save_checkpoint(
+                subagent_task_id,
+                "detail",
+                selection_fp,
+                {
+                    "direction_id": direction_id,
+                    "candidates": list(candidate_by_id.values()),
+                    "selection": _selection_payload(selection),
+                },
+            )
 
         comment_packet_ids: tuple[str, ...] = ()
         comment_required = bool(required_comment_fields)
-        comments_fp = canonical_fingerprint({
-            "selection": selection_fp,
-            "required_comment_fields": required_comment_fields,
-            "limit": comment_limit,
-            "top_level_only": comment_top_level_only,
-            "reply_depth_limit": comment_reply_depth_limit,
-            "sample_policy_id": comment_policy_id,
-        })
+        comments_fp = canonical_fingerprint(
+            {
+                "selection": selection_fp,
+                "required_comment_fields": required_comment_fields,
+                "limit": comment_limit,
+                "top_level_only": comment_top_level_only,
+                "reply_depth_limit": comment_reply_depth_limit,
+                "sample_policy_id": comment_policy_id,
+            }
+        )
         comment_record = self._checkpoint(subagent_task_id, "comments", comments_fp)
         if comment_required and comment_record:
             comment_packet_ids = tuple(comment_record.payload.get("packet_ids") or [])
@@ -537,7 +716,13 @@ class DirectionalExecutionPipeline:
         elif comment_required:
             self._start_checkpoint(subagent_task_id, "comments")
             if collect_comments is None:
-                collection = {"required": True, "status": "unavailable", "failure_reason": "comment_collector_unconfigured", "usable": False, "parents": []}
+                collection = {
+                    "required": True,
+                    "status": "unavailable",
+                    "failure_reason": "comment_collector_unconfigured",
+                    "usable": False,
+                    "parents": [],
+                }
             else:
                 collection = await self._collect_required_comments(
                     subagent_task_id=subagent_task_id,
@@ -553,9 +738,19 @@ class DirectionalExecutionPipeline:
                     comment_policy_id=comment_policy_id,
                 )
             comment_packet_ids = tuple(collection["packet_ids"])
-            self._save_checkpoint(subagent_task_id, "comments", comments_fp, {"direction_id": direction_id, **collection})
+            self._save_checkpoint(
+                subagent_task_id,
+                "comments",
+                comments_fp,
+                {"direction_id": direction_id, **collection},
+            )
             if not collection["usable"]:
-                selection = replace(selection, status="incomplete" if selection.selected_source_count else "insufficient_evidence")
+                selection = replace(
+                    selection,
+                    status="incomplete"
+                    if selection.selected_source_count
+                    else "insufficient_evidence",
+                )
 
         packet_record = self._checkpoint(subagent_task_id, "packet", selection_fp)
         replayed_packet = packet_record is not None
@@ -564,12 +759,31 @@ class DirectionalExecutionPipeline:
         else:
             self._start_checkpoint(subagent_task_id, "packet")
             packet_ids = tuple(self._persist_packets(direction_id, selection, candidate_by_id))
-            self._save_checkpoint(subagent_task_id, "packet", selection_fp, {"direction_id": direction_id, "packet_ids": list(packet_ids), "status": "incomplete" if len(packet_ids) < selection.selected_source_count else selection.status})
+            self._save_checkpoint(
+                subagent_task_id,
+                "packet",
+                selection_fp,
+                {
+                    "direction_id": direction_id,
+                    "packet_ids": list(packet_ids),
+                    "status": "incomplete"
+                    if len(packet_ids) < selection.selected_source_count
+                    else selection.status,
+                },
+            )
         if len(packet_ids) < selection.selected_source_count:
             selection = replace(selection, status="incomplete")
         if admission_contract and admission_policy and policy_snapshot:
             admission_packet_ids = (*packet_ids, *comment_packet_ids)
-            self._run_admission(subagent_task_id, direction_id, selection, admission_packet_ids, admission_contract, admission_policy, policy_snapshot)
+            self._run_admission(
+                subagent_task_id,
+                direction_id,
+                selection,
+                admission_packet_ids,
+                admission_contract,
+                admission_policy,
+                policy_snapshot,
+            )
         await self._flush()
         return DirectionEvidenceRun(
             selection,
@@ -629,9 +843,9 @@ class DirectionalExecutionPipeline:
             None,
         )
         packet_ids = tuple(packet_checkpoint.payload.get("packet_ids") or ())
-        comment_packet_ids = tuple(
-            comment_checkpoint.payload.get("packet_ids") or ()
-        ) if comment_checkpoint else ()
+        comment_packet_ids = (
+            tuple(comment_checkpoint.payload.get("packet_ids") or ()) if comment_checkpoint else ()
+        )
         if not packet_ids and not comment_packet_ids:
             raise ValueError("packet-only admission replay requires persisted packets")
         selection = _selection_from_payload(selection_checkpoint.payload["selection"])
@@ -648,16 +862,25 @@ class DirectionalExecutionPipeline:
         )
         return packet_ids
 
-    def _run_admission(self, task_id: str, direction_id: str, selection: DirectionSelection, packet_ids: tuple[str, ...], contract: DirectionContract, policy: SamplePolicy, snapshot: RunPolicySnapshot) -> None:
+    def _run_admission(
+        self,
+        task_id: str,
+        direction_id: str,
+        selection: DirectionSelection,
+        packet_ids: tuple[str, ...],
+        contract: DirectionContract,
+        policy: SamplePolicy,
+        snapshot: RunPolicySnapshot,
+    ) -> None:
         relevance_contract = frozen_query_relevance(contract, snapshot)
         strategy = DEFAULT_ADMISSION_STRATEGIES.get(direction_id)
         packets = [
-            packet for packet_id in packet_ids
-            if (packet := self._store.get_typed_record(DirectionalEvidencePacketRecord, packet_id)) is not None
+            packet
+            for packet_id in packet_ids
+            if (packet := self._store.get_typed_record(DirectionalEvidencePacketRecord, packet_id))
+            is not None
         ]
-        candidates_by_packet: list[
-            tuple[DirectionalEvidencePacketRecord, list]
-        ] = []
+        candidates_by_packet: list[tuple[DirectionalEvidencePacketRecord, list]] = []
         for packet in packets:
             if strategy is not None:
                 candidates = strategy.build_candidates(packet)
@@ -668,11 +891,27 @@ class DirectionalExecutionPipeline:
                 fact = facts[0]
                 scope = {"sample": "selected_packets"}
                 if fact.field_path == "comment_text":
-                    scope["parent_note_canonical_source_id"] = packet.payload.get("retrieval_context", {}).get("parent_note_canonical_source_id")
-                candidates = [build_claim_candidate(workflow_run_id=self._workflow_run_id, direction_id=direction_id, intent_id=contract.claim_rules[0], claim_type=contract.claim_rules[0], statement=fact.text, scope=scope, fact=fact, quote=fact.text, text_start=0, text_end=len(fact.text))]
+                    scope["parent_note_canonical_source_id"] = packet.payload.get(
+                        "retrieval_context", {}
+                    ).get("parent_note_canonical_source_id")
+                candidates = [
+                    build_claim_candidate(
+                        workflow_run_id=self._workflow_run_id,
+                        direction_id=direction_id,
+                        intent_id=contract.claim_rules[0],
+                        claim_type=contract.claim_rules[0],
+                        statement=fact.text,
+                        scope=scope,
+                        fact=fact,
+                        quote=fact.text,
+                        text_start=0,
+                        text_end=len(fact.text),
+                    )
+                ]
             candidates_by_packet.append((packet, candidates))
         comment_packets = [
-            packet for packet, _ in candidates_by_packet
+            packet
+            for packet, _ in candidates_by_packet
             if packet.payload.get("retrieval_context", {}).get("source_kind") == "comment"
         ]
         candidate_packets = comment_packets or packets
@@ -687,13 +926,13 @@ class DirectionalExecutionPipeline:
                     packet=packet,
                     contract=contract,
                     policy_snapshot=snapshot,
-                ) is None
+                )
+                is None
                 for candidate in candidates
             )
         }
         relevant_packets = [
-            packet for packet in candidate_packets
-            if packet.id in relevance_qualified_packet_ids
+            packet for packet in candidate_packets if packet.id in relevance_qualified_packet_ids
         ]
         eligible_packets = [
             packet
@@ -707,16 +946,10 @@ class DirectionalExecutionPipeline:
         sample_authors = {
             identity
             for packet in eligible_packets
-            if (
-                identity := admission_author_identity(
-                    packet.payload.get("field_projection", {})
-                )
-            )
+            if (identity := admission_author_identity(packet.payload.get("field_projection", {})))
         }
         selected_source_count = (
-            len(candidate_packets)
-            if comment_packets
-            else selection.selected_source_count
+            len(candidate_packets) if comment_packets else selection.selected_source_count
         )
         relevance_qualified_source_count = len(relevant_packets)
         eligible_source_count = len(eligible_packets)
@@ -739,25 +972,19 @@ class DirectionalExecutionPipeline:
                 "id": policy.id,
                 "schema_version": policy.schema_version,
                 "minimum_samples": policy.minimum_samples,
-                "minimum_independent_authors": (
-                    policy.minimum_independent_authors
-                ),
+                "minimum_independent_authors": (policy.minimum_independent_authors),
                 "author_cap": policy.author_cap,
                 "metadata": policy.metadata,
             },
             "metrics": {
                 "selected_source_count": selected_source_count,
-                "relevance_qualified_source_count": (
-                    relevance_qualified_source_count
-                ),
+                "relevance_qualified_source_count": (relevance_qualified_source_count),
                 "eligible_source_count": eligible_source_count,
                 "independent_author_count": independent_author_count,
             },
             "relevance_contract": relevance_contract,
             "relevance_algorithm_version": (
-                relevance_contract.get("algorithm_version")
-                if relevance_contract
-                else None
+                relevance_contract.get("algorithm_version") if relevance_contract else None
             ),
             "admission_algorithm_version": ALGORITHM_VERSION,
             "direction_result_algorithm_version": DIRECTION_RESULT_ALGORITHM_VERSION,
@@ -772,28 +999,42 @@ class DirectionalExecutionPipeline:
             for candidate in candidates:
                 if self._store.get_typed_record(type(candidate), candidate.id) is None:
                     self._store.save_claim_candidate(candidate)
-                decision = ClaimAdmissionEvaluator().evaluate(
-                    candidate=candidate,
-                    packet=packet,
-                    contract=contract,
-                    sample_policy=policy,
-                    policy_snapshot=snapshot,
-                    selected_source_count=selected_source_count,
-                    relevance_qualified_source_count=relevance_qualified_source_count,
-                    eligible_source_count=eligible_source_count,
-                    independent_author_count=independent_author_count,
-                    admission_packet_identities=admission_packet_identities,
-                ).record
+                decision = (
+                    ClaimAdmissionEvaluator()
+                    .evaluate(
+                        candidate=candidate,
+                        packet=packet,
+                        contract=contract,
+                        sample_policy=policy,
+                        policy_snapshot=snapshot,
+                        selected_source_count=selected_source_count,
+                        relevance_qualified_source_count=relevance_qualified_source_count,
+                        eligible_source_count=eligible_source_count,
+                        independent_author_count=independent_author_count,
+                        admission_packet_identities=admission_packet_identities,
+                    )
+                    .record
+                )
                 if self._store.get_typed_record(ClaimAdmissionDecisionRecord, decision.id) is None:
                     self._store.save_claim_admission_decision(decision)
                 decisions.append(decision)
-        output = build_direction_result(direction_id=direction_id, policy_snapshot_id=snapshot.id, decisions=decisions)
-        if self._store.get_typed_record(type(output.direction_result), output.direction_result.id) is None:
+        output = build_direction_result(
+            direction_id=direction_id, policy_snapshot_id=snapshot.id, decisions=decisions
+        )
+        if (
+            self._store.get_typed_record(type(output.direction_result), output.direction_result.id)
+            is None
+        ):
             self._store.save_direction_result_decision(output.direction_result)
         for weak in output.weak_signals:
             if self._store.get_typed_record(type(weak), weak.id) is None:
                 self._store.save_weak_signal(weak)
-        self._save_checkpoint(task_id, "facts", fingerprint, {"direction_id": direction_id, "packet_ids": list(packet_ids)})
+        self._save_checkpoint(
+            task_id,
+            "facts",
+            fingerprint,
+            {"direction_id": direction_id, "packet_ids": list(packet_ids)},
+        )
         self._save_checkpoint(
             task_id,
             "admission",
@@ -809,9 +1050,7 @@ class DirectionalExecutionPipeline:
                 "direction_result_algorithm_version": DIRECTION_RESULT_ALGORITHM_VERSION,
                 "sample_policy": checkpoint_identity["sample_policy"],
                 "computed_metrics": checkpoint_identity["metrics"],
-                "admission_packet_identities": checkpoint_identity[
-                    "admission_packets"
-                ],
+                "admission_packet_identities": checkpoint_identity["admission_packets"],
             },
         )
 
@@ -909,8 +1148,12 @@ class DirectionalExecutionPipeline:
                     "failure_reason": result.failure_reason,
                     "retryable": result.retryable,
                 }
-                page_fingerprint = canonical_fingerprint({"base": plan_hash, "group": group.id, "page": page_no, "cursor": cursor})
-                self._save_checkpoint(subagent_task_id, "collect_page", page_fingerprint, page_payload)
+                page_fingerprint = canonical_fingerprint(
+                    {"base": plan_hash, "group": group.id, "page": page_no, "cursor": cursor}
+                )
+                self._save_checkpoint(
+                    subagent_task_id, "collect_page", page_fingerprint, page_payload
+                )
                 self._terminal_operation_from_result(
                     subagent_task_id, "discover", operation_fingerprint, result
                 )
@@ -922,14 +1165,18 @@ class DirectionalExecutionPipeline:
             candidates.extend(group_candidates)
             final_pages = self._page_records(subagent_task_id, "collect_page", plan_hash, group.id)
             final_page = final_pages[-1] if final_pages else None
-            summaries.append({
-                "query_group_id": group.id,
-                "actual_count": len(group_candidates),
-                "target_count": group.candidate_limit,
-                "sort": group.sort,
-                "last_cursor": cursor,
-                "completeness": final_page.payload["completeness"] if final_page else "complete",
-            })
+            summaries.append(
+                {
+                    "query_group_id": group.id,
+                    "actual_count": len(group_candidates),
+                    "target_count": group.candidate_limit,
+                    "sort": group.sort,
+                    "last_cursor": cursor,
+                    "completeness": final_page.payload["completeness"]
+                    if final_page
+                    else "complete",
+                }
+            )
         return candidates, summaries
 
     async def _collect_required_comments(
@@ -956,7 +1203,9 @@ class DirectionalExecutionPipeline:
             candidate = candidate_by_id.get(parent_id)
             if candidate is None:
                 continue
-            collected_by_parent.setdefault(parent_id, (candidate, []))[1].extend(page.payload["items"])
+            collected_by_parent.setdefault(parent_id, (candidate, []))[1].extend(
+                page.payload["items"]
+            )
             self._complete_operation(
                 subagent_task_id,
                 "comments",
@@ -978,7 +1227,10 @@ class DirectionalExecutionPipeline:
             if not decision.selected:
                 continue
             candidate = candidate_by_id.get(decision.canonical_source_id)
-            if candidate is None or candidate.get("source_kind") in {"search_result", "search_result_minimal"}:
+            if candidate is None or candidate.get("source_kind") in {
+                "search_result",
+                "search_result_minimal",
+            }:
                 continue
             parent_id = str(candidate.get("canonical_id") or decision.canonical_source_id)
             pages = [item for item in page_records if item.payload["parent_note_id"] == parent_id]
@@ -996,30 +1248,41 @@ class DirectionalExecutionPipeline:
                     "reply_depth_limit": reply_depth_limit,
                     "sample_policy_id": comment_policy_id,
                 }
-                operation_fingerprint = self._begin_operation(subagent_task_id, operation="comments", request=request)
+                operation_fingerprint = self._begin_operation(
+                    subagent_task_id, operation="comments", request=request
+                )
                 self._start_checkpoint(subagent_task_id, "comments_page")
                 await self._flush()
                 try:
-                    result = await collect_comments({
-                        **candidate,
-                        "_collection_cursor": cursor,
-                        "_collection_limit": remaining,
-                        "_collection_top_level_only": top_level_only,
-                        "_collection_reply_depth_limit": reply_depth_limit,
-                    })
+                    result = await collect_comments(
+                        {
+                            **candidate,
+                            "_collection_cursor": cursor,
+                            "_collection_limit": remaining,
+                            "_collection_top_level_only": top_level_only,
+                            "_collection_reply_depth_limit": reply_depth_limit,
+                        }
+                    )
                 except Exception:
                     self._terminal_operation(
-                        subagent_task_id, "comments", operation_fingerprint,
-                        status="outcome_unknown", failure_code="provider_call_interrupted",
+                        subagent_task_id,
+                        "comments",
+                        operation_fingerprint,
+                        status="outcome_unknown",
+                        failure_code="provider_call_interrupted",
                         recovery_action="确认外部调用结果后再恢复；系统不会自动重放。",
                     )
                     await self._flush()
                     raise
-                page_items = [_manifest_value(item) for item in result.items if isinstance(item, dict)]
+                page_items = [
+                    _manifest_value(item) for item in result.items if isinstance(item, dict)
+                ]
                 page_items = page_items[:remaining]
                 known_for_parent = collected_by_parent.setdefault(parent_id, (candidate, []))[1]
                 known_for_parent.extend(page_items)
-                collected_comment_ids.update(str(item.get("canonical_id") or "") for item in page_items)
+                collected_comment_ids.update(
+                    str(item.get("canonical_id") or "") for item in page_items
+                )
                 collected_comment_ids.discard("")
                 reached_cap = len(collected_comment_ids) >= comment_limit
                 truncated = bool(result.next_cursor and reached_cap)
@@ -1051,8 +1314,12 @@ class DirectionalExecutionPipeline:
                     "failure_reason": result.failure_reason,
                     "retryable": result.retryable,
                 }
-                page_fingerprint = canonical_fingerprint({"base": comments_fp, "parent": parent_id, "page": page_no, "cursor": cursor})
-                self._save_checkpoint(subagent_task_id, "comments_page", page_fingerprint, page_payload)
+                page_fingerprint = canonical_fingerprint(
+                    {"base": comments_fp, "parent": parent_id, "page": page_no, "cursor": cursor}
+                )
+                self._save_checkpoint(
+                    subagent_task_id, "comments_page", page_fingerprint, page_payload
+                )
                 self._terminal_operation_from_result(
                     subagent_task_id, "comments", operation_fingerprint, result
                 )
@@ -1067,7 +1334,11 @@ class DirectionalExecutionPipeline:
 
         packet_ids: list[str] = []
         for parent_id, (candidate, items) in collected_by_parent.items():
-            parent_pages = [item for item in self._page_records(subagent_task_id, "comments_page", comments_fp) if item.payload["parent_note_id"] == parent_id]
+            parent_pages = [
+                item
+                for item in self._page_records(subagent_task_id, "comments_page", comments_fp)
+                if item.payload["parent_note_id"] == parent_id
+            ]
             final_page = parent_pages[-1] if parent_pages else None
             parent_packet_ids = self._persist_comment_packets(
                 direction_id=direction_id,
@@ -1091,28 +1362,30 @@ class DirectionalExecutionPipeline:
                     "top_level_only": top_level_only,
                     "reply_depth_limit": reply_depth_limit,
                     "sample_policy_id": comment_policy_id,
-                    "completeness": "truncated_by_cap" if stopped_by_direction_cap else (final_page.payload["completeness"] if final_page else "unavailable"),
+                    "completeness": "truncated_by_cap"
+                    if stopped_by_direction_cap
+                    else (final_page.payload["completeness"] if final_page else "unavailable"),
                     "status": final_page.payload["status"] if final_page else "failed",
                     "failure_reason": None,
                 },
             )
             packet_ids.extend(parent_packet_ids)
-            parent_results.append({
-                "parent_note_id": parent_id,
-                "status": final_page.payload["status"] if final_page else "failed",
-                "failure_reason": None,
-                "completeness": "truncated_by_cap" if stopped_by_direction_cap else (final_page.payload["completeness"] if final_page else "unavailable"),
-                "next_cursor": final_page.payload.get("next_cursor") if final_page else None,
-                "actual_comment_count": len(items),
-                "deduplicated_comment_count": len(parent_packet_ids),
-                "deduplicated_author_count": len(
-                    {
-                        str(item["author_id"])
-                        for item in items
-                        if item.get("author_id")
-                    }
-                ),
-            })
+            parent_results.append(
+                {
+                    "parent_note_id": parent_id,
+                    "status": final_page.payload["status"] if final_page else "failed",
+                    "failure_reason": None,
+                    "completeness": "truncated_by_cap"
+                    if stopped_by_direction_cap
+                    else (final_page.payload["completeness"] if final_page else "unavailable"),
+                    "next_cursor": final_page.payload.get("next_cursor") if final_page else None,
+                    "actual_comment_count": len(items),
+                    "deduplicated_comment_count": len(parent_packet_ids),
+                    "deduplicated_author_count": len(
+                        {str(item["author_id"]) for item in items if item.get("author_id")}
+                    ),
+                }
+            )
         return {
             "required": True,
             "status": "completed" if packet_ids else "incomplete",
@@ -1121,9 +1394,7 @@ class DirectionalExecutionPipeline:
             "parents": parent_results,
         }
 
-    def _blocking_operation_failure(
-        self, task_id: str, selection_status: str
-    ) -> str | None:
+    def _blocking_operation_failure(self, task_id: str, selection_status: str) -> str | None:
         failures = [
             str((item.payload.get("completion") or {}).get("failure_code") or "")
             for item in self._store.list_typed_records(StageCheckpointRecord)
@@ -1152,7 +1423,12 @@ class DirectionalExecutionPipeline:
                     return code
         return None
 
-    def _persist_packets(self, direction_id: str, selection: DirectionSelection, candidate_by_id: Mapping[str, dict[str, Any]]) -> list[str]:
+    def _persist_packets(
+        self,
+        direction_id: str,
+        selection: DirectionSelection,
+        candidate_by_id: Mapping[str, dict[str, Any]],
+    ) -> list[str]:
         packet_ids: list[str] = []
         for decision in selection.decisions:
             if not decision.selected:
@@ -1161,10 +1437,16 @@ class DirectionalExecutionPipeline:
             if candidate.get("source_kind") in {"search_result", "search_result_minimal"}:
                 continue
             provider = str(candidate.get("provider") or "xiaohongshu")
-            source = self._canonical_sources.resolve_note(provider=provider, note_id=str(candidate.get("canonical_id") or decision.canonical_source_id), canonical_url=str(candidate.get("source_url") or ""))
+            source = self._canonical_sources.resolve_note(
+                provider=provider,
+                note_id=str(candidate.get("canonical_id") or decision.canonical_source_id),
+                canonical_url=str(candidate.get("source_url") or ""),
+            )
             packet = build_packet(
-                direction_id=direction_id, canonical_source_id=source.id,
-                fields=candidate, availability=dict(candidate.get("field_availability") or {}),
+                direction_id=direction_id,
+                canonical_source_id=source.id,
+                fields=candidate,
+                availability=dict(candidate.get("field_availability") or {}),
                 retrieval_context={
                     "query_group_ids": list(decision.query_group_ids),
                     "query_hits": list(decision.query_hits),
@@ -1174,10 +1456,35 @@ class DirectionalExecutionPipeline:
             )
             packet_id = f"dep_{canonical_fingerprint({'run': self._workflow_run_id, 'packet': packet['field_projection_hash']})[:24]}"
             if self._store.get_typed_record(DirectionalEvidencePacketRecord, packet_id) is None:
-                self._store.save_directional_evidence_packet(DirectionalEvidencePacketRecord(packet_id, "content_research_directional_packet_v1", packet, workflow_run_id=self._workflow_run_id, research_direction_id=direction_id, canonical_source_id=source.id, field_projection_hash=packet["field_projection_hash"]))
+                self._store.save_directional_evidence_packet(
+                    DirectionalEvidencePacketRecord(
+                        packet_id,
+                        "content_research_directional_packet_v1",
+                        packet,
+                        workflow_run_id=self._workflow_run_id,
+                        research_direction_id=direction_id,
+                        canonical_source_id=source.id,
+                        field_projection_hash=packet["field_projection_hash"],
+                    )
+                )
             projection_id = f"dsp_{canonical_fingerprint({'run': self._workflow_run_id, 'direction': direction_id, 'source': source.id, 'packet': packet_id})[:24]}"
             if self._store.get_typed_record(DirectionSourceProjectionRecord, projection_id) is None:
-                self._store.save_direction_source_projection(DirectionSourceProjectionRecord(projection_id, "content_research_direction_projection_v1", {"selected": True, "reasons": list(decision.reasons), "query_group_ids": list(decision.query_group_ids), "query_hits": list(decision.query_hits)}, workflow_run_id=self._workflow_run_id, research_direction_id=direction_id, canonical_source_id=source.id, evidence_packet_id=packet_id))
+                self._store.save_direction_source_projection(
+                    DirectionSourceProjectionRecord(
+                        projection_id,
+                        "content_research_direction_projection_v1",
+                        {
+                            "selected": True,
+                            "reasons": list(decision.reasons),
+                            "query_group_ids": list(decision.query_group_ids),
+                            "query_hits": list(decision.query_hits),
+                        },
+                        workflow_run_id=self._workflow_run_id,
+                        research_direction_id=direction_id,
+                        canonical_source_id=source.id,
+                        evidence_packet_id=packet_id,
+                    )
+                )
             packet_ids.append(packet_id)
         return packet_ids
 
@@ -1227,19 +1534,22 @@ class DirectionalExecutionPipeline:
             if author:
                 entry["authors"].add(author)
         final_collection["repeated_need_phrases"] = {
-            phrase: {"comment_count": entry["comment_count"], "independent_author_count": len(entry["authors"])}
+            phrase: {
+                "comment_count": entry["comment_count"],
+                "independent_author_count": len(entry["authors"]),
+            }
             for phrase, entry in repeated_need_phrases.items()
         }
         packet_ids: list[str] = []
         for item in unique_items:
             comment_id = str(item.get("canonical_id") or "")
-            source = self._canonical_sources.resolve_comment(provider=provider, comment_id=comment_id, parent_note_canonical_source_id=parent.id)
+            source = self._canonical_sources.resolve_comment(
+                provider=provider, comment_id=comment_id, parent_note_canonical_source_id=parent.id
+            )
             context = {
                 "source_kind": "comment",
                 "parent_note_canonical_source_id": parent.id,
-                "query_group_ids": [
-                    str(item["query_group_id"]) for item in parent_query_hits
-                ],
+                "query_group_ids": [str(item["query_group_id"]) for item in parent_query_hits],
                 "query_hits": list(parent_query_hits),
                 "query_plan_hash": parent_query_plan_hash,
                 "required_comment_fields": list(required_comment_fields),
@@ -1262,10 +1572,36 @@ class DirectionalExecutionPipeline:
             )
             packet_id = f"dep_{canonical_fingerprint({'run': self._workflow_run_id, 'packet': packet['field_projection_hash']})[:24]}"
             if self._store.get_typed_record(DirectionalEvidencePacketRecord, packet_id) is None:
-                self._store.save_directional_evidence_packet(DirectionalEvidencePacketRecord(packet_id, "content_research_directional_packet_v1", packet, workflow_run_id=self._workflow_run_id, research_direction_id=direction_id, canonical_source_id=source.id, field_projection_hash=packet["field_projection_hash"]))
+                self._store.save_directional_evidence_packet(
+                    DirectionalEvidencePacketRecord(
+                        packet_id,
+                        "content_research_directional_packet_v1",
+                        packet,
+                        workflow_run_id=self._workflow_run_id,
+                        research_direction_id=direction_id,
+                        canonical_source_id=source.id,
+                        field_projection_hash=packet["field_projection_hash"],
+                    )
+                )
             projection_id = f"dsp_{canonical_fingerprint({'run': self._workflow_run_id, 'direction': direction_id, 'source': source.id, 'packet': packet_id})[:24]}"
             if self._store.get_typed_record(DirectionSourceProjectionRecord, projection_id) is None:
-                self._store.save_direction_source_projection(DirectionSourceProjectionRecord(projection_id, "content_research_direction_projection_v1", {"selected": True, "parent_note_canonical_source_id": parent.id, "query_group_ids": context["query_group_ids"], "query_hits": context["query_hits"], "collection": context["collection"]}, workflow_run_id=self._workflow_run_id, research_direction_id=direction_id, canonical_source_id=source.id, evidence_packet_id=packet_id))
+                self._store.save_direction_source_projection(
+                    DirectionSourceProjectionRecord(
+                        projection_id,
+                        "content_research_direction_projection_v1",
+                        {
+                            "selected": True,
+                            "parent_note_canonical_source_id": parent.id,
+                            "query_group_ids": context["query_group_ids"],
+                            "query_hits": context["query_hits"],
+                            "collection": context["collection"],
+                        },
+                        workflow_run_id=self._workflow_run_id,
+                        research_direction_id=direction_id,
+                        canonical_source_id=source.id,
+                        evidence_packet_id=packet_id,
+                    )
+                )
             packet_ids.append(packet_id)
         return packet_ids
 
@@ -1277,17 +1613,24 @@ class DirectionalExecutionPipeline:
         scope_id: str | None = None,
     ) -> list[StageCheckpointRecord]:
         records = [
-            item for item in self._store.list_typed_records(StageCheckpointRecord)
+            item
+            for item in self._store.list_typed_records(StageCheckpointRecord)
             if item.workflow_run_id == self._workflow_run_id
             and item.subagent_task_id == task_id
             and item.stage_name == stage
             and item.status == "completed"
             and item.payload.get("base_fingerprint") == base_fingerprint
-            and (scope_id is None or item.payload.get("query_group_id") == scope_id or item.payload.get("parent_note_id") == scope_id)
+            and (
+                scope_id is None
+                or item.payload.get("query_group_id") == scope_id
+                or item.payload.get("parent_note_id") == scope_id
+            )
         ]
         return sorted(records, key=lambda item: int(item.payload["page_no"]))
 
-    def _checkpoint(self, task_id: str, stage: str, fingerprint: str) -> StageCheckpointRecord | None:
+    def _checkpoint(
+        self, task_id: str, stage: str, fingerprint: str
+    ) -> StageCheckpointRecord | None:
         checkpoint = self._store.get_typed_record(
             StageCheckpointRecord,
             _checkpoint_id(self._workflow_run_id, task_id, stage, fingerprint),
@@ -1299,16 +1642,28 @@ class DirectionalExecutionPipeline:
         operation_fingerprint = self._operation_fingerprint(operation, request)
         lifecycle = self._operation_lifecycle(task_id, operation_fingerprint)
         if any(item.status == "outcome_unknown" for item in lifecycle):
-            raise OperationOutcomeUnknownError(operation=operation, operation_fingerprint=operation_fingerprint)
+            raise OperationOutcomeUnknownError(
+                operation=operation, operation_fingerprint=operation_fingerprint
+            )
         if any(item.status == "running" for item in lifecycle):
-            self._save_operation_checkpoint(task_id, operation, operation_fingerprint, "outcome_unknown")
-            raise OperationOutcomeUnknownError(operation=operation, operation_fingerprint=operation_fingerprint)
+            self._save_operation_checkpoint(
+                task_id, operation, operation_fingerprint, "outcome_unknown"
+            )
+            raise OperationOutcomeUnknownError(
+                operation=operation, operation_fingerprint=operation_fingerprint
+            )
         if any(item.status == "completed" for item in lifecycle):
             # The caller has no durable result to continue from, so reissuing the
             # request would still risk a duplicate provider-side operation.
-            self._save_operation_checkpoint(task_id, operation, operation_fingerprint, "outcome_unknown")
-            raise OperationOutcomeUnknownError(operation=operation, operation_fingerprint=operation_fingerprint)
-        self._save_operation_checkpoint(task_id, operation, operation_fingerprint, "running", request=request)
+            self._save_operation_checkpoint(
+                task_id, operation, operation_fingerprint, "outcome_unknown"
+            )
+            raise OperationOutcomeUnknownError(
+                operation=operation, operation_fingerprint=operation_fingerprint
+            )
+        self._save_operation_checkpoint(
+            task_id, operation, operation_fingerprint, "running", request=request
+        )
         return operation_fingerprint
 
     def _complete_operation(
@@ -1337,9 +1692,7 @@ class DirectionalExecutionPipeline:
         outcome = _safe_operation_outcome(result)
         failure_code = result.failure_reason
         if result.status in {"completed", "empty", "partial_completed"}:
-            self._complete_operation(
-                task_id, operation, operation_fingerprint, completion=outcome
-            )
+            self._complete_operation(task_id, operation, operation_fingerprint, completion=outcome)
             return
         status = _operation_terminal_status(failure_code)
         self._terminal_operation(
@@ -1382,14 +1735,28 @@ class DirectionalExecutionPipeline:
         )
 
     def _operation_fingerprint(self, operation: str, request: Mapping[str, Any]) -> str:
-        return canonical_fingerprint({"operation": operation, "request": _safe_operation_request(request)})
+        return canonical_fingerprint(
+            {"operation": operation, "request": _safe_operation_request(request)}
+        )
 
-    def _completed_operation(self, task_id: str, operation_fingerprint: str) -> StageCheckpointRecord | None:
-        return next((item for item in self._operation_lifecycle(task_id, operation_fingerprint) if item.status == "completed"), None)
+    def _completed_operation(
+        self, task_id: str, operation_fingerprint: str
+    ) -> StageCheckpointRecord | None:
+        return next(
+            (
+                item
+                for item in self._operation_lifecycle(task_id, operation_fingerprint)
+                if item.status == "completed"
+            ),
+            None,
+        )
 
-    def _operation_lifecycle(self, task_id: str, operation_fingerprint: str) -> list[StageCheckpointRecord]:
+    def _operation_lifecycle(
+        self, task_id: str, operation_fingerprint: str
+    ) -> list[StageCheckpointRecord]:
         return [
-            item for item in self._store.list_typed_records(StageCheckpointRecord)
+            item
+            for item in self._store.list_typed_records(StageCheckpointRecord)
             if item.workflow_run_id == self._workflow_run_id
             and item.subagent_task_id == task_id
             and item.stage_name == "operation"
@@ -1406,7 +1773,9 @@ class DirectionalExecutionPipeline:
         request: Mapping[str, Any] | None = None,
         completion: Mapping[str, Any] | None = None,
     ) -> None:
-        record_id = _operation_checkpoint_id(self._workflow_run_id, task_id, operation_fingerprint, status)
+        record_id = _operation_checkpoint_id(
+            self._workflow_run_id, task_id, operation_fingerprint, status
+        )
         existing = self._store.get_typed_record(StageCheckpointRecord, record_id)
         if existing is not None and existing.status != "superseded":
             return
@@ -1421,10 +1790,18 @@ class DirectionalExecutionPipeline:
         if completion is not None:
             payload["completion"] = _safe_operation_request(completion)
         running = next(
-            (item for item in self._operation_lifecycle(task_id, operation_fingerprint) if item.status == "running"),
+            (
+                item
+                for item in self._operation_lifecycle(task_id, operation_fingerprint)
+                if item.status == "running"
+            ),
             None,
         )
-        started_at = _utcnow() if status == "running" else (running.started_at if running is not None else None)
+        started_at = (
+            _utcnow()
+            if status == "running"
+            else (running.started_at if running is not None else None)
+        )
         finished_at = _utcnow() if status != "running" and started_at is not None else None
         self._store.save_stage_checkpoint(
             StageCheckpointRecord(
@@ -1441,9 +1818,12 @@ class DirectionalExecutionPipeline:
             )
         )
 
-    def _selection_revisions(self, task_id: str, selection_fingerprint: str) -> list[StageCheckpointRecord]:
+    def _selection_revisions(
+        self, task_id: str, selection_fingerprint: str
+    ) -> list[StageCheckpointRecord]:
         revisions = [
-            item for item in self._store.list_typed_records(StageCheckpointRecord)
+            item
+            for item in self._store.list_typed_records(StageCheckpointRecord)
             if item.workflow_run_id == self._workflow_run_id
             and item.subagent_task_id == task_id
             and item.stage_name == "selection_revision"
@@ -1455,11 +1835,26 @@ class DirectionalExecutionPipeline:
     def _start_checkpoint(self, task_id: str, stage: str) -> None:
         self._checkpoint_started_at[(task_id, stage)] = _utcnow()
 
-    def _save_checkpoint(self, task_id: str, stage: str, fingerprint: str, payload: dict[str, Any]) -> None:
+    def _save_checkpoint(
+        self, task_id: str, stage: str, fingerprint: str, payload: dict[str, Any]
+    ) -> None:
         stored_payload = {"workflow_run_id": self._workflow_run_id, **payload}
         started_at = self._checkpoint_started_at.pop((task_id, stage), None)
         finished_at = _utcnow() if started_at is not None else None
-        self._store.save_stage_checkpoint(StageCheckpointRecord(_checkpoint_id(self._workflow_run_id, task_id, stage, fingerprint), "content_research_stage_checkpoint_v1", stored_payload, workflow_run_id=self._workflow_run_id, subagent_task_id=task_id, stage_name=stage, input_fingerprint=fingerprint, status="completed", started_at=started_at, finished_at=finished_at))
+        self._store.save_stage_checkpoint(
+            StageCheckpointRecord(
+                _checkpoint_id(self._workflow_run_id, task_id, stage, fingerprint),
+                "content_research_stage_checkpoint_v1",
+                stored_payload,
+                workflow_run_id=self._workflow_run_id,
+                subagent_task_id=task_id,
+                stage_name=stage,
+                input_fingerprint=fingerprint,
+                status="completed",
+                started_at=started_at,
+                finished_at=finished_at,
+            )
+        )
 
 
 # Temporary import name for callers created during the earlier incomplete
@@ -1475,7 +1870,9 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _operation_checkpoint_id(workflow_run_id: str, task_id: str, operation_fingerprint: str, status: str) -> str:
+def _operation_checkpoint_id(
+    workflow_run_id: str, task_id: str, operation_fingerprint: str, status: str
+) -> str:
     return f"scp_{canonical_fingerprint({'run': workflow_run_id, 'task': task_id, 'stage': 'operation', 'input': operation_fingerprint, 'status': status})[:24]}"
 
 
@@ -1629,11 +2026,38 @@ def _packet_is_admission_eligible(
 
 def _sort_key(item: Mapping[str, Any]) -> tuple[Any, ...]:
     published = str(item.get("source_published_at") or "")
-    return (int(item.get("query_priority") or 0), -float(item.get("relevance") or 0), published, str(item.get("canonical_source_id") or item.get("canonical_id") or ""))
+    return (
+        int(item.get("query_priority") or 0),
+        -float(item.get("relevance") or 0),
+        published,
+        str(item.get("canonical_source_id") or item.get("canonical_id") or ""),
+    )
 
 
 def _manifest_value(item: Mapping[str, Any]) -> dict[str, Any]:
-    return {key: item.get(key) for key in ("provider", "canonical_source_id", "canonical_id", "source_url", "source_kind", "query_priority", "query_rank", "query_hits", "relevance", "source_published_at", "source_collected_at", "author_id", "author", "out_of_time_window", "blocking_unavailable", "detail_attempted", "field_availability", *PACKET_FIELD_NAMES)}
+    return {
+        key: item.get(key)
+        for key in (
+            "provider",
+            "canonical_source_id",
+            "canonical_id",
+            "source_url",
+            "source_kind",
+            "query_priority",
+            "query_rank",
+            "query_hits",
+            "relevance",
+            "source_published_at",
+            "source_collected_at",
+            "author_id",
+            "author",
+            "out_of_time_window",
+            "blocking_unavailable",
+            "detail_attempted",
+            "field_availability",
+            *PACKET_FIELD_NAMES,
+        )
+    }
 
 
 def _candidate_map(candidates: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -1641,9 +2065,7 @@ def _candidate_map(candidates: list[dict[str, Any]]) -> dict[str, dict[str, Any]
     by_id: dict[str, dict[str, Any]] = {}
     hits_by_id: dict[str, dict[str, int]] = {}
     for item in candidates:
-        source_id = str(
-            item.get("canonical_source_id") or item.get("canonical_id") or ""
-        )
+        source_id = str(item.get("canonical_source_id") or item.get("canonical_id") or "")
         if not source_id:
             continue
         current = by_id.get(source_id)
@@ -1656,9 +2078,7 @@ def _candidate_map(candidates: list[dict[str, Any]]) -> dict[str, dict[str, Any]
             group_id = str(hit.get("query_group_id") or "")
             rank = int(hit.get("rank") or 0)
             if group_id:
-                source_hits[group_id] = min(
-                    rank, source_hits.get(group_id, rank)
-                )
+                source_hits[group_id] = min(rank, source_hits.get(group_id, rank))
         group_id = str(item.get("query_group_id") or "")
         if group_id:
             rank = int(item.get("query_rank") or 0)

@@ -8,6 +8,7 @@ import pytest
 
 from app.api.routes.router import app
 from app.config import settings
+from app.content_research.persistence_models import StageCheckpointRecord
 from app.content_research.presearch.service import PresearchService
 from app.content_research.service import ContentResearchService
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
@@ -92,7 +93,9 @@ async def client(tmp_path):
     original = getattr(app.state, "content_research_service", None)
     app.state.content_research_service = ContentResearchService(
         store=SQLiteContentResearchStore(str(tmp_path / "content_research.db")),
-        presearch=PresearchService(FakeLLM(), first_feedback_timeout_seconds=0.05, hard_cutoff_seconds=0.1),
+        presearch=PresearchService(
+            FakeLLM(), first_feedback_timeout_seconds=0.05, hard_cutoff_seconds=0.1
+        ),
         workflow_runtime=FakeRuntime(str(tmp_path / "content_research.db")),
     )
     transport = httpx.ASGITransport(app=app)
@@ -118,7 +121,9 @@ async def _create_presearch(client):
 
 
 @pytest.mark.asyncio
-async def test_presearch_exposes_fixed_lite_direction_catalog_separately_from_llm_suggestions(client):
+async def test_presearch_exposes_fixed_lite_direction_catalog_separately_from_llm_suggestions(
+    client,
+):
     presearch = await _create_presearch(client)
 
     assert presearch["research_directions"] == ["产品营销", "用户评论痛点"]
@@ -151,7 +156,9 @@ async def test_confirm_brief_creates_plan_directions_tasks_and_workflow_summary(
     assert payload["workflow_run_id"] == presearch["workflow_run_id"]
     assert payload["brief"]["status"] == "ready"
     assert payload["brief"]["payload"]["confirmed_subject"] == "徒步短裤"
-    assert payload["brief"]["payload"]["subject_structure_hash"] == presearch["subject_structure_hash"]
+    assert (
+        payload["brief"]["payload"]["subject_structure_hash"] == presearch["subject_structure_hash"]
+    )
     assert payload["brief"]["payload"]["selected_competitors"] == ["迪卡侬"]
     assert payload["brief"]["payload"]["custom_competitors"] == ["凯乐石"]
     assert payload["brief"]["payload"]["direction_catalog"] == [
@@ -181,13 +188,17 @@ async def test_confirm_brief_creates_plan_directions_tasks_and_workflow_summary(
         == presearch["subject_structure_hash"]
         for item in payload["subagent_tasks"]
     )
-    assert payload["plan"]["payload"]["subject_structure_hash"] == presearch["subject_structure_hash"]
+    assert (
+        payload["plan"]["payload"]["subject_structure_hash"] == presearch["subject_structure_hash"]
+    )
 
     fetched = await client.get(f"/content-research/workflows/{presearch['workflow_run_id']}")
     assert fetched.status_code == 200
     assert fetched.json() == payload
 
-    snapshot = await client.get(f"/content-research/workflows/{presearch['workflow_run_id']}/policy-snapshot")
+    snapshot = await client.get(
+        f"/content-research/workflows/{presearch['workflow_run_id']}/policy-snapshot"
+    )
     assert snapshot.status_code == 200
     snapshot_payload = snapshot.json()
     assert snapshot_payload["workflow_run_id"] == presearch["workflow_run_id"]
@@ -197,13 +208,26 @@ async def test_confirm_brief_creates_plan_directions_tasks_and_workflow_summary(
         "competitor_discovery",
     ]
     assert snapshot_payload["effective_policy"]["report_compose_mode"] == "template_only"
-    assert snapshot_payload["effective_policy"]["subject_structure_hash"] == presearch["subject_structure_hash"]
+    assert (
+        snapshot_payload["effective_policy"]["subject_structure_hash"]
+        == presearch["subject_structure_hash"]
+    )
     assert len(snapshot_payload["direction_contracts"]) == 2
     assert len(snapshot_payload["sample_policies"]) == 2
-    assert snapshot_payload["validation_result"]["schema_version"] == "content_research_admission_capability_preflight_v1"
-    assert snapshot_payload["validation_result"]["directions"]["product_marketing"]["status"] == "formal_directional_result"
+    assert (
+        snapshot_payload["validation_result"]["schema_version"]
+        == "content_research_admission_capability_preflight_v1"
+    )
+    assert (
+        snapshot_payload["validation_result"]["directions"]["product_marketing"]["status"]
+        == "formal_directional_result"
+    )
     locked = snapshot_payload["effective_policy"]["locked_query_plan"]
-    assert locked["schema_version"] == "content_research_locked_query_plan_v1"
+    assert locked["schema_version"] == "content_research_locked_query_plan_v2"
+    assert locked["query_compiler_version"] == "content_research_query_compiler_v2"
+    assert locked["primary_query_group_cap"] == 2
+    assert locked["coverage_fallback_query_group_cap"] == 1
+    assert locked["candidate_cap_per_group"] == 20
     assert locked["custom_research_question"] == "关注夏季轻量户外"
     assert set(locked["directions"]) == {
         "product_marketing",
@@ -212,14 +236,30 @@ async def test_confirm_brief_creates_plan_directions_tasks_and_workflow_summary(
     for direction_id, direction_plan in locked["directions"].items():
         assert direction_plan["query_plan_hash"]
         assert direction_plan["query_groups"]
+        assert (
+            sum(group["activation"] == "primary" for group in direction_plan["query_groups"]) <= 2
+        )
+        assert (
+            sum(
+                group["activation"] == "coverage_fallback"
+                for group in direction_plan["query_groups"]
+            )
+            <= 1
+        )
         for group in direction_plan["query_groups"]:
             assert group["direction_id"] == direction_id
             assert group["normalized_query"]
             assert group["sort"] == "likes"
-            assert group["time_window"] == {
-                "end_at": snapshot_payload["run_as_of_at"]
-            }
+            assert group["time_window"] == {"end_at": snapshot_payload["run_as_of_at"]}
             assert group["candidate_cap"] == 20
+            assert group["roles"]
+            assert group["normalized_identity"]
+        task = next(
+            item for item in payload["subagent_tasks"] if item["direction_id"] == direction_id
+        )
+        assert (
+            task["payload"]["input_payload"]["query_plan_hash"] == direction_plan["query_plan_hash"]
+        )
     assert any(
         "关注夏季轻量户外" in group["normalized_query"]
         for direction in locked["directions"].values()
@@ -228,13 +268,21 @@ async def test_confirm_brief_creates_plan_directions_tasks_and_workflow_summary(
     assert all(
         sorted(contract["metadata"]["query_relevance"]["query_group_ids"])
         == sorted(
-            group["id"]
-            for group in locked["directions"][contract["direction_id"]][
-                "query_groups"
-            ]
+            group["id"] for group in locked["directions"][contract["direction_id"]]["query_groups"]
         )
         for contract in snapshot_payload["direction_contracts"]
     )
+    checkpoints = [
+        item
+        for item in app.state.content_research_service._store.list_typed_records(
+            StageCheckpointRecord
+        )
+        if item.workflow_run_id == presearch["workflow_run_id"] and item.stage_name == "query_plan"
+    ]
+    assert len(checkpoints) == 2
+    assert all(item.payload["primary_group_count"] <= 2 for item in checkpoints)
+    assert all(item.payload["fallback_group_count"] <= 1 for item in checkpoints)
+    assert all("normalized_query" not in str(item.payload) for item in checkpoints)
 
 
 @pytest.mark.asyncio

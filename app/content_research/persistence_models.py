@@ -64,7 +64,12 @@ class DirectionSourceProjectionRecord(TypedPersistenceRecord):
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        _required(self.workflow_run_id, self.research_direction_id, self.canonical_source_id, self.evidence_packet_id)
+        _required(
+            self.workflow_run_id,
+            self.research_direction_id,
+            self.canonical_source_id,
+            self.evidence_packet_id,
+        )
 
 
 @dataclass(frozen=True)
@@ -76,7 +81,12 @@ class DirectionalEvidencePacketRecord(TypedPersistenceRecord):
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        _required(self.workflow_run_id, self.research_direction_id, self.canonical_source_id, self.field_projection_hash)
+        _required(
+            self.workflow_run_id,
+            self.research_direction_id,
+            self.canonical_source_id,
+            self.field_projection_hash,
+        )
 
 
 @dataclass(frozen=True)
@@ -91,7 +101,15 @@ class ClaimCandidateRecord(TypedPersistenceRecord):
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        _required(self.workflow_run_id, self.research_direction_id, self.evidence_packet_id, self.statement, self.intent_id, self.claim_type, self.requested_state)
+        _required(
+            self.workflow_run_id,
+            self.research_direction_id,
+            self.evidence_packet_id,
+            self.statement,
+            self.intent_id,
+            self.claim_type,
+            self.requested_state,
+        )
 
 
 @dataclass(frozen=True)
@@ -103,7 +121,12 @@ class ClaimAdmissionDecisionRecord(TypedPersistenceRecord):
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        _required(self.research_direction_id, self.claim_candidate_id, self.decision, self.policy_snapshot_id)
+        _required(
+            self.research_direction_id,
+            self.claim_candidate_id,
+            self.decision,
+            self.policy_snapshot_id,
+        )
         if self.decision not in {"admitted", "downgraded", "rejected"}:
             raise ValueError("invalid admission decision")
 
@@ -147,7 +170,11 @@ class AggregateClaimRecord(TypedPersistenceRecord):
     def __post_init__(self) -> None:
         super().__post_init__()
         _required(self.research_plan_id, self.aggregate_type)
-        if self.aggregate_type not in {"cross_direction_corroboration", "cross_direction_tension", "action_hypothesis"}:
+        if self.aggregate_type not in {
+            "cross_direction_corroboration",
+            "cross_direction_tension",
+            "action_hypothesis",
+        }:
             raise ValueError("invalid aggregate claim type")
 
 
@@ -164,14 +191,38 @@ class StageCheckpointRecord(TypedPersistenceRecord):
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        _required(self.workflow_run_id, self.subagent_task_id, self.stage_name, self.input_fingerprint)
-        if self.stage_name not in {"subject_structure", "collect", "collect_page", "operation", "selection", "selection_revision", "detail", "comments", "comments_page", "packet", "facts", "admission", "reconcile", "aggregate", "compose", "faithfulness"}:
+        _required(
+            self.workflow_run_id, self.subagent_task_id, self.stage_name, self.input_fingerprint
+        )
+        if self.stage_name not in {
+            "subject_structure",
+            "query_plan",
+            "collect",
+            "collect_page",
+            "operation",
+            "selection",
+            "selection_revision",
+            "detail",
+            "comments",
+            "comments_page",
+            "packet",
+            "facts",
+            "admission",
+            "reconcile",
+            "aggregate",
+            "compose",
+            "faithfulness",
+        }:
             raise ValueError("invalid checkpoint stage")
         if self.retry_count < 0:
             raise ValueError("checkpoint retry_count cannot be negative")
         if self.finished_at is not None and self.started_at is None:
             raise ValueError("finished checkpoint requires started_at")
-        if self.started_at is not None and self.finished_at is not None and self.finished_at < self.started_at:
+        if (
+            self.started_at is not None
+            and self.finished_at is not None
+            and self.finished_at < self.started_at
+        ):
             raise ValueError("checkpoint finished_at cannot precede started_at")
 
 
@@ -188,7 +239,13 @@ class BudgetLedgerEntryRecord(TypedPersistenceRecord):
     def __post_init__(self) -> None:
         super().__post_init__()
         _required(self.research_plan_id, self.idempotency_key, self.reservation_status)
-        if self.reservation_status not in {"reserved", "committed", "released", "expired", "cost_unknown"}:
+        if self.reservation_status not in {
+            "reserved",
+            "committed",
+            "released",
+            "expired",
+            "cost_unknown",
+        }:
             raise ValueError("invalid reservation status")
         if self.reserved_amount < 0 or self.consumed_amount < 0:
             raise ValueError("ledger amounts cannot be negative")
@@ -275,5 +332,9 @@ class ReportPublicationRecord(TypedPersistenceRecord):
             self.faithfulness_decision_id,
             self.publication_state,
         )
-        if self.publication_state not in {"complete_verified_report", "partial_verified_report", "evidence_only_report"}:
+        if self.publication_state not in {
+            "complete_verified_report",
+            "partial_verified_report",
+            "evidence_only_report",
+        }:
             raise ValueError("invalid report publication state")

@@ -94,6 +94,7 @@ from app.content_research.sources.base import (
     DiscoverCandidatesRequest,
 )
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
+from app.content_research.subject_structure import parse_subject_structure
 from app.content_research.workflow import (
     BriefConfirmation,
     ResearchDirectionRegistry,
@@ -102,7 +103,11 @@ from app.content_research.workflow import (
 )
 from app.content_research.workflow.directional_pipeline import (
     DirectionalExecutionPipeline,
-    compile_query_groups,
+)
+from app.content_research.workflow.query_planner import (
+    QUERY_COMPILER_VERSION,
+    CompiledQueryPlan,
+    compile_structured_query_plan,
 )
 from app.memory.thread_store import ThreadStore
 from app.memory.workflow_store import WorkflowStore
@@ -142,9 +147,7 @@ class WorkflowRuntime(Protocol):
 
     async def wait_for_presearch_recovery(self, workflow_run_id: str, reason: dict) -> dict: ...
 
-    async def wait_for_subject_clarification(
-        self, workflow_run_id: str, reason: dict
-    ) -> dict: ...
+    async def wait_for_subject_clarification(self, workflow_run_id: str, reason: dict) -> dict: ...
 
     async def resume_subject_clarification(self, workflow_run_id: str) -> dict: ...
 
@@ -157,17 +160,13 @@ class WorkflowRuntime(Protocol):
 
     async def restart_presearch_step(self, workflow_run_id: str) -> dict: ...
 
-    async def record_step_execution_started(
-        self, workflow_run_id: str, step_name: str
-    ) -> None: ...
+    async def record_step_execution_started(self, workflow_run_id: str, step_name: str) -> None: ...
 
     async def record_step_execution_finished(
         self, workflow_run_id: str, step_name: str
     ) -> None: ...
 
-    async def abort_step_execution(
-        self, workflow_run_id: str, step_name: str
-    ) -> None: ...
+    async def abort_step_execution(self, workflow_run_id: str, step_name: str) -> None: ...
 
     async def complete_brief_and_plan_atomically(
         self,
@@ -210,13 +209,9 @@ class WorkflowRuntime(Protocol):
         self, *, workflow_run_id: str, task_outcomes: list[dict], artifact_refs: list[dict]
     ) -> bool: ...
 
-    async def wait_for_user_recovery(
-        self, *, workflow_run_id: str, reason: dict
-    ) -> dict: ...
+    async def wait_for_user_recovery(self, *, workflow_run_id: str, reason: dict) -> dict: ...
 
-    async def fail_formal_research(
-        self, *, workflow_run_id: str, reason: dict
-    ) -> dict: ...
+    async def fail_formal_research(self, *, workflow_run_id: str, reason: dict) -> dict: ...
 
 
 class WorkflowRunManagerRuntime:
@@ -261,12 +256,12 @@ class WorkflowRunManagerRuntime:
 
     async def wait_for_presearch_recovery(self, workflow_run_id: str, reason: dict) -> dict:
         async with WorkflowRunManager(self._db_path) as manager:
-            run = await manager.wait_for_user_recovery(workflow_run_id, step_name="presearch", reason=reason)
+            run = await manager.wait_for_user_recovery(
+                workflow_run_id, step_name="presearch", reason=reason
+            )
         return {"workflow_run_id": workflow_run_id, "status": run.status.value, "recoverable": True}
 
-    async def wait_for_subject_clarification(
-        self, workflow_run_id: str, reason: dict
-    ) -> dict:
+    async def wait_for_subject_clarification(self, workflow_run_id: str, reason: dict) -> dict:
         async with WorkflowRunManager(self._db_path) as manager:
             run = await manager.wait_for_user_input(
                 workflow_run_id,
@@ -309,23 +304,21 @@ class WorkflowRunManagerRuntime:
             run, _ = await manager.restart_step_and_retry_children(
                 workflow_run_id, step_name="presearch", child_task_ids=[]
             )
-        return {"workflow_run_id": workflow_run_id, "status": run.status.value if run else "running", "recoverable": True}
+        return {
+            "workflow_run_id": workflow_run_id,
+            "status": run.status.value if run else "running",
+            "recoverable": True,
+        }
 
-    async def record_step_execution_started(
-        self, workflow_run_id: str, step_name: str
-    ) -> None:
+    async def record_step_execution_started(self, workflow_run_id: str, step_name: str) -> None:
         async with WorkflowRunManager(self._db_path) as manager:
             await manager.record_step_execution_started(workflow_run_id, step_name)
 
-    async def record_step_execution_finished(
-        self, workflow_run_id: str, step_name: str
-    ) -> None:
+    async def record_step_execution_finished(self, workflow_run_id: str, step_name: str) -> None:
         async with WorkflowRunManager(self._db_path) as manager:
             await manager.record_step_execution_finished(workflow_run_id, step_name)
 
-    async def abort_step_execution(
-        self, workflow_run_id: str, step_name: str
-    ) -> None:
+    async def abort_step_execution(self, workflow_run_id: str, step_name: str) -> None:
         async with WorkflowRunManager(self._db_path) as manager:
             await manager.abort_step_execution(workflow_run_id, step_name)
 
@@ -528,9 +521,7 @@ class WorkflowRunManagerRuntime:
             "workflow_run_id": workflow_run_id,
             "status": run_status,
             "recoverable": True,
-            "recovered_child_task_ids": [
-                child.child_task_id for child in recovered_children
-            ],
+            "recovered_child_task_ids": [child.child_task_id for child in recovered_children],
         }
 
     async def acknowledge_pause_at_safe_boundary(self, *, workflow_run_id: str) -> dict:
@@ -657,7 +648,8 @@ class ContentResearchService:
         )
         if outcome.status == "waiting_model_config":
             await self._workflow_runtime.wait_for_presearch_recovery(
-                workflow_run_id, reason={"code": outcome.error_code, "message": outcome.error_message}
+                workflow_run_id,
+                reason={"code": outcome.error_code, "message": outcome.error_message},
             )
         elif outcome.status == "subject_needs_confirmation":
             await self._workflow_runtime.wait_for_subject_clarification(
@@ -692,27 +684,46 @@ class ContentResearchService:
     async def retry_presearch(self, workflow_run_id: str) -> ContentResearchPresearchResponse:
         brief = self._store.get_brief_by_workflow(workflow_run_id)
         if brief is None:
-            raise ContentResearchNotFoundError(f"Content research workflow not found: {workflow_run_id}")
+            raise ContentResearchNotFoundError(
+                f"Content research workflow not found: {workflow_run_id}"
+            )
         snapshot = await self._workflow_runtime.get_runtime_snapshot(workflow_run_id)
         run = snapshot.get("run") or {}
         steps = list(snapshot.get("steps") or [])
         presearch_step = next((step for step in steps if step.get("step_name") == "presearch"), {})
-        if run.get("status") != "waiting_user" or presearch_step.get("status") not in {"retrying", "running", ""}:
+        if run.get("status") != "waiting_user" or presearch_step.get("status") not in {
+            "retrying",
+            "running",
+            "",
+        }:
             raise ContentResearchValidationError("Presearch recovery is not available for this run")
-        if int(presearch_step.get("attempt_count") or 0) >= int(presearch_step.get("max_attempts") or 3):
+        if int(presearch_step.get("attempt_count") or 0) >= int(
+            presearch_step.get("max_attempts") or 3
+        ):
             raise ContentResearchValidationError("recovery budget exhausted")
         await self._workflow_runtime.restart_presearch_step(workflow_run_id)
         payload = brief.payload
-        request = PresearchInput(seed_text=str(payload["seed_text"]), user_note=payload.get("user_note"),
-            thread_id=brief.thread_id, workflow_run_id=workflow_run_id,
-            user_id=str(payload.get("user_id") or "default"), workspace_id=str(payload.get("workspace_id") or "default"))
-        llm_task = await self._presearch.create_llm_task(request)
-        outcome = await self._presearch.wait_for_first_feedback(
-            request=request, task=llm_task
+        request = PresearchInput(
+            seed_text=str(payload["seed_text"]),
+            user_note=payload.get("user_note"),
+            thread_id=brief.thread_id,
+            workflow_run_id=workflow_run_id,
+            user_id=str(payload.get("user_id") or "default"),
+            workspace_id=str(payload.get("workspace_id") or "default"),
         )
-        updated = self._save_brief(attempt_id=str(payload["attempt_id"]), brief_id=brief.id,
-            workflow_run_id=workflow_run_id, thread_id=brief.thread_id, seed_text=request.seed_text,
-            user_note=request.user_note, workspace_id=request.workspace_id, user_id=request.user_id, outcome=outcome)
+        llm_task = await self._presearch.create_llm_task(request)
+        outcome = await self._presearch.wait_for_first_feedback(request=request, task=llm_task)
+        updated = self._save_brief(
+            attempt_id=str(payload["attempt_id"]),
+            brief_id=brief.id,
+            workflow_run_id=workflow_run_id,
+            thread_id=brief.thread_id,
+            seed_text=request.seed_text,
+            user_note=request.user_note,
+            workspace_id=request.workspace_id,
+            user_id=request.user_id,
+            outcome=outcome,
+        )
         self._save_subject_structure_checkpoint(
             brief=updated,
             outcome=outcome,
@@ -726,7 +737,10 @@ class ContentResearchService:
             ),
         )
         if outcome.status == "waiting_model_config":
-            await self._workflow_runtime.wait_for_presearch_recovery(workflow_run_id, reason={"code": outcome.error_code, "message": outcome.error_message})
+            await self._workflow_runtime.wait_for_presearch_recovery(
+                workflow_run_id,
+                reason={"code": outcome.error_code, "message": outcome.error_message},
+            )
         elif outcome.status == "subject_needs_confirmation":
             await self._workflow_runtime.wait_for_subject_clarification(
                 workflow_run_id,
@@ -779,9 +793,7 @@ class ContentResearchService:
         ]
         clarifications.append(clarification)
         original_note = str(payload.get("user_note") or "").strip()
-        accumulated_note = "\n".join(
-            item for item in [original_note, *clarifications] if item
-        )
+        accumulated_note = "\n".join(item for item in [original_note, *clarifications] if item)
 
         resumed_presearch = prior_status == "subject_needs_confirmation"
         if resumed_presearch:
@@ -885,20 +897,12 @@ class ContentResearchService:
             and confirmation_request.subject_structure_hash
             != str(brief.payload.get("subject_structure_hash") or "")
         ):
-            raise ContentResearchValidationError(
-                "Cannot confirm a stale subject structure"
-            )
+            raise ContentResearchValidationError("Cannot confirm a stale subject structure")
         await self._require_presearch_ready_for_confirmation(brief)
         if str(brief.payload.get("subject_structure_state") or "") != "confirmed":
-            raise ContentResearchValidationError(
-                "Cannot confirm an unconfirmed subject structure"
-            )
-        record_boundary = getattr(
-            self._workflow_runtime, "record_step_execution_started", None
-        )
-        finish_boundary = getattr(
-            self._workflow_runtime, "record_step_execution_finished", None
-        )
+            raise ContentResearchValidationError("Cannot confirm an unconfirmed subject structure")
+        record_boundary = getattr(self._workflow_runtime, "record_step_execution_started", None)
+        finish_boundary = getattr(self._workflow_runtime, "record_step_execution_finished", None)
         abort_boundary = getattr(self._workflow_runtime, "abort_step_execution", None)
         if record_boundary is not None:
             await record_boundary(brief.workflow_run_id, "brief_confirm")
@@ -951,6 +955,42 @@ class ContentResearchService:
         selected_direction_ids: list[str],
     ) -> ContentResearchWorkflowSummaryResponse:
         plan_id = _new_id("rp")
+        run_as_of_at = utcnow()
+        structure_decision = parse_subject_structure(
+            dict(brief.payload.get("subject_structure") or {}),
+            normalized_input=" ".join(
+                item
+                for item in (
+                    str(brief.payload.get("seed_text") or "").strip(),
+                    str(brief.payload.get("user_note") or "").strip(),
+                    *(
+                        str(value).strip()
+                        for value in brief.payload.get("subject_clarifications") or ()
+                    ),
+                )
+                if item
+            ),
+        )
+        if structure_decision.state != "confirmed" or structure_decision.structure is None:
+            raise ContentResearchValidationError(
+                "Confirmed Brief requires a valid subject structure"
+            )
+        compiled_plans: dict[str, CompiledQueryPlan] = {
+            direction.id: compile_structured_query_plan(
+                direction_id=direction.id,
+                subject_structure=structure_decision.structure,
+                explicit_focus=confirmation.custom_research_question,
+                second_facet=(
+                    direction.default_questions[1]
+                    if len(direction.default_questions) > 1
+                    else direction.default_questions[0]
+                    if direction.default_questions
+                    else ""
+                ),
+                run_as_of_at=run_as_of_at,
+            )
+            for direction in directions
+        }
         task_specs = self._task_router.build_task_specs(
             workflow_run_id=brief.workflow_run_id,
             brief_id=brief.id,
@@ -963,10 +1003,19 @@ class ContentResearchService:
             workspace_id=str(brief.payload.get("workspace_id") or ""),
             user_id=str(brief.payload.get("user_id") or ""),
             subject_structure=dict(brief.payload.get("subject_structure") or {}),
-            subject_structure_hash=str(
-                brief.payload.get("subject_structure_hash") or ""
-            ),
+            subject_structure_hash=str(brief.payload.get("subject_structure_hash") or ""),
         )
+        task_specs = [
+            {
+                **spec,
+                "query_compiler_version": QUERY_COMPILER_VERSION,
+                "input_payload": {
+                    **dict(spec.get("input_payload") or {}),
+                    "query_plan_hash": compiled_plans[direction.id].plan_hash,
+                },
+            }
+            for spec, direction in zip(task_specs, directions, strict=True)
+        ]
         plan_payload = self._plan_builder.build(
             brief=brief,
             confirmation=confirmation,
@@ -999,28 +1048,16 @@ class ContentResearchService:
             status="draft",
             payload=plan_payload,
         )
-        run_as_of_at = utcnow()
         query_groups_by_direction = {
-            direction.id: compile_query_groups(
-                direction_id=direction.id,
-                subject=confirmation.confirmed_subject,
-                questions=[
-                    *direction.default_questions,
-                    *(
-                        [confirmation.custom_research_question]
-                        if confirmation.custom_research_question.strip()
-                        else []
-                    ),
-                ],
-                competitors=sorted(
-                    {
-                        *confirmation.selected_competitors,
-                        *confirmation.custom_competitors,
-                    }
+            direction_id: (
+                *(item.query_group for item in compiled_plan.primary_groups),
+                *(
+                    (compiled_plan.fallback_group.query_group,)
+                    if compiled_plan.fallback_group is not None
+                    else ()
                 ),
-                run_as_of_at=run_as_of_at,
             )
-            for direction in directions
+            for direction_id, compiled_plan in compiled_plans.items()
         }
         snapshot, sample_policies, direction_contracts = build_default_snapshot(
             snapshot_id=_new_id("rps"),
@@ -1037,9 +1074,7 @@ class ContentResearchService:
             confirmed_subject=confirmation.confirmed_subject,
             custom_research_question=confirmation.custom_research_question,
             subject_structure=dict(brief.payload.get("subject_structure") or {}),
-            subject_structure_hash=str(
-                brief.payload.get("subject_structure_hash") or ""
-            ),
+            subject_structure_hash=str(brief.payload.get("subject_structure_hash") or ""),
             query_groups_by_direction={
                 direction_id: tuple(
                     {
@@ -1050,6 +1085,9 @@ class ContentResearchService:
                         "sort": group.sort,
                         "time_window": dict(group.time_window or {}),
                         "candidate_cap": group.candidate_limit,
+                        "roles": list(group.roles),
+                        "activation": group.activation,
+                        "normalized_identity": group.normalized_identity,
                     }
                     for group in groups
                 )
@@ -1077,9 +1115,7 @@ class ContentResearchService:
                         "source_scope": direction.source_scope,
                         "expected_evidence_types": direction.expected_evidence_types,
                         "coverage_target": "p0_minimal",
-                        "subject_structure_hash": brief.payload.get(
-                            "subject_structure_hash"
-                        ),
+                        "subject_structure_hash": brief.payload.get("subject_structure_hash"),
                     },
                 )
             )
@@ -1116,6 +1152,13 @@ class ContentResearchService:
             task_specs=[task.payload for task in saved_tasks],
             confirmation_writer=persist_confirmation,
         )
+
+        for task in saved_tasks:
+            compiled_plan = compiled_plans[str(task.direction_id)]
+            self._save_query_plan_checkpoint(
+                task=task,
+                compiled_plan=compiled_plan,
+            )
 
         return await self.get_workflow_summary(brief.workflow_run_id)
 
@@ -1416,14 +1459,12 @@ class ContentResearchService:
                 "Packet-only replay requires terminal successful or partial specialist tasks"
             )
         contracts = {
-            item.direction_id: item
-            for item in self._store.list_direction_contracts(snapshot.id)
+            item.direction_id: item for item in self._store.list_direction_contracts(snapshot.id)
         }
         operation_ids_before = {
             item.id
             for item in self._store.list_typed_records(StageCheckpointRecord)
-            if item.workflow_run_id == workflow_run_id
-            and item.stage_name == "operation"
+            if item.workflow_run_id == workflow_run_id and item.stage_name == "operation"
         }
         packet_ids_by_direction: dict[str, list[str]] = {}
         pipeline = DirectionalExecutionPipeline(self._store)
@@ -1452,8 +1493,7 @@ class ContentResearchService:
         operation_ids_after_admission = {
             item.id
             for item in self._store.list_typed_records(StageCheckpointRecord)
-            if item.workflow_run_id == workflow_run_id
-            and item.stage_name == "operation"
+            if item.workflow_run_id == workflow_run_id and item.stage_name == "operation"
         }
         if operation_ids_after_admission != operation_ids_before:
             raise RuntimeError("packet-only admission replay changed provider operations")
@@ -1470,8 +1510,7 @@ class ContentResearchService:
         operation_ids_after_publication = {
             item.id
             for item in self._store.list_typed_records(StageCheckpointRecord)
-            if item.workflow_run_id == workflow_run_id
-            and item.stage_name == "operation"
+            if item.workflow_run_id == workflow_run_id and item.stage_name == "operation"
         }
         if operation_ids_after_publication != operation_ids_before:
             raise RuntimeError("downstream replay changed provider operations")
@@ -1513,8 +1552,7 @@ class ContentResearchService:
         decisions = [
             item
             for item in self._store.list_typed_records(ClaimAdmissionDecisionRecord)
-            if item.claim_candidate_id in candidates_by_id
-            and item.policy_snapshot_id == policy.id
+            if item.claim_candidate_id in candidates_by_id and item.policy_snapshot_id == policy.id
         ]
         admitted = sorted(
             (item for item in decisions if item.decision == "admitted"),
@@ -1801,10 +1839,10 @@ class ContentResearchService:
         # fields are collected.  The final detail checkpoint is therefore the
         # authoritative selection state for counts, coverage and status.
         selection = (
-            detail_checkpoint.payload.get("selection") if detail_checkpoint else None
-        ) or (
-            selection_checkpoint.payload.get("selection") if selection_checkpoint else {}
-        ) or {}
+            (detail_checkpoint.payload.get("selection") if detail_checkpoint else None)
+            or (selection_checkpoint.payload.get("selection") if selection_checkpoint else {})
+            or {}
+        )
         decisions = list(selection.get("decisions") or [])
         candidates = list((collect.payload.get("candidates") if collect else []) or [])
         packets = packet_read.packets
@@ -1937,8 +1975,13 @@ class ContentResearchService:
 
         if action == "retry_presearch":
             response = await self.retry_presearch(workflow_run_id)
-            return self._action_response(workflow_run_id=workflow_run_id, action=action,
-                status=response.status, result=response.model_dump(mode="json"), local_cache_id=response.brief_id)
+            return self._action_response(
+                workflow_run_id=workflow_run_id,
+                action=action,
+                status=response.status,
+                result=response.model_dump(mode="json"),
+                local_cache_id=response.brief_id,
+            )
 
         if action == "clarify_subject":
             clarification = ContentResearchSubjectClarificationRequest(**request.payload)
@@ -2002,7 +2045,9 @@ class ContentResearchService:
             await recovery_lock.acquire()
         try:
             if retry:
-                runtime_snapshot = await self._workflow_runtime.get_runtime_snapshot(workflow_run_id)
+                runtime_snapshot = await self._workflow_runtime.get_runtime_snapshot(
+                    workflow_run_id
+                )
                 runtime_run = runtime_snapshot.get("run") or {}
                 runtime_status = str(
                     runtime_run.get("status") or runtime_snapshot.get("run_status") or ""
@@ -2096,9 +2141,7 @@ class ContentResearchService:
             limit_per_specialist=request.limit,
         )
 
-    async def _require_presearch_ready_for_confirmation(
-        self, brief: ResearchBriefRecord
-    ) -> None:
+    async def _require_presearch_ready_for_confirmation(self, brief: ResearchBriefRecord) -> None:
         payload_status = str(brief.payload.get("status") or brief.status)
         timeout_status = str(brief.payload.get("timeout_status") or "none")
         if (
@@ -2112,9 +2155,7 @@ class ContentResearchService:
                 suggested_action="等待预检索最终完成或完成模型配置后重试",
             )
 
-        snapshot = await self._workflow_runtime.get_runtime_snapshot(
-            brief.workflow_run_id
-        )
+        snapshot = await self._workflow_runtime.get_runtime_snapshot(brief.workflow_run_id)
         presearch_step = next(
             (
                 step
@@ -2144,8 +2185,16 @@ class ContentResearchService:
         checkpoints are the durable source for that decision.
         """
         checkpoints = self._store.list_typed_records(StageCheckpointRecord)
-        recoverable_codes = {"auth_required", "timeout", "transient_error", "rate_limited", "unavailable"}
-        recovery_plans: list[tuple[SubagentTaskRecord, list[StageCheckpointRecord], set[str], set[str]]] = []
+        recoverable_codes = {
+            "auth_required",
+            "timeout",
+            "transient_error",
+            "rate_limited",
+            "unavailable",
+        }
+        recovery_plans: list[
+            tuple[SubagentTaskRecord, list[StageCheckpointRecord], set[str], set[str]]
+        ] = []
         for task in self._store.list_subagent_tasks_for_workflow(workflow_run_id):
             operations = [
                 checkpoint
@@ -2160,10 +2209,7 @@ class ContentResearchService:
             recoverable_operation_fingerprints = {
                 checkpoint.input_fingerprint
                 for checkpoint in operations
-                if str(
-                    (checkpoint.payload.get("completion") or {}).get("failure_code")
-                    or ""
-                )
+                if str((checkpoint.payload.get("completion") or {}).get("failure_code") or "")
                 in recoverable_codes
             }
             if not recoverable_operation_fingerprints:
@@ -2218,7 +2264,12 @@ class ContentResearchService:
                 )
             recovery_child_ids.append(child_task_id)
 
-        for task, operations, recoverable_operation_fingerprints, recoverable_operations in recovery_plans:
+        for (
+            task,
+            operations,
+            recoverable_operation_fingerprints,
+            recoverable_operations,
+        ) in recovery_plans:
             # Search pages feed every following directional boundary.  A
             # failed discover attempt may have left an empty aggregate
             # ``collect`` checkpoint behind; replaying it would skip the
@@ -2239,9 +2290,7 @@ class ContentResearchService:
                     }
                 )
             if "detail" in recoverable_operations:
-                reset_derived_stages.update(
-                    {"detail", "comments", "packet", "facts", "admission"}
-                )
+                reset_derived_stages.update({"detail", "comments", "packet", "facts", "admission"})
                 failed_candidate_ids = {
                     str((checkpoint.payload.get("request") or {}).get("canonical_source_id") or "")
                     for checkpoint in operations
@@ -2266,8 +2315,7 @@ class ContentResearchService:
                             key: value
                             for key, value in dict(candidate).items()
                             if not (
-                                str(candidate.get("canonical_id") or "")
-                                in failed_candidate_ids
+                                str(candidate.get("canonical_id") or "") in failed_candidate_ids
                                 and key in {"detail_attempted", "blocking_unavailable"}
                             )
                         }
@@ -2277,16 +2325,17 @@ class ContentResearchService:
                         replace(latest_revision, payload=revision_payload)
                     )
             if "comments" in recoverable_operations:
-                reset_derived_stages.update(
-                    {"comments", "packet", "facts", "admission"}
-                )
+                reset_derived_stages.update({"comments", "packet", "facts", "admission"})
             # Retire the whole recoverable operation lifecycle, including its
             # earlier ``running`` checkpoint.  Otherwise the next pipeline
             # attempt sees that stale start record as an unknown outcome and
             # refuses to call the provider.  Failed collection pages are
             # retired for the same reason; completed siblings stay reusable.
             for checkpoint in checkpoints:
-                if checkpoint.workflow_run_id != workflow_run_id or checkpoint.subagent_task_id != task.id:
+                if (
+                    checkpoint.workflow_run_id != workflow_run_id
+                    or checkpoint.subagent_task_id != task.id
+                ):
                     continue
                 is_recoverable_operation = (
                     checkpoint.stage_name == "operation"
@@ -2297,17 +2346,13 @@ class ContentResearchService:
                     and str(checkpoint.payload.get("operation_fingerprint") or "")
                     in recoverable_operation_fingerprints
                 )
-                is_discover_derived_checkpoint = (
-                    checkpoint.stage_name in reset_derived_stages
-                )
+                is_discover_derived_checkpoint = checkpoint.stage_name in reset_derived_stages
                 if (
                     is_recoverable_operation
                     or is_recoverable_collect_page
                     or is_discover_derived_checkpoint
                 ):
-                    self._store.save_stage_checkpoint(
-                        replace(checkpoint, status="superseded")
-                    )
+                    self._store.save_stage_checkpoint(replace(checkpoint, status="superseded"))
             payload = dict(task.payload)
             payload.pop("output_payload", None)
             payload["status"] = "queued"
@@ -2539,10 +2584,7 @@ class ContentResearchService:
             if checkpoint.workflow_run_id == brief.workflow_run_id
             and checkpoint.stage_name == "operation"
             and checkpoint.status != "superseded"
-            and str(
-                (checkpoint.payload.get("completion") or {}).get("failure_code")
-                or ""
-            )
+            and str((checkpoint.payload.get("completion") or {}).get("failure_code") or "")
             in recoverable_codes
         }
         outcomes: list[dict] = []
@@ -2567,8 +2609,7 @@ class ContentResearchService:
                     or ""
                 )
                 requires_recovery = (
-                    terminal.status == "failed"
-                    and terminal.id in recoverable_failure_by_task
+                    terminal.status == "failed" and terminal.id in recoverable_failure_by_task
                 )
                 outcomes.append(
                     {
@@ -2831,6 +2872,7 @@ class ContentResearchService:
                 None,
             )
             if callable(atomic_wait):
+
                 async def persist_brief(conn: aiosqlite.Connection) -> None:
                     await self._dispatch.persist_brief(conn, updated)
 
@@ -3009,6 +3051,48 @@ class ContentResearchService:
             )
         )
 
+    def _save_query_plan_checkpoint(
+        self,
+        *,
+        task: SubagentTaskRecord,
+        compiled_plan: CompiledQueryPlan,
+    ) -> None:
+        fallback_count = 1 if compiled_plan.fallback_group is not None else 0
+        logical_role_count = sum(len(item.roles) for item in compiled_plan.primary_groups) + (
+            len(compiled_plan.fallback_group.roles)
+            if compiled_plan.fallback_group is not None
+            else 0
+        )
+        physical_group_count = len(compiled_plan.primary_groups) + fallback_count
+        now = utcnow()
+        self._store.save_stage_checkpoint(
+            StageCheckpointRecord(
+                id=f"scp_{canonical_fingerprint({'run': task.workflow_run_id, 'task': task.id, 'stage': 'query_plan', 'input': compiled_plan.plan_hash})[:24]}",
+                schema_version="content_research_stage_checkpoint_v1",
+                payload={
+                    "schema_version": "content_research_query_plan_checkpoint_v1",
+                    "direction_id": task.direction_id,
+                    "query_plan_hash": compiled_plan.plan_hash,
+                    "query_compiler_version": compiled_plan.compiler_version,
+                    "primary_group_count": len(compiled_plan.primary_groups),
+                    "fallback_group_count": fallback_count,
+                    "merged_group_count": logical_role_count - physical_group_count,
+                    "fallback_group_id": (
+                        compiled_plan.fallback_group.query_group.id
+                        if compiled_plan.fallback_group is not None
+                        else None
+                    ),
+                },
+                workflow_run_id=task.workflow_run_id,
+                subagent_task_id=task.id,
+                stage_name="query_plan",
+                input_fingerprint=compiled_plan.plan_hash,
+                status="completed",
+                started_at=now,
+                finished_at=now,
+            )
+        )
+
     def _append_presearch_outcome_event(
         self,
         *,
@@ -3100,9 +3184,7 @@ class ContentResearchService:
             ),
             "subject_structure_hash": checklist.subject_structure_hash,
             "subject_structure_state": checklist.subject_structure_state,
-            "subject_structure_reason_codes": list(
-                checklist.subject_structure_reason_codes
-            ),
+            "subject_structure_reason_codes": list(checklist.subject_structure_reason_codes),
         }
 
     @staticmethod
@@ -3139,9 +3221,11 @@ class ContentResearchService:
             custom_competitor_input=str(payload.get("custom_competitor_input") or ""),
             timeout_status=str(payload.get("timeout_status") or "none"),
             fallback_used=bool(payload.get("fallback_used")),
-            error_code=payload.get("error_code"), error_message=payload.get("error_message"),
+            error_code=payload.get("error_code"),
+            error_message=payload.get("error_message"),
             recoverable=bool(payload.get("recoverable")),
-            configuration_source=payload.get("configuration_source"), model=payload.get("model"),
+            configuration_source=payload.get("configuration_source"),
+            model=payload.get("model"),
             subject_structure=dict(payload.get("subject_structure") or {}),
             subject_structure_hash=payload.get("subject_structure_hash"),
             subject_structure_state=str(
