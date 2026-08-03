@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Awaitable, Callable
+from datetime import datetime, timezone
 from typing import Any, Optional, TypeVar
 
 import aiosqlite
@@ -37,6 +38,65 @@ class WorkflowTransitionError(ValueError):
 
 
 T = TypeVar("T")
+
+
+def _utc_timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _timing_from_row(row: aiosqlite.Row) -> dict[str, Any]:
+    raw = row["timing_json"]
+    if not raw:
+        return {}
+    try:
+        value = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _open_interval(timing: dict[str, Any], key: str, at: str) -> None:
+    intervals = timing.setdefault(key, [])
+    if not isinstance(intervals, list):
+        intervals = []
+        timing[key] = intervals
+    if intervals and isinstance(intervals[-1], dict) and intervals[-1].get("finished_at") is None:
+        return
+    intervals.append({"started_at": at, "finished_at": None})
+
+
+def _close_interval(timing: dict[str, Any], key: str, at: str) -> None:
+    intervals = timing.get(key)
+    if not isinstance(intervals, list):
+        return
+    for interval in reversed(intervals):
+        if isinstance(interval, dict) and interval.get("finished_at") is None:
+            interval["finished_at"] = at
+            return
+
+
+def _queue_timing(timing: dict[str, Any], at: str) -> dict[str, Any]:
+    timing.setdefault("queued_at", at)
+    _open_interval(timing, "queue_spans", at)
+    return timing
+
+
+def _start_timing_execution(timing: dict[str, Any], at: str) -> dict[str, Any]:
+    _queue_timing(timing, at)
+    _close_interval(timing, "queue_spans", at)
+    _close_interval(timing, "retry_backoff_spans", at)
+    _close_interval(timing, "waiting_spans", at)
+    _open_interval(timing, "execution_spans", at)
+    return timing
+
+
+def _stop_timing_execution(timing: dict[str, Any], at: str) -> dict[str, Any]:
+    _close_interval(timing, "execution_spans", at)
+    return timing
+
+
+def _timing_json(timing: dict[str, Any]) -> str:
+    return _json_dump(timing)
 
 
 class WorkflowRunManager:
@@ -472,15 +532,19 @@ class WorkflowRunManager:
             if state_writer is not None:
                 await state_writer(self._conn)
             code, message = self._normalize_error(reason)
+            waiting_at = _utc_timestamp()
+            timing = _stop_timing_execution(_timing_from_row(step), waiting_at)
+            _open_interval(timing, "waiting_spans", waiting_at)
+            timing["waiting_started_at"] = waiting_at
             await self._conn.execute(
                 """
                 UPDATE workflow_steps
                 SET status='retrying', attempt_count=attempt_count + 1,
                     next_retry_at=NULL, active_job_id=NULL,
-                    error_code=?, error_message=?, updated_at=CURRENT_TIMESTAMP
+                    error_code=?, error_message=?, timing_json=?, updated_at=CURRENT_TIMESTAMP
                 WHERE step_id=?
                 """,
-                (code, message, step["step_id"]),
+                (code, message, _timing_json(timing), step["step_id"]),
             )
             await self._conn.execute(
                 """
@@ -718,13 +782,14 @@ class WorkflowRunManager:
                 max_attempts = int(item.get("max_attempts", 3))
                 input_hash = item.get("input_hash")
                 checkpoint = item.get("checkpoint")
+                timing = _queue_timing({}, _utc_timestamp())
                 await self._conn.execute(
                     """
                     INSERT INTO workflow_steps (
                         step_id, run_id, step_name, phase, status, max_attempts,
-                        input_hash, checkpoint_json, created_at, updated_at
+                        input_hash, checkpoint_json, timing_json, created_at, updated_at
                     )
-                    VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                     """,
                     (
                         step_id,
@@ -734,6 +799,7 @@ class WorkflowRunManager:
                         max_attempts,
                         input_hash,
                         _json_dump(checkpoint) if checkpoint is not None else None,
+                        _timing_json(timing),
                     ),
                 )
                 steps.append(self._step(await self._fetch_step_row(run_id, step_name)))
@@ -770,14 +836,15 @@ class WorkflowRunManager:
             step = await self._fetch_step_row(run_id, step_name)
             if step["status"] not in {"pending", "retrying"}:
                 raise WorkflowTransitionError(f"start_step not allowed from {step['status']}")
+            timing = _start_timing_execution(_timing_from_row(step), _utc_timestamp())
             await self._conn.execute(
                 """
                 UPDATE workflow_steps
-                SET status='running', active_job_id=?, started_at=COALESCE(started_at, CURRENT_TIMESTAMP),
+                SET status='running', active_job_id=?, timing_json=?, started_at=COALESCE(started_at, CURRENT_TIMESTAMP),
                     updated_at=CURRENT_TIMESTAMP
                 WHERE step_id=?
                 """,
-                (job_id, step["step_id"]),
+                (job_id, _timing_json(timing), step["step_id"]),
             )
             await self._conn.execute(
                 """
@@ -841,14 +908,15 @@ class WorkflowRunManager:
                 )
             if step["status"] != "running":
                 raise WorkflowTransitionError(f"complete_step not allowed from {step['status']}")
+            timing = _stop_timing_execution(_timing_from_row(step), _utc_timestamp())
             await self._conn.execute(
                 """
                 UPDATE workflow_steps
-                SET status='succeeded', output_artifact_refs_json=?, active_job_id=NULL,
+                SET status='succeeded', output_artifact_refs_json=?, active_job_id=NULL, timing_json=?,
                     completed_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP
                 WHERE step_id=?
                 """,
-                (json.dumps(artifact_refs or [], ensure_ascii=False, default=str), step["step_id"]),
+                (json.dumps(artifact_refs or [], ensure_ascii=False, default=str), _timing_json(timing), step["step_id"]),
             )
             await self._conn.execute(
                 "UPDATE workflow_runs SET active_job_id=NULL, updated_at=CURRENT_TIMESTAMP WHERE run_id=?",
@@ -879,15 +947,19 @@ class WorkflowRunManager:
             if step["status"] != "running":
                 raise WorkflowTransitionError(f"retry_step not allowed from {step['status']}")
             code, message = self._normalize_error(error)
+            retry_at = _utc_timestamp()
+            timing = _stop_timing_execution(_timing_from_row(step), retry_at)
+            _open_interval(timing, "retry_backoff_spans", retry_at)
+            timing["retry_backoff_started_at"] = retry_at
             await self._conn.execute(
                 """
                 UPDATE workflow_steps
                 SET status='retrying', attempt_count=attempt_count + 1,
                     next_retry_at=COALESCE(?, CURRENT_TIMESTAMP), active_job_id=NULL,
-                    error_code=?, error_message=?, updated_at=CURRENT_TIMESTAMP
+                    error_code=?, error_message=?, timing_json=?, updated_at=CURRENT_TIMESTAMP
                 WHERE step_id=?
                 """,
-                (next_retry_at, code, message, step["step_id"]),
+                (next_retry_at, code, message, _timing_json(timing), step["step_id"]),
             )
             await self._append_event(
                 run_id=run_id,
@@ -911,14 +983,15 @@ class WorkflowRunManager:
             if step["status"] not in {"running", "retrying"}:
                 raise WorkflowTransitionError(f"fail_step not allowed from {step['status']}")
             code, message = self._normalize_error(error)
+            timing = _stop_timing_execution(_timing_from_row(step), _utc_timestamp())
             await self._conn.execute(
                 """
                 UPDATE workflow_steps
-                SET status='failed', completed_at=CURRENT_TIMESTAMP, active_job_id=NULL,
+                SET status='failed', completed_at=CURRENT_TIMESTAMP, active_job_id=NULL, timing_json=?,
                     error_code=?, error_message=?, updated_at=CURRENT_TIMESTAMP
                 WHERE step_id=?
                 """,
-                (code, message, step["step_id"]),
+                (_timing_json(timing), code, message, step["step_id"]),
             )
             await self._append_event(
                 run_id=run_id,
@@ -943,14 +1016,15 @@ class WorkflowRunManager:
                 return self._step(step)
             if step["status"] not in {"running", "pending", "retrying"}:
                 raise WorkflowTransitionError(f"cancel_step not allowed from {step['status']}")
+            timing = _stop_timing_execution(_timing_from_row(step), _utc_timestamp())
             await self._conn.execute(
                 """
                 UPDATE workflow_steps
-                SET status='cancelled', completed_at=CURRENT_TIMESTAMP,
+                SET status='cancelled', timing_json=?, completed_at=CURRENT_TIMESTAMP,
                     active_job_id=NULL, updated_at=CURRENT_TIMESTAMP
                 WHERE step_id=?
                 """,
-                (step["step_id"],),
+                (_timing_json(timing), step["step_id"]),
             )
             await self._append_event(
                 run_id=run_id,
@@ -1047,14 +1121,15 @@ class WorkflowRunManager:
             created: list[WorkflowChildTask] = []
             for item in tasks:
                 child_task_id = _new_id("child")
+                timing = _queue_timing({}, _utc_timestamp())
                 await self._conn.execute(
                     """
                     INSERT INTO workflow_child_tasks (
                         child_task_id, run_id, step_id, task_type, slot_index, proposal_id,
-                        status, max_attempts, input_hash, checkpoint_json,
+                        status, max_attempts, input_hash, checkpoint_json, timing_json,
                         created_at, updated_at
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                     """,
                     (
                         child_task_id,
@@ -1068,6 +1143,7 @@ class WorkflowRunManager:
                         _json_dump(item.get("checkpoint"))
                         if item.get("checkpoint") is not None
                         else None,
+                        _timing_json(timing),
                     ),
                 )
                 created.append(self._child_task(await self._fetch_child_task_row(child_task_id)))
@@ -1099,14 +1175,15 @@ class WorkflowRunManager:
                 raise WorkflowTransitionError(
                     f"start_child_task not allowed from {child['status']}"
                 )
+            timing = _start_timing_execution(_timing_from_row(child), _utc_timestamp())
             await self._conn.execute(
                 """
                 UPDATE workflow_child_tasks
-                SET status='running', started_at=COALESCE(started_at, CURRENT_TIMESTAMP),
+                SET status='running', timing_json=?, started_at=COALESCE(started_at, CURRENT_TIMESTAMP),
                     updated_at=CURRENT_TIMESTAMP
                 WHERE child_task_id=?
                 """,
-                (child_task_id,),
+                (_timing_json(timing), child_task_id),
             )
             await self._append_event(
                 run_id=child["run_id"],
@@ -1142,15 +1219,16 @@ class WorkflowRunManager:
                 raise WorkflowTransitionError(
                     f"complete_child_task not allowed from {child['status']}"
                 )
+            timing = _stop_timing_execution(_timing_from_row(child), _utc_timestamp())
             await self._conn.execute(
                 """
                 UPDATE workflow_child_tasks
-                SET status='succeeded', output_artifact_refs_json=?, note_id=?,
+                SET status='succeeded', output_artifact_refs_json=?, note_id=?, timing_json=?,
                     error_code=NULL, error_message=NULL, completed_at=CURRENT_TIMESTAMP,
                     updated_at=CURRENT_TIMESTAMP
                 WHERE child_task_id=?
                 """,
-                (_json_dump(artifact_refs or []), note_id, child_task_id),
+                (_json_dump(artifact_refs or []), note_id, _timing_json(timing), child_task_id),
             )
             await self._append_event(
                 run_id=child["run_id"],
@@ -1189,14 +1267,18 @@ class WorkflowRunManager:
                     f"{child['max_attempts']} total attempts"
                 )
             code, message = self._normalize_error(error)
+            retry_at = _utc_timestamp()
+            timing = _stop_timing_execution(_timing_from_row(child), retry_at)
+            _open_interval(timing, "retry_backoff_spans", retry_at)
+            timing["retry_backoff_started_at"] = retry_at
             await self._conn.execute(
                 """
                 UPDATE workflow_child_tasks
                 SET status='retrying', attempt_count=attempt_count + 1,
-                    error_code=?, error_message=?, updated_at=CURRENT_TIMESTAMP
+                    error_code=?, error_message=?, timing_json=?, updated_at=CURRENT_TIMESTAMP
                 WHERE child_task_id=?
                 """,
-                (code, message, child_task_id),
+                (code, message, _timing_json(timing), child_task_id),
             )
             await self._append_event(
                 run_id=child["run_id"],
@@ -1254,14 +1336,15 @@ class WorkflowRunManager:
             if child["status"] not in {"running", "retrying"}:
                 raise WorkflowTransitionError(f"fail_child_task not allowed from {child['status']}")
             code, message = self._normalize_error(error)
+            timing = _stop_timing_execution(_timing_from_row(child), _utc_timestamp())
             await self._conn.execute(
                 """
                 UPDATE workflow_child_tasks
-                SET status='failed', error_code=?, error_message=?,
+                SET status='failed', timing_json=?, error_code=?, error_message=?,
                     completed_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP
                 WHERE child_task_id=?
                 """,
-                (code, message, child_task_id),
+                (_timing_json(timing), code, message, child_task_id),
             )
             await self._append_event(
                 run_id=child["run_id"],

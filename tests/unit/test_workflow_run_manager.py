@@ -49,6 +49,55 @@ async def test_start_run_sets_running_appends_event_and_updates_thread_active_ru
 
 
 @pytest.mark.asyncio
+async def test_step_timing_records_queue_and_closes_active_span(manager):
+    run = await manager.start_run(thread_id="thread-timing", user_id="user-timing")
+    step = (
+        await manager.initialize_steps(
+            run.run_id,
+            [{"step_name": "formal_research", "phase": "retrieval", "max_attempts": 3}],
+        )
+    )[0]
+
+    started = await manager.start_step(run.run_id, step.step_name)
+    completed = await manager.complete_step(run.run_id, step.step_name)
+
+    assert started.timing_json is not None
+    assert started.timing_json["queued_at"].endswith("+00:00")
+    assert started.timing_json["execution_spans"][-1]["finished_at"] is None
+    assert completed.timing_json is not None
+    assert completed.timing_json["execution_spans"][-1]["finished_at"].endswith("+00:00")
+
+
+@pytest.mark.asyncio
+async def test_waiting_closes_active_span_and_resumed_step_adds_a_new_span(manager):
+    run = await manager.start_run(thread_id="thread-waiting", user_id="user-waiting")
+    step = (
+        await manager.initialize_steps(
+            run.run_id,
+            [{"step_name": "formal_research", "phase": "retrieval", "max_attempts": 3}],
+        )
+    )[0]
+    await manager.start_step(run.run_id, step.step_name)
+
+    await manager.wait_for_user_recovery(
+        run.run_id,
+        step_name=step.step_name,
+        reason={"code": "transient_error", "message": "retry later"},
+    )
+    async with WorkflowStore(manager.db_path) as store:
+        waiting_step = (await store.list_steps(run.run_id))[0]
+    assert waiting_step.timing_json is not None
+    assert waiting_step.timing_json["execution_spans"][-1]["finished_at"] is not None
+    assert waiting_step.timing_json["waiting_started_at"].endswith("+00:00")
+
+    await manager.resume_run(run.run_id)
+    resumed = await manager.start_step(run.run_id, step.step_name)
+    assert resumed.timing_json is not None
+    assert len(resumed.timing_json["execution_spans"]) == 2
+    assert resumed.timing_json["execution_spans"][-1]["finished_at"] is None
+
+
+@pytest.mark.asyncio
 async def test_legal_run_transitions(manager):
     run = await manager.start_run(thread_id="thread-1", user_id="user-1")
 

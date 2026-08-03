@@ -74,6 +74,31 @@ async def test_create_start_retry_and_complete_child_task(seeded_manager):
 
 
 @pytest.mark.asyncio
+async def test_child_task_timing_keeps_retry_backoff_outside_active_spans(seeded_manager):
+    manager, run, step = seeded_manager
+    child = (
+        await manager.create_child_tasks(
+            run_id=run.run_id,
+            step_id=step.step_id,
+            tasks=[{"task_type": "note_generation", "slot_index": 0}],
+        )
+    )[0]
+
+    await manager.start_child_task(child.child_task_id)
+    retrying = await manager.retry_child_task(child.child_task_id, "temporary")
+    restarted = await manager.start_child_task(child.child_task_id)
+    completed = await manager.complete_child_task(child.child_task_id)
+
+    assert retrying.timing_json is not None
+    assert retrying.timing_json["execution_spans"][-1]["finished_at"] is not None
+    assert retrying.timing_json["retry_backoff_started_at"].endswith("+00:00")
+    assert restarted.timing_json is not None
+    assert len(restarted.timing_json["execution_spans"]) == 2
+    assert completed.timing_json is not None
+    assert all(span["finished_at"] for span in completed.timing_json["execution_spans"])
+
+
+@pytest.mark.asyncio
 async def test_fail_and_cancel_child_task(seeded_manager):
     manager, run, step = seeded_manager
     failed_child, cancelled_child = await manager.create_child_tasks(
