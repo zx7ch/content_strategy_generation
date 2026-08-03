@@ -21,6 +21,8 @@ from app.content_research.api_schemas import (
     ContentResearchDirectionEvidenceResponse,
     ContentResearchGovernanceResponse,
     ContentResearchLiteReportResponse,
+    ContentResearchLLMConfigurationRequest,
+    ContentResearchLLMConfigurationResponse,
     ContentResearchPresearchRequest,
     ContentResearchPresearchResponse,
     ContentResearchSourceCollectionRequest,
@@ -139,6 +141,10 @@ from app.models.workflow import WorkflowArtifactType
 from app.services.conversation_orchestrator import ConversationOrchestrator
 from app.services.creator_intent_router import ACTIVE_JOB_STATUSES, IntentContext, classify_intent
 from app.services.llm.tracked_client import build_default_llm_service
+from app.services.llm.configuration import LLMConfigurationCandidate
+from app.services.llm.configuration_service import LiteLLMConfigurationService
+from app.services.llm.configuration_store import SQLiteLLMConfigurationStore
+from app.services.llm.providers.openai_compatible import OpenAICompatibleAdapter
 from app.services.llm.usage_tracker import (
     LLMUsageEvent,
     LLMUsageStepSummary,
@@ -820,6 +826,17 @@ def _get_content_research_service(request: Request) -> ContentResearchService:
     )
 
 
+def _get_llm_configuration_service(request: Request) -> LiteLLMConfigurationService:
+    service = getattr(request.app.state, "llm_configuration_service", None)
+    if service is None:
+        service = LiteLLMConfigurationService(
+            store=SQLiteLLMConfigurationStore(settings.SQLITE_DB_PATH),
+            probe_adapter=OpenAICompatibleAdapter(provider="openai_compatible"),
+        )
+        request.app.state.llm_configuration_service = service
+    return service
+
+
 def _require_f003_lite_preview() -> None:
     if settings.F003_LITE_PREVIEW_ENABLED:
         return
@@ -901,6 +918,52 @@ async def create_content_research_presearch(
         )
     except Exception as exc:  # noqa: BLE001
         raise _content_research_error(exc) from exc
+
+
+@app.get("/content-research/llm-config", response_model=ContentResearchLLMConfigurationResponse)
+async def get_content_research_llm_configuration(request: Request) -> ContentResearchLLMConfigurationResponse:
+    principal = _resolve_workspace_principal_or_error(request)
+    assert principal.user_id is not None
+    return ContentResearchLLMConfigurationResponse(**_get_llm_configuration_service(request).get_summary(
+        principal.workspace_id, principal.user_id
+    ).__dict__)
+
+
+@app.post("/content-research/llm-config/validate", response_model=ContentResearchLLMConfigurationResponse)
+async def validate_content_research_llm_configuration(
+    payload: ContentResearchLLMConfigurationRequest, request: Request
+) -> ContentResearchLLMConfigurationResponse:
+    principal = _resolve_workspace_principal_or_error(request)
+    assert principal.user_id is not None
+    summary = await _get_llm_configuration_service(request).validate(
+        workspace_id=principal.workspace_id, user_id=principal.user_id,
+        candidate=LLMConfigurationCandidate(payload.base_url, payload.model, payload.api_key),
+    )
+    return ContentResearchLLMConfigurationResponse(**summary.__dict__)
+
+
+@app.put("/content-research/llm-config", response_model=ContentResearchLLMConfigurationResponse)
+async def save_content_research_llm_configuration(
+    payload: ContentResearchLLMConfigurationRequest, request: Request
+) -> ContentResearchLLMConfigurationResponse:
+    principal = _resolve_workspace_principal_or_error(request)
+    assert principal.user_id is not None
+    summary = await _get_llm_configuration_service(request).save(
+        workspace_id=principal.workspace_id, user_id=principal.user_id,
+        candidate=LLMConfigurationCandidate(payload.base_url, payload.model, payload.api_key),
+    )
+    if summary.status != "validated":
+        raise APIError(status_code=422, error_code=summary.error_code or "llm_protocol_incompatible", error_message="模型配置验证失败")
+    return ContentResearchLLMConfigurationResponse(**summary.__dict__)
+
+
+@app.delete("/content-research/llm-config", response_model=ContentResearchLLMConfigurationResponse)
+async def delete_content_research_llm_configuration(request: Request) -> ContentResearchLLMConfigurationResponse:
+    principal = _resolve_workspace_principal_or_error(request)
+    assert principal.user_id is not None
+    return ContentResearchLLMConfigurationResponse(**_get_llm_configuration_service(request).delete(
+        principal.workspace_id, principal.user_id
+    ).__dict__)
 
 
 @app.post("/content-research/providers/xiaohongshu/login/qr", response_model=XHSQRLoginResponse)

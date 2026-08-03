@@ -15,6 +15,9 @@ from app.content_research.worker import ContentResearchDispatchWorker
 from app.memory.job_store import JobStore
 from app.memory.thread_store import ThreadStore
 from app.services.llm.tracked_client import build_default_llm_service
+from app.services.llm.configuration_service import LiteLLMConfigurationService
+from app.services.llm.configuration_store import SQLiteLLMConfigurationStore
+from app.services.llm.providers.openai_compatible import OpenAICompatibleAdapter
 from app.services.step_executors import build_agent_step_executor_registry
 from app.services.xhs_qr_auth import XHSQRLoginSession
 from app.services.xhs_spider import XHSSpiderClient
@@ -39,7 +42,12 @@ async def _worker_lifespan(application):
         step_executor_registry=build_agent_step_executor_registry(db_path=settings.SQLITE_DB_PATH),
     )
     worker = JobWorker(job_store=job_store, orchestrator=orchestrator)
-    content_research_llm_service = build_default_llm_service()
+    content_research_llm_service = build_default_llm_service(settings.SQLITE_DB_PATH)
+    llm_configuration_store = SQLiteLLMConfigurationStore(settings.SQLITE_DB_PATH)
+    llm_configuration_service = LiteLLMConfigurationService(
+        store=llm_configuration_store,
+        probe_adapter=OpenAICompatibleAdapter(provider="openai_compatible"),
+    )
     content_research_dispatch_event = asyncio.Event()
     xhs_qr_login_session = XHSQRLoginSession()
     content_research_service = ContentResearchService(
@@ -100,6 +108,7 @@ async def _worker_lifespan(application):
     application.state.worker_stop_event = stop_event
     application.state.worker_task = worker_task
     application.state.content_research_llm_service = content_research_llm_service
+    application.state.llm_configuration_service = llm_configuration_service
     application.state.content_research_service = content_research_service
     application.state.xhs_qr_login_session = xhs_qr_login_session
     application.state.content_research_dispatch_worker = content_research_worker

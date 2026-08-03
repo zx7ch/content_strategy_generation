@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+
 from pydantic import BaseModel, Field
 
 CONTENT_RESEARCH_API_SCHEMA_VERSION = "content_research_api_v1"
@@ -21,6 +23,23 @@ class ContentResearchPresearchRequest(BaseModel):
     seed_text: str = Field(min_length=1)
     user_note: str | None = None
     thread_id: str = Field(min_length=1)
+
+
+class ContentResearchLLMConfigurationRequest(BaseModel):
+    base_url: str = Field(min_length=1)
+    model: str = Field(min_length=1)
+    api_key: str | None = None
+
+
+class ContentResearchLLMConfigurationResponse(BaseModel):
+    source: str
+    status: str
+    base_url: str
+    model: str
+    api_key_configured: bool
+    api_key_suffix: str | None = None
+    validated_at: datetime | None = None
+    error_code: str | None = None
 
 
 class ContentResearchChecklistResponse(BaseModel):
