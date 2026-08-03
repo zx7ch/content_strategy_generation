@@ -18,13 +18,19 @@ class FakeUsage:
 
 
 class FakeCompletions:
-    def __init__(self, response: Any = None, error: Exception | None = None) -> None:
+    def __init__(self, response: Any = None, error: Exception | list[Exception] | None = None) -> None:
         self.response = response
         self.error = error
         self.calls: list[dict[str, Any]] = []
 
     async def create(self, **kwargs: Any) -> Any:
         self.calls.append(kwargs)
+        if isinstance(self.error, list):
+            if self.error:
+                error = self.error.pop(0)
+                if error is not None:
+                    raise error
+            return self.response
         if self.error is not None:
             raise self.error
         return self.response
@@ -168,11 +174,48 @@ async def test_openai_compatible_adapter_propagates_provider_exception() -> None
         clock=FakeClock([1.0]),
     )
 
-    with pytest.raises(RuntimeError) as exc_info:
+    from app.services.llm.failures import LLMProviderFailure
+
+    with pytest.raises(LLMProviderFailure) as exc_info:
         await adapter.generate(
             LLMRequest(messages=[Message(role="user", content="hi")], task_type="chat"),
             api_key="key",
             model="gpt-test",
         )
 
-    assert exc_info.value is expected
+    assert exc_info.value.code == "llm_service_unavailable"
+    assert exc_info.value.__cause__ is expected
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_adapter_uses_request_scoped_base_url():
+    completions = FakeCompletions(make_response())
+    client_factory = FakeClientFactory(completions)
+    adapter = OpenAICompatibleAdapter(provider="openai", client_factory=client_factory, clock=FakeClock([1.0, 1.0]))
+
+    await adapter.generate(
+        LLMRequest(messages=[Message(role="user", content="hi")], task_type="chat"),
+        api_key="key", model="local-model", base_url="http://127.0.0.1:11434/v1",
+    )
+
+    assert client_factory.calls == [{"api_key": "key", "base_url": "http://127.0.0.1:11434/v1"}]
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_adapter_retries_without_unsupported_optional_parameters():
+    class HTTP400(Exception):
+        status_code = 400
+
+        def __str__(self) -> str:
+            return "unsupported temperature and max_tokens"
+
+    completions = FakeCompletions(make_response(), error=[HTTP400(), None])
+    client_factory = FakeClientFactory(completions)
+    adapter = OpenAICompatibleAdapter(provider="openai", client_factory=client_factory, clock=FakeClock([1.0, 1.0]))
+
+    await adapter.generate(
+        LLMRequest(messages=[Message(role="user", content="hi")], task_type="chat", max_tokens=8),
+        api_key="key", model="local-model", base_url="http://127.0.0.1:11434/v1",
+    )
+
+    assert completions.calls[1] == {"model": "local-model", "messages": [{"role": "user", "content": "hi"}]}

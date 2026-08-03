@@ -9,6 +9,7 @@ from typing import Any
 from openai import AsyncOpenAI
 
 from app.services.llm.types import LLMRequest, LLMResponse, TokenUsage
+from app.services.llm.failures import LLMProviderFailure, classify_provider_exception, unsupported_optional_parameters
 
 
 DEFAULT_BASE_URLS: dict[str, str] = {
@@ -49,12 +50,17 @@ class OpenAICompatibleAdapter:
         self.base_url = base_url or DEFAULT_BASE_URLS.get(self.provider)
         self._client_factory = client_factory
         self._clock = clock
-        if not self.base_url:
-            raise ValueError(f"No default base_url configured for provider: {provider}")
-
-    async def generate(self, request: LLMRequest, api_key: str, model: str) -> LLMResponse:
+    async def generate(
+        self, request: LLMRequest, api_key: str, model: str, base_url: str | None = None
+    ) -> LLMResponse:
         if request.stream:
             raise NotImplementedError("Streaming is not supported by OpenAICompatibleAdapter yet")
+
+        effective_base_url = base_url or self.base_url
+        if not effective_base_url:
+            raise LLMProviderFailure(
+                "llm_protocol_incompatible", "模型服务 Base URL 未配置", True, None
+            )
 
         payload: dict[str, Any] = {
             "model": model,
@@ -66,15 +72,31 @@ class OpenAICompatibleAdapter:
         if request.response_format is not None:
             payload["response_format"] = request.response_format
 
-        client = self._client_factory(api_key=api_key, base_url=self.base_url)
+        client = self._client_factory(api_key=api_key, base_url=effective_base_url)
         started_at = self._clock()
-        response = await client.chat.completions.create(**payload)
+        try:
+            response = await client.chat.completions.create(**payload)
+        except Exception as exc:
+            fields = unsupported_optional_parameters(exc)
+            if fields:
+                retry_payload = {key: value for key, value in payload.items() if key not in fields}
+                try:
+                    response = await client.chat.completions.create(**retry_payload)
+                except Exception as retry_error:
+                    raise classify_provider_exception(retry_error) from retry_error
+            else:
+                raise classify_provider_exception(exc) from exc
         latency_ms = int((self._clock() - started_at) * 1000)
 
         choices = _read_value(response, "choices", []) or []
         first_choice = choices[0] if choices else None
         message = _read_value(first_choice, "message", None) if first_choice is not None else None
         content = _read_value(message, "content", "") or ""
+
+        if not choices or first_choice is None or message is None or not isinstance(content, str):
+            raise LLMProviderFailure(
+                "llm_protocol_incompatible", "模型服务响应格式不兼容", True, None
+            )
 
         return LLMResponse(
             content=str(content).strip(),

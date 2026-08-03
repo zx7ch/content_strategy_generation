@@ -8,6 +8,7 @@ from app.services.llm.configuration import (
     UserLLMConfiguration,
 )
 from app.services.llm.configuration_store import SQLiteLLMConfigurationStore
+from app.services.llm.failures import LLMProviderFailure
 from app.services.llm.pricing import DEFAULT_PRICING, ModelPricing, PricingCalculator, UsageCost
 from app.services.llm.providers.openai_compatible import OpenAICompatibleAdapter
 from app.services.llm.router import ModelRouter, build_default_policy_map
@@ -38,6 +39,7 @@ __all__ = [
     "LLMConfigurationCandidate",
     "LLMConfigurationReader",
     "LLMConfigurationSummary",
+    "LLMProviderFailure",
     "DEFAULT_PRICING",
     "LLMCallContext",
     "LLMRequest",

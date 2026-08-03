@@ -6,6 +6,7 @@ import pytest
 
 from app.services.llm.pricing import ModelPricing, PricingCalculator
 from app.services.llm.tracked_client import TrackedLLMChatClient
+from app.services.llm.failures import LLMProviderFailure
 from app.services.llm.types import LLMCallContext, LLMResponse, TokenUsage
 from app.services.llm.usage_tracker import LLMUsageTracker
 
@@ -112,3 +113,21 @@ async def test_tracked_chat_client_records_failed_event_and_reraises(tmp_path):
     assert row["total_tokens"] == 0
     assert row["status"] == "failed"
     assert row["error_message"] == "provider down"
+
+
+@pytest.mark.asyncio
+async def test_tracked_chat_client_records_stable_provider_failure_without_upstream_body(tmp_path):
+    db_path = str(tmp_path / "usage.db")
+    service = FakeLLMService(error=LLMProviderFailure("llm_auth_invalid", "API Key 无效", True, 401))
+    client = TrackedLLMChatClient(
+        llm_service=service, usage_tracker=LLMUsageTracker(db_path),
+        pricing_calculator=PricingCalculator(),
+        context=LLMCallContext(session_id="session-3", job_id="job-3"), model_policy="balanced",
+    )
+
+    with pytest.raises(LLMProviderFailure):
+        await client.chat(system="system", user="user")
+
+    with sqlite3.connect(db_path) as conn:
+        row = conn.execute("SELECT error_message FROM llm_usage_events").fetchone()
+    assert row == ("llm_auth_invalid: API Key 无效",)

@@ -6,6 +6,8 @@ from typing import Final
 
 from app.config import settings
 from app.services.llm.credentials import CredentialResolver
+from app.services.llm.configuration_store import SQLiteLLMConfigurationStore
+from app.services.llm.failures import LLMProviderFailure
 from app.services.llm.pricing import PricingCalculator, UsageCost
 from app.services.llm.providers.openai_compatible import OpenAICompatibleAdapter
 from app.services.llm.router import ModelRouter
@@ -23,7 +25,7 @@ DEFAULT_OPENAI_COMPATIBLE_PROVIDERS: Final[tuple[str, ...]] = (
 )
 
 
-def build_default_llm_service() -> LLMService:
+def build_default_llm_service(db_path: str | None = None) -> LLMService:
     providers = {
         provider: OpenAICompatibleAdapter(
             provider=provider,
@@ -31,10 +33,12 @@ def build_default_llm_service() -> LLMService:
         )
         for provider in DEFAULT_OPENAI_COMPATIBLE_PROVIDERS
     }
+    providers["openai_compatible"] = OpenAICompatibleAdapter(provider="openai_compatible")
     return LLMService(
         router=ModelRouter(settings_obj=settings),
         credential_resolver=CredentialResolver(settings),
         providers=providers,
+        configuration_reader=SQLiteLLMConfigurationStore(db_path or settings.SQLITE_DB_PATH),
     )
 
 
@@ -78,6 +82,13 @@ class TrackedLLMChatClient:
 
         try:
             response = await self._llm_service.generate(request)
+        except LLMProviderFailure as exc:
+            await self._record(
+                provider=exc.provider or "unknown", model=exc.model or "unknown", usage=TokenUsage(),
+                cost=UsageCost(), latency_ms=None, status="failed",
+                error_message=f"{exc.code}: {exc.public_message}",
+            )
+            raise
         except Exception as exc:
             await self._record(
                 provider="unknown",
@@ -145,7 +156,7 @@ def build_default_tracked_chat_client(
     agent_name: str | None = None,
 ) -> TrackedLLMChatClient:
     return TrackedLLMChatClient(
-        llm_service=build_default_llm_service(),
+        llm_service=build_default_llm_service(db_path),
         usage_tracker=LLMUsageTracker(db_path),
         pricing_calculator=PricingCalculator(),
         context=LLMCallContext(
