@@ -12,7 +12,7 @@ from app.services.llm.configuration import (
     UserLLMConfiguration,
 )
 from app.services.llm.configuration_store import SQLiteLLMConfigurationStore
-from app.services.llm.failures import LLMProviderFailure, classify_provider_exception
+from app.services.llm.failures import LLMProviderFailure
 from app.services.llm.types import LLMRequest, Message
 
 
@@ -65,7 +65,10 @@ class LiteLLMConfigurationService:
     async def save(
         self, *, workspace_id: str, user_id: str, candidate: LLMConfigurationCandidate
     ) -> LLMConfigurationSummary:
-        normalized = self._normalize_candidate(workspace_id, user_id, candidate)
+        try:
+            normalized = self._normalize_candidate(workspace_id, user_id, candidate)
+        except LLMProviderFailure as exc:
+            return self._invalid_summary(candidate, exc.code)
         validation = await self.validate(
             workspace_id=workspace_id, user_id=user_id, candidate=normalized
         )

@@ -86,3 +86,36 @@ async def test_configuration_put_cors_preflight_accepts_real_origin(client):
     assert response.status_code == 200
     assert response.headers["access-control-allow-origin"] == "http://localhost:3000"
     assert "PUT" in response.headers["access-control-allow-methods"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("payload", "error_code"),
+    [
+        (
+            {
+                "base_url": "ftp://proxy.example/v1",
+                "model": "model-x",
+                "api_key": "secret-that-must-never-be-returned",
+            },
+            "llm_protocol_incompatible",
+        ),
+        (
+            {"base_url": "https://proxy.example/v1", "model": "model-x"},
+            "llm_auth_invalid",
+        ),
+    ],
+)
+async def test_configuration_put_normalization_failure_is_safe_stable_422(
+    client, payload, error_code
+):
+    response = await client.put(
+        "/content-research/llm-config",
+        headers={"X-Workspace-Id": "ws_1", "X-User-Id": "user_1"},
+        json=payload,
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error_code"] == error_code
+    assert response.json()["error_message"] == "模型配置验证失败"
+    assert "secret-that-must-never-be-returned" not in response.text

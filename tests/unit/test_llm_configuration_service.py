@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from datetime import datetime
-
 import pytest
 
 from app.services.llm.configuration import LLMConfigurationCandidate
@@ -107,3 +105,33 @@ async def test_validate_reuses_existing_key_only_when_present(tmp_path):
     )
     assert reused.status == "validated"
     assert reused.api_key_suffix == "1234"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("candidate", "error_code"),
+    [
+        (
+            LLMConfigurationCandidate("ftp://proxy.example/v1", "model-x", "secret-1234"),
+            "llm_protocol_incompatible",
+        ),
+        (
+            LLMConfigurationCandidate("https://proxy.example/v1", "model-x", None),
+            "llm_auth_invalid",
+        ),
+    ],
+)
+async def test_save_normalization_failure_returns_redacted_invalid_summary(
+    tmp_path, candidate, error_code
+):
+    service, adapter = make_configuration_service(tmp_path, response='{"ok":true}')
+
+    summary = await service.save(
+        workspace_id="ws_1", user_id="user_1", candidate=candidate
+    )
+
+    assert summary.status == "invalid"
+    assert summary.error_code == error_code
+    assert summary.api_key_suffix == ("1234" if candidate.api_key else None)
+    assert "secret-1234" not in repr(summary)
+    assert adapter.calls == []
