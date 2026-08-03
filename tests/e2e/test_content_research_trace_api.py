@@ -383,7 +383,9 @@ async def test_content_research_trace_api_redacts_persisted_source_results(
         "max_attempts",
         "started_at",
         "completed_at",
+        "timing",
     }
+    assert payload["runtime_steps"][0]["timing"]["timing_source"] == "recorded"
     serialized = response.text
     for forbidden in (
         "RAW_TRACE_REQUEST_MUST_NOT_ESCAPE",

@@ -15,6 +15,7 @@ from app.content_research.service import (
     WorkflowRunManagerRuntime,
 )
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
+from app.content_research.observation.trace_service import _project_timing
 from app.services.llm.pricing import UsageCost
 from app.services.llm.types import LLMCallContext, LLMResponse, TokenUsage
 from app.services.llm.usage_tracker import LLMUsageEventInput, LLMUsageTracker
@@ -196,6 +197,40 @@ async def test_trace_returns_zero_usage_defaults_when_no_usage_rows(service):
     assert trace.usage_summary == {}
     assert trace.usage_steps == []
     assert trace.usage_events == []
+
+
+@pytest.mark.asyncio
+async def test_trace_projects_recorded_timing_without_exposing_runtime_json(service):
+    presearch = await _confirmed_workflow(service)
+
+    trace = await service.get_workflow_trace(presearch.workflow_run_id)
+
+    formal_step = trace.runtime_steps[-1]
+    timing = formal_step["timing"]
+    assert timing["timing_source"] == "recorded"
+    assert timing["queued_at"].endswith("+00:00")
+    assert timing["execution_started_at"].endswith("+00:00")
+    assert timing["active_duration_ms"] >= 0
+    assert timing["queue_duration_ms"] >= 0
+    assert "timing_json" not in formal_step
+
+
+def test_trace_timing_marks_legacy_step_estimated_without_precision_invention():
+    timing = _project_timing(
+        {
+            "status": "succeeded",
+            "started_at": "2026-08-03 01:00:00",
+            "completed_at": "2026-08-03 01:00:03",
+        },
+        as_of="2026-08-03T01:00:10.123456+00:00",
+    )
+
+    assert timing == {
+        "execution_started_at": "2026-08-03T01:00:00+00:00",
+        "execution_finished_at": "2026-08-03T01:00:03+00:00",
+        "active_duration_ms": 3000,
+        "timing_source": "estimated",
+    }
 
 
 @pytest.mark.asyncio

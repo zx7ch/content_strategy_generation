@@ -70,6 +70,7 @@ class ContentResearchTraceService:
         provider_operations = _provider_operations(self._store, workflow_run_id)
         observation_event_dicts = [_safe_observation_event_dict(event) for event in observation_events]
         source_operation_events = [_source_operation_event_dict(event) for event in observation_events]
+        trace_as_of = datetime.now(timezone.utc)
 
         return ContentResearchTraceResponse(
             workflow_run_id=workflow_run_id,
@@ -87,8 +88,11 @@ class ContentResearchTraceService:
             traces=[_safe_trace_dict(trace) for trace in traces],
             observation_events=observation_event_dicts,
             workflow_events=[_safe_workflow_event_dict(event) for event in workflow_event_dicts],
-            runtime_steps=[_safe_runtime_step_dict(step) for step in runtime_steps],
-            runtime_child_tasks=[_safe_runtime_child_task_dict(task) for task in runtime_child_tasks],
+            runtime_steps=[_safe_runtime_step_dict(step, as_of=trace_as_of) for step in runtime_steps],
+            runtime_child_tasks=[
+                _safe_runtime_child_task_dict(task, as_of=trace_as_of)
+                for task in runtime_child_tasks
+            ],
             usage_summary={},
             external_api_summary=_external_api_summary(
                 source_operation_events, provider_operations
@@ -166,14 +170,17 @@ def _safe_workflow_event_dict(event: dict) -> dict:
     })
 
 
-def _safe_runtime_step_dict(step: Any) -> dict:
-    return _select_safe_fields(_json_dict(step), {
+def _safe_runtime_step_dict(step: Any, *, as_of: datetime) -> dict:
+    value = _json_dict(step)
+    safe = _select_safe_fields(value, {
         "step_id", "step_name", "phase", "status", "attempt_count",
         "max_attempts", "started_at", "completed_at", "error_code",
     })
+    safe["timing"] = _project_timing(value, as_of=as_of)
+    return safe
 
 
-def _safe_runtime_child_task_dict(task: Any) -> dict:
+def _safe_runtime_child_task_dict(task: Any, *, as_of: datetime) -> dict:
     value = _json_dict(task)
     safe = _select_safe_fields(value, {
         "child_task_id", "step_id", "task_type", "status", "attempt_count",
@@ -191,6 +198,7 @@ def _safe_runtime_child_task_dict(task: Any) -> dict:
             "limit": max_attempts,
         },
     }
+    safe["timing"] = _project_timing(value, as_of=as_of)
     return safe
 
 
@@ -225,6 +233,82 @@ def _llm_recovery_projection(
         if payload.get("configuration_source") in {"user", "system_default"} else None,
         "model": payload.get("model") if isinstance(payload.get("model"), str) else None,
     }
+
+
+def _project_timing(value: dict, *, as_of: datetime | str) -> dict:
+    """Return a Lite-safe timing view without leaking the durable JSON record."""
+    recorded = value.get("timing_json")
+    as_of_at = _parse_dt(as_of)
+    if isinstance(recorded, dict) and isinstance(recorded.get("execution_spans"), list):
+        execution_spans = recorded["execution_spans"]
+        active_duration_ms = 0
+        first_execution_at: datetime | None = None
+        last_finished_at: datetime | None = None
+        for span in execution_spans:
+            if not isinstance(span, dict):
+                continue
+            started_at = _parse_dt(span.get("started_at"))
+            if started_at is None:
+                continue
+            first_execution_at = first_execution_at or started_at
+            finished_at = _parse_dt(span.get("finished_at"))
+            if finished_at is None and str(value.get("status") or "") == "running":
+                finished_at = as_of_at
+            if finished_at is None:
+                continue
+            active_duration_ms += max(0, int((finished_at - started_at).total_seconds() * 1000))
+            last_finished_at = finished_at
+
+        queue_duration_ms = _interval_duration_ms(recorded.get("queue_spans"), as_of=None)
+        timing: dict[str, Any] = {
+            "active_duration_ms": active_duration_ms,
+            "queue_duration_ms": queue_duration_ms,
+            "timing_source": "recorded",
+        }
+        for source_key, target_key in (
+            ("queued_at", "queued_at"),
+            ("waiting_started_at", "waiting_started_at"),
+            ("retry_backoff_started_at", "retry_backoff_started_at"),
+        ):
+            timestamp = _parse_dt(recorded.get(source_key))
+            if timestamp is not None:
+                timing[target_key] = timestamp.isoformat()
+        if first_execution_at is not None:
+            timing["execution_started_at"] = first_execution_at.isoformat()
+        if last_finished_at is not None:
+            timing["execution_finished_at"] = last_finished_at.isoformat()
+        return timing
+
+    started_at = _parse_dt(value.get("started_at"))
+    finished_at = _parse_dt(value.get("completed_at"))
+    timing = {"timing_source": "estimated"}
+    if started_at is None:
+        return timing
+    effective_end = finished_at or (as_of_at if str(value.get("status") or "") == "running" else None)
+    if effective_end is None:
+        return timing
+    timing.update(
+        {
+            "execution_started_at": started_at.isoformat(),
+            "execution_finished_at": effective_end.isoformat(),
+            "active_duration_ms": max(0, int((effective_end - started_at).total_seconds() * 1000)),
+        }
+    )
+    return timing
+
+
+def _interval_duration_ms(value: Any, *, as_of: datetime | None) -> int:
+    if not isinstance(value, list):
+        return 0
+    total = 0
+    for interval in value:
+        if not isinstance(interval, dict):
+            continue
+        started_at = _parse_dt(interval.get("started_at"))
+        finished_at = _parse_dt(interval.get("finished_at")) or as_of
+        if started_at is not None and finished_at is not None:
+            total += max(0, int((finished_at - started_at).total_seconds() * 1000))
+    return total
 
 
 def _safe_provider_operation_dict(operation: dict) -> dict:
