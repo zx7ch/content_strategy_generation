@@ -686,6 +686,8 @@ class ContentResearchService:
             custom_competitors=confirmation.custom_competitors,
             custom_research_question=confirmation.custom_research_question,
             directions=directions,
+            workspace_id=str(brief.payload.get("workspace_id") or ""),
+            user_id=str(brief.payload.get("user_id") or ""),
         )
         plan_payload = self._plan_builder.build(
             brief=brief,
@@ -1073,6 +1075,10 @@ class ContentResearchService:
                 "schema_version": "content_research_governed_snapshot_metadata_v2",
                 "governed_snapshot": governed,
                 "governed_input_fingerprint": governed_input_fingerprint,
+                "llm_scope": {
+                    "workspace_id": str(brief.payload.get("workspace_id") or ""),
+                    "user_id": str(brief.payload.get("user_id") or ""),
+                },
             },
         )
         saved = self._store.save_result_snapshot(snapshot)
@@ -2219,6 +2225,12 @@ class ContentResearchService:
             "transient_error",
             "rate_limited",
             "unavailable",
+            "llm_auth_invalid",
+            "llm_account_unavailable",
+            "llm_model_unavailable",
+            "llm_rate_limited",
+            "llm_service_unavailable",
+            "llm_protocol_incompatible",
         }
         recoverable_failure_by_task = {
             checkpoint.subagent_task_id: str(

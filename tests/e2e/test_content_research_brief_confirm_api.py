@@ -150,6 +150,14 @@ async def test_confirm_brief_creates_plan_directions_tasks_and_workflow_summary(
         "competitor_discovery",
     ]
     assert [item["status"] for item in payload["subagent_tasks"]] == ["queued", "queued"]
+    assert {
+        (
+            item["payload"]["llm_scope"]["workspace_id"],
+            item["payload"]["llm_scope"]["user_id"],
+            item["payload"]["workflow_run_id"],
+        )
+        for item in payload["subagent_tasks"]
+    } == {("ws-1", "user-1", presearch["workflow_run_id"])}
 
     fetched = await client.get(f"/content-research/workflows/{presearch['workflow_run_id']}")
     assert fetched.status_code == 200

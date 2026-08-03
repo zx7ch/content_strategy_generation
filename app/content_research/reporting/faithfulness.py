@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from app.content_research.analysis import DirectionalAnalysisLLM
+from app.content_research.llm_scope import content_research_llm_context
 from app.content_research.models import ResearchResultSnapshotRecord
 from app.content_research.reporting.composer import (
     _limitation_ids as _composed_limitation_ids,
@@ -18,7 +19,8 @@ from app.content_research.reporting.composer import (
 from app.content_research.reporting.composer import _scope_card_id
 from app.content_research.reporting.contracts import ReportDraft
 from app.services.llm.pricing import DEFAULT_PRICING, PricingCalculator
-from app.services.llm.types import LLMCallContext, LLMRequest, Message
+from app.services.llm.failures import LLMProviderFailure
+from app.services.llm.types import LLMRequest, Message
 
 
 @dataclass(frozen=True)
@@ -82,9 +84,10 @@ class LLMReportSemanticAuditor:
                     temperature=0,
                     max_tokens=500,
                     response_format={"type": "json_object"},
-                    context=LLMCallContext(
+                    context=content_research_llm_context(
+                        snapshot.metadata,
                         session_id=snapshot.workflow_run_id,
-                        job_id=snapshot.workflow_run_id,
+                        workflow_run_id=snapshot.workflow_run_id,
                         step_name="report_faithfulness",
                         agent_name="report_semantic_auditor",
                     ),
@@ -122,6 +125,13 @@ class LLMReportSemanticAuditor:
                     "cost_usd": cost.total_cost,
                     "cost_unknown": False,
                 },
+            )
+        except LLMProviderFailure as exc:
+            return SemanticAuditResult(
+                "unavailable",
+                (exc.code,),
+                model_version=exc.model,
+                prompt_version=self._PROMPT_VERSION,
             )
         except Exception:
             return SemanticAuditResult("unavailable", ("semantic_audit_provider_unavailable",))
