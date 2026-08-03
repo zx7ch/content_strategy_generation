@@ -360,7 +360,20 @@ Lite 的证据字段只允许 `content_text` 与 `title`（投影过滤）。评
 - API/schema 覆盖全部 7 种非空选择组合和空选择拒绝；浏览器覆盖单选、双选、全选。真实采集复用 `product_marketing`；`partial`、`evidence_only`、恢复卡与 citation 跳转三态使用后端受控真实状态，浏览器不得 mock API payload。
 - 验证宽屏、窄屏、刷新恢复、重复点击、citation drawer、三种来源跳转状态、三档发布呈现与 workflow 恢复卡。
 
-**通过条件**：预发布环境中新合同为唯一 Creator/report 合同；选择、scope、报告三态、恢复卡和 citation drawer 均通过上述 API/浏览器验收。Gate 4A 不对正式用户发布，也不代表所有目录方向的采集能力已完成。
+#### Task 5H — Lite runtime model configuration and pre-research recovery（P0，待开始）
+
+为避免 `.env` 中固定 LLM Provider、模型或 API Key 不可用时阻断 Lite 发布，Creator 在右侧栏“本次研究摘要”下方增加紧凑“模型服务”卡片。用户只配置 `base_url`、`model`、`api_key`；Lite 限定 OpenAI-compatible Chat Completions 协议，但不维护具体模型 ID 白名单。`temperature`、输出长度、结构化输出提示、超时和自动重试仍由系统按任务管理，不开放给用户。
+
+- API Key 可明文保存在本地 SQLite，但查询接口只返回是否已配置和末四位；日志、Trace、usage event、异常及 Creator 消息不得包含完整 Key、Authorization header 或原始上游响应。
+- 运行时优先使用当前 Workspace/用户的已验证配置，未配置时使用 `.env` 系统默认；用户配置调用失败后不得静默切换 Provider、模型或 `.env`。
+- 保存配置前必须通过真实最小 Chat Completions 验证，不依赖 `/models`；验证覆盖连接、鉴权、模型可用、非空文本和可解析结构化文本。失败候选不得覆盖当前有效配置，保存后无需重启服务即可生效。
+- LLM 失败稳定分类为鉴权、账户/权益、模型不存在、限流、服务不可用、协议不兼容和结构化输出无效。可恢复失败使 workflow 收敛到 `waiting_user`，右侧卡片提供“配置模型”和验证成功后的“继续调研”。
+- 恢复沿用同一 run 和现有用户恢复预算，从最早未完成 LLM checkpoint 继续；已经完成的 Spider packet/checkpoint 必须复用且 Provider operation 数不得增加。若 pre-research 在首次采集前失败，则只重试 pre-research，随后进入首次 Spider 采集。
+- 本 Task 不建设加密托管、Workspace 管理 UI、独立设置中心、Anthropic 原生协议、用户自定义推理参数、模型目录同步或自动多模型 fallback。
+- 该最小闭环与 5G-2B 的真实时间分段解耦；模型不可用会直接阻断真实 Lite run，因此 Task 5H 优先实施，5G-2B 不是其前置条件。
+- 完整设计与验收矩阵见 `docs/superpowers/specs/2026-08-03-f003-lite-model-configuration-design.md`。
+
+**通过条件**：预发布环境中新合同为唯一 Creator/report 合同；选择、scope、报告三态、恢复卡、citation drawer、模型配置与模型故障后的同 run 恢复均通过上述 API/浏览器验收。Gate 4A 不对正式用户发布，也不代表所有目录方向的采集能力已完成。
 
 ### Task 5：Lite 报告质量合同收口
 
