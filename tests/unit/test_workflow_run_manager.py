@@ -119,6 +119,25 @@ async def test_recorded_step_boundary_brackets_work_before_state_transition(mana
 
 
 @pytest.mark.asyncio
+async def test_pause_boundary_closes_active_span(manager):
+    run = await manager.start_run(thread_id="thread-paused", user_id="user-paused")
+    step = (
+        await manager.initialize_steps(
+            run.run_id,
+            [{"step_name": "formal_research", "phase": "retrieval", "max_attempts": 3}],
+        )
+    )[0]
+    await manager.start_step(run.run_id, step.step_name)
+    await manager.pause_run(run.run_id)
+    await manager.ack_pause_at_boundary(run.run_id, step.step_name)
+
+    async with WorkflowStore(manager.db_path) as store:
+        paused_step = (await store.list_steps(run.run_id))[0]
+    assert paused_step.timing_json is not None
+    assert paused_step.timing_json["execution_spans"][-1]["finished_at"] is not None
+
+
+@pytest.mark.asyncio
 async def test_legal_run_transitions(manager):
     run = await manager.start_run(thread_id="thread-1", user_id="user-1")
 

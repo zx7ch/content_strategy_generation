@@ -87,6 +87,7 @@ def _start_timing_execution(timing: dict[str, Any], at: str) -> dict[str, Any]:
     _close_interval(timing, "queue_spans", at)
     _close_interval(timing, "retry_backoff_spans", at)
     _close_interval(timing, "waiting_spans", at)
+    _close_interval(timing, "pause_spans", at)
     _open_interval(timing, "execution_spans", at)
     return timing
 
@@ -632,16 +633,19 @@ class WorkflowRunManager:
                 )
             step = await self._fetch_step_row(run_id, step_name)
             if step["status"] == WorkflowStepStatus.RUNNING.value:
+                paused_at = _utc_timestamp()
+                timing = _stop_timing_execution(_timing_from_row(step), paused_at)
+                _open_interval(timing, "pause_spans", paused_at)
                 await self._conn.execute(
                     """
                     UPDATE workflow_steps
                     SET status='retrying', attempt_count=attempt_count + 1,
                         active_job_id=NULL, next_retry_at=CURRENT_TIMESTAMP,
                         error_code='RUN_PAUSED', error_message='run paused at safe boundary',
-                        updated_at=CURRENT_TIMESTAMP
+                        timing_json=?, updated_at=CURRENT_TIMESTAMP
                     WHERE step_id=?
                     """,
-                    (step["step_id"],),
+                    (_timing_json(timing), step["step_id"]),
                 )
             await self._pause_job_if_present(job_id or run["active_job_id"])
             await self._conn.execute(
