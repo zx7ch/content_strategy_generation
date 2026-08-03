@@ -129,7 +129,11 @@ async def test_cancel_step_closes_every_open_interval_for_each_cancellable_state
             json.dumps(
                 {
                     open_interval_key: [
-                        {"started_at": open_at, "finished_at": None}
+                        {"started_at": open_at, "finished_at": None},
+                        {
+                            "started_at": "2026-08-03T01:00:01.000001+00:00",
+                            "finished_at": None,
+                        },
                     ]
                 }
             ),
@@ -143,8 +147,11 @@ async def test_cancel_step_closes_every_open_interval_for_each_cancellable_state
     assert cancelled.status == WorkflowStepStatus.CANCELLED
     assert cancelled.completed_at is not None
     assert cancelled.timing_json is not None
-    assert cancelled.timing_json[open_interval_key][0]["finished_at"] is not None
-    assert cancelled.timing_json[open_interval_key][0]["finished_at"].endswith("+00:00")
+    finished_at = {
+        span["finished_at"] for span in cancelled.timing_json[open_interval_key]
+    }
+    assert len(finished_at) == 1
+    assert next(iter(finished_at)).endswith("+00:00")
 
 
 @pytest.mark.asyncio

@@ -36,6 +36,7 @@ class WorkflowStepStatus(str, Enum):
     PENDING = "pending"
     RUNNING = "running"
     RETRYING = "retrying"
+    PAUSED = "paused"
     SKIPPED = "skipped"
     SUCCEEDED = "succeeded"
     FAILED = "failed"

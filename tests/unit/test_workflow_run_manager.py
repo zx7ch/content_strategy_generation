@@ -63,7 +63,11 @@ async def _seed_nonterminal_descendant_matrix(
                     {
                         "started_at": "2026-08-03T01:00:00.000001+00:00",
                         "finished_at": None,
-                    }
+                    },
+                    {
+                        "started_at": "2026-08-03T01:00:01.000001+00:00",
+                        "finished_at": None,
+                    },
                 ]
                 for key in interval_keys[status]
             }
