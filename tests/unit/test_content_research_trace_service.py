@@ -6,7 +6,11 @@ import pytest
 
 from app.content_research.api_schemas import ContentResearchBriefConfirmRequest
 from app.content_research.models import ResearchBriefRecord
-from app.content_research.observation.trace_service import _llm_recovery_projection
+from app.content_research.observation.trace_service import (
+    _duration_ms,
+    _llm_recovery_projection,
+    _project_timing,
+)
 from app.content_research.persistence_models import StageCheckpointRecord
 from app.content_research.presearch.service import PresearchService
 from app.content_research.service import (
@@ -15,7 +19,6 @@ from app.content_research.service import (
     WorkflowRunManagerRuntime,
 )
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
-from app.content_research.observation.trace_service import _duration_ms, _project_timing
 from app.memory.workflow_store import WorkflowStore
 from app.services.llm.pricing import UsageCost
 from app.services.llm.types import LLMCallContext, LLMResponse, TokenUsage
@@ -32,6 +35,22 @@ class FakeLLM:
                     "research_directions": ["产品营销", "用户评论痛点"],
                     "custom_research_question": "",
                     "custom_competitor_input": "",
+                    "subject_structure": {
+                        "schema_version": "content_research_subject_structure_v1",
+                        "canonical_subject": "徒步短裤",
+                        "subject_type": "category",
+                        "core_entities": [
+                            {
+                                "canonical_name": "徒步短裤",
+                                "raw_mentions": ["徒步短裤"],
+                            }
+                        ],
+                        "research_intents": ["产品营销"],
+                        "context_modifiers": ["夏季"],
+                        "synonym_groups": {"徒步短裤": ["户外短裤"]},
+                        "ambiguities": [],
+                        "resolution_state": "resolved",
+                    },
                 },
                 ensure_ascii=False,
             ),

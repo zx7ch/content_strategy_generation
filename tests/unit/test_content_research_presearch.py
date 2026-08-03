@@ -10,6 +10,7 @@ from app.content_research.api_schemas import (
     ContentResearchBriefConfirmRequest,
     ContentResearchWorkflowActionRequest,
 )
+from app.content_research.persistence_models import StageCheckpointRecord
 from app.content_research.presearch.service import PresearchService
 from app.content_research.service import (
     ContentResearchService,
@@ -38,6 +39,23 @@ class FakeRuntime:
         self.calls.append({"workflow_run_id": workflow_run_id, "event": "wait_for_presearch_recovery", "reason": reason})
         return {"workflow_run_id": workflow_run_id, "status": "waiting_user"}
 
+    async def wait_for_subject_clarification(self, workflow_run_id: str, reason: dict) -> dict:
+        self.waiting = True
+        self.calls.append({
+            "workflow_run_id": workflow_run_id,
+            "event": "wait_for_subject_clarification",
+            "reason": reason,
+        })
+        return {"workflow_run_id": workflow_run_id, "status": "waiting_user"}
+
+    async def resume_subject_clarification(self, workflow_run_id: str) -> dict:
+        self.waiting = False
+        self.calls.append({
+            "workflow_run_id": workflow_run_id,
+            "event": "resume_subject_clarification",
+        })
+        return {"workflow_run_id": workflow_run_id, "status": "running"}
+
     async def restart_presearch_step(self, workflow_run_id: str) -> dict:
         self.waiting = False
         self.calls.append({"workflow_run_id": workflow_run_id, "event": "restart_presearch_step"})
@@ -63,6 +81,22 @@ class FakeLLM:
                 "research_directions": ["产品卖点表达", "用户评论痛点"],
                 "custom_research_question": "关注夏季轻量户外",
                 "custom_competitor_input": "",
+                "subject_structure": {
+                    "schema_version": "content_research_subject_structure_v1",
+                    "canonical_subject": "短裤",
+                    "subject_type": "category",
+                    "core_entities": [
+                        {
+                            "canonical_name": "短裤",
+                            "raw_mentions": ["短裤"],
+                        }
+                    ],
+                    "research_intents": ["产品卖点"],
+                    "context_modifiers": ["夏季轻量户外"],
+                    "synonym_groups": {"短裤": ["户外短裤"]},
+                    "ambiguities": [],
+                    "resolution_state": "resolved",
+                },
             },
             ensure_ascii=False,
         )
@@ -78,6 +112,65 @@ class FakeLLM:
             raise RuntimeError("llm unavailable")
         return LLMResponse(
             content=self.content,
+            provider="fake",
+            model="fake-model",
+            usage=TokenUsage(total_tokens=10),
+            latency_ms=1,
+        )
+
+
+class AmbiguousThenClarifiedLLM(FakeLLM):
+    def __init__(self) -> None:
+        super().__init__()
+        self.responses = [
+            {
+                "subject_confirmation": "‘苹果’可能指品牌或水果，请补充说明。",
+                "competitor_tags": [],
+                "research_directions": ["产品营销"],
+                "custom_research_question": "",
+                "custom_competitor_input": "",
+                "subject_structure": {
+                    "schema_version": "content_research_subject_structure_v1",
+                    "canonical_subject": "苹果",
+                    "subject_type": "ambiguous",
+                    "core_entities": [
+                        {"canonical_name": "Apple 品牌", "raw_mentions": ["苹果"]},
+                        {"canonical_name": "苹果水果", "raw_mentions": ["苹果"]},
+                    ],
+                    "research_intents": ["年轻人偏好"],
+                    "context_modifiers": [],
+                    "synonym_groups": {},
+                    "ambiguities": ["苹果指 Apple 品牌还是水果"],
+                    "resolution_state": "needs_confirmation",
+                },
+            },
+            {
+                "subject_confirmation": "已确认调研 Apple 品牌在年轻人中的偏好。",
+                "competitor_tags": ["华为", "小米"],
+                "research_directions": ["产品营销"],
+                "custom_research_question": "",
+                "custom_competitor_input": "",
+                "subject_structure": {
+                    "schema_version": "content_research_subject_structure_v1",
+                    "canonical_subject": "Apple 品牌",
+                    "subject_type": "brand",
+                    "core_entities": [
+                        {"canonical_name": "Apple 品牌", "raw_mentions": ["苹果"]},
+                    ],
+                    "research_intents": ["年轻人偏好"],
+                    "context_modifiers": [],
+                    "synonym_groups": {"Apple 品牌": ["Apple"]},
+                    "ambiguities": [],
+                    "resolution_state": "resolved",
+                },
+            },
+        ]
+
+    async def generate(self, request):
+        self.requests.append(request)
+        response = self.responses.pop(0)
+        return LLMResponse(
+            content=json.dumps(response, ensure_ascii=False),
             provider="fake",
             model="fake-model",
             usage=TokenUsage(total_tokens=10),
@@ -136,6 +229,156 @@ async def test_presearch_success_creates_workflow_brief_trace_and_observation(st
     with sqlite3.connect(store._db_path) as conn:
         evidence_rows = conn.execute("SELECT COUNT(*) FROM content_research_evidence_records").fetchone()[0]
     assert evidence_rows == 0
+
+
+@pytest.mark.asyncio
+async def test_presearch_returns_backend_validated_subject_structure(store):
+    content = json.dumps(
+        {
+            "subject_confirmation": "夏季防晒穿搭",
+            "subject_structure": {
+                "schema_version": "content_research_subject_structure_v1",
+                "canonical_subject": "防晒服饰",
+                "subject_type": "category",
+                "core_entities": [
+                    {
+                        "canonical_name": "防晒服饰",
+                        "raw_mentions": ["防晒穿搭"],
+                    }
+                ],
+                "research_intents": ["穿搭"],
+                "context_modifiers": ["夏季"],
+                "synonym_groups": {"防晒服饰": ["防晒衣", "防晒服"]},
+                "ambiguities": [],
+                "resolution_state": "resolved",
+            },
+            "competitor_tags": [],
+            "research_directions": ["产品营销"],
+            "custom_research_question": "",
+            "custom_competitor_input": "",
+        },
+        ensure_ascii=False,
+    )
+    service = _service(store, FakeLLM(content=content))
+
+    response = await service.submit_presearch(
+        seed_text="夏季防晒穿搭",
+        user_note=None,
+        thread_id="thread_1",
+        user_id="user_1",
+    )
+
+    assert response.subject_structure_state == "confirmed"
+    assert response.subject_structure_reason_codes == []
+    assert response.subject_structure["canonical_subject"] == "防晒服饰"
+    assert response.subject_structure_hash
+    brief = store.get_brief(response.brief_id)
+    assert brief is not None
+    assert brief.payload["subject_structure_hash"] == response.subject_structure_hash
+
+
+@pytest.mark.asyncio
+async def test_subject_clarification_reuses_run_without_model_recovery_or_spider(store):
+    runtime = FakeRuntime()
+    llm = AmbiguousThenClarifiedLLM()
+    service = _service(store, llm, runtime=runtime)
+
+    first = await service.submit_presearch(
+        seed_text="苹果适合年轻人吗",
+        user_note=None,
+        thread_id="thread_1",
+        user_id="user_1",
+    )
+
+    assert first.status == "subject_needs_confirmation"
+    assert first.subject_structure_state == "needs_confirmation"
+    assert runtime.calls[-1]["event"] == "wait_for_subject_clarification"
+    assert all(call.get("event") != "wait_for_presearch_recovery" for call in runtime.calls)
+
+    action = await service.run_workflow_action(
+        workflow_run_id=first.workflow_run_id,
+        request=ContentResearchWorkflowActionRequest(
+            action="clarify_subject",
+            payload={"clarification_text": "这里的苹果是 Apple 品牌，不是水果。"},
+        ),
+    )
+
+    assert action.workflow_run_id == first.workflow_run_id
+    assert action.result["attempt_id"] == first.attempt_id
+    assert action.result["brief_id"] == first.brief_id
+    assert action.result["status"] == "completed"
+    assert action.result["subject_structure_state"] == "confirmed"
+    assert action.result["subject_structure_hash"] != first.subject_structure_hash
+    assert runtime.calls[-2]["event"] == "resume_subject_clarification"
+    assert runtime.calls[-1]["event"] == "presearch_ready"
+    assert all(call.get("event") != "restart_presearch_step" for call in runtime.calls)
+    assert all(call.get("event") != "wait_for_presearch_recovery" for call in runtime.calls)
+    assert len(llm.requests) == 2
+    assert "Apple 品牌" in llm.requests[1].messages[-1].content
+
+    with pytest.raises(ContentResearchValidationError, match="stale subject structure"):
+        await service.confirm_brief(
+            brief_id=first.brief_id,
+            confirmation_request=ContentResearchBriefConfirmRequest(
+                confirmed_subject="Apple 品牌",
+                subject_structure_hash=str(first.subject_structure_hash),
+                subject_type="brand",
+                selected_competitors=[],
+                custom_competitors=[],
+                selected_directions=["product_marketing"],
+                custom_research_question="",
+            ),
+        )
+
+    checkpoints = [
+        item
+        for item in store.list_typed_records(StageCheckpointRecord)
+        if item.workflow_run_id == first.workflow_run_id
+        and item.stage_name == "subject_structure"
+    ]
+    assert len(checkpoints) == 2
+    assert [item.payload["state"] for item in checkpoints] == [
+        "needs_confirmation",
+        "confirmed",
+    ]
+    assert all(item.payload.get("raw_input") is None for item in checkpoints)
+    assert all(item.stage_name != "operation" for item in store.list_typed_records(StageCheckpointRecord))
+
+
+@pytest.mark.asyncio
+async def test_subject_clarification_does_not_increment_real_runtime_attempt_count(store):
+    runtime = WorkflowRunManagerRuntime(store._db_path)
+    service = _service(store, AmbiguousThenClarifiedLLM(), runtime=runtime)
+
+    first = await service.submit_presearch(
+        seed_text="苹果适合年轻人吗",
+        user_note=None,
+        thread_id="thread_real_runtime_clarification",
+        user_id="user_1",
+    )
+    waiting = await runtime.get_runtime_snapshot(first.workflow_run_id)
+    waiting_step = next(
+        step for step in waiting["steps"] if step["step_name"] == "presearch"
+    )
+    assert waiting["run"]["status"] == "waiting_user"
+    assert waiting_step["status"] == "retrying"
+    assert waiting_step["attempt_count"] == 0
+
+    await service.run_workflow_action(
+        workflow_run_id=first.workflow_run_id,
+        request=ContentResearchWorkflowActionRequest(
+            action="clarify_subject",
+            payload={"clarification_text": "这里的苹果是 Apple 品牌，不是水果。"},
+        ),
+    )
+
+    completed = await runtime.get_runtime_snapshot(first.workflow_run_id)
+    completed_step = next(
+        step for step in completed["steps"] if step["step_name"] == "presearch"
+    )
+    assert completed["run"]["status"] == "running"
+    assert completed_step["status"] == "succeeded"
+    assert completed_step["attempt_count"] == 0
 
 
 @pytest.mark.asyncio

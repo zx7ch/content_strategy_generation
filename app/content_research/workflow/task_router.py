@@ -56,6 +56,8 @@ class SubagentTaskRouter:
         directions: list[ResearchDirectionDefinition],
         workspace_id: str,
         user_id: str,
+        subject_structure: dict[str, Any] | None = None,
+        subject_structure_hash: str | None = None,
     ) -> list[dict]:
         competitors = [*selected_competitors, *custom_competitors]
         return [
@@ -75,6 +77,8 @@ class SubagentTaskRouter:
                 "input_payload": {
                     "schema_version": "content_research_subagent_input_v1",
                     "confirmed_subject": confirmed_subject,
+                    "subject_structure": dict(subject_structure or {}),
+                    "subject_structure_hash": subject_structure_hash,
                     "competitors": competitors,
                     "custom_research_question": custom_research_question,
                     "direction": {

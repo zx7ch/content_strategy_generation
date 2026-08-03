@@ -12,14 +12,14 @@ from app.content_research.observation.trace_service import (
     _derive_current_stage,
     _provider_operations,
 )
-from app.content_research.presearch.service import PresearchService
 from app.content_research.persistence_models import StageCheckpointRecord
+from app.content_research.presearch.service import PresearchService
 from app.content_research.service import ContentResearchService, WorkflowRunManagerRuntime
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
-from app.services.workflow_run_manager import WorkflowRunManager, WorkflowTransitionError
 from app.services.llm.pricing import UsageCost
 from app.services.llm.types import LLMCallContext, LLMResponse, TokenUsage
 from app.services.llm.usage_tracker import LLMUsageEventInput, LLMUsageTracker
+from app.services.workflow_run_manager import WorkflowRunManager, WorkflowTransitionError
 
 
 class FakeLLM:
@@ -32,6 +32,17 @@ class FakeLLM:
                     "research_directions": ["产品营销", "品牌活动"],
                     "custom_research_question": "",
                     "custom_competitor_input": "",
+                    "subject_structure": {
+                        "schema_version": "content_research_subject_structure_v1",
+                        "canonical_subject": "Satisfy Running",
+                        "subject_type": "brand",
+                        "core_entities": [{"canonical_name": "Satisfy Running", "raw_mentions": ["Satisfy Running"]}],
+                        "research_intents": ["品牌内容"],
+                        "context_modifiers": [],
+                        "synonym_groups": {},
+                        "ambiguities": [],
+                        "resolution_state": "resolved",
+                    },
                 },
                 ensure_ascii=False,
             ),

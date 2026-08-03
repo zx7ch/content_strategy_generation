@@ -17,6 +17,7 @@ P0_WORKFLOW_ACTIONS = (
     "resume_formal_research",
     "end_content_research",
     "retry_presearch",
+    "clarify_subject",
 )
 
 
@@ -74,10 +75,15 @@ class ContentResearchPresearchResponse(BaseModel):
     recoverable: bool = False
     configuration_source: str | None = None
     model: str | None = None
+    subject_structure: dict = Field(default_factory=dict)
+    subject_structure_hash: str | None = None
+    subject_structure_state: str = "needs_confirmation"
+    subject_structure_reason_codes: list[str] = Field(default_factory=list)
 
 
 class ContentResearchBriefConfirmRequest(BaseModel):
     confirmed_subject: str = Field(min_length=1)
+    subject_structure_hash: str | None = Field(default=None, min_length=1)
     subject_type: str = "unknown"
     selected_competitors: list[str] = Field(default_factory=list)
     custom_competitors: list[str] = Field(default_factory=list)
@@ -265,6 +271,10 @@ class ContentResearchWorkflowActionRequest(BaseModel):
     schema_version: str = WORKFLOW_ACTION_REQUEST_SCHEMA_VERSION
     action: str = Field(min_length=1)
     payload: dict = Field(default_factory=dict)
+
+
+class ContentResearchSubjectClarificationRequest(BaseModel):
+    clarification_text: str = Field(min_length=1, max_length=2000)
 
 
 class ContentResearchWorkflowActionResponse(BaseModel):

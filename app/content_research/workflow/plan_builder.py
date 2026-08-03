@@ -44,6 +44,8 @@ class ResearchPlanBuilder:
             "research_brief_id": brief.id,
             "workflow_run_id": brief.workflow_run_id,
             "confirmed_subject": confirmation.confirmed_subject,
+            "subject_structure": dict(brief.payload.get("subject_structure") or {}),
+            "subject_structure_hash": brief.payload.get("subject_structure_hash"),
             "subject_type": confirmation.subject_type,
             "selected_competitors": confirmation.selected_competitors,
             "custom_competitors": confirmation.custom_competitors,

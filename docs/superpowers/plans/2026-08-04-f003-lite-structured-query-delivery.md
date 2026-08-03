@@ -46,17 +46,17 @@
 - Produces immutable `SubjectEntity`, `SubjectStructure`, `SubjectStructureDecision`, `parse_subject_structure(data, normalized_input)`, and `subject_structure_fingerprint(structure)`.
 - API produces `subject_structure`, `subject_structure_hash`, `subject_structure_state`, and stable reason codes; workflow action `clarify_subject` accepts `clarification_text`.
 
-- [ ] **Step 1: Write failing subject validation tests**
+- [x] **Step 1: Write failing subject validation tests**
 
 Cover a grounded `夏季防晒穿搭` structure, empty/ungrounded entities, unresolved `苹果` ambiguity, multiple primary entities, orphan/duplicate synonyms, and malformed JSON. Assert numeric LLM confidence is ignored.
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 Run: `pytest -q tests/unit/test_content_research_subject_structure.py tests/unit/test_content_research_presearch.py -k 'structure or grounded or ambiguous'`
 
 Expected: missing subject-structure module/schema behavior.
 
-- [ ] **Step 3: Implement the minimal value objects and trust gate**
+- [x] **Step 3: Implement the minimal value objects and trust gate**
 
 ```python
 @dataclass(frozen=True)
@@ -68,19 +68,19 @@ class SubjectStructureDecision:
 
 Normalize Unicode/whitespace/case, ground every raw mention in user input, require one Lite primary entity, validate synonym ownership/duplicates, and use `needs_confirmation` for semantic ambiguity. Keep the existing single bounded format-repair call; a second malformed response remains model-configuration failure.
 
-- [ ] **Step 4: Write failing same-run clarification tests**
+- [x] **Step 4: Write failing same-run clarification tests**
 
 Create an ambiguous presearch, send `clarify_subject` to the same workflow action endpoint, and assert the run ID is unchanged, external call count remains zero, model-recovery attempt count is unchanged, and the updated structure is confirmed. Confirming a stale/unconfirmed structure hash must fail.
 
-- [ ] **Step 5: Implement the API/service clarification boundary**
+- [x] **Step 5: Implement the API/service clarification boundary**
 
 Allow `subject_structure` in `StageCheckpointRecord`, then persist each structure input/hash and a `subject_structure` checkpoint. `clarify_subject` appends clarification to the same Pre-research input, supersedes only the executable unconfirmed structure, and rejects runs whose formal collection started. Freeze the confirmed structure identity into Brief, Plan, task payloads, and `RunPolicySnapshot` inputs.
 
-- [ ] **Step 6: Write and implement the minimal Creator interaction**
+- [x] **Step 6: Write and implement the minimal Creator interaction**
 
 Test that the Pre-research card has no input, the normal composer placeholder becomes `补充你要调研的具体对象……`, sending routes to `clarify_subject`, the normal message remains visible, and a valid response renders `核心对象｜意图｜场景` in the card.
 
-- [ ] **Step 7: Run GREEN**
+- [x] **Step 7: Run GREEN**
 
 Run: `pytest -q tests/unit/test_content_research_subject_structure.py tests/unit/test_content_research_presearch.py tests/e2e/test_content_research_presearch_api.py tests/e2e/test_content_research_brief_confirm_api.py tests/acceptance/test_content_research_creator_ui_contract.py`
 

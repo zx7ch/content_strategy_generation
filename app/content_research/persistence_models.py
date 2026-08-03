@@ -165,7 +165,7 @@ class StageCheckpointRecord(TypedPersistenceRecord):
     def __post_init__(self) -> None:
         super().__post_init__()
         _required(self.workflow_run_id, self.subagent_task_id, self.stage_name, self.input_fingerprint)
-        if self.stage_name not in {"collect", "collect_page", "operation", "selection", "selection_revision", "detail", "comments", "comments_page", "packet", "facts", "admission", "reconcile", "aggregate", "compose", "faithfulness"}:
+        if self.stage_name not in {"subject_structure", "collect", "collect_page", "operation", "selection", "selection_revision", "detail", "comments", "comments_page", "packet", "facts", "admission", "reconcile", "aggregate", "compose", "faithfulness"}:
             raise ValueError("invalid checkpoint stage")
         if self.retry_count < 0:
             raise ValueError("checkpoint retry_count cannot be negative")

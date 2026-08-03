@@ -31,6 +31,7 @@ from app.content_research.api_schemas import (
     ContentResearchSourceCollectionRequest,
     ContentResearchSourceCollectionResponse,
     ContentResearchSubagentTaskResponse,
+    ContentResearchSubjectClarificationRequest,
     ContentResearchTraceResponse,
     ContentResearchWorkflowActionRequest,
     ContentResearchWorkflowActionResponse,
@@ -140,6 +141,12 @@ class WorkflowRuntime(Protocol):
     async def mark_presearch_ready(self, workflow_run_id: str) -> None: ...
 
     async def wait_for_presearch_recovery(self, workflow_run_id: str, reason: dict) -> dict: ...
+
+    async def wait_for_subject_clarification(
+        self, workflow_run_id: str, reason: dict
+    ) -> dict: ...
+
+    async def resume_subject_clarification(self, workflow_run_id: str) -> dict: ...
 
     async def wait_for_presearch_recovery_atomically(
         self,
@@ -256,6 +263,31 @@ class WorkflowRunManagerRuntime:
         async with WorkflowRunManager(self._db_path) as manager:
             run = await manager.wait_for_user_recovery(workflow_run_id, step_name="presearch", reason=reason)
         return {"workflow_run_id": workflow_run_id, "status": run.status.value, "recoverable": True}
+
+    async def wait_for_subject_clarification(
+        self, workflow_run_id: str, reason: dict
+    ) -> dict:
+        async with WorkflowRunManager(self._db_path) as manager:
+            run = await manager.wait_for_user_input(
+                workflow_run_id,
+                step_name="presearch",
+                reason=reason,
+            )
+        return {
+            "workflow_run_id": workflow_run_id,
+            "status": run.status.value,
+            "recoverable": True,
+        }
+
+    async def resume_subject_clarification(self, workflow_run_id: str) -> dict:
+        async with WorkflowRunManager(self._db_path) as manager:
+            run = await manager.resume_run(workflow_run_id)
+            await manager.start_step(workflow_run_id, "presearch")
+        return {
+            "workflow_run_id": workflow_run_id,
+            "status": run.status.value,
+            "recoverable": True,
+        }
 
     async def wait_for_presearch_recovery_atomically(
         self,
@@ -604,6 +636,17 @@ class ContentResearchService:
             user_id=user_id,
             outcome=outcome,
         )
+        self._save_subject_structure_checkpoint(
+            brief=brief,
+            outcome=outcome,
+            input_fingerprint=canonical_fingerprint(
+                {
+                    "seed_text": normalized_seed,
+                    "user_note": user_note or "",
+                    "attempt_id": attempt_id,
+                }
+            ),
+        )
         self._append_presearch_outcome_event(
             trace_id=trace_id,
             workflow_run_id=workflow_run_id,
@@ -615,6 +658,14 @@ class ContentResearchService:
         if outcome.status == "waiting_model_config":
             await self._workflow_runtime.wait_for_presearch_recovery(
                 workflow_run_id, reason={"code": outcome.error_code, "message": outcome.error_message}
+            )
+        elif outcome.status == "subject_needs_confirmation":
+            await self._workflow_runtime.wait_for_subject_clarification(
+                workflow_run_id,
+                reason={
+                    "code": "subject_clarification_required",
+                    "message": outcome.checklist.subject_confirmation,
+                },
             )
         elif outcome.timeout_status != "first_timeout":
             await self._workflow_runtime.mark_presearch_ready(workflow_run_id)
@@ -662,13 +713,153 @@ class ContentResearchService:
         updated = self._save_brief(attempt_id=str(payload["attempt_id"]), brief_id=brief.id,
             workflow_run_id=workflow_run_id, thread_id=brief.thread_id, seed_text=request.seed_text,
             user_note=request.user_note, workspace_id=request.workspace_id, user_id=request.user_id, outcome=outcome)
+        self._save_subject_structure_checkpoint(
+            brief=updated,
+            outcome=outcome,
+            input_fingerprint=canonical_fingerprint(
+                {
+                    "seed_text": request.seed_text,
+                    "user_note": request.user_note or "",
+                    "attempt_id": str(payload["attempt_id"]),
+                    "recovery": True,
+                }
+            ),
+        )
         if outcome.status == "waiting_model_config":
             await self._workflow_runtime.wait_for_presearch_recovery(workflow_run_id, reason={"code": outcome.error_code, "message": outcome.error_message})
+        elif outcome.status == "subject_needs_confirmation":
+            await self._workflow_runtime.wait_for_subject_clarification(
+                workflow_run_id,
+                reason={
+                    "code": "subject_clarification_required",
+                    "message": outcome.checklist.subject_confirmation,
+                },
+            )
         elif outcome.timeout_status != "first_timeout":
             await self._workflow_runtime.mark_presearch_ready(workflow_run_id)
         if llm_task is not None and outcome.timeout_status == "first_timeout":
             traces = self._store.list_traces_for_workflow(workflow_run_id)
             trace = traces[0] if traces else self._ensure_source_trace(updated)
+            asyncio.create_task(
+                self._finalize_hard_cutoff(
+                    request=request,
+                    task=llm_task,
+                    attempt_id=str(payload["attempt_id"]),
+                    trace_id=trace.id,
+                    sequence_no=self._next_observation_sequence(trace.id),
+                )
+            )
+        return self._response_from_brief(updated)
+
+    async def clarify_subject(
+        self,
+        *,
+        workflow_run_id: str,
+        clarification_text: str,
+    ) -> ContentResearchPresearchResponse:
+        brief = self._store.get_brief_by_workflow(workflow_run_id)
+        if brief is None:
+            raise ContentResearchNotFoundError(
+                f"Content research workflow not found: {workflow_run_id}"
+            )
+        payload = brief.payload
+        prior_status = str(payload.get("status") or "")
+        if prior_status not in {"subject_needs_confirmation", "completed"}:
+            raise ContentResearchValidationError(
+                "Subject clarification is not available for this run"
+            )
+
+        clarification = clarification_text.strip()
+        if not clarification:
+            raise ContentResearchValidationError("clarification_text is required")
+        clarifications = [
+            str(item).strip()
+            for item in list(payload.get("subject_clarifications") or [])
+            if str(item).strip()
+        ]
+        clarifications.append(clarification)
+        original_note = str(payload.get("user_note") or "").strip()
+        accumulated_note = "\n".join(
+            item for item in [original_note, *clarifications] if item
+        )
+
+        resumed_presearch = prior_status == "subject_needs_confirmation"
+        if resumed_presearch:
+            await self._workflow_runtime.resume_subject_clarification(workflow_run_id)
+        request = PresearchInput(
+            seed_text=str(payload["seed_text"]),
+            user_note=accumulated_note,
+            thread_id=brief.thread_id,
+            workflow_run_id=workflow_run_id,
+            user_id=str(payload.get("user_id") or "default"),
+            workspace_id=str(payload.get("workspace_id") or "default"),
+        )
+        llm_task = await self._presearch.create_llm_task(request)
+        outcome = await self._presearch.wait_for_first_feedback(
+            request=request,
+            task=llm_task,
+        )
+        previous_structure = {
+            "structure_hash": payload.get("subject_structure_hash"),
+            "state": payload.get("subject_structure_state"),
+            "reason_codes": list(payload.get("subject_structure_reason_codes") or []),
+        }
+        updated = replace(
+            brief,
+            status="final_timeout" if outcome.status == "final_timeout" else "draft",
+            payload={
+                **payload,
+                **self._outcome_payload(outcome),
+                "subject_clarifications": clarifications,
+                "subject_structure_history": [
+                    *list(payload.get("subject_structure_history") or []),
+                    previous_structure,
+                ],
+            },
+            updated_at=utcnow(),
+        )
+        updated = self._store.save_brief(updated)
+        input_fingerprint = canonical_fingerprint(
+            {
+                "seed_text": request.seed_text,
+                "user_note": request.user_note or "",
+                "attempt_id": str(payload["attempt_id"]),
+                "clarification_index": len(clarifications),
+            }
+        )
+        self._save_subject_structure_checkpoint(
+            brief=updated,
+            outcome=outcome,
+            input_fingerprint=input_fingerprint,
+        )
+
+        traces = self._store.list_traces_for_workflow(workflow_run_id)
+        trace = traces[0] if traces else self._ensure_source_trace(updated)
+        self._append_presearch_outcome_event(
+            trace_id=trace.id,
+            workflow_run_id=workflow_run_id,
+            thread_id=brief.thread_id,
+            sequence_no=self._next_observation_sequence(trace.id),
+            outcome=outcome,
+            attempt_id=str(payload["attempt_id"]),
+        )
+        if outcome.status == "waiting_model_config" and resumed_presearch:
+            await self._workflow_runtime.wait_for_presearch_recovery(
+                workflow_run_id,
+                reason={"code": outcome.error_code, "message": outcome.error_message},
+            )
+        elif outcome.status == "subject_needs_confirmation" and resumed_presearch:
+            await self._workflow_runtime.wait_for_subject_clarification(
+                workflow_run_id,
+                reason={
+                    "code": "subject_clarification_required",
+                    "message": outcome.checklist.subject_confirmation,
+                },
+            )
+        elif outcome.timeout_status != "first_timeout" and resumed_presearch:
+            await self._workflow_runtime.mark_presearch_ready(workflow_run_id)
+
+        if llm_task is not None and outcome.timeout_status == "first_timeout":
             asyncio.create_task(
                 self._finalize_hard_cutoff(
                     request=request,
@@ -689,7 +880,19 @@ class ContentResearchService:
         brief = self._store.get_brief(brief_id)
         if brief is None:
             raise ContentResearchNotFoundError(f"Research brief not found: {brief_id}")
+        if (
+            confirmation_request.subject_structure_hash is not None
+            and confirmation_request.subject_structure_hash
+            != str(brief.payload.get("subject_structure_hash") or "")
+        ):
+            raise ContentResearchValidationError(
+                "Cannot confirm a stale subject structure"
+            )
         await self._require_presearch_ready_for_confirmation(brief)
+        if str(brief.payload.get("subject_structure_state") or "") != "confirmed":
+            raise ContentResearchValidationError(
+                "Cannot confirm an unconfirmed subject structure"
+            )
         record_boundary = getattr(
             self._workflow_runtime, "record_step_execution_started", None
         )
@@ -759,6 +962,10 @@ class ContentResearchService:
             directions=directions,
             workspace_id=str(brief.payload.get("workspace_id") or ""),
             user_id=str(brief.payload.get("user_id") or ""),
+            subject_structure=dict(brief.payload.get("subject_structure") or {}),
+            subject_structure_hash=str(
+                brief.payload.get("subject_structure_hash") or ""
+            ),
         )
         plan_payload = self._plan_builder.build(
             brief=brief,
@@ -829,6 +1036,10 @@ class ContentResearchService:
             provider_capabilities=_freeze_adapter_capabilities(self._source_registry),
             confirmed_subject=confirmation.confirmed_subject,
             custom_research_question=confirmation.custom_research_question,
+            subject_structure=dict(brief.payload.get("subject_structure") or {}),
+            subject_structure_hash=str(
+                brief.payload.get("subject_structure_hash") or ""
+            ),
             query_groups_by_direction={
                 direction_id: tuple(
                     {
@@ -866,6 +1077,9 @@ class ContentResearchService:
                         "source_scope": direction.source_scope,
                         "expected_evidence_types": direction.expected_evidence_types,
                         "coverage_target": "p0_minimal",
+                        "subject_structure_hash": brief.payload.get(
+                            "subject_structure_hash"
+                        ),
                     },
                 )
             )
@@ -1725,6 +1939,20 @@ class ContentResearchService:
             response = await self.retry_presearch(workflow_run_id)
             return self._action_response(workflow_run_id=workflow_run_id, action=action,
                 status=response.status, result=response.model_dump(mode="json"), local_cache_id=response.brief_id)
+
+        if action == "clarify_subject":
+            clarification = ContentResearchSubjectClarificationRequest(**request.payload)
+            response = await self.clarify_subject(
+                workflow_run_id=workflow_run_id,
+                clarification_text=clarification.clarification_text,
+            )
+            return self._action_response(
+                workflow_run_id=workflow_run_id,
+                action=action,
+                status=response.status,
+                result=response.model_dump(mode="json"),
+                local_cache_id=response.brief_id,
+            )
 
         if action == "end_content_research":
             result = await self._workflow_runtime.end_content_research_run(
@@ -2617,8 +2845,41 @@ class ContentResearchService:
                     request.workflow_run_id,
                     reason=reason,
                 )
+        elif outcome.status == "subject_needs_confirmation":
+            self._store.save_brief(updated)
+            self._save_subject_structure_checkpoint(
+                brief=updated,
+                outcome=outcome,
+                input_fingerprint=canonical_fingerprint(
+                    {
+                        "seed_text": request.seed_text,
+                        "user_note": request.user_note or "",
+                        "attempt_id": attempt_id,
+                        "hard_cutoff": True,
+                    }
+                ),
+            )
+            await self._workflow_runtime.wait_for_subject_clarification(
+                request.workflow_run_id,
+                reason={
+                    "code": "subject_clarification_required",
+                    "message": outcome.checklist.subject_confirmation,
+                },
+            )
         else:
             self._store.save_brief(updated)
+            self._save_subject_structure_checkpoint(
+                brief=updated,
+                outcome=outcome,
+                input_fingerprint=canonical_fingerprint(
+                    {
+                        "seed_text": request.seed_text,
+                        "user_note": request.user_note or "",
+                        "attempt_id": attempt_id,
+                        "hard_cutoff": True,
+                    }
+                ),
+            )
             await self._workflow_runtime.mark_presearch_ready(request.workflow_run_id)
         self._append_presearch_outcome_event(
             trace_id=trace_id,
@@ -2713,6 +2974,41 @@ class ContentResearchService:
         )
         return self._store.save_brief(brief)
 
+    def _save_subject_structure_checkpoint(
+        self,
+        *,
+        brief: ResearchBriefRecord,
+        outcome: PresearchOutcome,
+        input_fingerprint: str,
+    ) -> None:
+        checklist = outcome.checklist
+        if checklist.subject_structure_hash is None:
+            return
+        task_id = f"presearch:{brief.payload['attempt_id']}"
+        checkpoint_id = f"scp_{canonical_fingerprint({'run': brief.workflow_run_id, 'task': task_id, 'stage': 'subject_structure', 'input': input_fingerprint})[:24]}"
+        now = utcnow()
+        self._store.save_stage_checkpoint(
+            StageCheckpointRecord(
+                id=checkpoint_id,
+                schema_version="content_research_stage_checkpoint_v1",
+                payload={
+                    "schema_version": "content_research_subject_structure_checkpoint_v1",
+                    "structure_hash": checklist.subject_structure_hash,
+                    "state": checklist.subject_structure_state,
+                    "reason_codes": list(checklist.subject_structure_reason_codes),
+                    "provider": outcome.provider,
+                    "model": outcome.model,
+                },
+                workflow_run_id=brief.workflow_run_id,
+                subagent_task_id=task_id,
+                stage_name="subject_structure",
+                input_fingerprint=input_fingerprint,
+                status="completed",
+                started_at=now,
+                finished_at=now,
+            )
+        )
+
     def _append_presearch_outcome_event(
         self,
         *,
@@ -2779,6 +3075,8 @@ class ContentResearchService:
     @staticmethod
     def _outcome_payload(outcome: PresearchOutcome) -> dict:
         checklist = outcome.checklist
+        from app.content_research.subject_structure import subject_structure_payload
+
         return {
             "status": outcome.status,
             "subject_confirmation": checklist.subject_confirmation,
@@ -2795,6 +3093,16 @@ class ContentResearchService:
             "provider": outcome.provider,
             "model": outcome.model,
             "configuration_source": outcome.configuration_source,
+            "subject_structure": (
+                subject_structure_payload(checklist.subject_structure)
+                if checklist.subject_structure is not None
+                else {}
+            ),
+            "subject_structure_hash": checklist.subject_structure_hash,
+            "subject_structure_state": checklist.subject_structure_state,
+            "subject_structure_reason_codes": list(
+                checklist.subject_structure_reason_codes
+            ),
         }
 
     @staticmethod
@@ -2834,6 +3142,14 @@ class ContentResearchService:
             error_code=payload.get("error_code"), error_message=payload.get("error_message"),
             recoverable=bool(payload.get("recoverable")),
             configuration_source=payload.get("configuration_source"), model=payload.get("model"),
+            subject_structure=dict(payload.get("subject_structure") or {}),
+            subject_structure_hash=payload.get("subject_structure_hash"),
+            subject_structure_state=str(
+                payload.get("subject_structure_state") or "needs_confirmation"
+            ),
+            subject_structure_reason_codes=list(
+                payload.get("subject_structure_reason_codes") or []
+            ),
             local_cache_id=brief.id,
         )
 

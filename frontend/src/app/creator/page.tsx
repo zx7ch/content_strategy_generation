@@ -23,6 +23,7 @@ import {
 import { useBrandContext } from "@/components/providers/BrandProvider";
 import {
   startContentResearchFormalResearch,
+  clarifyContentResearchSubject,
   confirmContentResearchBrief,
   createContentResearchPresearch,
   endContentResearchWorkflow,
@@ -678,8 +679,11 @@ function ContentResearchIntentCard({
   onConfirmed: (summary: ContentResearchWorkflowSummary) => void;
   onError: (message: string) => void;
 }) {
-  const [subjectInput, setSubjectInput] = useState(intent.seed);
-  const subject = subjectInput.trim() || "本轮调研";
+  const structure = intent.presearch.subject_structure ?? {};
+  const subject = structure.canonical_subject?.trim() || intent.seed || "本轮调研";
+  const coreObject = structure.core_entities?.[0]?.canonical_name?.trim() || subject;
+  const intents = (structure.research_intents ?? []).filter(Boolean).join("、") || "待确认";
+  const contexts = (structure.context_modifiers ?? []).filter(Boolean).join("、") || "无特定场景";
   const presearchConclusion = intent.presearch.subject_confirmation.trim();
   const initialCompetitors = intent.presearch.competitor_tags.length ? intent.presearch.competitor_tags : ["待补充竞品"];
   const visibleDirections = LITE_DIRECTION_CATALOG
@@ -708,6 +712,7 @@ function ContentResearchIntentCard({
     try {
       const summary = await confirmContentResearchBrief(intent.presearch.workflow_run_id, {
         confirmed_subject: subject,
+        subject_structure_hash: intent.presearch.subject_structure_hash ?? "",
         subject_type: "category",
         selected_competitors: selectedCompetitors,
         custom_competitors: splitInlineList(extraCompetitors),
@@ -733,6 +738,21 @@ function ContentResearchIntentCard({
     );
   }
 
+  if (intent.presearch.status === "subject_needs_confirmation") {
+    return (
+      <div className="flex justify-start">
+        <div className="w-full max-w-[92%] rounded-2xl border border-amber-200 bg-amber-50 px-5 py-4 text-sm text-amber-950 shadow-sm">
+          <p className="text-base font-semibold">还需要你确认调研主体</p>
+          <p className="mt-2 leading-6">{intent.presearch.subject_confirmation}</p>
+          <p className="mt-3 rounded-xl bg-white/70 px-3 py-2 text-xs leading-5 text-slate-700">
+            核心对象：{coreObject}｜意图：{intents}｜场景：{contexts}
+          </p>
+          <p className="mt-3 text-xs text-amber-800">请直接在底部对话框补充说明；系统会在本次任务内重新确认，不会启动 Spider。</p>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="flex justify-start">
       <div className="w-full max-w-[92%] space-y-4">
@@ -752,13 +772,16 @@ function ContentResearchIntentCard({
         </div>
 
         <div className="rounded-2xl border border-line bg-white px-5 py-4 shadow-sm">
+          <p className="mb-3 rounded-xl bg-[#f4f7f5] px-3 py-2 text-xs leading-5 text-slate-600">
+            核心对象：{coreObject}｜意图：{intents}｜场景：{contexts}
+          </p>
           <p className="text-lg font-semibold leading-7 text-ink">
             我们识别到你要调研的是「{subject}」。是否准确？
           </p>
           {presearchConclusion && (
             <p className="mt-2 text-sm leading-6 text-quiet">预检索判断：{presearchConclusion}</p>
           )}
-          <p className="mt-2 text-sm text-slate-400">若不准确，可直接修改下方的调研主体。</p>
+          <p className="mt-2 text-sm text-slate-400">若不准确，请直接在底部对话框补充说明。</p>
           <div className="mt-4 flex flex-wrap gap-2">
             {[
               ["yes", "准确，继续"],
@@ -778,17 +801,6 @@ function ContentResearchIntentCard({
               </button>
             ))}
           </div>
-          {subjectConfirmed && subjectConfirmed !== "yes" && (
-            <label className="mt-4 block text-sm text-quiet">
-              调研主体
-              <input
-                value={subjectInput}
-                onChange={(event) => setSubjectInput(event.target.value)}
-                className="mt-2 h-11 w-full rounded-xl border border-line bg-white px-4 text-sm text-ink outline-none focus:border-[#789180]"
-                aria-label="调研主体"
-              />
-            </label>
-          )}
         </div>
 
         <div className="rounded-2xl border border-line bg-white px-5 py-4 shadow-sm">
@@ -2332,6 +2344,37 @@ export default function CreatorPage() {
       return;
     }
 
+    if (
+      contentResearchIntent
+      && !contentResearchRun
+      && ["subject_needs_confirmation", "completed"].includes(
+        contentResearchIntent.presearch.status,
+      )
+    ) {
+      try {
+        const clarified = await clarifyContentResearchSubject(
+          contentResearchIntent.presearch.workflow_run_id,
+          text,
+        );
+        setContentResearchIntent((current) => current
+          ? { ...current, presearch: clarified.result }
+          : current
+        );
+        appendMessage({
+          role: "assistant",
+          text: clarified.result.status === "subject_needs_confirmation"
+            ? clarified.result.subject_confirmation
+            : `已更新主题结构：${clarified.result.subject_confirmation}`,
+        });
+      } catch {
+        appendMessage({ role: "system", text: "主题补充处理失败，请检查模型配置后重试。" });
+      } finally {
+        setIsLoading(false);
+        inputRef.current?.focus();
+      }
+      return;
+    }
+
     if (contentResearchMode) {
       try {
         appendMessage({
@@ -2860,6 +2903,12 @@ export default function CreatorPage() {
               placeholder={
                 contentResearchMode
                   ? "输入品类、品牌或 SKU，发送后开始内容调研"
+                  : contentResearchIntent
+                      && !contentResearchRun
+                      && ["subject_needs_confirmation", "completed"].includes(
+                        contentResearchIntent.presearch.status,
+                      )
+                    ? "补充你要调研的具体对象……"
                   : isTaskRunning
                     ? "任务进行中，可继续补充要求..."
                     : "发消息..."

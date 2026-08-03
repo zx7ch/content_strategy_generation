@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 STAGE_SEQUENCE = (
-    "collect", "selection", "detail", "packet", "facts", "admission", "reconcile", "aggregate", "compose", "faithfulness",
+    "subject_structure", "collect", "selection", "detail", "packet", "facts", "admission", "reconcile", "aggregate", "compose", "faithfulness",
 )
 
 

@@ -600,6 +600,66 @@ class WorkflowRunManager:
 
         return await self._transaction(op)
 
+    async def wait_for_user_input(
+        self,
+        run_id: str,
+        *,
+        step_name: str,
+        reason: str | dict[str, Any],
+    ) -> WorkflowRun:
+        """Pause for ordinary user clarification without consuming retry budget."""
+
+        async def op() -> WorkflowRun:
+            assert self._conn is not None
+            run = await self._fetch_run_row(run_id)
+            if run["status"] != WorkflowRunStatus.RUNNING.value:
+                raise WorkflowTransitionError(
+                    f"wait_for_user_input requires running run, got {run['status']}"
+                )
+            step = await self._fetch_step_row(run_id, step_name)
+            if step["status"] != WorkflowStepStatus.RUNNING.value:
+                raise WorkflowTransitionError(
+                    f"wait_for_user_input not allowed from {step['status']}"
+                )
+            code, message = self._normalize_error(reason)
+            waiting_at = _utc_timestamp()
+            timing = _stop_timing_execution(_timing_from_row(step), waiting_at)
+            _open_interval(timing, "waiting_spans", waiting_at)
+            timing["waiting_started_at"] = waiting_at
+            await self._conn.execute(
+                """
+                UPDATE workflow_steps
+                SET status='retrying', next_retry_at=NULL, active_job_id=NULL,
+                    error_code=?, error_message=?, timing_json=?, updated_at=CURRENT_TIMESTAMP
+                WHERE step_id=?
+                """,
+                (code, message, _timing_json(timing), step["step_id"]),
+            )
+            await self._conn.execute(
+                """
+                UPDATE workflow_runs
+                SET status='waiting_user', active_job_id=NULL, updated_at=CURRENT_TIMESTAMP
+                WHERE run_id=?
+                """,
+                (run_id,),
+            )
+            await self._append_event(
+                run_id=run_id,
+                thread_id=run["thread_id"],
+                step_id=step["step_id"],
+                event_type="run_waiting_user_input",
+                payload={
+                    "step_name": step_name,
+                    "reason_code": code,
+                    "reason_message": message,
+                    "recovery_required": False,
+                    "user_input_required": True,
+                },
+            )
+            return self._run(await self._fetch_run_row(run_id))
+
+        return await self._transaction(op)
+
     async def cancel_run(self, run_id: str, reason: str = "user_cancelled") -> WorkflowRun:
         async def op() -> WorkflowRun:
             assert self._conn is not None

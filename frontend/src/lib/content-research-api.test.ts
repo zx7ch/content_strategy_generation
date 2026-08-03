@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   ContentResearchApiError,
+  clarifyContentResearchSubject,
   startContentResearchFormalResearch,
   confirmContentResearchBrief,
   createContentResearchPresearch,
@@ -131,6 +132,44 @@ test("retry presearch returns the same persisted identifiers", async () => {
   assert.match(requestBody, /"action":"retry_presearch"/);
   assert.equal(result.attempt_id, "att_1");
   assert.equal(result.brief_id, "rb_1");
+});
+
+test("subject clarification stays on the same workflow run", async () => {
+  let requestBody = "";
+  globalThis.fetch = (async (_input, init) => {
+    requestBody = String(init?.body ?? "");
+    return jsonResponse({
+      schema_version: "content_research_workflow_action_response_v1",
+      workflow_run_id: "run_1",
+      action: "clarify_subject",
+      status: "completed",
+      result: {
+        attempt_id: "att_1",
+        workflow_run_id: "run_1",
+        brief_id: "rb_1",
+        status: "completed",
+        subject_confirmation: "Apple 品牌",
+        competitor_tags: [],
+        research_directions: [],
+        direction_catalog: [],
+        custom_research_question: "",
+        timeout_status: "none",
+        fallback_used: false,
+        subject_structure: { canonical_subject: "Apple 品牌" },
+        subject_structure_state: "confirmed",
+        subject_structure_reason_codes: [],
+      },
+    });
+  }) as typeof fetch;
+
+  const response = await clarifyContentResearchSubject(
+    "run_1",
+    "这里指 Apple 品牌",
+  );
+
+  assert.match(requestBody, /"action":"clarify_subject"/);
+  assert.match(requestBody, /"clarification_text":"这里指 Apple 品牌"/);
+  assert.equal(response.result.workflow_run_id, "run_1");
 });
 
 test("confirmContentResearchBrief posts selected directions", async () => {

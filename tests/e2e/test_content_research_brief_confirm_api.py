@@ -61,6 +61,22 @@ class FakeLLM:
                     "research_directions": ["产品营销", "用户评论痛点"],
                     "custom_research_question": "",
                     "custom_competitor_input": "",
+                    "subject_structure": {
+                        "schema_version": "content_research_subject_structure_v1",
+                        "canonical_subject": "徒步短裤",
+                        "subject_type": "category",
+                        "core_entities": [
+                            {
+                                "canonical_name": "徒步短裤",
+                                "raw_mentions": ["徒步短裤"],
+                            }
+                        ],
+                        "research_intents": ["产品营销"],
+                        "context_modifiers": [],
+                        "synonym_groups": {"徒步短裤": ["户外短裤"]},
+                        "ambiguities": [],
+                        "resolution_state": "resolved",
+                    },
                 },
                 ensure_ascii=False,
             ),
@@ -121,6 +137,7 @@ async def test_confirm_brief_creates_plan_directions_tasks_and_workflow_summary(
         f"/content-research/briefs/{presearch['brief_id']}/confirm",
         json={
             "confirmed_subject": "徒步短裤",
+            "subject_structure_hash": presearch["subject_structure_hash"],
             "subject_type": "category",
             "selected_competitors": ["迪卡侬"],
             "custom_competitors": ["凯乐石"],
@@ -134,6 +151,7 @@ async def test_confirm_brief_creates_plan_directions_tasks_and_workflow_summary(
     assert payload["workflow_run_id"] == presearch["workflow_run_id"]
     assert payload["brief"]["status"] == "ready"
     assert payload["brief"]["payload"]["confirmed_subject"] == "徒步短裤"
+    assert payload["brief"]["payload"]["subject_structure_hash"] == presearch["subject_structure_hash"]
     assert payload["brief"]["payload"]["selected_competitors"] == ["迪卡侬"]
     assert payload["brief"]["payload"]["custom_competitors"] == ["凯乐石"]
     assert payload["brief"]["payload"]["direction_catalog"] == [
@@ -158,6 +176,12 @@ async def test_confirm_brief_creates_plan_directions_tasks_and_workflow_summary(
         )
         for item in payload["subagent_tasks"]
     } == {("ws-1", "user-1", presearch["workflow_run_id"])}
+    assert all(
+        item["payload"]["input_payload"]["subject_structure_hash"]
+        == presearch["subject_structure_hash"]
+        for item in payload["subagent_tasks"]
+    )
+    assert payload["plan"]["payload"]["subject_structure_hash"] == presearch["subject_structure_hash"]
 
     fetched = await client.get(f"/content-research/workflows/{presearch['workflow_run_id']}")
     assert fetched.status_code == 200
@@ -173,6 +197,7 @@ async def test_confirm_brief_creates_plan_directions_tasks_and_workflow_summary(
         "competitor_discovery",
     ]
     assert snapshot_payload["effective_policy"]["report_compose_mode"] == "template_only"
+    assert snapshot_payload["effective_policy"]["subject_structure_hash"] == presearch["subject_structure_hash"]
     assert len(snapshot_payload["direction_contracts"]) == 2
     assert len(snapshot_payload["sample_policies"]) == 2
     assert snapshot_payload["validation_result"]["schema_version"] == "content_research_admission_capability_preflight_v1"

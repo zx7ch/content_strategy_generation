@@ -7,10 +7,14 @@ import json
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from app.services.llm.types import LLMCallContext, LLMRequest, LLMResponse
-from app.services.llm.failures import LLMProviderFailure, classify_provider_exception
-
 from app.content_research.presearch.prompts import build_presearch_messages
+from app.content_research.subject_structure import (
+    SubjectStructure,
+    parse_subject_structure,
+    subject_structure_fingerprint,
+)
+from app.services.llm.failures import LLMProviderFailure, classify_provider_exception
+from app.services.llm.types import LLMCallContext, LLMRequest, LLMResponse
 
 
 class PresearchLLM(Protocol):
@@ -34,6 +38,10 @@ class PresearchChecklist:
     research_directions: list[str]
     custom_research_question: str = ""
     custom_competitor_input: str = ""
+    subject_structure: SubjectStructure | None = None
+    subject_structure_state: str = "needs_confirmation"
+    subject_structure_reason_codes: tuple[str, ...] = ()
+    subject_structure_hash: str | None = None
 
 
 @dataclass(frozen=True)
@@ -139,7 +147,9 @@ class PresearchService:
                 )
             ), timeout=self.hard_cutoff_seconds)
             try:
-                checklist = self._parse_checklist(response.content)
+                checklist = self._parse_checklist(
+                    response.content, request.seed_text, request.user_note
+                )
             except (TypeError, ValueError, json.JSONDecodeError):
                 # A transport-successful but malformed structured response gets
                 # one bounded retry before asking the user for configuration.
@@ -154,10 +164,14 @@ class PresearchService:
                     )
                 ), timeout=self.hard_cutoff_seconds)
                 try:
-                    checklist = self._parse_checklist(retry_response.content)
+                    checklist = self._parse_checklist(
+                        retry_response.content, request.seed_text, request.user_note
+                    )
                     response = retry_response
                 except (TypeError, ValueError, json.JSONDecodeError):
-                    from app.content_research.presearch.fallback_templates import build_fallback_checklist
+                    from app.content_research.presearch.fallback_templates import (
+                        build_fallback_checklist,
+                    )
                     return PresearchOutcome(
                         status="waiting_model_config",
                         checklist=build_fallback_checklist(request.seed_text, request.user_note),
@@ -167,7 +181,12 @@ class PresearchService:
                         model=retry_response.model,
                         configuration_source=retry_response.configuration_source,
                     )
-            return PresearchOutcome(status="completed", checklist=checklist, fallback_used=False,
+            status = (
+                "completed"
+                if checklist.subject_structure_state == "confirmed"
+                else "subject_needs_confirmation"
+            )
+            return PresearchOutcome(status=status, checklist=checklist, fallback_used=False,
                 provider=response.provider, model=response.model,
                 configuration_source=response.configuration_source)
         except asyncio.TimeoutError:
@@ -197,19 +216,38 @@ class PresearchService:
                 configuration_source=failure.configuration_source,
             )
 
-    def _parse_checklist(self, content: str) -> PresearchChecklist:
+    def _parse_checklist(
+        self, content: str, seed_text: str, user_note: str | None
+    ) -> PresearchChecklist:
         data = json.loads(content)
         if not isinstance(data, dict):
             raise ValueError("presearch response must be a JSON object")
         subject = str(data.get("subject_confirmation") or "").strip()
         if not subject:
             raise ValueError("presearch response missing subject_confirmation")
+        structure_data = data.get("subject_structure")
+        if not isinstance(structure_data, dict):
+            raise ValueError("presearch response missing subject_structure")
+        grounding_input = " ".join(
+            item for item in (seed_text.strip(), (user_note or "").strip()) if item
+        )
+        structure_decision = parse_subject_structure(
+            structure_data,
+            normalized_input=grounding_input,
+        )
+        structure = structure_decision.structure
         return PresearchChecklist(
             subject_confirmation=subject,
             competitor_tags=self._string_list(data.get("competitor_tags")),
             research_directions=self._string_list(data.get("research_directions")),
             custom_research_question=str(data.get("custom_research_question") or ""),
             custom_competitor_input=str(data.get("custom_competitor_input") or ""),
+            subject_structure=structure,
+            subject_structure_state=structure_decision.state,
+            subject_structure_reason_codes=structure_decision.reason_codes,
+            subject_structure_hash=(
+                subject_structure_fingerprint(structure) if structure else None
+            ),
         )
 
     @staticmethod

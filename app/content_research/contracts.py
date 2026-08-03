@@ -420,6 +420,8 @@ def build_default_snapshot(
     ]
     | None = None,
     custom_research_question: str = "",
+    subject_structure: Mapping[str, Any] | None = None,
+    subject_structure_hash: str | None = None,
 ) -> tuple[RunPolicySnapshot, list[SamplePolicy], list[DirectionContract]]:
     from app.content_research.admission.governance_keys import GOVERNANCE_POLICY_V1
     from app.content_research.workflow.direction_registry import ResearchDirectionRegistry
@@ -512,6 +514,13 @@ def build_default_snapshot(
         policy["query_relevance"] = relevance_by_direction
     if locked_query_plan is not None:
         policy["locked_query_plan"] = locked_query_plan
+    if subject_structure is not None or subject_structure_hash is not None:
+        if not subject_structure or not subject_structure_hash:
+            raise ValueError(
+                "subject_structure and subject_structure_hash must be frozen together"
+            )
+        policy["subject_structure"] = dict(subject_structure)
+        policy["subject_structure_hash"] = subject_structure_hash
     if direction_catalog is not None:
         policy |= {
             "direction_catalog_version": DIRECTION_CATALOG_VERSION,

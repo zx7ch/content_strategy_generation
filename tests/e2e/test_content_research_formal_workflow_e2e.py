@@ -26,14 +26,27 @@ LITE_DIRECTIONS = [
 
 
 class FakeLLM:
-    async def generate(self, _request):
+    async def generate(self, request):
+        user_prompt = request.messages[-1].content
+        subject = "慢速调研" if "慢速调研" in user_prompt else "徒步短裤"
         return LLMResponse(
             content=json.dumps({
-                "subject_confirmation": "徒步短裤",
+                "subject_confirmation": subject,
                 "competitor_tags": ["迪卡侬"],
                 "research_directions": LITE_DIRECTIONS,
                 "custom_research_question": "请给出下一步建议",
                 "custom_competitor_input": "",
+                "subject_structure": {
+                    "schema_version": "content_research_subject_structure_v1",
+                    "canonical_subject": subject,
+                    "subject_type": "category",
+                    "core_entities": [{"canonical_name": subject, "raw_mentions": [subject]}],
+                    "research_intents": ["产品营销"],
+                    "context_modifiers": [],
+                    "synonym_groups": {subject: ["户外短裤"]},
+                    "ambiguities": [],
+                    "resolution_state": "resolved",
+                },
             }, ensure_ascii=False),
             provider="fake", model="fake", usage=TokenUsage(total_tokens=1), latency_ms=1,
         )

@@ -18,6 +18,7 @@ def test_p0_workflow_action_contract_lists_supported_actions():
         "resume_formal_research",
         "end_content_research",
         "retry_presearch",
+        "clarify_subject",
     )
 
     request = ContentResearchWorkflowActionRequest(action="confirm_brief")

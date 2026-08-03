@@ -44,6 +44,16 @@ export interface ContentResearchPresearchResponse {
   recoverable?: boolean;
   configuration_source?: string | null;
   model?: string | null;
+  subject_structure: {
+    canonical_subject?: string;
+    core_entities?: Array<{ canonical_name?: string; raw_mentions?: string[] }>;
+    research_intents?: string[];
+    context_modifiers?: string[];
+    [key: string]: unknown;
+  };
+  subject_structure_hash?: string | null;
+  subject_structure_state: string;
+  subject_structure_reason_codes: string[];
 }
 
 export interface LLMConfigurationInput { base_url: string; model: string; api_key?: string | null; }
@@ -51,6 +61,7 @@ export interface LLMConfiguration { source: string; status: string; base_url: st
 
 export interface ContentResearchBriefConfirmRequest {
   confirmed_subject: string;
+  subject_structure_hash?: string | null;
   subject_type: string;
   selected_competitors: string[];
   custom_competitors: string[];
@@ -172,7 +183,7 @@ export interface ContentResearchFormalResearchResponse {
 
 export interface ContentResearchWorkflowActionRequest {
   schema_version?: string;
-  action: "confirm_brief" | "start_formal_research" | "retry_formal_research" | "resume_formal_research" | "end_content_research" | "retry_presearch";
+  action: "confirm_brief" | "start_formal_research" | "retry_formal_research" | "resume_formal_research" | "end_content_research" | "retry_presearch" | "clarify_subject";
   payload?: JsonObject;
 }
 
@@ -413,6 +424,16 @@ export async function endContentResearchWorkflow(workflowRunId: string): Promise
   return runContentResearchWorkflowAction(workflowRunId, {
     action: "end_content_research",
     payload: {},
+  });
+}
+
+export async function clarifyContentResearchSubject(
+  workflowRunId: string,
+  clarificationText: string
+): Promise<ContentResearchWorkflowActionResponse<ContentResearchPresearchResponse>> {
+  return runContentResearchWorkflowAction(workflowRunId, {
+    action: "clarify_subject",
+    payload: { clarification_text: clarificationText },
   });
 }
 
