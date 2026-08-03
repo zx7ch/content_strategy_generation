@@ -1322,6 +1322,7 @@ function ContentResearchTraceInspector({
   const displayTimeline = [...timeline].reverse();
   const recovery = contentResearchRecoveryState(run);
   const childTasks = recordList(run.trace?.runtime_child_tasks);
+  const logicalCheckpoints = recordList(run.trace?.logical_checkpoints);
   const terminalPublished = run.report ? litePublicationState(run.report) !== null : false;
   const [expandedStepId, setExpandedStepId] = useState<string | null>(null);
   const refreshTraceRef = useRef(onRefresh);
@@ -1489,6 +1490,42 @@ function ContentResearchTraceInspector({
               <p className="mt-2 text-xs leading-5 text-ink">完成扫码认证后可继续同一轮调研。</p>
               {authenticationControls}
             </article>
+          )}
+
+          {logicalCheckpoints.length > 0 && (
+            <section className="mb-4" aria-label="结构化调研决策">
+              <p className="mb-2 text-xs font-semibold text-quiet">结构与覆盖决策</p>
+              <div className="space-y-2">
+                {logicalCheckpoints.map((checkpoint, index) => {
+                  const stage = stringField(checkpoint, "stage");
+                  const counts = checkpoint.counts && typeof checkpoint.counts === "object" && !Array.isArray(checkpoint.counts)
+                    ? checkpoint.counts as Record<string, unknown>
+                    : {};
+                  const title = stage === "subject_structure"
+                    ? "主题结构已确认"
+                    : stage === "query_plan"
+                      ? "检索计划已冻结"
+                      : stage === "coverage_decision"
+                        ? "证据覆盖判定"
+                        : stage === "fallback_decision"
+                          ? "补位检索判定"
+                          : "历史相关性修订";
+                  const detail = stage === "query_plan"
+                    ? `主检索 ${numberField(checkpoint, "primary_group_count")} 组 · 补位 ${numberField(checkpoint, "fallback_group_count")} 组 · 合并 ${numberField(checkpoint, "merged_group_count")} 组`
+                    : stage === "coverage_decision"
+                      ? `发现 ${numberField(counts, "discovered")} · 去重 ${numberField(counts, "deduplicated")} · 相关 ${numberField(counts, "relevant")} · 准入 ${numberField(counts, "admitted")}`
+                      : stage === "fallback_decision"
+                        ? `Q3：${stringField(checkpoint, "state", "未启用")}`
+                        : `状态：${stringField(checkpoint, "state", stringField(checkpoint, "status"))}`;
+                  return (
+                    <article key={`${stage}-${index}`} className="rounded-xl border border-line bg-white px-3 py-2.5 text-xs">
+                      <div className="flex items-center justify-between gap-3"><p className="font-medium text-ink">{title}</p><span className="text-quiet">{stringField(checkpoint, "status")}</span></div>
+                      <p className="mt-1 leading-5 text-quiet">{detail}</p>
+                    </article>
+                  );
+                })}
+              </div>
+            </section>
           )}
 
           <section aria-label="Content Research Trace timeline">

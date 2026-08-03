@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import timedelta
 
 import pytest
 
@@ -9,6 +10,7 @@ from app.content_research.models import ResearchBriefRecord
 from app.content_research.observation.trace_service import (
     _duration_ms,
     _llm_recovery_projection,
+    _logical_checkpoint_projection,
     _project_timing,
 )
 from app.content_research.persistence_models import StageCheckpointRecord
@@ -100,6 +102,66 @@ def test_llm_recovery_exposes_only_the_durable_failure_boundary():
     assert "secret" not in str(recovery)
 
 
+def test_logical_checkpoint_projection_is_safe_and_newest_first(store):
+    from app.content_research.models import utcnow
+
+    now = utcnow()
+    store.save_stage_checkpoint(
+        StageCheckpointRecord(
+            id="scp-plan-safe",
+            schema_version="content_research_stage_checkpoint_v1",
+            payload={
+                "query_plan_hash": "a" * 64,
+                "primary_group_count": 2,
+                "fallback_group_count": 1,
+                "complete_query": "徒步短裤 API_KEY=secret",
+                "raw_subject": "private subject",
+            },
+            workflow_run_id="run-safe",
+            subagent_task_id="sat-safe",
+            stage_name="query_plan",
+            input_fingerprint="plan-fingerprint",
+            status="completed",
+            started_at=now,
+            finished_at=now,
+        )
+    )
+    store.save_stage_checkpoint(
+        StageCheckpointRecord(
+            id="scp-coverage-safe",
+            schema_version="content_research_stage_checkpoint_v1",
+            payload={
+                "satisfied": False,
+                "reason_codes": ["minimum_relevant_samples_unmet"],
+                "counts": {"discovered": 30, "admitted": 0},
+                "note_id": "secret-note-id",
+            },
+            workflow_run_id="run-safe",
+            subagent_task_id="sat-safe",
+            stage_name="coverage_decision",
+            input_fingerprint="coverage-fingerprint",
+            status="completed",
+            started_at=now,
+            finished_at=now,
+            created_at=now + timedelta(seconds=1),
+        )
+    )
+
+    projection = _logical_checkpoint_projection(store, "run-safe")
+
+    assert [item["stage"] for item in projection] == [
+        "coverage_decision",
+        "query_plan",
+    ]
+    assert projection[1]["query_plan_hash_short"] == "a" * 12
+    assert projection[0]["counts"] == {"discovered": 30, "admitted": 0}
+    serialized = json.dumps(projection, ensure_ascii=False)
+    assert "complete_query" not in serialized
+    assert "private subject" not in serialized
+    assert "secret-note-id" not in serialized
+    assert "API_KEY" not in serialized
+
+
 def test_final_timeout_recovery_keeps_a_safe_reload_boundary():
     brief = ResearchBriefRecord(
         id="brief_timeout",
@@ -149,7 +211,9 @@ def store(db_path):
 def service(db_path, store):
     return ContentResearchService(
         store=store,
-        presearch=PresearchService(FakeLLM(), first_feedback_timeout_seconds=0.05, hard_cutoff_seconds=0.1),
+        presearch=PresearchService(
+            FakeLLM(), first_feedback_timeout_seconds=0.05, hard_cutoff_seconds=0.1
+        ),
         workflow_runtime=WorkflowRunManagerRuntime(db_path),
     )
 

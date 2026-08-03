@@ -17,6 +17,7 @@ STAGE_SEQUENCE = (
     "detail",
     "coverage_decision",
     "fallback_decision",
+    "relevance_revision",
     "packet",
     "facts",
     "admission",

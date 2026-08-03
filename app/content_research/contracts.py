@@ -157,9 +157,12 @@ _DIRECTION_CONTRACT_SPECS: dict[str, dict[str, Any]] = {
     },
 }
 
-QUERY_RELEVANCE_SCHEMA_VERSION = "content_research_query_relevance_v1"
+QUERY_RELEVANCE_SCHEMA_VERSION = "content_research_query_relevance_v2"
 QUERY_RELEVANCE_MATCHING_MODE = "normalized_substring_any_anchor_v1"
-QUERY_RELEVANCE_ALGORITHM_VERSION = "query_relevance_v1"
+QUERY_RELEVANCE_ALGORITHM_VERSION = "query_relevance_v2"
+LEGACY_QUERY_RELEVANCE_VERSIONS = {
+    ("content_research_query_relevance_v1", "query_relevance_v1"),
+}
 QUERY_SUBJECT_NOT_SUPPORTED = "query_subject_not_supported"
 LOCKED_QUERY_PLAN_SCHEMA_VERSION = "content_research_locked_query_plan_v2"
 ADMISSION_ALGORITHM_VERSION = "claim_admission_v2"
@@ -187,8 +190,9 @@ def build_query_relevance_contract(
     direction_id: str,
     confirmed_subject: str,
     query_group_ids: tuple[str, ...],
+    subject_structure: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Build the immutable subject/category gate shared by policy and admission."""
+    """Build the immutable core-entity gate shared by policy and admission."""
     subject_anchor = normalize_relevance_text(confirmed_subject)
     if not subject_anchor:
         raise ValueError("query relevance requires a confirmed subject anchor")
@@ -197,23 +201,49 @@ def build_query_relevance_contract(
     )
     if not frozen_query_group_ids:
         raise ValueError("query relevance requires frozen query group ids")
-    category_anchors: list[str] = []
+    core_entity_anchors: list[str] = []
+    legacy_category_anchors: list[str] = []
     allowed_synonyms: dict[str, list[str]] = {}
-    for category, synonyms in _CATEGORY_SYNONYM_GROUPS:
-        normalized_category = normalize_relevance_text(category)
-        if normalized_category not in subject_anchor:
-            continue
-        category_anchors.append(normalized_category)
-        allowed_synonyms[normalized_category] = sorted(
-            {normalize_relevance_text(item) for item in synonyms}
-        )
-        break
+    if subject_structure:
+        for entity in subject_structure.get("core_entities") or ():
+            if not isinstance(entity, Mapping):
+                continue
+            anchor = normalize_relevance_text(str(entity.get("canonical_name") or ""))
+            if not anchor:
+                continue
+            core_entity_anchors.append(anchor)
+            aliases = (subject_structure.get("synonym_groups") or {}).get(
+                str(entity.get("canonical_name") or ""), ()
+            )
+            allowed_synonyms[anchor] = sorted(
+                {
+                    normalized
+                    for item in aliases
+                    if (normalized := normalize_relevance_text(str(item)))
+                }
+            )
+    else:
+        # Read compatibility for pre-structure runs. New runs never use this
+        # fixed legacy category bridge.
+        for category, synonyms in _CATEGORY_SYNONYM_GROUPS:
+            normalized_category = normalize_relevance_text(category)
+            if normalized_category not in subject_anchor:
+                continue
+            core_entity_anchors.append(normalized_category)
+            legacy_category_anchors.append(normalized_category)
+            allowed_synonyms[normalized_category] = sorted(
+                {normalize_relevance_text(item) for item in synonyms}
+            )
+            break
+    if not core_entity_anchors:
+        core_entity_anchors = [subject_anchor]
     quote_fields = CLAIM_QUOTE_FIELDS.get(direction_id, {})
     return {
         "schema_version": QUERY_RELEVANCE_SCHEMA_VERSION,
         "algorithm_version": QUERY_RELEVANCE_ALGORITHM_VERSION,
         "subject_anchors": sorted({subject_anchor}),
-        "category_anchors": sorted(set(category_anchors)),
+        "core_entity_anchors": sorted(set(core_entity_anchors)),
+        "category_anchors": sorted(set(legacy_category_anchors)),
         "allowed_synonyms": {key: allowed_synonyms[key] for key in sorted(allowed_synonyms)},
         "matching_mode": QUERY_RELEVANCE_MATCHING_MODE,
         "query_group_ids": list(frozen_query_group_ids),
@@ -478,8 +508,14 @@ class DirectionContract:
         if relevance is not None:
             if (
                 not isinstance(relevance, dict)
-                or relevance.get("schema_version") != QUERY_RELEVANCE_SCHEMA_VERSION
-                or relevance.get("algorithm_version") != QUERY_RELEVANCE_ALGORITHM_VERSION
+                or (
+                    relevance.get("schema_version"),
+                    relevance.get("algorithm_version"),
+                )
+                not in {
+                    (QUERY_RELEVANCE_SCHEMA_VERSION, QUERY_RELEVANCE_ALGORITHM_VERSION),
+                    *LEGACY_QUERY_RELEVANCE_VERSIONS,
+                }
                 or relevance.get("matching_mode") != QUERY_RELEVANCE_MATCHING_MODE
                 or relevance.get("reason_code") != QUERY_SUBJECT_NOT_SUPPORTED
                 or not relevance.get("subject_anchors")
@@ -596,6 +632,7 @@ def build_default_snapshot(
                 direction_id=direction_id,
                 confirmed_subject=confirmed_subject,
                 query_group_ids=tuple(query_group_ids_by_direction[direction_id]),
+                subject_structure=subject_structure,
             )
             for direction_id in requested_ids
         }

@@ -139,6 +139,7 @@ export interface ContentResearchTrace {
     retryable: boolean;
     recovery_action?: string | null;
   }>;
+  logical_checkpoints: JsonObject[];
   usage_steps: JsonObject[];
   usage_events: JsonObject[];
   llm_recovery?: {

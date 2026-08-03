@@ -167,6 +167,7 @@ class ContentResearchTraceResponse(BaseModel):
     usage_summary: dict = Field(default_factory=dict)
     external_api_summary: dict = Field(default_factory=dict)
     provider_operations: list[dict] = Field(default_factory=list)
+    logical_checkpoints: list[dict] = Field(default_factory=list)
     usage_steps: list[dict] = Field(default_factory=list)
     usage_events: list[dict] = Field(default_factory=list)
     llm_recovery: dict = Field(default_factory=dict)

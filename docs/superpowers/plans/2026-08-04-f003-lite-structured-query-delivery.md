@@ -173,7 +173,7 @@ Do not add shared cross-direction behavior. Preserve current single-direction au
 
 Run: `pytest -q tests/unit/test_content_research_directional_pipeline.py tests/integration/test_content_research_direction_pipeline_store.py`
 
-- [ ] **Step 7: Commit Task 3**
+- [x] **Step 7: Commit Task 3**
 
 ```bash
 git add app/content_research/persistence_models.py app/content_research/workflow/directional_pipeline.py app/content_research/contracts.py tests/unit/test_content_research_directional_pipeline.py tests/integration/test_content_research_direction_pipeline_store.py
@@ -202,31 +202,31 @@ git commit -m "feat(content-research): activate frozen Lite coverage fallback"
 - Adds safe `subject_structure`, `query_plan`, `coverage_decision`, `fallback_decision`, and `relevance_revision` checkpoint projections.
 - Guards `replay_downstream_from_persisted_packets(workflow_run_id)` with an append-only `query_relevance_v2` revision for eligible history.
 
-- [ ] **Step 1: Write failing Trace safety tests**
+- [x] **Step 1: Write failing Trace safety tests**
 
 Assert newest-first workflow ordering is unchanged; structure/plan short hashes, group counts, merged count, staged coverage counts, and fallback reasons are visible; Q3 does not increase error/retry counts; recursive projection excludes complete query, raw subject, note ID, Prompt, secrets, request headers, and raw provider payload. Legacy operations remain readable without fabricated new fields.
 
-- [ ] **Step 2: Write failing historical replay tests**
+- [x] **Step 2: Write failing historical replay tests**
 
 Seed a legacy snapshot, completed selection, persisted packets, and terminal specialist task. Assert replay appends `relevance_revision`, changes neither provider-operation nor packet ID sets, and republishes from admission onward. Reject mismatched subject/snapshot/query groups, missing packets/checkpoints, and unsupported revisions.
 
-- [ ] **Step 3: Run RED**
+- [x] **Step 3: Run RED**
 
 Run: `pytest -q tests/unit/test_content_research_trace_service.py tests/integration/test_content_research_packet_replay.py -k 'structure or query_plan or coverage or fallback or revision or safe'`
 
-- [ ] **Step 4: Implement safe logical checkpoint projection**
+- [x] **Step 4: Implement safe logical checkpoint projection**
 
 Allow `relevance_revision` in `StageCheckpointRecord`; `subject_structure`, `query_plan`, `coverage_decision`, and `fallback_decision` were introduced by Tasks 1–3. Project only stage/status/time, short hashes, roles/counts, direction ID, and stable reason codes. Keep existing specialist-scoped provider operation aggregation; do not add consumer/reuse counters.
 
-- [ ] **Step 5: Implement guarded historical revision and replay**
+- [x] **Step 5: Implement guarded historical revision and replay**
 
 Generate structure from the already confirmed legacy subject with no Spider capability, validate base snapshot and locked QueryGroup identities, append immutable `query_relevance_v2` revision, include its hash/version in admission fingerprints, and enforce identical operation/packet sets before and after publication.
 
-- [ ] **Step 6: Render minimal Trace details**
+- [x] **Step 6: Render minimal Trace details**
 
 In the existing expert/Pre-research cards show compact subject status, primary/fallback group counts, merged count, staged coverage, and Q3 state/reason. Keep current timeline order and stage numbers.
 
-- [ ] **Step 7: Run focused regression and build**
+- [x] **Step 7: Run focused regression and build**
 
 Run: `pytest -q tests/unit/test_content_research_subject_structure.py tests/unit/test_content_research_query_planner.py tests/unit/test_content_research_directional_pipeline.py tests/unit/test_content_research_trace_service.py tests/integration/test_content_research_direction_pipeline_store.py tests/integration/test_content_research_packet_replay.py tests/e2e/test_content_research_presearch_api.py tests/e2e/test_content_research_brief_confirm_api.py tests/e2e/test_content_research_creator_browser.py tests/e2e/test_content_research_formal_workflow_e2e.py`
 
@@ -236,7 +236,7 @@ Run: `.venv/bin/ruff check app/content_research tests/unit tests/integration tes
 
 Run: `git diff --check`
 
-- [ ] **Step 8: Record evidence and commit Task 4**
+- [x] **Step 8: Record evidence and commit Task 4**
 
 Record exact test counts, one new-run acceptance, one historical replay, unchanged operation/packet counts, and publication state in Task 5I. Do not claim cross-direction dedup or Gate 4B completion.
 

@@ -32,9 +32,7 @@ class ContentResearchTraceService:
     ) -> ContentResearchTraceResponse:
         traces = self._store.list_traces_for_workflow(workflow_run_id)
         observation_events = [
-            event
-            for trace in traces
-            for event in self._store.list_observation_events(trace.id)
+            event for trace in traces for event in self._store.list_observation_events(trace.id)
         ]
 
         # Trace is a query-only projection: opening it must not DDL/commit or
@@ -54,7 +52,11 @@ class ContentResearchTraceService:
             steps=[_json_dict(step) for step in runtime_steps],
             traces=traces,
         )
-        run_status = str(run.status.value if run and hasattr(run.status, "value") else run.status) if run else brief.status
+        run_status = (
+            str(run.status.value if run and hasattr(run.status, "value") else run.status)
+            if run
+            else brief.status
+        )
         duration_ms = _duration_ms(
             traces=traces,
             observation_events=observation_events,
@@ -68,8 +70,12 @@ class ContentResearchTraceService:
         # representation.  The records contain provider payloads and must
         # never cross the Lite Trace API boundary.
         provider_operations = _provider_operations(self._store, workflow_run_id)
-        observation_event_dicts = [_safe_observation_event_dict(event) for event in observation_events]
-        source_operation_events = [_source_operation_event_dict(event) for event in observation_events]
+        observation_event_dicts = [
+            _safe_observation_event_dict(event) for event in observation_events
+        ]
+        source_operation_events = [
+            _source_operation_event_dict(event) for event in observation_events
+        ]
         trace_as_of = datetime.now(timezone.utc)
 
         return ContentResearchTraceResponse(
@@ -84,11 +90,15 @@ class ContentResearchTraceService:
                 workflow_events=workflow_event_dicts,
                 usage_events=usage_events_dicts,
             ),
-            retry_count=_retry_count(workflow_events=workflow_event_dicts, usage_steps=usage_steps_dicts),
+            retry_count=_retry_count(
+                workflow_events=workflow_event_dicts, usage_steps=usage_steps_dicts
+            ),
             traces=[_safe_trace_dict(trace) for trace in traces],
             observation_events=observation_event_dicts,
             workflow_events=[_safe_workflow_event_dict(event) for event in workflow_event_dicts],
-            runtime_steps=[_safe_runtime_step_dict(step, as_of=trace_as_of) for step in runtime_steps],
+            runtime_steps=[
+                _safe_runtime_step_dict(step, as_of=trace_as_of) for step in runtime_steps
+            ],
             runtime_child_tasks=[
                 _safe_runtime_child_task_dict(task, as_of=trace_as_of)
                 for task in runtime_child_tasks
@@ -97,11 +107,15 @@ class ContentResearchTraceService:
             external_api_summary=_external_api_summary(
                 source_operation_events, provider_operations
             ),
-            provider_operations=[_safe_provider_operation_dict(item) for item in provider_operations],
+            provider_operations=[
+                _safe_provider_operation_dict(item) for item in provider_operations
+            ],
+            logical_checkpoints=_logical_checkpoint_projection(self._store, workflow_run_id),
             usage_steps=[],
             usage_events=[],
             llm_recovery=_llm_recovery_projection(
-                run_status=run_status, current_stage=current_stage,
+                run_status=run_status,
+                current_stage=current_stage,
                 runtime_steps=[_json_dict(step) for step in runtime_steps],
                 workflow_events=workflow_event_dicts,
                 brief=brief,
@@ -122,33 +136,37 @@ def _json_dict(value: Any) -> dict:
 
 
 def _safe_trace_dict(trace: TraceRecord) -> dict:
-    return _json_safe({
-        "id": trace.id,
-        "workflow_run_id": trace.workflow_run_id,
-        "thread_id": trace.thread_id,
-        "schema_version": trace.schema_version,
-        "status": trace.status,
-        "started_at": trace.started_at,
-        "created_at": trace.created_at,
-        "updated_at": trace.updated_at,
-    })
+    return _json_safe(
+        {
+            "id": trace.id,
+            "workflow_run_id": trace.workflow_run_id,
+            "thread_id": trace.thread_id,
+            "schema_version": trace.schema_version,
+            "status": trace.status,
+            "started_at": trace.started_at,
+            "created_at": trace.created_at,
+            "updated_at": trace.updated_at,
+        }
+    )
 
 
 def _safe_observation_event_dict(event: ObservationEventRecord) -> dict:
-    return _json_safe({
-        "id": event.id,
-        "trace_id": event.trace_id,
-        "workflow_run_id": event.workflow_run_id,
-        "thread_id": event.thread_id,
-        "schema_version": event.schema_version,
-        "status": event.status,
-        "sequence_no": event.sequence_no,
-        "event_type": event.event_type,
-        "event_name": event.event_name,
-        "timestamp": event.timestamp,
-        "created_at": event.created_at,
-        "updated_at": event.updated_at,
-    })
+    return _json_safe(
+        {
+            "id": event.id,
+            "trace_id": event.trace_id,
+            "workflow_run_id": event.workflow_run_id,
+            "thread_id": event.thread_id,
+            "schema_version": event.schema_version,
+            "status": event.status,
+            "sequence_no": event.sequence_no,
+            "event_type": event.event_type,
+            "event_name": event.event_name,
+            "timestamp": event.timestamp,
+            "created_at": event.created_at,
+            "updated_at": event.updated_at,
+        }
+    )
 
 
 def _source_operation_event_dict(event: ObservationEventRecord) -> dict:
@@ -164,28 +182,57 @@ def _source_operation_event_dict(event: ObservationEventRecord) -> dict:
 
 
 def _safe_workflow_event_dict(event: dict) -> dict:
-    return _select_safe_fields(event, {
-        "id", "run_id", "thread_id", "step_id", "job_id", "event_type",
-        "event_level", "created_at",
-    })
+    return _select_safe_fields(
+        event,
+        {
+            "id",
+            "run_id",
+            "thread_id",
+            "step_id",
+            "job_id",
+            "event_type",
+            "event_level",
+            "created_at",
+        },
+    )
 
 
 def _safe_runtime_step_dict(step: Any, *, as_of: datetime) -> dict:
     value = _json_dict(step)
-    safe = _select_safe_fields(value, {
-        "step_id", "step_name", "phase", "status", "attempt_count",
-        "max_attempts", "started_at", "completed_at", "error_code",
-    })
+    safe = _select_safe_fields(
+        value,
+        {
+            "step_id",
+            "step_name",
+            "phase",
+            "status",
+            "attempt_count",
+            "max_attempts",
+            "started_at",
+            "completed_at",
+            "error_code",
+        },
+    )
     safe["timing"] = _project_timing(value, as_of=as_of)
     return safe
 
 
 def _safe_runtime_child_task_dict(task: Any, *, as_of: datetime) -> dict:
     value = _json_dict(task)
-    safe = _select_safe_fields(value, {
-        "child_task_id", "step_id", "task_type", "status", "attempt_count",
-        "max_attempts", "started_at", "completed_at", "error_code",
-    })
+    safe = _select_safe_fields(
+        value,
+        {
+            "child_task_id",
+            "step_id",
+            "task_type",
+            "status",
+            "attempt_count",
+            "max_attempts",
+            "started_at",
+            "completed_at",
+            "error_code",
+        },
+    )
     recovery_count = max(int(value.get("attempt_count") or 0), 0)
     max_attempts = max(int(value.get("max_attempts") or 3), 1)
     safe["retry_counters"] = {
@@ -210,7 +257,9 @@ def _llm_recovery_projection(
     workflow_events: list[dict],
     brief: ResearchBriefRecord,
 ) -> dict:
-    presearch_step = next((step for step in runtime_steps if step.get("step_name") == "presearch"), {})
+    presearch_step = next(
+        (step for step in runtime_steps if step.get("step_name") == "presearch"), {}
+    )
     required = run_status == "waiting_user" and current_stage == "presearch"
     error_code = presearch_step.get("error_code")
     if not isinstance(error_code, str) or not error_code.startswith("llm_"):
@@ -231,7 +280,8 @@ def _llm_recovery_projection(
         "required_since": recovery_event.get("created_at") if recovery_event else None,
         "error_code": error_code,
         "configuration_source": payload.get("configuration_source")
-        if payload.get("configuration_source") in {"user", "system_default"} else None,
+        if payload.get("configuration_source") in {"user", "system_default"}
+        else None,
         "model": payload.get("model") if isinstance(payload.get("model"), str) else None,
     }
 
@@ -274,9 +324,7 @@ def _project_timing(value: dict, *, as_of: datetime | str) -> dict:
 
         status = str(value.get("status") or "")
         queue_as_of = as_of_at if status == "pending" else None
-        queue_duration_ms = _interval_duration_ms(
-            recorded.get("queue_spans"), as_of=queue_as_of
-        )
+        queue_duration_ms = _interval_duration_ms(recorded.get("queue_spans"), as_of=queue_as_of)
         timing: dict[str, Any] = {"timing_source": "recorded"}
         if execution_spans:
             timing["active_duration_ms"] = active_duration_ms
@@ -291,13 +339,9 @@ def _project_timing(value: dict, *, as_of: datetime | str) -> dict:
                 ("retry_backoff_started_at", "retry_backoff_spans"),
             ):
                 intervals = recorded.get(interval_key)
-                has_open_interval = (
-                    isinstance(intervals, list)
-                    and any(
-                        isinstance(interval, dict)
-                        and interval.get("finished_at") is None
-                        for interval in intervals
-                    )
+                has_open_interval = isinstance(intervals, list) and any(
+                    isinstance(interval, dict) and interval.get("finished_at") is None
+                    for interval in intervals
                 )
                 # Early recorded rows had only the scalar boundary. Preserve
                 # those while using interval state whenever it is available.
@@ -317,7 +361,9 @@ def _project_timing(value: dict, *, as_of: datetime | str) -> dict:
     timing = {"timing_source": "estimated"}
     if started_at is None:
         return timing
-    effective_end = finished_at or (as_of_at if str(value.get("status") or "") == "running" else None)
+    effective_end = finished_at or (
+        as_of_at if str(value.get("status") or "") == "running" else None
+    )
     if effective_end is None:
         return timing
     timing.update(
@@ -345,11 +391,24 @@ def _interval_duration_ms(value: Any, *, as_of: datetime | None) -> int:
 
 
 def _safe_provider_operation_dict(operation: dict) -> dict:
-    safe = _select_safe_fields(operation, {
-        "operation_id", "operation_fingerprint", "operation", "provider", "provider_operation",
-        "source_kind", "result_status", "status", "started_at", "finished_at",
-        "failure_code", "retryable", "candidate_dispositions",
-    })
+    safe = _select_safe_fields(
+        operation,
+        {
+            "operation_id",
+            "operation_fingerprint",
+            "operation",
+            "provider",
+            "provider_operation",
+            "source_kind",
+            "result_status",
+            "status",
+            "started_at",
+            "finished_at",
+            "failure_code",
+            "retryable",
+            "candidate_dispositions",
+        },
+    )
     if not safe.get("candidate_dispositions"):
         safe.pop("candidate_dispositions", None)
     retry_count = operation.get("automatic_retry_count")
@@ -360,9 +419,7 @@ def _safe_provider_operation_dict(operation: dict) -> dict:
         and isinstance(retry_limit, int)
         and retry_limit >= 0
     ):
-        safe["retry_counters"] = {
-            "provider_automatic": {"used": retry_count, "limit": retry_limit}
-        }
+        safe["retry_counters"] = {"provider_automatic": {"used": retry_count, "limit": retry_limit}}
     return safe
 
 
@@ -384,13 +441,23 @@ def _usage_summary_dict(summary: LLMUsageSummary) -> dict:
     return _json_safe(asdict(summary))
 
 
-def _external_api_summary(
-    observation_events: list[dict], provider_operations: list[dict]
-) -> dict:
+def _external_api_summary(observation_events: list[dict], provider_operations: list[dict]) -> dict:
     """Summarize source-adapter calls for UI observability, never for recovery."""
-    started = [event for event in observation_events if event.get("event_name") == "source_collection_started"]
-    completed = [event for event in observation_events if event.get("event_name") == "source_collection_completed"]
-    failed = [event for event in observation_events if event.get("event_name") == "source_collection_failed"]
+    started = [
+        event
+        for event in observation_events
+        if event.get("event_name") == "source_collection_started"
+    ]
+    completed = [
+        event
+        for event in observation_events
+        if event.get("event_name") == "source_collection_completed"
+    ]
+    failed = [
+        event
+        for event in observation_events
+        if event.get("event_name") == "source_collection_failed"
+    ]
     by_provider: dict[str, int] = {}
     by_operation: dict[str, int] = {}
     for event in started:
@@ -401,13 +468,17 @@ def _external_api_summary(
         by_operation[operation] = by_operation.get(operation, 0) + 1
     for operation in provider_operations:
         provider = str(operation.get("provider") or "unknown")
-        operation_name = str(operation.get("provider_operation") or operation.get("operation") or "collect")
+        operation_name = str(
+            operation.get("provider_operation") or operation.get("operation") or "collect"
+        )
         by_provider[provider] = by_provider.get(provider, 0) + 1
         by_operation[operation_name] = by_operation.get(operation_name, 0) + 1
     return {
         "call_count": len(started) + len(provider_operations),
-        "completed_count": len(completed) + sum(item.get("status") == "completed" for item in provider_operations),
-        "failed_count": len(failed) + sum(item.get("status") not in {"completed", "running"} for item in provider_operations),
+        "completed_count": len(completed)
+        + sum(item.get("status") == "completed" for item in provider_operations),
+        "failed_count": len(failed)
+        + sum(item.get("status") not in {"completed", "running"} for item in provider_operations),
         "by_provider": by_provider,
         "by_operation": by_operation,
     }
@@ -416,9 +487,11 @@ def _external_api_summary(
 def _provider_operations(store: SQLiteContentResearchStore, workflow_run_id: str) -> list[dict]:
     """Return safe, durable provider-operation outcomes for Trace projection."""
     records = [
-        item for item in store.list_typed_records(StageCheckpointRecord)
+        item
+        for item in store.list_typed_records(StageCheckpointRecord)
         if item.workflow_run_id == workflow_run_id and item.stage_name == "operation"
     ]
+
     latest: dict[tuple[str, str], Any] = {}
     for record in sorted(records, key=lambda item: (item.created_at, item.id)):
         fingerprint = str(record.payload.get("operation_fingerprint") or "")
@@ -431,7 +504,9 @@ def _provider_operations(store: SQLiteContentResearchStore, workflow_run_id: str
             "operation_fingerprint": fingerprint,
             "operation": record.payload.get("operation"),
             "provider": (record.payload.get("completion") or {}).get("provider"),
-            "provider_operation": (record.payload.get("completion") or {}).get("provider_operation"),
+            "provider_operation": (record.payload.get("completion") or {}).get(
+                "provider_operation"
+            ),
             "source_kind": (record.payload.get("completion") or {}).get("source_kind"),
             "result_status": (record.payload.get("completion") or {}).get("result_status"),
             "item_count": (record.payload.get("completion") or {}).get("item_count"),
@@ -456,6 +531,73 @@ def _provider_operations(store: SQLiteContentResearchStore, workflow_run_id: str
         }
         for (task_id, fingerprint), record in sorted(latest.items())
     ]
+
+
+def _logical_checkpoint_projection(
+    store: SQLiteContentResearchStore, workflow_run_id: str
+) -> list[dict[str, Any]]:
+    """Project logical decisions newest-first without executable/user data."""
+    supported = {
+        "subject_structure",
+        "query_plan",
+        "coverage_decision",
+        "fallback_decision",
+        "relevance_revision",
+    }
+    records = [
+        item
+        for item in store.list_typed_records(StageCheckpointRecord)
+        if item.workflow_run_id == workflow_run_id and item.stage_name in supported
+    ]
+    projected: list[dict[str, Any]] = []
+    for record in sorted(records, key=lambda item: (item.created_at, item.id), reverse=True):
+        payload = dict(record.payload or {})
+        item: dict[str, Any] = {
+            "stage": record.stage_name,
+            "status": record.status,
+            "started_at": _json_safe(record.started_at),
+            "finished_at": _json_safe(record.finished_at),
+        }
+        for source, target in (
+            ("direction_id", "direction_id"),
+            ("state", "state"),
+            ("primary_group_count", "primary_group_count"),
+            ("fallback_group_count", "fallback_group_count"),
+            ("merged_group_count", "merged_group_count"),
+            ("satisfied", "satisfied"),
+        ):
+            if source in payload:
+                item[target] = _json_safe(payload[source])
+        for source, target in (
+            ("structure_hash", "structure_hash_short"),
+            ("query_plan_hash", "query_plan_hash_short"),
+            ("revision_hash", "revision_hash_short"),
+        ):
+            value = str(payload.get(source) or "")
+            if value:
+                item[target] = value[:12]
+        reason_codes = payload.get("reason_codes")
+        if isinstance(reason_codes, list):
+            item["reason_codes"] = [str(value) for value in reason_codes if isinstance(value, str)]
+        counts = payload.get("counts")
+        if isinstance(counts, dict):
+            item["counts"] = {
+                key: int(counts[key])
+                for key in (
+                    "discovered",
+                    "deduplicated",
+                    "relevant",
+                    "detail_eligible",
+                    "admitted",
+                    "independent_authors",
+                    "direct_core_support",
+                    "explicit_focus_support",
+                    "replacement_capacity",
+                )
+                if isinstance(counts.get(key), int) and counts[key] >= 0
+            }
+        projected.append(item)
+    return projected
 
 
 def _json_safe(value: Any) -> Any:
@@ -487,7 +629,14 @@ def _duration_ms(
     run: dict,
 ) -> int:
     times: list[datetime] = []
-    for key in ("started_at", "created_at", "updated_at", "completed_at", "failed_at", "cancelled_at"):
+    for key in (
+        "started_at",
+        "created_at",
+        "updated_at",
+        "completed_at",
+        "failed_at",
+        "cancelled_at",
+    ):
         parsed = _parse_dt(run.get(key))
         if parsed:
             times.append(parsed)
@@ -524,7 +673,9 @@ def _parse_dt(value: Any) -> datetime | None:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
-def _error_count(*, observation_events: list[dict], workflow_events: list[dict], usage_events: list[dict]) -> int:
+def _error_count(
+    *, observation_events: list[dict], workflow_events: list[dict], usage_events: list[dict]
+) -> int:
     count = 0
     for event in observation_events:
         if _event_has_error(event):
@@ -539,7 +690,9 @@ def _error_count(*, observation_events: list[dict], workflow_events: list[dict],
 
 
 def _retry_count(*, workflow_events: list[dict], usage_steps: list[dict]) -> int:
-    workflow_retry_count = sum(1 for event in workflow_events if "retry" in str(event.get("event_type") or ""))
+    workflow_retry_count = sum(
+        1 for event in workflow_events if "retry" in str(event.get("event_type") or "")
+    )
     failed_usage_calls = sum(int(step.get("failed_calls") or 0) for step in usage_steps)
     return workflow_retry_count + failed_usage_calls
 

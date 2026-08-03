@@ -28,9 +28,7 @@ def query_relevance_reason(
         return QUERY_SUBJECT_NOT_SUPPORTED
     reason = str(relevance["reason_code"])
     context = dict(packet.payload.get("retrieval_context") or {})
-    packet_group_ids = [
-        str(item) for item in context.get("query_group_ids", ()) if str(item)
-    ]
+    packet_group_ids = [str(item) for item in context.get("query_group_ids", ()) if str(item)]
     frozen_group_ids = {str(item) for item in relevance["query_group_ids"]}
     locked_direction = dict(
         (
@@ -76,13 +74,12 @@ def query_relevance_reason(
     if len(refs) != 1:
         return reason
     ref = refs[0]
-    allowed_fields = set(
-        relevance.get("claim_quote_fields", {}).get(candidate.claim_type, ())
-    )
+    allowed_fields = set(relevance.get("claim_quote_fields", {}).get(candidate.claim_type, ()))
     if str(ref.get("field_path") or "") not in allowed_fields:
         return reason
     quote = normalize_relevance_text(str(ref.get("quote") or ""))
     anchors = [
+        *relevance.get("core_entity_anchors", ()),
         *relevance.get("subject_anchors", ()),
         *relevance.get("category_anchors", ()),
         *[

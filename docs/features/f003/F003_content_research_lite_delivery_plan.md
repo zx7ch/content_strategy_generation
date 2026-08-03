@@ -378,7 +378,7 @@ Lite 的证据字段只允许 `content_text` 与 `title`（投影过滤）。评
 - Creator 空闲时即在“本次研究摘要”下显示模型卡。LLM 故障进入同一 run 的 `waiting_user`；刷新后从 durable `llm_recovery` 恢复，只有故障后重新验证保存的配置才能继续，且复用原 workflow/attempt/brief，不重复已完成采集。
 - 组合验收通过 150 项后端/API、53 项前端、production build，以及 Key 遮罩、reload 同 run 恢复和 Trace timing 三项真实浏览器回归。
 
-#### Task 5I — Lite structured subject and deterministic query plan（P0，方案已确认，待实现）
+#### Task 5I — Lite structured subject and deterministic query plan（P0，已完成，2026-08-04）
 
 Lite 只交付结构化主题到可信采集的核心闭环，不扩展为通用语义规划平台。完整设计见 `docs/superpowers/specs/2026-08-03-f003-lite-structured-relevance-replay-design.md`。
 
@@ -394,6 +394,8 @@ Lite 只交付结构化主题到可信采集的核心闭环，不扩展为通用
 - Spider 返回数量不等于可用证据，必须分别记录 discovered、deduplicated、relevant、detail-eligible、admitted。现有候选和 packet 必须先耗尽/重放，再允许 Q3；任何下游修复不得为了重做 admission/report 重跑 Spider。
 - 最小验收覆盖：可信主题、对话澄清歧义/空主体、Q1/Q2 去重、同方向 note 去重、Q3 确定性激活、Trace 脱敏、显式重点未覆盖的 partial 语义，以及刷新/恢复不增加既有 provider operation。
 - 明确延期：多核心对象自动拆分、可视化主题编辑器、embedding 相关性、动态全局预算、多语言 query expansion、复杂否定规划和多轮 LLM query 改写。
+
+- 完成记录：新 run 已冻结通用结构化主题、`query_relevance_v2` 与确定性 `2 + 1` 计划；Q3 仅在持久化主组覆盖不足时激活，恢复不会重复主组 operation。历史任务通过 append-only `relevance_revision` 从既有 packets 重放准入到发布，并校验 provider operation 与 packet ID 集合不变。安全 Trace 保持最近记录在上，仅投影短哈希、组数、阶段计数与稳定原因码。聚焦后端/API/Trace/前端验收 112 项、内容调研单元测试 270 项、前端 54 项及 production build 通过；浏览器自动化依赖缺失时不计为通过证据。
 
 **通过条件**：预发布环境中新合同为唯一 Creator/report 合同；选择、scope、报告三态、恢复卡、citation drawer、模型配置与模型故障后的同 run 恢复均通过上述 API/浏览器验收。Gate 4A 不对正式用户发布，也不代表所有目录方向的采集能力已完成。
 

@@ -43,7 +43,15 @@ from app.content_research.api_schemas import (
     SnapshotResponse,
 )
 from app.content_research.async_dispatch import AsyncFormalResearchDispatchRepository
-from app.content_research.contracts import DIRECTION_CATALOG_V1, build_default_snapshot
+from app.content_research.contracts import (
+    DIRECTION_CATALOG_V1,
+    QUERY_RELEVANCE_ALGORITHM_VERSION,
+    DirectionContract,
+    RunPolicySnapshot,
+    build_default_snapshot,
+    build_query_relevance_contract,
+    policy_hash,
+)
 from app.content_research.decisions import ResearchDecisionService
 from app.content_research.evidence import EvidenceService
 from app.content_research.evidence.governance_reader import (
@@ -1461,10 +1469,20 @@ class ContentResearchService:
         contracts = {
             item.direction_id: item for item in self._store.list_direction_contracts(snapshot.id)
         }
+        snapshot, contracts = await self._replay_relevance_context(
+            brief=brief,
+            snapshot=snapshot,
+            contracts=contracts,
+        )
         operation_ids_before = {
             item.id
             for item in self._store.list_typed_records(StageCheckpointRecord)
             if item.workflow_run_id == workflow_run_id and item.stage_name == "operation"
+        }
+        packet_ids_before = {
+            item.id
+            for item in self._store.list_typed_records(DirectionalEvidencePacketRecord)
+            if item.workflow_run_id == workflow_run_id
         }
         packet_ids_by_direction: dict[str, list[str]] = {}
         pipeline = DirectionalExecutionPipeline(self._store)
@@ -1514,6 +1532,13 @@ class ContentResearchService:
         }
         if operation_ids_after_publication != operation_ids_before:
             raise RuntimeError("downstream replay changed provider operations")
+        packet_ids_after = {
+            item.id
+            for item in self._store.list_typed_records(DirectionalEvidencePacketRecord)
+            if item.workflow_run_id == workflow_run_id
+        }
+        if packet_ids_after != packet_ids_before:
+            raise RuntimeError("downstream replay changed evidence packets")
         report = await self.get_lite_report(workflow_run_id=workflow_run_id)
         return {
             "workflow_run_id": workflow_run_id,
@@ -1522,6 +1547,165 @@ class ContentResearchService:
             "publication_state": report.publication.get("state"),
             "report": report.model_dump(mode="json"),
         }
+
+    async def _replay_relevance_context(
+        self,
+        *,
+        brief: ResearchBriefRecord,
+        snapshot: RunPolicySnapshot,
+        contracts: dict[str, DirectionContract],
+    ) -> tuple[RunPolicySnapshot, dict[str, DirectionContract]]:
+        relevance_by_direction = dict(snapshot.effective_policy.get("query_relevance") or {})
+        if relevance_by_direction and all(
+            str(value.get("algorithm_version") or "") == QUERY_RELEVANCE_ALGORITHM_VERSION
+            for value in relevance_by_direction.values()
+            if isinstance(value, dict)
+        ):
+            return snapshot, contracts
+
+        locked_directions = dict(
+            snapshot.effective_policy.get("locked_query_plan", {}).get("directions", {}) or {}
+        )
+        if set(locked_directions) != set(contracts):
+            raise ContentResearchValidationError(
+                "Historical relevance revision does not match locked directions"
+            )
+        existing_revision = next(
+            (
+                item
+                for item in reversed(self._store.list_typed_records(StageCheckpointRecord))
+                if item.workflow_run_id == brief.workflow_run_id
+                and item.stage_name == "relevance_revision"
+                and item.status == "completed"
+                and item.payload.get("base_snapshot_id") == snapshot.id
+                and item.payload.get("base_snapshot_hash") == snapshot.effective_policy_hash
+            ),
+            None,
+        )
+        subject_structure = (
+            dict(existing_revision.payload.get("subject_structure") or {})
+            if existing_revision
+            else dict(brief.payload.get("subject_structure") or {})
+        )
+        subject = str(
+            brief.payload.get("confirmed_subject")
+            or brief.payload.get("seed_text")
+            or brief.payload.get("subject_confirmation")
+            or ""
+        ).strip()
+        structure_decision = parse_subject_structure(
+            subject_structure,
+            normalized_input=" ".join(
+                item
+                for item in (
+                    str(brief.payload.get("seed_text") or "").strip(),
+                    str(brief.payload.get("user_note") or "").strip(),
+                    subject,
+                )
+                if item
+            ),
+        )
+        if structure_decision.state != "confirmed" or structure_decision.structure is None:
+            task = await self._presearch.create_llm_task(
+                PresearchInput(
+                    seed_text=subject,
+                    user_note="历史任务相关性修订；仅生成主题结构，不采集来源。",
+                    thread_id=brief.thread_id,
+                    workflow_run_id=brief.workflow_run_id,
+                    user_id=str(brief.payload.get("user_id") or "local"),
+                    workspace_id=str(brief.payload.get("workspace_id") or "default"),
+                )
+            )
+            if task is None:
+                raise ContentResearchValidationError(
+                    "Historical relevance revision requires a configured Pre-research model"
+                )
+            outcome = await task
+            if (
+                outcome.checklist.subject_structure_state != "confirmed"
+                or outcome.checklist.subject_structure is None
+            ):
+                raise ContentResearchValidationError(
+                    "Historical relevance revision produced an invalid subject structure"
+                )
+            subject_structure = asdict(outcome.checklist.subject_structure)
+
+        revised_relevance: dict[str, dict[str, Any]] = {}
+        revised_contracts: dict[str, DirectionContract] = {}
+        for direction_id, contract in contracts.items():
+            locked_group_ids = tuple(
+                str(item.get("id") or "")
+                for item in locked_directions[direction_id].get("query_groups") or ()
+                if str(item.get("id") or "")
+            )
+            original_ids = tuple(
+                str(item)
+                for item in (contract.metadata.get("query_relevance") or {}).get(
+                    "query_group_ids", ()
+                )
+            )
+            if not locked_group_ids or set(original_ids) != set(locked_group_ids):
+                raise ContentResearchValidationError(
+                    "Historical relevance revision query groups do not match"
+                )
+            relevance = build_query_relevance_contract(
+                direction_id=direction_id,
+                confirmed_subject=subject,
+                query_group_ids=locked_group_ids,
+                subject_structure=subject_structure,
+            )
+            revised_relevance[direction_id] = relevance
+            revised_contracts[direction_id] = replace(
+                contract,
+                metadata={**contract.metadata, "query_relevance": relevance},
+            )
+        revised_policy = {
+            **snapshot.effective_policy,
+            "query_relevance": revised_relevance,
+        }
+        revision_hash = canonical_fingerprint(
+            {
+                "base_snapshot_id": snapshot.id,
+                "base_snapshot_hash": snapshot.effective_policy_hash,
+                "subject_structure": subject_structure,
+                "query_relevance": revised_relevance,
+            }
+        )
+        revised_snapshot = replace(
+            snapshot,
+            effective_policy=revised_policy,
+            effective_policy_hash=policy_hash(revised_policy),
+            metadata={
+                **snapshot.metadata,
+                "relevance_revision_hash": revision_hash,
+            },
+        )
+        if existing_revision is None:
+            now = utcnow()
+            self._store.save_stage_checkpoint(
+                StageCheckpointRecord(
+                    id=f"scp_{revision_hash[:24]}",
+                    schema_version="content_research_stage_checkpoint_v1",
+                    payload={
+                        "schema_version": "content_research_relevance_revision_v1",
+                        "base_snapshot_id": snapshot.id,
+                        "base_snapshot_hash": snapshot.effective_policy_hash,
+                        "revision_hash": revision_hash,
+                        "algorithm_version": QUERY_RELEVANCE_ALGORITHM_VERSION,
+                        "reason": "structured_subject_anchor_repair",
+                        "subject_structure": subject_structure,
+                        "direction_ids": sorted(revised_relevance),
+                    },
+                    workflow_run_id=brief.workflow_run_id,
+                    subagent_task_id="historical-relevance-replay",
+                    stage_name="relevance_revision",
+                    input_fingerprint=revision_hash,
+                    status="completed",
+                    started_at=now,
+                    finished_at=now,
+                )
+            )
+        return revised_snapshot, revised_contracts
 
     def _build_governed_snapshot(
         self,
