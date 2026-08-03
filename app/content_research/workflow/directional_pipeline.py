@@ -113,6 +113,52 @@ class DirectionSelection:
 
 
 @dataclass(frozen=True)
+class DirectionCoverageCounts:
+    discovered: int
+    deduplicated: int
+    relevant: int
+    detail_eligible: int
+    admitted: int
+    independent_authors: int
+    direct_core_support: int
+    explicit_focus_support: int
+    replacement_capacity: int
+
+
+@dataclass(frozen=True)
+class DirectionCoverageDecision:
+    satisfied: bool
+    reason_codes: tuple[str, ...]
+    counts: DirectionCoverageCounts
+
+
+def evaluate_direction_coverage(
+    *,
+    counts: DirectionCoverageCounts,
+    minimum_samples: int,
+    minimum_independent_authors: int,
+    requires_explicit_focus: bool,
+) -> DirectionCoverageDecision:
+    """Evaluate frozen Lite coverage without issuing or rewriting a query."""
+    reasons: list[str] = []
+    if counts.relevant < minimum_samples or counts.admitted < minimum_samples:
+        reasons.append("minimum_relevant_samples_unmet")
+    if counts.independent_authors < minimum_independent_authors:
+        reasons.append("minimum_independent_authors_unmet")
+    if counts.direct_core_support < 1:
+        reasons.append("direct_core_support_unmet")
+    if requires_explicit_focus and counts.explicit_focus_support < 1:
+        reasons.append("explicit_user_focus_unmet")
+    if reasons and counts.replacement_capacity < 1:
+        reasons.append("replacement_capacity_exhausted")
+    return DirectionCoverageDecision(
+        satisfied=not reasons,
+        reason_codes=tuple(reasons),
+        counts=counts,
+    )
+
+
+@dataclass(frozen=True)
 class DirectionEvidenceRun:
     selection: DirectionSelection
     packet_ids: tuple[str, ...]
@@ -215,6 +261,38 @@ def _frozen_query_groups(
     if not groups:
         raise ValueError("frozen query plan has no active primary groups")
     return groups
+
+
+def _frozen_fallback_group(
+    snapshot: RunPolicySnapshot | None,
+    direction_id: str,
+) -> QueryGroup | None:
+    if snapshot is None:
+        return None
+    direction = dict(
+        (
+            snapshot.effective_policy.get("locked_query_plan", {})
+            .get("directions", {})
+            .get(direction_id, {})
+        )
+        or {}
+    )
+    for value in direction.get("query_groups") or ():
+        if str(value.get("activation") or "primary") != "coverage_fallback":
+            continue
+        return QueryGroup(
+            id=str(value["id"]),
+            direction_id=str(value["direction_id"]),
+            query=str(value["normalized_query"]),
+            priority=int(value["priority"]),
+            sort=str(value["sort"]),
+            candidate_limit=int(value["candidate_cap"]),
+            time_window=dict(value["time_window"]),
+            roles=tuple(value.get("roles") or ()),
+            activation="coverage_fallback",
+            normalized_identity=str(value.get("normalized_identity") or ""),
+        )
+    return None
 
 
 def select_candidates(
@@ -460,6 +538,21 @@ class DirectionalExecutionPipeline:
             candidate_limit=candidate_limit_per_query,
             run_as_of_at=run_as_of_at,
         )
+        fallback_group = _frozen_fallback_group(policy_snapshot, direction_id)
+        fallback_is_active = bool(
+            fallback_group
+            and any(
+                item.workflow_run_id == self._workflow_run_id
+                and item.subagent_task_id == subagent_task_id
+                and item.stage_name == "fallback_decision"
+                and item.status == "completed"
+                and item.payload.get("fallback_group_id") == fallback_group.id
+                and item.payload.get("state") == "activated"
+                for item in self._store.list_typed_records(StageCheckpointRecord)
+            )
+        )
+        if fallback_group is not None and fallback_is_active:
+            groups = (*groups, fallback_group)
         active_plan_hash = query_plan_hash(groups)
         locked_direction = (
             dict(
@@ -773,9 +866,10 @@ class DirectionalExecutionPipeline:
             )
         if len(packet_ids) < selection.selected_source_count:
             selection = replace(selection, status="incomplete")
+        admission_payload: dict[str, Any] | None = None
         if admission_contract and admission_policy and policy_snapshot:
             admission_packet_ids = (*packet_ids, *comment_packet_ids)
-            self._run_admission(
+            admission_payload = self._run_admission(
                 subagent_task_id,
                 direction_id,
                 selection,
@@ -784,6 +878,124 @@ class DirectionalExecutionPipeline:
                 admission_policy,
                 policy_snapshot,
             )
+        if admission_payload is not None:
+            metrics = dict(admission_payload.get("computed_metrics") or {})
+            selected_decisions = [item for item in selection.decisions if item.selected]
+            explicit_focus_group_ids = {group.id for group in groups if "user_focus" in group.roles}
+            counts = DirectionCoverageCounts(
+                discovered=len(candidates),
+                deduplicated=len(candidate_by_id),
+                relevant=int(metrics.get("relevance_qualified_source_count") or 0),
+                detail_eligible=int(metrics.get("eligible_source_count") or 0),
+                admitted=int(metrics.get("admitted_source_count") or 0),
+                independent_authors=int(metrics.get("independent_author_count") or 0),
+                direct_core_support=int(metrics.get("relevance_qualified_source_count") or 0),
+                explicit_focus_support=sum(
+                    1
+                    for item in selected_decisions
+                    if explicit_focus_group_ids.intersection(item.query_group_ids)
+                ),
+                replacement_capacity=sum(
+                    1
+                    for item in candidate_by_id.values()
+                    if not item.get("blocking_unavailable") and not item.get("detail_attempted")
+                ),
+            )
+            coverage = evaluate_direction_coverage(
+                counts=counts,
+                minimum_samples=admission_policy.minimum_samples,
+                minimum_independent_authors=(admission_policy.minimum_independent_authors),
+                requires_explicit_focus=bool(explicit_focus_group_ids),
+            )
+            coverage_fingerprint = canonical_fingerprint(
+                {
+                    "query_plan_hash": plan_hash,
+                    "candidate_manifest_hash": selection.candidate_manifest_hash,
+                    "sample_policy_id": admission_policy.id,
+                    "relevance_algorithm_version": (
+                        admission_payload.get("relevance_contract") or {}
+                    ).get("algorithm_version"),
+                    "counts": asdict(counts),
+                }
+            )
+            if not self._checkpoint(subagent_task_id, "coverage_decision", coverage_fingerprint):
+                self._start_checkpoint(subagent_task_id, "coverage_decision")
+                self._save_checkpoint(
+                    subagent_task_id,
+                    "coverage_decision",
+                    coverage_fingerprint,
+                    {
+                        "direction_id": direction_id,
+                        "query_plan_hash": plan_hash,
+                        "satisfied": coverage.satisfied,
+                        "reason_codes": list(coverage.reason_codes),
+                        "counts": asdict(counts),
+                    },
+                )
+            if fallback_group is not None:
+                blocking_failure = self._blocking_operation_failure(
+                    subagent_task_id, selection.status
+                )
+                fallback_fingerprint = canonical_fingerprint(
+                    {
+                        "coverage_fingerprint": coverage_fingerprint,
+                        "fallback_group_id": fallback_group.id,
+                        "reason_codes": coverage.reason_codes,
+                    }
+                )
+                fallback_state = (
+                    "not_needed"
+                    if coverage.satisfied
+                    else "blocked_by_provider_failure"
+                    if blocking_failure
+                    else "exhausted"
+                    if fallback_is_active
+                    else "activated"
+                )
+                if not self._checkpoint(
+                    subagent_task_id, "fallback_decision", fallback_fingerprint
+                ):
+                    self._start_checkpoint(subagent_task_id, "fallback_decision")
+                    self._save_checkpoint(
+                        subagent_task_id,
+                        "fallback_decision",
+                        fallback_fingerprint,
+                        {
+                            "direction_id": direction_id,
+                            "query_plan_hash": plan_hash,
+                            "fallback_group_id": fallback_group.id,
+                            "state": fallback_state,
+                            "reason_codes": list(coverage.reason_codes),
+                        },
+                    )
+                if fallback_state == "activated":
+                    await self._flush()
+                    return await self.execute(
+                        workflow_run_id=workflow_run_id,
+                        subagent_task_id=subagent_task_id,
+                        direction_id=direction_id,
+                        subject=subject,
+                        questions=questions,
+                        competitors=competitors,
+                        author_cap=author_cap,
+                        minimum_samples=minimum_samples,
+                        minimum_independent_authors=minimum_independent_authors,
+                        detail_fetch_cap=detail_fetch_cap,
+                        candidate_limit_per_query=candidate_limit_per_query,
+                        snapshot_id=snapshot_id,
+                        discover=discover,
+                        collect_detail=collect_detail,
+                        collect_comments=collect_comments,
+                        required_comment_fields=required_comment_fields,
+                        comment_limit=comment_limit,
+                        comment_top_level_only=comment_top_level_only,
+                        comment_reply_depth_limit=comment_reply_depth_limit,
+                        comment_policy_id=comment_policy_id,
+                        run_as_of_at=run_as_of_at,
+                        admission_contract=admission_contract,
+                        admission_policy=admission_policy,
+                        policy_snapshot=policy_snapshot,
+                    )
         await self._flush()
         return DirectionEvidenceRun(
             selection,
@@ -871,7 +1083,7 @@ class DirectionalExecutionPipeline:
         contract: DirectionContract,
         policy: SamplePolicy,
         snapshot: RunPolicySnapshot,
-    ) -> None:
+    ) -> dict[str, Any]:
         relevance_contract = frozen_query_relevance(contract, snapshot)
         strategy = DEFAULT_ADMISSION_STRATEGIES.get(direction_id)
         packets = [
@@ -990,8 +1202,9 @@ class DirectionalExecutionPipeline:
             "direction_result_algorithm_version": DIRECTION_RESULT_ALGORITHM_VERSION,
         }
         fingerprint = canonical_fingerprint(checkpoint_identity)
-        if self._checkpoint(task_id, "admission", fingerprint):
-            return
+        existing_admission = self._checkpoint(task_id, "admission", fingerprint)
+        if existing_admission:
+            return dict(existing_admission.payload)
         self._start_checkpoint(task_id, "facts")
         self._start_checkpoint(task_id, "admission")
         decisions: list[ClaimAdmissionDecisionRecord] = []
@@ -1035,24 +1248,36 @@ class DirectionalExecutionPipeline:
             fingerprint,
             {"direction_id": direction_id, "packet_ids": list(packet_ids)},
         )
+        admission_payload = {
+            "direction_id": direction_id,
+            "decision_ids": [item.id for item in decisions],
+            "direction_result_id": output.direction_result.id,
+            "policy_snapshot_id": snapshot.id,
+            "policy_snapshot_hash": snapshot.effective_policy_hash,
+            "relevance_contract": relevance_contract,
+            "algorithm_version": ALGORITHM_VERSION,
+            "direction_result_algorithm_version": DIRECTION_RESULT_ALGORITHM_VERSION,
+            "sample_policy": checkpoint_identity["sample_policy"],
+            "computed_metrics": {
+                **checkpoint_identity["metrics"],
+                "admitted_source_count": len(
+                    {
+                        evidence_ref
+                        for item in decisions
+                        if item.decision == "admitted"
+                        for evidence_ref in item.payload.get("evidence_refs", ())
+                    }
+                ),
+            },
+            "admission_packet_identities": checkpoint_identity["admission_packets"],
+        }
         self._save_checkpoint(
             task_id,
             "admission",
             fingerprint,
-            {
-                "direction_id": direction_id,
-                "decision_ids": [item.id for item in decisions],
-                "direction_result_id": output.direction_result.id,
-                "policy_snapshot_id": snapshot.id,
-                "policy_snapshot_hash": snapshot.effective_policy_hash,
-                "relevance_contract": relevance_contract,
-                "algorithm_version": ALGORITHM_VERSION,
-                "direction_result_algorithm_version": DIRECTION_RESULT_ALGORITHM_VERSION,
-                "sample_policy": checkpoint_identity["sample_policy"],
-                "computed_metrics": checkpoint_identity["metrics"],
-                "admission_packet_identities": checkpoint_identity["admission_packets"],
-            },
+            admission_payload,
         )
+        return admission_payload
 
     async def _collect_search_pages(
         self,

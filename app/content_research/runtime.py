@@ -15,6 +15,8 @@ STAGE_SEQUENCE = (
     "collect",
     "selection",
     "detail",
+    "coverage_decision",
+    "fallback_decision",
     "packet",
     "facts",
     "admission",

@@ -128,7 +128,7 @@ Allow `query_plan` in `StageCheckpointRecord`. Add structure/hash, `query_compil
 
 Run: `pytest -q tests/unit/test_content_research_query_planner.py tests/unit/test_content_research_contracts.py tests/e2e/test_content_research_brief_confirm_api.py`
 
-- [ ] **Step 6: Commit Task 2**
+- [x] **Step 6: Commit Task 2**
 
 ```bash
 git add app/content_research/workflow/query_planner.py app/content_research/workflow/directional_pipeline.py app/content_research/persistence_models.py app/content_research/contracts.py app/content_research/service.py tests/unit/test_content_research_query_planner.py tests/unit/test_content_research_contracts.py tests/e2e/test_content_research_brief_confirm_api.py
@@ -147,29 +147,29 @@ git commit -m "feat(content-research): freeze Lite 2 plus 1 query plans"
 **Interfaces:**
 - Produces `coverage_decision` and `fallback_decision` checkpoints with staged counts, stable reasons, and the frozen Q3 ID.
 
-- [ ] **Step 1: Write failing coverage tests**
+- [x] **Step 1: Write failing coverage tests**
 
 Cover independent failures of minimum relevant eligible samples, minimum authors, direct core support, explicit user focus, and invalid/unavailable detail replacement. Assert sufficient Q1/Q2 skips Q3; an unmet condition activates only frozen Q3 once; Q3 exhaustion returns partial/insufficient; refresh/replay preserves the decision and provider operation IDs.
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 Run: `pytest -q tests/unit/test_content_research_directional_pipeline.py tests/integration/test_content_research_direction_pipeline_store.py -k 'coverage or fallback or explicit_focus'`
 
 Expected: missing coverage/fallback checkpoints and inactive-group handling.
 
-- [ ] **Step 3: Add the two checkpoint stages**
+- [x] **Step 3: Add the two checkpoint stages**
 
 Allow `coverage_decision` and `fallback_decision` in `StageCheckpointRecord`. Fingerprint coverage from plan hash, candidate manifest, direction policy, relevance version, and staged counts; fingerprint fallback from coverage fingerprint plus frozen Q3 ID and stable reason codes.
 
-- [ ] **Step 4: Implement staged counts and Q3 activation**
+- [x] **Step 4: Implement staged counts and Q3 activation**
 
 Record discovered, deduplicated, relevant, detail-eligible, admitted, and independent-author counts. Consume the existing per-direction `detail_fetch_cap=30`; invalid prevalidation candidates and duplicate hits do not consume a slot. Exhaust persisted primary candidates before activating Q3. Reuse a completed fallback decision on recovery and never generate a new query.
 
-- [ ] **Step 5: Keep existing provider failure scope**
+- [x] **Step 5: Keep existing provider failure scope**
 
 Do not add shared cross-direction behavior. Preserve current single-direction auth, outcome-unknown, automatic retry, note-unavailable replacement, and checkpoint recovery semantics. Q3 is normal control flow and does not increment error/retry counts.
 
-- [ ] **Step 6: Run GREEN**
+- [x] **Step 6: Run GREEN**
 
 Run: `pytest -q tests/unit/test_content_research_directional_pipeline.py tests/integration/test_content_research_direction_pipeline_store.py`
 

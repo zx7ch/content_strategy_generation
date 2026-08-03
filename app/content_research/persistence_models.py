@@ -202,6 +202,8 @@ class StageCheckpointRecord(TypedPersistenceRecord):
             "operation",
             "selection",
             "selection_revision",
+            "coverage_decision",
+            "fallback_decision",
             "detail",
             "comments",
             "comments_page",

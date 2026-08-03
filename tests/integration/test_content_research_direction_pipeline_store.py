@@ -21,6 +21,7 @@ from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
 from app.content_research.workflow.directional_pipeline import (
     DirectionalEvidencePipeline,
     OperationOutcomeUnknownError,
+    QueryGroup,
     compile_query_groups,
 )
 from app.content_research.workflow.task_router import SubagentTaskRouter
@@ -66,12 +67,136 @@ def _build_frozen_pipeline_snapshot(
                         or {"end_at": frozen_at.isoformat()}
                     ),
                     "candidate_cap": group.candidate_limit,
+                    "roles": list(group.roles),
+                    "activation": group.activation,
+                    "normalized_identity": group.normalized_identity,
                 }
                 for group in frozen_groups
             )
         },
     )
     return snapshot, policies, contracts, frozen_groups
+
+
+@pytest.mark.asyncio
+async def test_frozen_fallback_activates_once_without_repeating_primary_discovery(
+    tmp_path,
+):
+    store = SQLiteContentResearchStore(str(tmp_path / "coverage-fallback.db"))
+    frozen_at = datetime(2026, 8, 4, tzinfo=timezone.utc)
+    primary = QueryGroup(
+        id="qg-primary",
+        direction_id="product_marketing",
+        query="徒步短裤 产品营销",
+        priority=0,
+        candidate_limit=20,
+        time_window={"end_at": frozen_at.isoformat()},
+        roles=("core_intent",),
+        activation="primary",
+        normalized_identity="primary-identity",
+    )
+    fallback = QueryGroup(
+        id="qg-fallback",
+        direction_id="product_marketing",
+        query="户外短裤 夏季",
+        priority=2,
+        candidate_limit=20,
+        time_window={"end_at": frozen_at.isoformat()},
+        roles=("coverage_fallback",),
+        activation="coverage_fallback",
+        normalized_identity="fallback-identity",
+    )
+    snapshot, policies, contracts, _ = _build_frozen_pipeline_snapshot(
+        snapshot_id="rps-fallback",
+        workflow_run_id="run-fallback",
+        direction_id="product_marketing",
+        subject="徒步短裤",
+        questions=("产品营销",),
+        groups=(primary, fallback),
+        run_as_of_at=frozen_at,
+    )
+    store.save_run_policy_snapshot(snapshot)
+    for policy in policies:
+        store.save_sample_policy(policy)
+    for frozen_contract in contracts:
+        store.save_direction_contract(frozen_contract)
+    contract = contracts[0]
+    calls: list[str] = []
+
+    def note(note_id: str, author_id: str) -> dict:
+        return {
+            "provider": "xiaohongshu",
+            "canonical_id": note_id,
+            "source_kind": "note_detail",
+            "source_url": f"https://example.test/{note_id}",
+            "author": author_id,
+            "author_id": author_id,
+            "title": "夏季徒步短裤实测",
+            "content_text": "轻量透气的徒步短裤适合夏季户外。",
+            "tags": ["徒步短裤"],
+            "note_type": "image_text",
+            "metrics": {"likes": 10},
+            "metrics_observed_at": frozen_at.isoformat(),
+            "source_published_at": "2026-08-01T00:00:00+00:00",
+            "ip_location": "上海",
+            "media": {"count": 1},
+            "field_availability": {
+                field: "present" for field in contract.required_note_fields
+            },
+        }
+
+    async def discover(group):
+        calls.append(group.id)
+        if group.id == primary.id:
+            return [note("note-primary", "author-primary")]
+        return [
+            note("note-fallback-1", "author-fallback-1"),
+            note("note-fallback-2", "author-fallback-2"),
+        ]
+
+    kwargs = {
+        "workflow_run_id": "run-fallback",
+        "subagent_task_id": "sat-fallback",
+        "direction_id": "product_marketing",
+        "subject": "徒步短裤",
+        "questions": ["产品营销"],
+        "competitors": [],
+        "author_cap": policies[0].author_cap,
+        "minimum_samples": policies[0].minimum_samples,
+        "minimum_independent_authors": policies[0].minimum_independent_authors,
+        "detail_fetch_cap": policies[0].detail_fetch_cap,
+        "snapshot_id": snapshot.id,
+        "run_as_of_at": snapshot.run_as_of_at,
+        "admission_contract": contract,
+        "admission_policy": policies[0],
+        "policy_snapshot": snapshot,
+        "discover": discover,
+    }
+    first = await DirectionalEvidencePipeline(store).execute(**kwargs)
+    operation_ids = [
+        item.id
+        for item in store.list_typed_records(StageCheckpointRecord)
+        if item.stage_name == "operation"
+    ]
+    second = await DirectionalEvidencePipeline(store).execute(**kwargs)
+
+    assert calls == [primary.id, fallback.id]
+    assert first.selection.status == "complete"
+    assert second.selection == first.selection
+    assert [
+        item.id
+        for item in store.list_typed_records(StageCheckpointRecord)
+        if item.stage_name == "operation"
+    ] == operation_ids
+    fallback_decisions = [
+        item
+        for item in store.list_typed_records(StageCheckpointRecord)
+        if item.stage_name == "fallback_decision"
+    ]
+    assert [item.payload["state"] for item in fallback_decisions] == [
+        "activated",
+        "not_needed",
+    ]
 
 
 @pytest.mark.asyncio
