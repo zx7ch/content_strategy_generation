@@ -98,9 +98,10 @@ def test_final_entity_schema_has_only_role_specific_columns(tmp_path):
             "0010",
             "0011",
             "0012",
-                "0013",
-                "0014",
-            ]
+            "0013",
+            "0014",
+            "0015",
+        ]
         for table in (
             "content_research_canonical_sources",
             "content_research_claim_candidates",
