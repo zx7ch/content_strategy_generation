@@ -33,3 +33,44 @@ test("trace duration stops at the recovery boundary instead of counting wait tim
 
   assert.equal(value, "3.0s（等待恢复）");
 });
+
+test("recorded timing separates active queue and waiting", () => {
+  const value = traceExecutionDurationText(
+    {
+      status: "retrying",
+      timing: {
+        active_duration_ms: 24_407,
+        queue_duration_ms: 570,
+        waiting_started_at: "2026-08-03T01:00:25.000001+00:00",
+        timing_source: "recorded",
+      },
+    },
+    []
+  );
+
+  assert.equal(value, "执行 24.4s · 排队 0.6s · 等待恢复中");
+});
+
+test("recorded timing below one tenth second remains visible", () => {
+  const value = traceExecutionDurationText(
+    {
+      status: "succeeded",
+      timing: { active_duration_ms: 23, queue_duration_ms: 0, timing_source: "recorded" },
+    },
+    []
+  );
+
+  assert.equal(value, "执行 <0.1s");
+});
+
+test("estimated timing labels the legacy duration as approximate", () => {
+  const value = traceExecutionDurationText(
+    {
+      status: "succeeded",
+      timing: { active_duration_ms: 3_000, timing_source: "estimated" },
+    },
+    []
+  );
+
+  assert.equal(value, "执行约 3.0s");
+});
