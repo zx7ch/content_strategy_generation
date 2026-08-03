@@ -52,7 +52,11 @@ async def client_with_db(tmp_path):
         workflow_runtime=WorkflowRunManagerRuntime(db_path),
     )
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://testserver",
+        headers={"X-Workspace-Id": "workspace-trace-api", "X-User-Id": "user-trace-api"},
+    ) as client:
         yield client, db_path
     if original is None:
         delattr(app.state, "content_research_service")
@@ -434,8 +438,9 @@ async def test_content_research_trace_api_redacts_persisted_source_results(
         "attempt_count",
         "max_attempts",
         "started_at",
-        "completed_at",
-        "timing",
+            "completed_at",
+            "error_code",
+            "timing",
     }
     assert payload["runtime_steps"][0]["timing"]["timing_source"] == "recorded"
     serialized = response.text
