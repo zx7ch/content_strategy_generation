@@ -1062,14 +1062,14 @@ git commit -m "test(content-research): accept Lite model configuration recovery"
 
 ## Final Verification Checklist
 
-- [ ] The right sidebar order is Trace, evidence/Trace, research summary, model service.
-- [ ] Only `base_url`, `model`, and `api_key` are editable.
-- [ ] A free-form model ID works when the endpoint passes the live probe.
-- [ ] A saved configuration is effective on the next call without process restart.
-- [ ] A selected user configuration never silently falls back after failure.
-- [ ] `.env` is used only when no validated user configuration exists.
-- [ ] Full API keys and Authorization headers are absent from every public/logged projection.
-- [ ] Pre-search failure enters `waiting_user`; successful retry reuses attempt, brief, and run IDs.
-- [ ] Completed Spider operations and packets are unchanged by model configuration recovery.
-- [ ] Existing successful/published runs still reject replay.
-- [ ] Focused backend, frontend build, and browser tests pass.
+- [x] The right sidebar order is Trace, evidence/Trace, research summary, model service.
+- [x] Only `base_url`, `model`, and `api_key` are editable.
+- [x] A free-form model ID works when the endpoint passes the live probe.
+- [x] A saved configuration is effective on the next call without process restart.
+- [x] A selected user configuration never silently falls back after failure.
+- [x] `.env` is used only when no validated user configuration exists.
+- [x] Full API keys and Authorization headers are absent from every public/logged projection.
+- [x] Pre-search failure enters `waiting_user`; successful retry reuses attempt, brief, and run IDs.
+- [x] Completed Spider operations and packets are unchanged by model configuration recovery.
+- [x] Existing successful/published runs still reject replay.
+- [x] Focused backend, frontend build, and browser tests pass.

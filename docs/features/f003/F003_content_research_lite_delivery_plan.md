@@ -350,7 +350,7 @@ Lite 的证据字段只允许 `content_text` 与 `title`（投影过滤）。评
   - `published report artifact is missing` 现按 publication-pending 处理：Content Research API error 保留 HTTP status，404／artifact-missing 不再终止轮询或写入永久对话错误；报告可见后同一 run 原位显示最新 publication。
   - 该 run 暴露了旧 `cheap_fast` 预检索路由的 Kimi Coding 会员权益 402。预检索现已切换到既有 `balanced` OpenAI 路由；最小真实调用确认 provider=`openai`、model=`gpt-4o-mini` 且返回非空。当前 persisted packets 已完成 admitted-evidence 验收，无需再次采集。
 
-##### Task 5G-2B — Recorded Trace timing semantics（P0，待开始）
+##### Task 5G-2B — Recorded Trace timing semantics（P0，已完成，2026-08-03）
 
 - Trace 保持当前倒序时间线：最近/当前阶段在最上面，最早阶段在最下面，阶段编号仍表示原始 workflow 顺序。
 - 在共享 workflow runtime 记录真实 queue、active execution、retry/backoff 和 waiting 边界；Lite `/trace` 只做安全投影。等待时间不得继续累加为执行耗时，历史秒级记录必须标记为 `estimated`。
@@ -359,8 +359,10 @@ Lite 的证据字段只允许 `content_text` 与 `title`（投影过滤）。评
 - Gate 2 的已验证 workflow、run、checkpoint、canonical source、冻结 citation group、trace 和验收产物保留。删除 EvidenceBundle 表前，必须证明这些留存证据不依赖旧模型，并用迁移前后回归保护。
 - API/schema 覆盖全部 7 种非空选择组合和空选择拒绝；浏览器覆盖单选、双选、全选。真实采集复用 `product_marketing`；`partial`、`evidence_only`、恢复卡与 citation 跳转三态使用后端受控真实状态，浏览器不得 mock API payload。
 - 验证宽屏、窄屏、刷新恢复、重复点击、citation drawer、三种来源跳转状态、三档发布呈现与 workflow 恢复卡。
+- 完成记录：workflow runtime 已耐久记录 queue、active、retry/backoff、waiting/pause 边界；暂停、取消、失败和完成会以同一 UTC 边界闭合父子 span，等待时间不计 active。历史缺少完整 timing 的记录继续标记 `estimated`。
+- Creator 保持最近事件在最上、原始阶段编号不变。组合验收通过 150 项后端/API、53 项前端、production build，以及 API-backed 浏览器的 newest-first、阶段编号和 recorded timing 文案回归。
 
-#### Task 5H — Lite runtime model configuration and pre-research recovery（P0，待开始）
+#### Task 5H — Lite runtime model configuration and pre-research recovery（P0，已完成，2026-08-03）
 
 为避免 `.env` 中固定 LLM Provider、模型或 API Key 不可用时阻断 Lite 发布，Creator 在右侧栏“本次研究摘要”下方增加紧凑“模型服务”卡片。用户只配置 `base_url`、`model`、`api_key`；Lite 限定 OpenAI-compatible Chat Completions 协议，但不维护具体模型 ID 白名单。`temperature`、输出长度、结构化输出提示、超时和自动重试仍由系统按任务管理，不开放给用户。
 
@@ -372,6 +374,9 @@ Lite 的证据字段只允许 `content_text` 与 `title`（投影过滤）。评
 - 本 Task 不建设加密托管、Workspace 管理 UI、独立设置中心、Anthropic 原生协议、用户自定义推理参数、模型目录同步或自动多模型 fallback。
 - 该最小闭环与 5G-2B 的真实时间分段解耦；模型不可用会直接阻断真实 Lite run，因此 Task 5H 优先实施，5G-2B 不是其前置条件。
 - 完整设计与验收矩阵见 `docs/superpowers/specs/2026-08-03-f003-lite-model-configuration-design.md`。
+- 完成记录：本地 SQLite 按 Workspace/用户保存已验证的 OpenAI-compatible `base_url`、`model`、`api_key`；API/Trace/日志只投影安全摘要和 Key 末四位。配置即时贯穿 pre-search、analysis 与 faithfulness，不会在用户配置失败后静默回退 `.env`。
+- Creator 空闲时即在“本次研究摘要”下显示模型卡。LLM 故障进入同一 run 的 `waiting_user`；刷新后从 durable `llm_recovery` 恢复，只有故障后重新验证保存的配置才能继续，且复用原 workflow/attempt/brief，不重复已完成采集。
+- 组合验收通过 150 项后端/API、53 项前端、production build，以及 Key 遮罩、reload 同 run 恢复和 Trace timing 三项真实浏览器回归。
 
 **通过条件**：预发布环境中新合同为唯一 Creator/report 合同；选择、scope、报告三态、恢复卡、citation drawer、模型配置与模型故障后的同 run 恢复均通过上述 API/浏览器验收。Gate 4A 不对正式用户发布，也不代表所有目录方向的采集能力已完成。
 
