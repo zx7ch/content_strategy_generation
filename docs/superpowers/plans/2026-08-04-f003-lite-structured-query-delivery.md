@@ -2,230 +2,101 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Deliver the Lite structured-subject, deterministic `2 + 1` query plan, run-scoped single-flight collection, safe Trace, and packet-only historical recovery without rerunning Spider.
+**Goal:** Deliver the single-direction Lite structured-subject, deterministic `2 + 1` query plan, coverage fallback, safe Trace, and packet-only historical recovery without rerunning Spider.
 
-**Architecture:** Pre-research produces a versioned `SubjectStructure` that backend code validates and the user confirms. A deterministic compiler freezes Q1/Q2 and inactive Q3 into `RunPolicySnapshot`; the directional pipeline consumes them through a run-scoped collection ledger that separates physical provider operations from direction-level evaluation and lineage. Durable logical checkpoints explain structure, plan, binding, coverage, fallback, and historical revision while the existing Trace exposes only safe summaries.
+**Architecture:** Pre-research produces a backend-validated `SubjectStructure` and uses the normal Creator composer for ambiguity clarification. A deterministic compiler freezes at most Q1/Q2 plus inactive Q3; the existing directional pipeline deduplicates candidates, evaluates frozen coverage, and activates Q3 once. Safe logical checkpoints explain structure, plan, coverage, fallback, and historical revision; cross-direction single-flight is explicitly deferred to Gate 4B.
 
 **Tech Stack:** Python 3.11 dataclasses and Pydantic, FastAPI, SQLite/aiosqlite, pytest/pytest-asyncio, Next.js/React/TypeScript, Node test runner.
 
 ## Global Constraints
 
 - Lite automatically executes exactly one confirmed primary core entity.
-- Freeze at most two primary QueryGroups and one inactive coverage fallback; `candidate_cap=20` per group.
-- Synonyms are admission equivalents and fallback material, never a default primary group.
-- `detail_fetch_cap=30` is a per-direction detail-evaluation cap; physical calls are counted separately.
-- Equivalent searches and provider note IDs are physically collected once per run while every logical direction/QueryGroup hit remains replayable.
-- Existing candidates and packets are consumed before Q3 or another provider call.
-- Clarification uses the normal Creator composer and the same Pre-research run; it is not an LLM recovery attempt.
-- Historical runs never receive a new query plan and may only replay when their frozen identities and persisted packets validate.
-- Trace remains newest-first and never exposes complete query text, raw user input, provider note ID, prompts, credentials, request headers, or raw provider payload.
-- Preserve unrelated local changes, including the dirty `app/ingest/xhs_spider` submodule and existing untracked files.
+- Freeze at most two primary QueryGroups and one inactive Q3; `candidate_cap=20` per group.
+- Synonyms are admission equivalents and Q3 material, never a default primary group.
+- `detail_fetch_cap=30` remains the per-direction detail-evaluation cap.
+- Merge equivalent Q1/Q2 and deduplicate canonical notes inside one direction while retaining all QueryGroup hits.
+- Consume existing candidates and packets before Q3 or another provider call.
+- Clarification uses the normal composer and same Pre-research run; it is not model recovery.
+- Historical runs keep their original query plans and replay only from validated persisted packets.
+- Trace stays newest-first and never exposes complete query text, raw user input, note ID, prompts, credentials, headers, or raw provider payload.
+- Do not implement cross-direction operation ownership, shared artifacts, bindings, shared failures, or physical/logical double-entry counters in Task 5I.
+- Preserve unrelated local changes, including `app/ingest/xhs_spider` and untracked files.
 
 ---
 
-## File Map
-
-- Create `app/content_research/subject_structure.py`: versioned subject value objects, grounding, normalization, validation, safe summary, and fingerprints.
-- Modify `app/content_research/presearch/prompts.py`: request the structured subject schema.
-- Modify `app/content_research/presearch/service.py`: parse/repair structured output and return `subject_needs_confirmation` separately from model failure.
-- Modify `app/content_research/api_schemas.py`: publish safe subject fields and add `clarify_subject` action payload.
-- Modify `app/content_research/service.py`: persist structure, clarify the same run, confirm a matching structure, freeze query plans, and append historical revisions.
-- Modify `app/content_research/workflow/plan_builder.py`: carry confirmed structure identity into the plan/task inputs.
-- Create `app/content_research/workflow/query_planner.py`: deterministic Q1/Q2/Q3 compilation, normalization, deduplication, activation metadata, and plan hashing.
-- Modify `app/content_research/contracts.py`: freeze structure/query/coverage/ledger versions and Q3 activation policy.
-- Create `app/content_research/workflow/run_collection_ledger.py`: atomic run-level operation reservation, artifact completion, logical bindings, and shared failure lookup.
-- Modify `app/content_research/async_pipeline_store.py`: transactional `INSERT ... ON CONFLICT DO NOTHING` reservation/read helpers.
-- Modify `app/content_research/persistence_models.py`: allow the new logical checkpoint stages.
-- Modify `app/content_research/workflow/directional_pipeline.py`: consume frozen active groups, reuse physical artifacts, count direction evaluations, evaluate coverage, and activate frozen Q3 once.
-- Modify `app/content_research/workflow/task_router.py`: route adapter calls through the run collection ledger.
-- Modify `app/content_research/observation/trace_service.py`: project physical-call and logical-reuse counters safely.
-- Modify `app/content_research/reporting/read_model.py`: include safe new checkpoint summaries.
-- Modify `frontend/src/lib/content-research-api.ts`: subject/clarification/Trace contracts.
-- Modify `frontend/src/app/creator/page.tsx`: compact subject summary, normal-composer clarification mode, and safe Trace labels.
-
----
-
-### Task 1: Versioned Subject Structure and Deterministic Trust Gate
+### Task 1: Structured Subject and Conversational Clarification
 
 **Files:**
 - Create: `app/content_research/subject_structure.py`
 - Modify: `app/content_research/presearch/prompts.py`
 - Modify: `app/content_research/presearch/service.py`
-- Test: `tests/unit/test_content_research_subject_structure.py`
-- Test: `tests/unit/test_content_research_presearch.py`
-
-**Interfaces:**
-- Produces: `SubjectEntity`, `SubjectStructure`, `SubjectStructureDecision`, `parse_subject_structure(data, normalized_input)`, `subject_structure_fingerprint(structure)`.
-- `PresearchChecklist.subject_structure` carries the JSON-safe validated structure or a `needs_confirmation` decision.
-
-- [ ] **Step 1: Write failing value-object tests**
-
-```python
-def test_structure_requires_grounded_single_core_entity_for_lite():
-    decision = parse_subject_structure(
-        {"canonical_subject": "防晒服饰", "subject_type": "category",
-         "core_entities": [{"canonical_name": "防晒服饰", "raw_mentions": ["防晒穿搭"]}],
-         "research_intents": ["穿搭"], "context_modifiers": ["夏季"],
-         "synonym_groups": {"防晒服饰": ["防晒衣"]}, "ambiguities": [],
-         "resolution_state": "resolved"},
-        normalized_input="夏季防晒穿搭",
-    )
-    assert decision.state == "confirmed"
-    assert decision.structure.core_entities[0].raw_mentions == ("防晒穿搭",)
-
-def test_structure_rejects_ungrounded_or_multiple_entities():
-    ungrounded = {
-        "canonical_subject": "防晒服饰", "subject_type": "category",
-        "core_entities": [{"canonical_name": "防晒服饰", "raw_mentions": ["防晒衣"]}],
-        "research_intents": ["推荐"], "context_modifiers": ["夏季通勤"],
-        "synonym_groups": {}, "ambiguities": [], "resolution_state": "resolved",
-    }
-    multiple = {
-        "canonical_subject": "防晒组合", "subject_type": "compound",
-        "core_entities": [
-            {"canonical_name": "防晒衣", "raw_mentions": ["防晒衣"]},
-            {"canonical_name": "防晒霜", "raw_mentions": ["防晒霜"]},
-        ],
-        "research_intents": ["搭配"], "context_modifiers": [],
-        "synonym_groups": {}, "ambiguities": [], "resolution_state": "resolved",
-    }
-    assert parse_subject_structure(ungrounded, "夏季通勤").reason_codes == ("core_entity_ungrounded",)
-    assert "multiple_primary_entities" in parse_subject_structure(multiple, "防晒衣和防晒霜").reason_codes
-```
-
-- [ ] **Step 2: Run the focused tests and verify RED**
-
-Run: `pytest -q tests/unit/test_content_research_subject_structure.py`
-
-Expected: import failure for `app.content_research.subject_structure`.
-
-- [ ] **Step 3: Implement immutable subject types and code-owned validation**
-
-```python
-@dataclass(frozen=True)
-class SubjectEntity:
-    canonical_name: str
-    raw_mentions: tuple[str, ...]
-
-@dataclass(frozen=True)
-class SubjectStructure:
-    schema_version: str
-    canonical_subject: str
-    subject_type: str
-    core_entities: tuple[SubjectEntity, ...]
-    research_intents: tuple[str, ...]
-    context_modifiers: tuple[str, ...]
-    synonym_groups: tuple[tuple[str, tuple[str, ...]], ...]
-    ambiguities: tuple[str, ...]
-    resolution_state: str
-
-@dataclass(frozen=True)
-class SubjectStructureDecision:
-    state: str
-    structure: SubjectStructure | None
-    reason_codes: tuple[str, ...]
-```
-
-Normalize Unicode/whitespace/case, require every raw mention in normalized input, reject empty/orphan/duplicate groups, reject unresolved ambiguity, and reject more than one primary entity for Lite. Do not use numeric LLM confidence.
-
-- [ ] **Step 4: Change the presearch prompt and parser to require the structure**
-
-Add the exact JSON fields from the design and keep the existing checklist fields. On malformed output, retain the existing one bounded format-repair request. A second malformed response remains `waiting_model_config`; a valid but ambiguous structure returns `subject_needs_confirmation` with stable reason codes and no fallback checklist pretending the topic is confirmed.
-
-- [ ] **Step 5: Run subject and presearch tests GREEN**
-
-Run: `pytest -q tests/unit/test_content_research_subject_structure.py tests/unit/test_content_research_presearch.py`
-
-Expected: all selected tests pass.
-
-- [ ] **Step 6: Commit Task 1**
-
-```bash
-git add app/content_research/subject_structure.py app/content_research/presearch/prompts.py app/content_research/presearch/service.py tests/unit/test_content_research_subject_structure.py tests/unit/test_content_research_presearch.py
-git commit -m "feat(content-research): validate structured Lite subjects"
-```
-
-### Task 2: Same-Run Conversational Clarification and Brief Confirmation
-
-**Files:**
 - Modify: `app/content_research/api_schemas.py`
+- Modify: `app/content_research/persistence_models.py`
 - Modify: `app/content_research/service.py`
 - Modify: `app/content_research/workflow/plan_builder.py`
 - Modify: `frontend/src/lib/content-research-api.ts`
 - Modify: `frontend/src/app/creator/page.tsx`
+- Test: `tests/unit/test_content_research_subject_structure.py`
+- Test: `tests/unit/test_content_research_presearch.py`
 - Test: `tests/e2e/test_content_research_presearch_api.py`
 - Test: `tests/e2e/test_content_research_brief_confirm_api.py`
-- Test: `frontend/src/lib/content-research-api.test.ts`
 - Test: `tests/acceptance/test_content_research_creator_ui_contract.py`
 
 **Interfaces:**
-- Consumes: `SubjectStructureDecision` from Task 1.
-- Produces: workflow action `clarify_subject`, `ContentResearchPresearchResponse.subject_structure`, `.subject_structure_state`, `.subject_structure_reason_codes`, and a confirmed structure hash stored in Brief/Plan.
+- Produces immutable `SubjectEntity`, `SubjectStructure`, `SubjectStructureDecision`, `parse_subject_structure(data, normalized_input)`, and `subject_structure_fingerprint(structure)`.
+- API produces `subject_structure`, `subject_structure_hash`, `subject_structure_state`, and stable reason codes; workflow action `clarify_subject` accepts `clarification_text`.
 
-- [ ] **Step 1: Write failing API tests for clarification**
+- [ ] **Step 1: Write failing subject validation tests**
+
+Cover a grounded `夏季防晒穿搭` structure, empty/ungrounded entities, unresolved `苹果` ambiguity, multiple primary entities, orphan/duplicate synonyms, and malformed JSON. Assert numeric LLM confidence is ignored.
+
+- [ ] **Step 2: Run RED**
+
+Run: `pytest -q tests/unit/test_content_research_subject_structure.py tests/unit/test_content_research_presearch.py -k 'structure or grounded or ambiguous'`
+
+Expected: missing subject-structure module/schema behavior.
+
+- [ ] **Step 3: Implement the minimal value objects and trust gate**
 
 ```python
-async def test_ambiguous_subject_clarifies_in_same_run_without_spider(client):
-    response = await client.post(
-        "/content-research/presearch",
-        json={"seed_text": "苹果适合年轻人吗", "thread_id": "thread-1"},
-    )
-    created = response.json()
-    assert created["status"] == "subject_needs_confirmation"
-    clarified = await client.post(
-        f"/content-research/workflows/{created['workflow_run_id']}/actions",
-        json={"action": "clarify_subject", "payload": {"clarification_text": "苹果品牌，关注年轻人的内容偏好"}},
-    )
-    assert clarified.json()["workflow_run_id"] == created["workflow_run_id"]
-    assert clarified.json()["subject_structure_state"] == "confirmed"
-    trace = await client.get(
-        f"/content-research/workflows/{created['workflow_run_id']}/trace"
-    )
-    assert trace.json()["external_api_summary"]["call_count"] == 0
+@dataclass(frozen=True)
+class SubjectStructureDecision:
+    state: str  # confirmed | needs_confirmation
+    structure: SubjectStructure | None
+    reason_codes: tuple[str, ...]
 ```
 
-Also assert clarification does not increment the presearch model-recovery attempt counter and formal confirmation rejects a stale/unconfirmed structure hash.
+Normalize Unicode/whitespace/case, ground every raw mention in user input, require one Lite primary entity, validate synonym ownership/duplicates, and use `needs_confirmation` for semantic ambiguity. Keep the existing single bounded format-repair call; a second malformed response remains model-configuration failure.
 
-- [ ] **Step 2: Run backend API tests RED**
+- [ ] **Step 4: Write failing same-run clarification tests**
 
-Run: `pytest -q tests/e2e/test_content_research_presearch_api.py tests/e2e/test_content_research_brief_confirm_api.py -k 'clarif or subject_structure'`
+Create an ambiguous presearch, send `clarify_subject` to the same workflow action endpoint, and assert the run ID is unchanged, external call count remains zero, model-recovery attempt count is unchanged, and the updated structure is confirmed. Confirming a stale/unconfirmed structure hash must fail.
 
-Expected: missing action/schema fields.
+- [ ] **Step 5: Implement the API/service clarification boundary**
 
-- [ ] **Step 3: Implement same-run clarification service boundary**
+Allow `subject_structure` in `StageCheckpointRecord`, then persist each structure input/hash and a `subject_structure` checkpoint. `clarify_subject` appends clarification to the same Pre-research input, supersedes only the executable unconfirmed structure, and rejects runs whose formal collection started. Freeze the confirmed structure identity into Brief, Plan, task payloads, and `RunPolicySnapshot` inputs.
 
-Add `clarify_subject(workflow_run_id, clarification_text)` that appends the clarification to the stored Presearch input, calls the Task 1 Presearch boundary, persists a new input/structure fingerprint and `subject_structure` checkpoint, and updates the existing Brief. It must reject runs whose formal collection already started.
+- [ ] **Step 6: Write and implement the minimal Creator interaction**
 
-- [ ] **Step 4: Require confirmed structure identity when freezing the plan**
+Test that the Pre-research card has no input, the normal composer placeholder becomes `补充你要调研的具体对象……`, sending routes to `clarify_subject`, the normal message remains visible, and a valid response renders `核心对象｜意图｜场景` in the card.
 
-Extend `BriefConfirmation` and `ContentResearchBriefConfirmRequest` with `subject_structure_hash`. `_build_and_persist_confirmed_plan` loads the stored structure, checks state/hash, stores the structure and generation identity in Brief/Plan/task payloads, and refuses free-text subject replacement after confirmation.
+- [ ] **Step 7: Run GREEN**
 
-- [ ] **Step 5: Write failing frontend contract tests**
+Run: `pytest -q tests/unit/test_content_research_subject_structure.py tests/unit/test_content_research_presearch.py tests/e2e/test_content_research_presearch_api.py tests/e2e/test_content_research_brief_confirm_api.py tests/acceptance/test_content_research_creator_ui_contract.py`
 
-Assert the normal composer sends `clarify_subject` when the active run state is `subject_needs_confirmation`, the card contains no text input, and the compact line renders core object/intent/context.
-
-- [ ] **Step 6: Implement the Creator clarification mode**
-
-Keep the card read-only. Change the composer placeholder to `补充你要调研的具体对象……`, route submit to `clarify_subject`, keep the message in the ordinary timeline, update the existing card from the response, and return to ordinary content-research confirmation when valid.
-
-- [ ] **Step 7: Run backend and frontend tests GREEN**
-
-Run: `pytest -q tests/e2e/test_content_research_presearch_api.py tests/e2e/test_content_research_brief_confirm_api.py tests/acceptance/test_content_research_creator_ui_contract.py`
-
-Run: `cd frontend && node --test src/lib/content-research-api.test.ts`
-
-- [ ] **Step 8: Commit Task 2**
+- [ ] **Step 8: Commit Task 1**
 
 ```bash
-git add app/content_research/api_schemas.py app/content_research/service.py app/content_research/workflow/plan_builder.py frontend/src/lib/content-research-api.ts frontend/src/app/creator/page.tsx tests/e2e/test_content_research_presearch_api.py tests/e2e/test_content_research_brief_confirm_api.py frontend/src/lib/content-research-api.test.ts tests/acceptance/test_content_research_creator_ui_contract.py
-git commit -m "feat(content-research): clarify Lite subjects in conversation"
+git add app/content_research/subject_structure.py app/content_research/presearch/prompts.py app/content_research/presearch/service.py app/content_research/api_schemas.py app/content_research/persistence_models.py app/content_research/service.py app/content_research/workflow/plan_builder.py frontend/src/lib/content-research-api.ts frontend/src/app/creator/page.tsx tests/unit/test_content_research_subject_structure.py tests/unit/test_content_research_presearch.py tests/e2e/test_content_research_presearch_api.py tests/e2e/test_content_research_brief_confirm_api.py tests/acceptance/test_content_research_creator_ui_contract.py
+git commit -m "feat(content-research): confirm structured Lite subjects"
 ```
 
-### Task 3: Versioned `2 + 1` Query Compiler and Frozen Policy
+### Task 2: Deterministic Q1/Q2/Q3 Compiler and Frozen Policy
 
 **Files:**
 - Create: `app/content_research/workflow/query_planner.py`
 - Modify: `app/content_research/workflow/directional_pipeline.py`
+- Modify: `app/content_research/persistence_models.py`
 - Modify: `app/content_research/contracts.py`
 - Modify: `app/content_research/service.py`
 - Test: `tests/unit/test_content_research_query_planner.py`
@@ -233,287 +104,144 @@ git commit -m "feat(content-research): clarify Lite subjects in conversation"
 - Test: `tests/e2e/test_content_research_brief_confirm_api.py`
 
 **Interfaces:**
-- Produces: `QueryRole`, `PlannedQueryGroup`, `CompiledQueryPlan`, `compile_lite_query_plan(structure, direction, explicit_focus, run_as_of_at)`.
-- Frozen QueryGroup payload adds `role`, `activation`, and `normalized_identity`; Q3 is frozen but inactive.
+- Produces `PlannedQueryGroup(role, activation, normalized_identity, query_group)` and `CompiledQueryPlan(primary_groups, fallback_group, plan_hash)` from the confirmed structure and direction definition.
 
 - [ ] **Step 1: Write failing compiler tests**
 
-```python
-def test_compiler_deduplicates_q1_q2_and_keeps_roles():
-    plan = compile_lite_query_plan(structure, direction, explicit_focus="夏季穿搭", run_as_of_at=NOW)
-    assert len(plan.primary_groups) <= 2
-    assert len({g.normalized_identity for g in plan.primary_groups}) == len(plan.primary_groups)
-    assert plan.fallback_group.activation == "coverage_fallback"
-    assert all(g.role != "synonym_primary" for g in plan.groups)
-```
+Assert Q1 is core entity + primary intent; Q2 is core entity + explicit focus or second direction facet; normalized duplicates merge while retaining both roles; Q2 may be absent; exactly one synonym-based Q3 is frozen inactive; ordering/hash are stable; every group has candidate cap 20 and frozen time window.
 
-Cover absent focus, duplicate Q1/Q2, frozen synonym fallback, candidate cap 20, stable ordering, and stable hash across insertion order.
-
-- [ ] **Step 2: Run compiler tests RED**
+- [ ] **Step 2: Run RED**
 
 Run: `pytest -q tests/unit/test_content_research_query_planner.py`
 
-- [ ] **Step 3: Implement the focused compiler**
+Expected: missing compiler and activation metadata.
 
-Normalize Unicode/case/whitespace/punctuation and confirmed aliases for identity. Compile Q1 core + primary direction intent; compile Q2 core + explicit focus or second frozen direction facet only when distinct; compile one inactive Q3 alias + uncovered focus. Do not make a Cartesian product.
+- [ ] **Step 3: Implement the minimal compiler**
 
-- [ ] **Step 4: Freeze compiler and coverage versions in the snapshot**
+Normalize Unicode/case/whitespace/punctuation and confirmed aliases for identity. Do not build a Cartesian product. Q3 uses the next frozen alias plus uncovered focus and has `activation="coverage_fallback"`.
 
-Add `subject_structure`, `subject_structure_hash`, `query_compiler_version`, `coverage_policy_version`, primary/fallback caps, and full group activation metadata to `locked_query_plan`. Update `_frozen_query_groups` and plan hashing to verify every field.
+- [ ] **Step 4: Freeze and validate the plan**
 
-- [ ] **Step 5: Run compiler, contract, and confirmation tests GREEN**
+Allow `query_plan` in `StageCheckpointRecord`. Add structure/hash, `query_compiler_version`, `coverage_policy_version`, primary/fallback caps, group role/activation, and full stable group payload to `locked_query_plan`. Update `_frozen_query_groups`, policy validation, plan hash, and direction relevance QueryGroup IDs. New runs use v2; history remains unchanged.
+
+- [ ] **Step 5: Run GREEN**
 
 Run: `pytest -q tests/unit/test_content_research_query_planner.py tests/unit/test_content_research_contracts.py tests/e2e/test_content_research_brief_confirm_api.py`
 
-- [ ] **Step 6: Commit Task 3**
+- [ ] **Step 6: Commit Task 2**
 
 ```bash
-git add app/content_research/workflow/query_planner.py app/content_research/workflow/directional_pipeline.py app/content_research/contracts.py app/content_research/service.py tests/unit/test_content_research_query_planner.py tests/unit/test_content_research_contracts.py tests/e2e/test_content_research_brief_confirm_api.py
-git commit -m "feat(content-research): freeze deterministic Lite query plans"
+git add app/content_research/workflow/query_planner.py app/content_research/workflow/directional_pipeline.py app/content_research/persistence_models.py app/content_research/contracts.py app/content_research/service.py tests/unit/test_content_research_query_planner.py tests/unit/test_content_research_contracts.py tests/e2e/test_content_research_brief_confirm_api.py
+git commit -m "feat(content-research): freeze Lite 2 plus 1 query plans"
 ```
 
-### Task 4: Run-Scoped Single-Flight Collection Ledger
+### Task 3: Direction Coverage Decision and Frozen Q3 Activation
 
 **Files:**
-- Create: `app/content_research/workflow/run_collection_ledger.py`
 - Modify: `app/content_research/persistence_models.py`
-- Modify: `app/content_research/async_pipeline_store.py`
-- Modify: `app/content_research/workflow/task_router.py`
-- Test: `tests/unit/test_content_research_run_collection_ledger.py`
-- Test: `tests/integration/test_content_research_run_collection_singleflight.py`
-
-**Interfaces:**
-- Produces: `PhysicalOperationIdentity`, `OperationReservation`, `RunCollectionLedger.reserve()`, `.complete()`, `.fail()`, `.bind()`, `.artifact()`.
-- Uses deterministic run-owned checkpoint IDs with `subagent_task_id="run_collection:<run_id>"`.
-
-- [ ] **Step 1: Write failing atomic reservation tests**
-
-```python
-async def test_concurrent_consumers_get_one_owner_and_one_reuser(db_path):
-    identity = PhysicalOperationIdentity.search(
-        run_id="run_1", provider="xiaohongshu",
-        normalized_query_identity="query-hash", sort="likes",
-        time_window={"end_at": "2026-08-04T00:00:00+00:00"},
-        candidate_cap=20, cursor=None,
-    )
-    ledger = RunCollectionLedger(db_path)
-    first, second = await asyncio.gather(
-        ledger.reserve(identity=identity, consumer_id="pm"),
-        ledger.reserve(identity=identity, consumer_id="cp"),
-    )
-    assert sorted([first.role, second.role]) == ["owner", "reuser"]
-    assert first.physical_operation_id == second.physical_operation_id
-```
-
-Cover completed reuse, outcome-unknown blocking, one shared auth failure, stable artifact refs, and distinct cursors producing distinct search operations.
-
-- [ ] **Step 2: Run ledger tests RED**
-
-Run: `pytest -q tests/unit/test_content_research_run_collection_ledger.py tests/integration/test_content_research_run_collection_singleflight.py`
-
-- [ ] **Step 3: Extend allowed checkpoint stages**
-
-Add `subject_structure`, `query_plan`, `collection_artifact`, `collection_binding`, `coverage_decision`, `fallback_decision`, and `relevance_revision` to `StageCheckpointRecord` validation. Keep schema `content_research_stage_checkpoint_v1` readable for old stages.
-
-- [ ] **Step 4: Implement atomic reservation in the async persistence session**
-
-Use `BEGIN IMMEDIATE` plus deterministic `INSERT ... ON CONFLICT(id) DO NOTHING`, then read the winning row in the same transaction. Never overwrite an existing running/completed/outcome-unknown physical fact. Store only safe request identity in the operation checkpoint.
-
-- [ ] **Step 5: Persist collection artifacts and bindings separately**
-
-Search artifacts contain persisted candidate/page refs; detail artifacts contain canonical source and normalized packet refs. Binding payloads contain direction ID, QueryGroup ID/role, physical operation ID, artifact ref, `reused`, and `evaluation_slot_consumed`—not raw provider payload.
-
-- [ ] **Step 6: Route adapter calls through the ledger**
-
-Owners perform and complete the adapter call. Reusers await/read the terminal artifact. A failed or outcome-unknown result propagates to all bindings; child completion never deletes the run-owned record.
-
-- [ ] **Step 7: Run ledger tests GREEN**
-
-Run: `pytest -q tests/unit/test_content_research_run_collection_ledger.py tests/integration/test_content_research_run_collection_singleflight.py`
-
-- [ ] **Step 8: Commit Task 4**
-
-```bash
-git add app/content_research/workflow/run_collection_ledger.py app/content_research/persistence_models.py app/content_research/async_pipeline_store.py app/content_research/workflow/task_router.py tests/unit/test_content_research_run_collection_ledger.py tests/integration/test_content_research_run_collection_singleflight.py
-git commit -m "feat(content-research): single-flight Lite collection calls"
-```
-
-### Task 5: Direction Evaluation Cap, Coverage Decisions, and Frozen Q3
-
-**Files:**
 - Modify: `app/content_research/workflow/directional_pipeline.py`
-- Modify: `app/content_research/workflow/run_collection_ledger.py`
 - Modify: `app/content_research/contracts.py`
 - Test: `tests/unit/test_content_research_directional_pipeline.py`
 - Test: `tests/integration/test_content_research_direction_pipeline_store.py`
 
 **Interfaces:**
-- Consumes: frozen active/inactive groups from Task 3 and artifacts/bindings from Task 4.
-- Produces: `CoverageDecision` checkpoint with staged counts and `FallbackDecision` checkpoint with stable reason codes.
+- Produces `coverage_decision` and `fallback_decision` checkpoints with staged counts, stable reasons, and the frozen Q3 ID.
 
-- [ ] **Step 1: Write failing coverage and cap tests**
+- [ ] **Step 1: Write failing coverage tests**
 
-```python
-async def test_reused_detail_counts_once_per_direction_but_one_physical_call():
-    runs = await execute_two_directions_with_shared_note(detail_fetch_cap=3)
-    assert runs["pm"].direction_detail_evaluated_count == 1
-    assert runs["cp"].direction_detail_evaluated_count == 1
-    assert runs["trace"].physical_detail_call_count == 1
+Cover independent failures of minimum relevant eligible samples, minimum authors, direct core support, explicit user focus, and invalid/unavailable detail replacement. Assert sufficient Q1/Q2 skips Q3; an unmet condition activates only frozen Q3 once; Q3 exhaustion returns partial/insufficient; refresh/replay preserves the decision and provider operation IDs.
 
-async def test_q3_activates_once_for_explicit_focus_gap_and_survives_resume():
-    first = await execute_until_fallback_checkpoint()
-    resumed = await resume_same_run()
-    assert first.fallback_group_id == resumed.fallback_group_id
-    assert resumed.provider_queries.count(first.fallback_group_id) == 1
-```
+- [ ] **Step 2: Run RED**
 
-Cover minimum samples, independent authors, core support, explicit focus, invalid/unavailable replacement, Q3 exhausted partial state, and Q3 not counted as retry/error.
+Run: `pytest -q tests/unit/test_content_research_directional_pipeline.py tests/integration/test_content_research_direction_pipeline_store.py -k 'coverage or fallback or explicit_focus'`
 
-Define `execute_two_directions_with_shared_note(detail_fetch_cap)` in the same
-integration test file to build two frozen direction contracts, one shared fake
-adapter note, two logical task executions, and the final safe Trace projection.
-Define `execute_until_fallback_checkpoint()` and `resume_same_run()` there to
-use one temporary SQLite database and return the persisted fallback ID plus the
-capturing adapter's issued QueryGroup IDs.
+Expected: missing coverage/fallback checkpoints and inactive-group handling.
 
-- [ ] **Step 2: Run focused pipeline tests RED**
+- [ ] **Step 3: Add the two checkpoint stages**
 
-Run: `pytest -q tests/unit/test_content_research_directional_pipeline.py tests/integration/test_content_research_direction_pipeline_store.py -k 'fallback or evaluation or coverage or reused'`
+Allow `coverage_decision` and `fallback_decision` in `StageCheckpointRecord`. Fingerprint coverage from plan hash, candidate manifest, direction policy, relevance version, and staged counts; fingerprint fallback from coverage fingerprint plus frozen Q3 ID and stable reason codes.
 
-- [ ] **Step 3: Implement direction evaluation counting**
+- [ ] **Step 4: Implement staged counts and Q3 activation**
 
-Consume an evaluation slot when a distinct canonical note detail is first considered by a direction, regardless of artifact reuse. Do not consume for invalid prevalidation candidates or repeated hits of the same note in the same direction. Stop at frozen cap 30.
+Record discovered, deduplicated, relevant, detail-eligible, admitted, and independent-author counts. Consume the existing per-direction `detail_fetch_cap=30`; invalid prevalidation candidates and duplicate hits do not consume a slot. Exhaust persisted primary candidates before activating Q3. Reuse a completed fallback decision on recovery and never generate a new query.
 
-- [ ] **Step 4: Implement durable staged coverage and Q3 activation**
+- [ ] **Step 5: Keep existing provider failure scope**
 
-Persist discovered/deduplicated/relevant/detail-eligible/admitted/author/focus counts. Activate only the frozen Q3 when a stable reason remains after primary pools are consumed. Reuse an existing fallback decision on replay and publish partial/insufficient focus semantics after Q3 exhaustion.
+Do not add shared cross-direction behavior. Preserve current single-direction auth, outcome-unknown, automatic retry, note-unavailable replacement, and checkpoint recovery semantics. Q3 is normal control flow and does not increment error/retry counts.
 
-- [ ] **Step 5: Propagate shared failures with correct scope**
-
-Auth pauses the run once; outcome-unknown blocks all consumers; automatic retry remains physical-operation scoped; note-unavailable lets each direction choose its next persisted candidate without rerunning search.
-
-- [ ] **Step 6: Run directional tests GREEN**
+- [ ] **Step 6: Run GREEN**
 
 Run: `pytest -q tests/unit/test_content_research_directional_pipeline.py tests/integration/test_content_research_direction_pipeline_store.py`
 
-- [ ] **Step 7: Commit Task 5**
+- [ ] **Step 7: Commit Task 3**
 
 ```bash
-git add app/content_research/workflow/directional_pipeline.py app/content_research/workflow/run_collection_ledger.py app/content_research/contracts.py tests/unit/test_content_research_directional_pipeline.py tests/integration/test_content_research_direction_pipeline_store.py
-git commit -m "feat(content-research): activate deterministic coverage fallback"
+git add app/content_research/persistence_models.py app/content_research/workflow/directional_pipeline.py app/content_research/contracts.py tests/unit/test_content_research_directional_pipeline.py tests/integration/test_content_research_direction_pipeline_store.py
+git commit -m "feat(content-research): activate frozen Lite coverage fallback"
 ```
 
-### Task 6: Safe Trace and Checkpoint Observability
+### Task 4: Safe Trace, Historical Replay, and Acceptance
 
 **Files:**
+- Modify: `app/content_research/persistence_models.py`
+- Modify: `app/content_research/service.py`
+- Modify: `app/content_research/contracts.py`
+- Modify: `app/content_research/workflow/directional_pipeline.py`
 - Modify: `app/content_research/observation/trace_service.py`
 - Modify: `app/content_research/reporting/read_model.py`
 - Modify: `app/content_research/api_schemas.py`
 - Modify: `frontend/src/lib/content-research-api.ts`
 - Modify: `frontend/src/app/creator/page.tsx`
 - Test: `tests/unit/test_content_research_trace_service.py`
-- Test: `tests/e2e/test_content_research_creator_browser.py`
-
-**Interfaces:**
-- Produces safe `query_plan_summary`, `coverage_summary`, `fallback_summary`, `collection_reuse_summary`, `physical_detail_call_count`, and direction `detail_evaluated_count` projections.
-
-- [ ] **Step 1: Write failing safe-projection tests**
-
-Assert one physical operation with two bindings appears as call count 1, consumer count 2, reuse count 1; Q3 activation does not increase retry/error counts; newest-first ordering remains; forbidden query/note/prompt/secret strings are absent recursively.
-
-- [ ] **Step 2: Run Trace tests RED**
-
-Run: `pytest -q tests/unit/test_content_research_trace_service.py -k 'physical or binding or coverage or fallback or safe'`
-
-- [ ] **Step 3: Deduplicate physical operations by run-owned identity**
-
-Replace the current `(subagent_task_id, operation_fingerprint)` public aggregation key with stable `physical_operation_id`. Continue reading legacy task-scoped operations when the new ID is absent; never fabricate binding/reuse counts for legacy records.
-
-- [ ] **Step 4: Project logical checkpoints and double counters safely**
-
-Allow only stage/status/time, short hashes, role/count/reason fields, direction ID, consumer/reuse counts, and evaluation usage. Do not publish complete normalized query, raw subject, provider note ID, prompt, request, completion payload, or artifact content.
-
-- [ ] **Step 5: Render concise Trace details in Creator**
-
-Within the existing expert step card show query-plan counts, merged count, physical call count, reuse count, direction evaluation count/cap, coverage counts, and fallback reason. Keep current newest-first event order and workflow stage numbering.
-
-- [ ] **Step 6: Run backend and browser Trace tests GREEN**
-
-Run: `pytest -q tests/unit/test_content_research_trace_service.py tests/e2e/test_content_research_creator_browser.py -k 'trace or subject or fallback or reuse'`
-
-- [ ] **Step 7: Commit Task 6**
-
-```bash
-git add app/content_research/observation/trace_service.py app/content_research/reporting/read_model.py app/content_research/api_schemas.py frontend/src/lib/content-research-api.ts frontend/src/app/creator/page.tsx tests/unit/test_content_research_trace_service.py tests/e2e/test_content_research_creator_browser.py
-git commit -m "feat(content-research): expose safe Lite query observability"
-```
-
-### Task 7: Historical Relevance Revision and End-to-End Acceptance
-
-**Files:**
-- Modify: `app/content_research/service.py`
-- Modify: `app/content_research/contracts.py`
-- Modify: `app/content_research/workflow/directional_pipeline.py`
 - Test: `tests/integration/test_content_research_packet_replay.py`
+- Test: `tests/e2e/test_content_research_creator_browser.py`
 - Test: `tests/e2e/test_content_research_formal_workflow_e2e.py`
 - Modify: `docs/features/f003/F003_content_research_lite_delivery_plan.md`
 
 **Interfaces:**
-- Produces: append-only `relevance_revision` checkpoint and guarded `replay_downstream_from_persisted_packets(workflow_run_id)` behavior for eligible history.
+- Adds safe `subject_structure`, `query_plan`, `coverage_decision`, `fallback_decision`, and `relevance_revision` checkpoint projections.
+- Guards `replay_downstream_from_persisted_packets(workflow_run_id)` with an append-only `query_relevance_v2` revision for eligible history.
 
-- [ ] **Step 1: Write failing historical replay tests**
+- [ ] **Step 1: Write failing Trace safety tests**
 
-```python
-async def test_v1_run_appends_revision_and_replays_without_provider_calls(service):
-    before = provider_operation_ids(RUN_ID)
-    result = await service.replay_downstream_from_persisted_packets(RUN_ID)
-    assert result["provider_operation_count"] == len(before)
-    assert provider_operation_ids(RUN_ID) == before
-    assert latest_checkpoint(RUN_ID, "relevance_revision").status == "completed"
-    assert result["publication_state"] in {"complete_verified_report", "partial_verified_report"}
-```
+Assert newest-first workflow ordering is unchanged; structure/plan short hashes, group counts, merged count, staged coverage counts, and fallback reasons are visible; Q3 does not increase error/retry counts; recursive projection excludes complete query, raw subject, note ID, Prompt, secrets, request headers, and raw provider payload. Legacy operations remain readable without fabricated new fields.
 
-In the same test file, define `provider_operation_ids(run_id)` by filtering
-`StageCheckpointRecord` for `stage_name == "operation"`, and define
-`latest_checkpoint(run_id, stage)` by sorting matching records by
-`(created_at, id)` and returning the final item. The fixture must seed a legacy
-snapshot, completed selection, persisted packets, and terminal specialist task;
-it must not provide a source adapter to the replay boundary.
+- [ ] **Step 2: Write failing historical replay tests**
 
-Also reject mismatched subject/snapshot/query groups, missing selection/packet checkpoints, unsupported revisions, and any replay that changes operation or packet identity sets.
+Seed a legacy snapshot, completed selection, persisted packets, and terminal specialist task. Assert replay appends `relevance_revision`, changes neither provider-operation nor packet ID sets, and republishes from admission onward. Reject mismatched subject/snapshot/query groups, missing packets/checkpoints, and unsupported revisions.
 
-- [ ] **Step 2: Run replay tests RED**
+- [ ] **Step 3: Run RED**
 
-Run: `pytest -q tests/integration/test_content_research_packet_replay.py`
+Run: `pytest -q tests/unit/test_content_research_trace_service.py tests/integration/test_content_research_packet_replay.py -k 'structure or query_plan or coverage or fallback or revision or safe'`
 
-- [ ] **Step 3: Implement append-only revision validation**
+- [ ] **Step 4: Implement safe logical checkpoint projection**
 
-Generate the structure from the already confirmed subject and locked legacy plan with no Spider capability, validate base snapshot/query identities, persist `query_relevance_v2` revision identity, include its hash/version in admission fingerprints, and leave the original snapshot/contract unchanged.
+Allow `relevance_revision` in `StageCheckpointRecord`; `subject_structure`, `query_plan`, `coverage_decision`, and `fallback_decision` were introduced by Tasks 1–3. Project only stage/status/time, short hashes, roles/counts, direction ID, and stable reason codes. Keep existing specialist-scoped provider operation aggregation; do not add consumer/reuse counters.
 
-- [ ] **Step 4: Extend downstream replay guardrails**
+- [ ] **Step 5: Implement guarded historical revision and replay**
 
-Require terminal successful/partial specialist tasks, completed selection and packet checkpoints, at least one persisted packet, matching revision identities, and identical provider-operation/packet sets before and after publication.
+Generate structure from the already confirmed legacy subject with no Spider capability, validate base snapshot and locked QueryGroup identities, append immutable `query_relevance_v2` revision, include its hash/version in admission fingerprints, and enforce identical operation/packet sets before and after publication.
 
-- [ ] **Step 5: Run full focused regression**
+- [ ] **Step 6: Render minimal Trace details**
 
-Run: `pytest -q tests/unit/test_content_research_subject_structure.py tests/unit/test_content_research_query_planner.py tests/unit/test_content_research_run_collection_ledger.py tests/unit/test_content_research_directional_pipeline.py tests/unit/test_content_research_trace_service.py tests/integration/test_content_research_run_collection_singleflight.py tests/integration/test_content_research_direction_pipeline_store.py tests/integration/test_content_research_packet_replay.py tests/e2e/test_content_research_presearch_api.py tests/e2e/test_content_research_brief_confirm_api.py tests/e2e/test_content_research_formal_workflow_e2e.py`
+In the existing expert/Pre-research cards show compact subject status, primary/fallback group counts, merged count, staged coverage, and Q3 state/reason. Keep current timeline order and stage numbers.
+
+- [ ] **Step 7: Run focused regression and build**
+
+Run: `pytest -q tests/unit/test_content_research_subject_structure.py tests/unit/test_content_research_query_planner.py tests/unit/test_content_research_directional_pipeline.py tests/unit/test_content_research_trace_service.py tests/integration/test_content_research_direction_pipeline_store.py tests/integration/test_content_research_packet_replay.py tests/e2e/test_content_research_presearch_api.py tests/e2e/test_content_research_brief_confirm_api.py tests/e2e/test_content_research_creator_browser.py tests/e2e/test_content_research_formal_workflow_e2e.py`
 
 Run: `cd frontend && npx tsc --noEmit && npm run build`
-
-- [ ] **Step 6: Run hygiene checks**
 
 Run: `.venv/bin/ruff check app/content_research tests/unit tests/integration tests/e2e`
 
 Run: `git diff --check`
 
-- [ ] **Step 7: Record exact acceptance evidence**
+- [ ] **Step 8: Record evidence and commit Task 4**
 
-Update Task 5I with test counts, one new-run ID, one historical replay run ID, before/after provider operation counts, physical/reuse/evaluation Trace counters, and publication state. Do not mark complete if a real authenticated canary required by Gate 4B was not executed.
-
-- [ ] **Step 8: Commit Task 7**
+Record exact test counts, one new-run acceptance, one historical replay, unchanged operation/packet counts, and publication state in Task 5I. Do not claim cross-direction dedup or Gate 4B completion.
 
 ```bash
-git add app/content_research/service.py app/content_research/contracts.py app/content_research/workflow/directional_pipeline.py tests/integration/test_content_research_packet_replay.py tests/e2e/test_content_research_formal_workflow_e2e.py docs/features/f003/F003_content_research_lite_delivery_plan.md
+git add app/content_research/persistence_models.py app/content_research/service.py app/content_research/contracts.py app/content_research/workflow/directional_pipeline.py app/content_research/observation/trace_service.py app/content_research/reporting/read_model.py app/content_research/api_schemas.py frontend/src/lib/content-research-api.ts frontend/src/app/creator/page.tsx tests/unit/test_content_research_trace_service.py tests/integration/test_content_research_packet_replay.py tests/e2e/test_content_research_creator_browser.py tests/e2e/test_content_research_formal_workflow_e2e.py docs/features/f003/F003_content_research_lite_delivery_plan.md
 git commit -m "feat(content-research): complete Lite structured query delivery"
 ```
 
@@ -521,7 +249,9 @@ git commit -m "feat(content-research): complete Lite structured query delivery"
 
 ## Plan Self-Review
 
-- Spec coverage: Tasks 1–3 cover subject trust, clarification, compact confirmation, `2 + 1`, normalization, deduplication, and frozen versions; Tasks 4–5 cover single-flight, artifacts, bindings, shared failures, direction caps, staged coverage, and Q3; Task 6 covers safe newest-first observability; Task 7 covers history and no-Spider replay.
-- Scope: multi-entity auto decomposition, card input, embeddings, adaptive run-wide budget, multilingual expansion, complex negation, cross-run cache, and repeated LLM query rewriting are absent by design.
-- Type consistency: `SubjectStructure`, `CompiledQueryPlan`, `RunCollectionLedger`, `CoverageDecision`, physical operation identity, structure/plan hashes, and checkpoint stage names have one spelling throughout the tasks.
-- Recovery consistency: clarification is same-run Pre-research without recovery-budget use; provider recovery is physical-operation scoped; historical replay cannot compile or execute a new query plan.
+- Task 1 covers structure trust, ambiguity, same-run composer clarification, and confirmation identity.
+- Task 2 covers deterministic Q1/Q2/Q3, normalized deduplication, frozen budgets, and versioning.
+- Task 3 covers staged evidence counts, per-direction cap, one-time Q3 activation, and recovery determinism.
+- Task 4 covers safe newest-first Trace, eligible historical packet-only replay, frontend visibility, and end-to-end verification.
+- Cross-direction single-flight, collection artifacts/bindings, shared failure propagation, and physical/logical double-entry counters are explicitly deferred to Gate 4B.
+- Multi-entity decomposition, card input, embeddings, adaptive budgets, multilingual expansion, complex negation, cross-run cache, and repeated query rewriting remain out of scope.

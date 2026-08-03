@@ -386,14 +386,13 @@ Lite 只交付结构化主题到可信采集的核心闭环，不扩展为通用
 - Brief 显示“核心对象｜意图｜场景”。确认后由版本化编译器冻结最多两个主 QueryGroup：Q1 为核心对象 + 主研究意图，Q2 为核心对象 + 用户明确重点／尚未覆盖场景；规范化后相同则合并，不为凑数执行重复搜索。
 - 同义词不作为默认独立 QueryGroup，仅作为确定性准入等价词和最多一个预编译补位 Q3。Q3 只有在相关 eligible 样本、独立作者、核心对象、用户明确重点或详情失败补位仍有缺口时激活；刷新、恢复和重试不得生成不同 Q3。
 - 冻结 `primary_query_group_cap=2`、`coverage_fallback_query_group_cap=1`、每 QueryGroup `candidate_cap=20`；正常搜索候选上限为每方向 40，触发补位后最多 60。既有 `detail_fetch_cap=30`、样本、作者和重试预算继续由共享 `RunPolicySnapshot` 唯一定义，重试不能重置或放大预算。
-- 搜索与笔记详情按 run 级物理去重：等价 normalized query 只请求一次，同一 provider note ID 只拉取一次；每个方向、QueryGroup、rank hit 的完整 lineage 仍保留。多方向继续分别执行冻结门槛，但本 Task 不新增自适应全局预算。
-- run 级去重必须是原子 single-flight：物理 operation 按 `reserved -> running -> completed|failed|outcome_unknown` 持久化，所有权属于 run。Provider lifecycle checkpoint、可复用 collection artifact 与方向级 `collection_binding` 分离；并发专家不能 check-then-call 重复请求。
-- 既有 `detail_fetch_cap=30` 明确为每方向“详情样本评估上限”：复用详情不增加物理 Spider 调用，但在每个消费方向各计一个 evaluation slot。Trace 分别显示 run 级 physical detail call count 与方向级 evaluated count，复用不得绕过冻结样本范围。
-- 新增安全逻辑 checkpoint：`subject_structure`、`query_plan`、`collection_binding`、`coverage_decision`、`fallback_decision`、`relevance_revision`。它们在现有倒序 Trace 内作为专家/预检索细节展示，不增加伪 workflow 阶段；Q3 和复用不计为错误/重试。物理 operation 只计一次并显示消费者/复用数量。
+- Task 5I 只做单方向核心：等价 normalized Q1/Q2 合并，同一方向内 canonical note 去重，并保留每个 QueryGroup/rank hit 的完整 lineage。跨方向原子 single-flight、共享 collection artifact/binding 和共享失败传播延期到 Gate 4B，在多个方向开放真实并发采集前完成。
+- 既有 `detail_fetch_cap=30` 明确为每方向“详情样本评估上限”；Task 5I 沿用现有单方向 operation 计数，不新增物理/逻辑双账本。Gate 4B 引入跨方向复用时再分别投影 physical call 与方向 evaluated count。
+- 新增安全逻辑 checkpoint：`subject_structure`、`query_plan`、`coverage_decision`、`fallback_decision`、`relevance_revision`。它们在现有倒序 Trace 内作为专家/预检索细节展示，不增加伪 workflow 阶段；Q3 不计为错误/重试。
 - `needs_confirmation` 是独立产品状态而非模型失败。Creator 复用底部正常对话输入框，将消息以同 run `clarify_subject` action 提交；Pre-research 卡片只显示澄清问题、结构摘要与确认状态，不增加输入框。澄清不消耗模型故障恢复预算、不调用 Spider；采集开始后修改主题必须新建 run。
-- 共享物理失败只产生一次事实：auth 暂停整个 run，outcome-unknown 阻止所有消费者盲重试，自动重试只由物理 operation 消费，note-unavailable 由各方向独立补位。公开 Trace 不返回完整 query、原始主题、note ID、Prompt、凭据、请求头或 provider 原始 payload。
+- Task 5I 沿用现有单方向 auth/outcome-unknown/自动重试/note-unavailable 语义。公开 Trace 不返回完整 query、原始主题、note ID、Prompt、凭据、请求头或 provider 原始 payload。
 - Spider 返回数量不等于可用证据，必须分别记录 discovered、deduplicated、relevant、detail-eligible、admitted。现有候选和 packet 必须先耗尽/重放，再允许 Q3；任何下游修复不得为了重做 admission/report 重跑 Spider。
-- 最小验收覆盖：可信主题、对话澄清歧义/空主体、Q1/Q2 去重、Q3 确定性激活、并发 single-flight、多方向 query/note 物理去重、共享失败、逻辑/物理双计数、Trace 脱敏、显式重点未覆盖的 partial 语义，以及刷新/恢复不增加既有 provider operation。
+- 最小验收覆盖：可信主题、对话澄清歧义/空主体、Q1/Q2 去重、同方向 note 去重、Q3 确定性激活、Trace 脱敏、显式重点未覆盖的 partial 语义，以及刷新/恢复不增加既有 provider operation。
 - 明确延期：多核心对象自动拆分、可视化主题编辑器、embedding 相关性、动态全局预算、多语言 query expansion、复杂否定规划和多轮 LLM query 改写。
 
 **通过条件**：预发布环境中新合同为唯一 Creator/report 合同；选择、scope、报告三态、恢复卡、citation drawer、模型配置与模型故障后的同 run 恢复均通过上述 API/浏览器验收。Gate 4A 不对正式用户发布，也不代表所有目录方向的采集能力已完成。
@@ -428,6 +427,7 @@ Lite 只交付结构化主题到可信采集的核心闭环，不扩展为通用
 
 ### Gate 4B：真实能力与正式交付验收
 
+- 在多个方向开放真实并发采集前，实现 run 级原子 single-flight：共享物理 operation、collection artifact/binding、失败传播和 physical/logical 双计数；同 query/note 的跨方向调用必须由真实并发 E2E 证明只执行一次。
 - 完成 Gate 3 后，三个方向各自通过一次真实成功 canary，并完成一次三方向全选的真实 run，验证并行、汇总计数、幂等报告物化和 citation。
 - 完成一次已请求方向的证据不足 run 与一次可恢复失败后继续的 run；在移除 preview flag 的候选发布环境重跑 Gate 4A 的浏览器主路径。
 - Task 5 的报告质量合同与 legacy report artifact 清理必须通过，才可将三方向真实 canary 的输出视为正式 Lite 报告。

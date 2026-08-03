@@ -47,8 +47,8 @@ Lite ships only the following core path:
 2. compact Brief confirmation of core object, intent, and context;
 3. at most two primary QueryGroups, normalized before identity and deduplicated;
 4. at most one precompiled deterministic coverage fallback;
-5. run-level physical deduplication of equivalent searches and note details,
-   while retaining all direction and QueryGroup hit lineage;
+5. normalized QueryGroup and canonical-note deduplication inside each direction,
+   while retaining all QueryGroup hit lineage;
 6. deterministic core-object and explicit-user-focus coverage checks;
 7. checkpoint replay that consumes persisted candidates and packets before any
    new provider call;
@@ -57,8 +57,11 @@ Lite ships only the following core path:
 
 Lite does not ship automatic multi-core-entity decomposition, a visual subject
 editor, embeddings, an adaptive global budget, multilingual query expansion,
-general negation planning, or repeated LLM query rewriting. The formal schema
-may represent future capabilities, but the Lite executor must not activate them.
+general negation planning, repeated LLM query rewriting, or cross-direction
+single-flight collection. The formal schema may represent future capabilities,
+but the Lite executor must not activate them. Cross-direction physical reuse is
+a Gate 4B prerequisite before multiple directions are enabled for real parallel
+collection, not part of Task 5I's single-direction release path.
 
 ## General Subject Structure
 
@@ -191,7 +194,12 @@ partial-report contract.
 Q3 activation is a durable, idempotent checkpoint decision. Refresh and resume
 cannot generate another fallback or rerun Q1/Q2.
 
-## Run-Level Physical Deduplication
+## Gate 4B Cross-Direction Physical Deduplication
+
+The following contract is retained for the formal multi-direction release but
+is explicitly deferred from Task 5I. Task 5I continues to deduplicate normalized
+Q1/Q2 queries and canonical note IDs within one direction using the existing
+directional pipeline.
 
 The logical direction plan and the physical provider-call ledger are separate.
 Within one run:
@@ -244,23 +252,15 @@ stages:
 | --- | --- | --- |
 | `subject_structure` | generation identity and deterministic validation | resolution state, type, reason codes, short structure hash |
 | `query_plan` | frozen Q1/Q2/Q3 roles and normalized deduplication | primary/fallback counts, merged count, short plan hash |
-| `collection_binding` | logical consumer to physical artifact | direction, QueryGroup role, reused boolean |
 | `coverage_decision` | staged eligibility and focus coverage | discovered/deduplicated/relevant/detail-eligible/admitted counts |
 | `fallback_decision` | durable Q3 activation | activated/exhausted and stable reason codes |
 | `relevance_revision` | historical packet-only v2 repair | revision state and zero-provider-call replay marker |
 
-Physical provider calls remain `operation` checkpoints but use a run-scoped
-physical identity derived from run, provider, operation, and safe request
-identity rather than subagent ownership. A physical operation exposes a stable
-safe ID, consumer count, reuse count, status, retry counters, and real
-start/finish time. It never exposes full query text, raw user input, provider
-note ID, prompt, credentials, request headers, or raw provider payload.
-
-Trace reports both:
-
-- `physical_detail_call_count`: unique Spider detail calls in the run;
-- `direction_detail_evaluated_count`: distinct details evaluated by the
-  direction against its frozen cap of 30.
+Task 5I leaves existing specialist-scoped physical `operation` checkpoints and
+provider counters unchanged. It adds safe structure, plan, coverage, fallback,
+and historical-revision detail only. `collection_binding`, run-owned physical
+operation identities, consumer/reuse counts, and cross-direction double-entry
+accounting are delivered with the Gate 4B single-flight ledger.
 
 Q3 activation and collection reuse are normal control flow, not errors or
 retries. `fallback_exhausted`, an actual provider failure, or an invalid subject
@@ -387,19 +387,17 @@ TDD coverage must prove:
     deterministic fallback and partial-result behavior;
 14. a refresh, user recovery, or specialist retry cannot reset candidate/detail
     budgets or create a different Q3.
-15. concurrent consumers reserve one physical operation and persist separate
-    logical bindings without duplicate Spider calls;
-16. a reused detail consumes one evaluation slot per consuming direction while
-    physical call count remains one;
-17. shared auth, outcome-unknown, transient, and note-unavailable failures are
-    projected once and propagate to all consumers with the specified scope;
-18. subject clarification uses the existing composer, stays in the same
+15. subject clarification uses the existing composer, stays in the same
     Pre-research run, and does not consume model-recovery budget;
-19. Trace exposes safe plan, coverage, fallback, binding, physical-call, and
-    direction-evaluation summaries without query, note ID, prompt, or secret
+16. Trace exposes safe plan, coverage, fallback, and direction-evaluation
+    summaries without query, note ID, prompt, or secret
     leakage;
-20. old runs remain readable without fabricated new checkpoints, while an
+17. old runs remain readable without fabricated new checkpoints, while an
     eligible historical replay adds `relevance_revision` and zero operations.
+
+Gate 4B adds separate concurrency acceptance for atomic ownership, collection
+artifacts/bindings, shared failures, physical/logical double counters, and
+cross-direction no-duplicate Spider calls.
 
 ## Acceptance
 
