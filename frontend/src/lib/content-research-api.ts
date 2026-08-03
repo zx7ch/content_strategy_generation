@@ -132,6 +132,7 @@ export interface ContentResearchTrace {
   usage_events: JsonObject[];
   llm_recovery?: {
     required?: boolean;
+    required_since?: string | null;
     error_code?: string | null;
     configuration_source?: string | null;
     model?: string | null;

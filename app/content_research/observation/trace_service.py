@@ -98,7 +98,9 @@ class ContentResearchTraceService:
             usage_events=[],
             llm_recovery=_llm_recovery_projection(
                 run_status=run_status, current_stage=current_stage,
-                runtime_steps=[_json_dict(step) for step in runtime_steps], brief=brief,
+                runtime_steps=[_json_dict(step) for step in runtime_steps],
+                workflow_events=workflow_event_dicts,
+                brief=brief,
             ),
         )
 
@@ -193,7 +195,12 @@ def _safe_runtime_child_task_dict(task: Any) -> dict:
 
 
 def _llm_recovery_projection(
-    *, run_status: str, current_stage: str | None, runtime_steps: list[dict], brief: ResearchBriefRecord
+    *,
+    run_status: str,
+    current_stage: str | None,
+    runtime_steps: list[dict],
+    workflow_events: list[dict],
+    brief: ResearchBriefRecord,
 ) -> dict:
     presearch_step = next((step for step in runtime_steps if step.get("step_name") == "presearch"), {})
     required = run_status == "waiting_user" and current_stage == "presearch"
@@ -201,8 +208,18 @@ def _llm_recovery_projection(
     if not isinstance(error_code, str) or not error_code.startswith("llm_"):
         error_code = None
     payload = brief.payload
+    recovery_event = next(
+        (
+            event
+            for event in reversed(workflow_events)
+            if event.get("event_type") == "run_waiting_user"
+            and str((event.get("payload_json") or {}).get("reason_code") or "").startswith("llm_")
+        ),
+        None,
+    )
     return {
         "required": required,
+        "required_since": recovery_event.get("created_at") if recovery_event else None,
         "error_code": error_code,
         "configuration_source": payload.get("configuration_source")
         if payload.get("configuration_source") in {"user", "system_default"} else None,

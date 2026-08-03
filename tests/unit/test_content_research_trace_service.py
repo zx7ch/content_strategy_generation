@@ -5,6 +5,8 @@ import json
 import pytest
 
 from app.content_research.api_schemas import ContentResearchBriefConfirmRequest
+from app.content_research.models import ResearchBriefRecord
+from app.content_research.observation.trace_service import _llm_recovery_projection
 from app.content_research.persistence_models import StageCheckpointRecord
 from app.content_research.presearch.service import PresearchService
 from app.content_research.service import (
@@ -36,6 +38,40 @@ class FakeLLM:
             usage=TokenUsage(total_tokens=10),
             latency_ms=1,
         )
+
+
+def test_llm_recovery_exposes_only_the_durable_failure_boundary():
+    brief = ResearchBriefRecord(
+        id="brief_recovery",
+        workflow_run_id="run_recovery",
+        thread_id="thread_recovery",
+        schema_version="content_research_brief_v1",
+        status="draft",
+        payload={"configuration_source": "user", "model": "model-x"},
+    )
+
+    recovery = _llm_recovery_projection(
+        run_status="waiting_user",
+        current_stage="presearch",
+        runtime_steps=[{"step_name": "presearch", "error_code": "llm_auth_invalid"}],
+        workflow_events=[
+            {
+                "event_type": "run_waiting_user",
+                "created_at": "2026-08-03T01:02:03+00:00",
+                "payload_json": {"reason_code": "llm_auth_invalid", "reason_message": "secret"},
+            }
+        ],
+        brief=brief,
+    )
+
+    assert recovery == {
+        "required": True,
+        "required_since": "2026-08-03T01:02:03+00:00",
+        "error_code": "llm_auth_invalid",
+        "configuration_source": "user",
+        "model": "model-x",
+    }
+    assert "secret" not in str(recovery)
 
 
 @pytest.fixture()

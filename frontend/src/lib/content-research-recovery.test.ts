@@ -10,10 +10,10 @@ test("reload recovery uses the durable workflow and Trace without transient inte
       transientPresearch: null,
       durableRun: {
         workflowRunId: "run_durable",
-        llmRecovery: { required: true },
+        llmRecovery: { required: true, required_since: "2026-08-03T01:02:03+00:00" },
       },
     }),
-    { recoveryPending: true, workflowRunId: "run_durable" },
+    { recoveryPending: true, workflowRunId: "run_durable", requiredSince: "2026-08-03T01:02:03+00:00" },
   );
 });
 
@@ -27,7 +27,7 @@ test("non-recovery durable runs do not expose a model continuation", () => {
         llmRecovery: { required: false },
       },
     }),
-    { recoveryPending: false, workflowRunId: null },
+    { recoveryPending: false, workflowRunId: null, requiredSince: null },
   );
 });
 
@@ -44,6 +44,6 @@ test("the current presearch remains the first recovery target before reload", ()
         llmRecovery: { required: true },
       },
     }),
-    { recoveryPending: true, workflowRunId: "run_transient" },
+    { recoveryPending: true, workflowRunId: "run_transient", requiredSince: null },
   );
 });

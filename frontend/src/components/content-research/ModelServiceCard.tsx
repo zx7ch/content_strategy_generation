@@ -15,10 +15,12 @@ function statusLabel(status: string): string {
 
 export function ModelServiceCard({
   recoveryPending,
+  recoveryRequiredSince = null,
   onContinue,
   onConfigurationChanged,
 }: {
   recoveryPending: boolean;
+  recoveryRequiredSince?: string | null;
   onContinue: () => void | Promise<void>;
   onConfigurationChanged: (configuration: LLMConfiguration) => void;
 }) {
@@ -40,7 +42,7 @@ export function ModelServiceCard({
 
   useEffect(() => {
     setRecoveryReady(false);
-  }, [recoveryPending]);
+  }, [recoveryPending, recoveryRequiredSince]);
 
   const apply = (value: LLMConfiguration) => {
     setConfiguration(value); setBaseUrl(value.base_url); setModel(value.model); setApiKey("");
@@ -77,15 +79,22 @@ export function ModelServiceCard({
     finally { busyRef.current = false; setBusy(false); }
   };
 
+  const display = configuration ?? { source: "system_default", status: "not_configured", base_url: "", model: "", api_key_configured: false };
+  const validatedAfterFailure = Boolean(
+    recoveryRequiredSince
+    && display.status === "validated"
+    && display.validated_at
+    && Date.parse(display.validated_at) > Date.parse(recoveryRequiredSince),
+  );
+  const canContinueRecovery = recoveryPending && (recoveryReady || validatedAfterFailure);
+
   const continueRecovery = async () => {
-    if (busyRef.current || !recoveryReady) return;
+    if (busyRef.current || !canContinueRecovery) return;
     busyRef.current = true; setBusy(true); setMessage("");
     try { await onContinue(); }
     catch { setMessage("继续调研失败，请重试。"); }
     finally { busyRef.current = false; setBusy(false); }
   };
-
-  const display = configuration ?? { source: "system_default", status: "not_configured", base_url: "", model: "", api_key_configured: false };
   return <section className="mb-4 rounded-xl border border-line bg-white p-4" aria-label="模型服务">
     <h2 className="text-sm font-semibold text-ink">模型服务</h2>
     <p className="mt-1 text-xs text-quiet">{statusLabel(display.status)}</p>
@@ -95,7 +104,7 @@ export function ModelServiceCard({
     {recoveryPending && <p className="mt-3 rounded-lg bg-amber-50 px-2 py-1.5 text-xs text-amber-900">模型配置需要更新后才能继续调研。</p>}
     {message && <p className="mt-2 text-xs text-quiet">{message}</p>}
     {!editing ? <div className="mt-3 flex gap-2"><button type="button" onClick={() => setEditing(true)} className="rounded-lg border border-line px-3 py-1.5 text-xs">配置模型</button>
-      {recoveryPending && recoveryReady && <button type="button" disabled={busy} onClick={() => void continueRecovery()} className="rounded-lg bg-blue-600 px-3 py-1.5 text-xs text-white disabled:opacity-40">{busy ? "继续中" : "继续调研"}</button>}
+      {canContinueRecovery && <button type="button" disabled={busy} onClick={() => void continueRecovery()} className="rounded-lg bg-blue-600 px-3 py-1.5 text-xs text-white disabled:opacity-40">{busy ? "继续中" : "继续调研"}</button>}
     </div> : <div className="mt-3 space-y-2 border-t border-line pt-3">
       <label className="block text-xs">Base URL<input aria-label="Base URL" value={baseUrl} onChange={(event) => { setBaseUrl(event.target.value); setRecoveryReady(false); }} className="mt-1 w-full rounded border border-line px-2 py-1" /></label>
       <label className="block text-xs">模型<input aria-label="模型" value={model} onChange={(event) => { setModel(event.target.value); setRecoveryReady(false); }} className="mt-1 w-full rounded border border-line px-2 py-1" /></label>

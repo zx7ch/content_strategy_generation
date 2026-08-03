@@ -1569,12 +1569,14 @@ function ContentResearchContextSidebar({
   onExpandedChange,
   onModifyDirections,
   recoveryPending = false,
+  recoveryRequiredSince = null,
   onContinuePresearch = async () => {},
 }: {
   run: ContentResearchRunState;
   onExpandedChange: (expanded: boolean) => void;
   onModifyDirections: () => void;
   recoveryPending?: boolean;
+  recoveryRequiredSince?: string | null;
   onContinuePresearch?: () => void | Promise<void>;
 }) {
   const report = run.report;
@@ -1628,7 +1630,7 @@ function ContentResearchContextSidebar({
           {!evidenceOnly && <li>{numberField(report.status_strip, "lead_count")} 条初步信号</li>}
         </ul> : <p className="text-xs leading-5 text-quiet">暂无已发布报告；此处不会显示未冻结的来源、结论或指标。</p>}
       </section>
-      <ModelServiceCard recoveryPending={recoveryPending} onContinue={onContinuePresearch} onConfigurationChanged={() => undefined} />
+      <ModelServiceCard recoveryPending={recoveryPending} recoveryRequiredSince={recoveryRequiredSince} onContinue={onContinuePresearch} onConfigurationChanged={() => undefined} />
     </aside>
   );
 }
@@ -1725,6 +1727,9 @@ export default function CreatorPage() {
         const items = await listThreads(selectedBrandId);
         if (cancelled) return;
         setThreads(items);
+        // A user can create/send while the initial list is still in flight.
+        // Never let late hydration reset that live presearch interaction.
+        if (activeThreadIdRef.current) return;
         if (restoredThreadId) {
           const restoredThread = items.find((item) => item.thread_id === restoredThreadId);
           if (restoredThread) {
@@ -2269,6 +2274,7 @@ export default function CreatorPage() {
     try {
       const created = await createThread(undefined, selectedBrandId);
       addThreadToState(created.thread_id, created.title);
+      activeThreadIdRef.current = created.thread_id;
       setActiveThreadId(created.thread_id);
       resetConversation();
     } catch {
@@ -2299,6 +2305,7 @@ export default function CreatorPage() {
         : firstMessage;
       const created = await createThread(title, selectedBrandId);
       addThreadToState(created.thread_id, created.title);
+      activeThreadIdRef.current = created.thread_id;
       setActiveThreadId(created.thread_id);
       return created.thread_id;
     } catch {
@@ -2922,6 +2929,7 @@ export default function CreatorPage() {
         onExpandedChange={setTraceExpanded}
         onModifyDirections={() => void modifyContentResearchDirections()}
         recoveryPending={modelRecovery.recoveryPending}
+        recoveryRequiredSince={modelRecovery.requiredSince}
         onContinuePresearch={continueModelRecovery}
       />}
       {!contentResearchRun && <aside className="hidden w-[300px] shrink-0 overflow-y-auto border-l border-line bg-slate-50 p-4 lg:block" aria-label="内容调研上下文">
@@ -2933,7 +2941,7 @@ export default function CreatorPage() {
               : "暂无进行中的内容调研。发起调研后，此处会显示冻结范围与研究摘要。"}
           </p>
         </section>
-        <ModelServiceCard recoveryPending={modelRecovery.recoveryPending} onContinue={continueModelRecovery} onConfigurationChanged={() => undefined} />
+        <ModelServiceCard recoveryPending={modelRecovery.recoveryPending} recoveryRequiredSince={modelRecovery.requiredSince} onContinue={continueModelRecovery} onConfigurationChanged={() => undefined} />
       </aside>}
       {contentResearchRun && <ContentResearchTraceInspector
         run={contentResearchRun}

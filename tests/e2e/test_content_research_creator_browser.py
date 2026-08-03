@@ -28,6 +28,7 @@ from app.content_research.reporting.publication_materializer import (
 )
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
 from app.memory.thread_store import ThreadStore
+from app.models.workflow import WorkflowPhase
 from app.services.workflow_run_manager import WorkflowRunManager
 from tests.browser_process import (
     chrome_executable,
@@ -247,7 +248,7 @@ def test_creator_hides_lite_entry_when_preview_is_disabled(browser_page):
 
 def test_creator_model_service_card_masks_saved_key(browser_page):
     page, stack = browser_page
-    page.goto(stack["frontend_url"] + "/creator", wait_until="domcontentloaded")
+    page.goto(stack["frontend_url"] + "/creator", wait_until="networkidle")
     card = page.get_by_role("region", name="模型服务")
     expect(card).to_be_visible(timeout=15000)
     expect(card).to_have_count(1)
@@ -271,32 +272,29 @@ def test_creator_model_service_card_masks_saved_key(browser_page):
 
 def test_creator_model_failure_edit_save_and_continue_same_presearch(browser_page):
     page, stack = browser_page
-    responses: list[dict] = []
     retry_requests: list[dict] = []
 
-    def record_response(response) -> None:
-        if response.url.endswith("/content-research/presearch") and response.status == 201:
-            responses.append(response.json())
+    brand_id = default_brand_id(stack["backend_url"])
+    first = run_async_in_thread(
+        seed_model_presearch_recovery(
+            stack["db_path"], brand_id=brand_id, title="模型失败恢复"
+        )
+    )
 
     def record_request(request) -> None:
         if request.url.endswith("/actions") and '"action":"retry_presearch"' in (request.post_data or ""):
             retry_requests.append(request.post_data_json)
 
-    page.on("response", record_response)
     page.on("request", record_request)
-    page.goto(stack["frontend_url"] + "/creator", wait_until="domcontentloaded")
-    page.get_by_role("button", name=re.compile("内容调研")).click(timeout=15000)
-    page.locator("textarea").fill("模型失败恢复")
-    page.locator("textarea").press("Enter")
+    open_creator_with_restored_run(
+        page, stack["frontend_url"], first["workflow_run_id"]
+    )
 
     card = page.get_by_role("region", name="模型服务")
     expect(card.get_by_text("模型配置需要更新后才能继续调研。", exact=True)).to_be_visible(timeout=20000)
     expect(page.get_by_role("heading", name="在开始前，请确认几个关键点")).to_have_count(0)
     expect(card.get_by_role("button", name="继续调研")).to_have_count(0)
-    assert len(responses) == 1
-    first = responses[0]
-
-    page.reload(wait_until="domcontentloaded")
+    page.reload(wait_until="networkidle")
     card = page.get_by_role("region", name="模型服务")
     expect(card.get_by_text("模型配置需要更新后才能继续调研。", exact=True)).to_be_visible(timeout=20000)
     expect(page.get_by_role("region", name="模型服务")).to_have_count(1)
@@ -1149,6 +1147,93 @@ async def seed_recovery(
         "run_id": run.run_id,
         "thread_id": thread["id"],
         "brief_id": brief.id,
+    }
+
+
+async def seed_model_presearch_recovery(
+    db_path: str,
+    *,
+    brand_id: str,
+    title: str,
+) -> dict[str, str]:
+    async with ThreadStore(db_path) as thread_store:
+        thread = await thread_store.create_thread(
+            title=title,
+            workspace_id=WORKSPACE_ID,
+            brand_id=brand_id,
+        )
+    async with WorkflowRunManager(db_path) as manager:
+        run = await manager.start_run(
+            thread_id=thread["id"],
+            user_id="operator",
+            initial_request=title,
+        )
+        await manager.initialize_steps(
+            run.run_id,
+            [
+                {
+                    "step_name": "presearch",
+                    "phase": WorkflowPhase.INTAKE,
+                    "max_attempts": 3,
+                },
+                {
+                    "step_name": "brief_confirm",
+                    "phase": WorkflowPhase.INTAKE,
+                    "max_attempts": 1,
+                },
+                {
+                    "step_name": "plan_build",
+                    "phase": WorkflowPhase.INTAKE,
+                    "max_attempts": 1,
+                },
+                {
+                    "step_name": "formal_research",
+                    "phase": WorkflowPhase.RETRIEVAL,
+                    "max_attempts": 1,
+                },
+            ],
+        )
+        await manager.start_step(run.run_id, "presearch")
+        await manager.wait_for_user_recovery(
+            run.run_id,
+            step_name="presearch",
+            reason={"code": "llm_auth_invalid", "message": "API Key 无效"},
+        )
+    brief = ResearchBriefRecord(
+        id=f"brief_{run.run_id}",
+        workflow_run_id=run.run_id,
+        thread_id=thread["id"],
+        schema_version="content_research_brief_v1",
+        status="draft",
+        payload={
+            "schema_version": "content_research_brief_v1",
+            "attempt_id": f"attempt_{run.run_id}",
+            "seed_text": title,
+            "user_note": None,
+            "workspace_id": WORKSPACE_ID,
+            "user_id": "operator",
+            "status": "waiting_model_config",
+            "subject_confirmation": title,
+            "competitor_tags": [],
+            "research_directions": [],
+            "direction_catalog": list(DIRECTION_CATALOG_V1),
+            "custom_research_question": "",
+            "custom_competitor_input": "",
+            "timeout_status": "none",
+            "fallback_used": False,
+            "error_code": "llm_auth_invalid",
+            "error_message": "API Key 无效",
+            "recoverable": True,
+            "configuration_source": "user",
+            "model": "deterministic-e2e",
+        },
+    )
+    SQLiteContentResearchStore(db_path).save_brief(brief)
+    return {
+        "workflow_run_id": run.run_id,
+        "attempt_id": str(brief.payload["attempt_id"]),
+        "brief_id": brief.id,
+        "thread_id": thread["id"],
     }
 
 
