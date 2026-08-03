@@ -98,6 +98,27 @@ async def test_waiting_closes_active_span_and_resumed_step_adds_a_new_span(manag
 
 
 @pytest.mark.asyncio
+async def test_recorded_step_boundary_brackets_work_before_state_transition(manager):
+    run = await manager.start_run(thread_id="thread-boundary", user_id="user-boundary")
+    step = (
+        await manager.initialize_steps(
+            run.run_id,
+            [{"step_name": "plan_build", "phase": "intake", "max_attempts": 1}],
+        )
+    )[0]
+
+    recorded = await manager.record_step_execution_started(run.run_id, step.step_name)
+    started = await manager.start_step(run.run_id, step.step_name)
+    completed = await manager.complete_step(run.run_id, step.step_name)
+
+    assert recorded.status.value == "pending"
+    assert started.timing_json == recorded.timing_json
+    assert completed.timing_json is not None
+    assert len(completed.timing_json["execution_spans"]) == 1
+    assert completed.timing_json["execution_spans"][0]["finished_at"] is not None
+
+
+@pytest.mark.asyncio
 async def test_legal_run_transitions(manager):
     run = await manager.start_run(thread_id="thread-1", user_id="user-1")
 

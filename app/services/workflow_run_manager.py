@@ -82,7 +82,8 @@ def _queue_timing(timing: dict[str, Any], at: str) -> dict[str, Any]:
 
 
 def _start_timing_execution(timing: dict[str, Any], at: str) -> dict[str, Any]:
-    _queue_timing(timing, at)
+    if not isinstance(timing.get("execution_spans"), list) or not timing["execution_spans"]:
+        _queue_timing(timing, at)
     _close_interval(timing, "queue_spans", at)
     _close_interval(timing, "retry_backoff_spans", at)
     _close_interval(timing, "waiting_spans", at)
@@ -861,6 +862,38 @@ class WorkflowRunManager:
                 job_id=job_id,
                 event_type="step_started",
                 payload={"step_name": step_name},
+            )
+            return self._step(await self._fetch_step_row(run_id, step_name))
+
+        return await self._transaction(op)
+
+    async def record_step_execution_started(
+        self, run_id: str, step_name: str
+    ) -> WorkflowStep:
+        """Record a real server-side work boundary before deferred state writes.
+
+        Content Research builds its confirmation and plan objects before their
+        final atomic persistence. This method captures that real work start
+        without advancing the workflow state machine early; a later
+        ``start_step`` reuses the open execution span.
+        """
+
+        async def op() -> WorkflowStep:
+            assert self._conn is not None
+            run = await self._fetch_run_row(run_id)
+            if run["status"] != WorkflowRunStatus.RUNNING.value:
+                raise WorkflowTransitionError(
+                    f"record_step_execution_started requires running run, got {run['status']}"
+                )
+            step = await self._fetch_step_row(run_id, step_name)
+            if step["status"] not in {"pending", "running", "retrying"}:
+                raise WorkflowTransitionError(
+                    f"record_step_execution_started not allowed from {step['status']}"
+                )
+            timing = _start_timing_execution(_timing_from_row(step), _utc_timestamp())
+            await self._conn.execute(
+                "UPDATE workflow_steps SET timing_json=?, updated_at=CURRENT_TIMESTAMP WHERE step_id=?",
+                (_timing_json(timing), step["step_id"]),
             )
             return self._step(await self._fetch_step_row(run_id, step_name))
 

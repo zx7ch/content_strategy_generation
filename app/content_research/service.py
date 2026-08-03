@@ -150,6 +150,10 @@ class WorkflowRuntime(Protocol):
 
     async def restart_presearch_step(self, workflow_run_id: str) -> dict: ...
 
+    async def record_step_execution_started(
+        self, workflow_run_id: str, step_name: str
+    ) -> None: ...
+
     async def complete_brief_and_plan_atomically(
         self,
         *,
@@ -266,6 +270,12 @@ class WorkflowRunManagerRuntime:
                 workflow_run_id, step_name="presearch", child_task_ids=[]
             )
         return {"workflow_run_id": workflow_run_id, "status": run.status.value if run else "running", "recoverable": True}
+
+    async def record_step_execution_started(
+        self, workflow_run_id: str, step_name: str
+    ) -> None:
+        async with WorkflowRunManager(self._db_path) as manager:
+            await manager.record_step_execution_started(workflow_run_id, step_name)
 
     async def complete_brief_and_plan_atomically(
         self,
@@ -660,6 +670,9 @@ class ContentResearchService:
         if brief is None:
             raise ContentResearchNotFoundError(f"Research brief not found: {brief_id}")
         await self._require_presearch_ready_for_confirmation(brief)
+        record_boundary = getattr(self._workflow_runtime, "record_step_execution_started", None)
+        if record_boundary is not None:
+            await record_boundary(brief.workflow_run_id, "brief_confirm")
         selected_direction_ids = self._direction_registry.canonicalize_many(
             confirmation_request.selected_directions
         )
@@ -676,6 +689,8 @@ class ContentResearchService:
             selected_directions=selected_direction_ids,
             custom_research_question=confirmation_request.custom_research_question.strip(),
         )
+        if record_boundary is not None:
+            await record_boundary(brief.workflow_run_id, "plan_build")
         plan_id = _new_id("rp")
         task_specs = self._task_router.build_task_specs(
             workflow_run_id=brief.workflow_run_id,
