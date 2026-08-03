@@ -43,6 +43,7 @@ import {
 } from "@/lib/content-research-api";
 import { ModelServiceCard } from "@/components/content-research/ModelServiceCard";
 import { traceExecutionDurationText } from "@/lib/content-research-trace";
+import { resolveContentResearchModelRecovery } from "@/lib/content-research-recovery";
 
 type TaskStatus = "running" | "paused" | "failed" | "cancelled" | "completed";
 type MessageRole = "assistant" | "user" | "system";
@@ -1671,6 +1672,20 @@ export default function CreatorPage() {
   const isTaskRunning = task?.status === "running" || task?.status === "paused";
   const showTaskCard = task?.status === "running" || task?.status === "paused" || task?.status === "failed";
   const allArtifactRefs = collectArtifactRefs(messages);
+  const modelRecovery = resolveContentResearchModelRecovery({
+    transientPresearch: contentResearchIntent
+      ? {
+          workflowRunId: contentResearchIntent.presearch.workflow_run_id,
+          status: contentResearchIntent.presearch.status,
+        }
+      : null,
+    durableRun: contentResearchRun
+      ? {
+          workflowRunId: contentResearchRun.workflowRunId,
+          llmRecovery: contentResearchRun.trace?.llm_recovery,
+        }
+      : null,
+  });
 
   useEffect(() => { taskRef.current = task; }, [task]);
   useEffect(() => { activeThreadIdRef.current = activeThreadId; }, [activeThreadId]);
@@ -2107,6 +2122,20 @@ export default function CreatorPage() {
     void startContentResearchForRun(summary.workflow_run_id);
   }
 
+  async function continueModelRecovery() {
+    const workflowRunId = modelRecovery.workflowRunId;
+    if (!workflowRunId) return;
+    const presearch = await retryContentResearchPresearch(workflowRunId);
+    const durablePayload = contentResearchRun?.summary.brief.payload ?? {};
+    const seed = contentResearchIntent?.seed
+      || stringField(durablePayload, "seed_text")
+      || stringField(durablePayload, "subject_confirmation")
+      || "本轮调研";
+    setContentResearchIntent({ seed, presearch });
+    setContentResearchRun(null);
+    setTraceExpanded(false);
+  }
+
   async function selectThread(threadId: string) {
     setActiveThreadId(threadId);
     setActiveMenuId(null);
@@ -2147,7 +2176,14 @@ export default function CreatorPage() {
         latestFailure = visibleFailures[visibleFailures.length - 1];
         restoredRunId = latestReport?.workflow_run_id ?? artifactRunIds[artifactRunIds.length - 1] ?? null;
       }
-      const runIdForThread = restoredRunId ?? contentResearchRunForThread(threadId);
+      // The workflow API is the authority for classifying this durable run.
+      // A legacy Creator run simply returns the documented Content Research
+      // 404 and is hydrated by the legacy snapshot path below.
+      const durableContentResearchRunId = thread.active_run_id ?? null;
+      const runIdForThread =
+        restoredRunId
+        ?? contentResearchRunForThread(threadId)
+        ?? durableContentResearchRunId;
       if (runIdForThread) {
         try {
           const workflow = await getContentResearchWorkflow(runIdForThread);
@@ -2885,19 +2921,19 @@ export default function CreatorPage() {
         run={contentResearchRun}
         onExpandedChange={setTraceExpanded}
         onModifyDirections={() => void modifyContentResearchDirections()}
-        recoveryPending={contentResearchIntent?.presearch.status === "waiting_model_config"}
-        onContinuePresearch={async () => {
-          if (!contentResearchIntent) return;
-          const presearch = await retryContentResearchPresearch(contentResearchIntent.presearch.workflow_run_id);
-          setContentResearchIntent({ ...contentResearchIntent, presearch });
-        }}
+        recoveryPending={modelRecovery.recoveryPending}
+        onContinuePresearch={continueModelRecovery}
       />}
-      {(contentResearchMode || contentResearchIntent) && !contentResearchRun && <aside className="hidden w-[300px] shrink-0 overflow-y-auto border-l border-line bg-slate-50 p-4 lg:block" aria-label="内容调研上下文">
-        <ModelServiceCard recoveryPending={contentResearchIntent?.presearch.status === "waiting_model_config"} onContinue={async () => {
-          if (!contentResearchIntent) return;
-          const presearch = await retryContentResearchPresearch(contentResearchIntent.presearch.workflow_run_id);
-          setContentResearchIntent({ ...contentResearchIntent, presearch });
-        }} onConfigurationChanged={() => undefined} />
+      {!contentResearchRun && <aside className="hidden w-[300px] shrink-0 overflow-y-auto border-l border-line bg-slate-50 p-4 lg:block" aria-label="内容调研上下文">
+        <h2 className="mb-3 text-sm font-semibold text-ink">本次研究摘要</h2>
+        <section className="mb-4 rounded-xl border border-line bg-white p-4" aria-label="内容调研研究摘要">
+          <p className="text-xs leading-5 text-quiet">
+            {contentResearchIntent
+              ? "调研范围尚未确认；正式报告发布后将在此显示冻结摘要。"
+              : "暂无进行中的内容调研。发起调研后，此处会显示冻结范围与研究摘要。"}
+          </p>
+        </section>
+        <ModelServiceCard recoveryPending={modelRecovery.recoveryPending} onContinue={continueModelRecovery} onConfigurationChanged={() => undefined} />
       </aside>}
       {contentResearchRun && <ContentResearchTraceInspector
         run={contentResearchRun}

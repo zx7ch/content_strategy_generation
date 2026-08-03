@@ -248,8 +248,16 @@ def test_creator_hides_lite_entry_when_preview_is_disabled(browser_page):
 def test_creator_model_service_card_masks_saved_key(browser_page):
     page, stack = browser_page
     page.goto(stack["frontend_url"] + "/creator", wait_until="domcontentloaded")
-    page.get_by_role("button", name=re.compile("内容调研")).click(timeout=15000)
     card = page.get_by_role("region", name="模型服务")
+    expect(card).to_be_visible(timeout=15000)
+    expect(card).to_have_count(1)
+    summary = page.locator('section[aria-label="内容调研研究摘要"]')
+    expect(summary).to_be_visible()
+    assert summary.evaluate(
+        "(summary) => Boolean(summary.compareDocumentPosition(document.querySelector('[aria-label=\"模型服务\"]')) & Node.DOCUMENT_POSITION_FOLLOWING)"
+    )
+    page.get_by_role("button", name=re.compile("内容调研")).click(timeout=15000)
+    expect(page.get_by_role("region", name="模型服务")).to_have_count(1)
     card.get_by_role("button", name="配置模型").click()
     card.get_by_label("Base URL", exact=True).fill("https://proxy.example/v1")
     card.get_by_label("模型", exact=True).fill("model-x")
@@ -287,6 +295,11 @@ def test_creator_model_failure_edit_save_and_continue_same_presearch(browser_pag
     expect(card.get_by_role("button", name="继续调研")).to_have_count(0)
     assert len(responses) == 1
     first = responses[0]
+
+    page.reload(wait_until="domcontentloaded")
+    card = page.get_by_role("region", name="模型服务")
+    expect(card.get_by_text("模型配置需要更新后才能继续调研。", exact=True)).to_be_visible(timeout=20000)
+    expect(page.get_by_role("region", name="模型服务")).to_have_count(1)
 
     with sqlite3.connect(stack["db_path"]) as connection:
         before = (

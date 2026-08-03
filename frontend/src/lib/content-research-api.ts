@@ -130,6 +130,12 @@ export interface ContentResearchTrace {
   }>;
   usage_steps: JsonObject[];
   usage_events: JsonObject[];
+  llm_recovery?: {
+    required?: boolean;
+    error_code?: string | null;
+    configuration_source?: string | null;
+    model?: string | null;
+  };
 }
 
 export interface ContentResearchSourceCollectionRequest {
