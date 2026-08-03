@@ -16,6 +16,7 @@ P0_WORKFLOW_ACTIONS = (
     "pause_formal_research",
     "resume_formal_research",
     "end_content_research",
+    "retry_presearch",
 )
 
 
@@ -68,6 +69,11 @@ class ContentResearchPresearchResponse(BaseModel):
     remote_run_id: str | None = None
     local_cache_id: str | None = None
     sync_status: str = "local_only"
+    error_code: str | None = None
+    error_message: str | None = None
+    recoverable: bool = False
+    configuration_source: str | None = None
+    model: str | None = None
 
 
 class ContentResearchBriefConfirmRequest(BaseModel):
@@ -157,6 +163,7 @@ class ContentResearchTraceResponse(BaseModel):
     provider_operations: list[dict] = Field(default_factory=list)
     usage_steps: list[dict] = Field(default_factory=list)
     usage_events: list[dict] = Field(default_factory=list)
+    llm_recovery: dict = Field(default_factory=dict)
 
 
 class ContentResearchSourceCollectionRequest(BaseModel):

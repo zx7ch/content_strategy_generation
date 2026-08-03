@@ -905,16 +905,18 @@ async def _generate_thread_title(user_message: str) -> str:
 async def create_content_research_presearch(
     payload: ContentResearchPresearchRequest,
     request: Request,
-    x_user_id: str = Header(default=DEFAULT_USER_ID, alias="X-User-Id"),
 ) -> ContentResearchPresearchResponse:
     _require_f003_lite_preview()
+    principal = _resolve_workspace_principal_or_error(request)
+    assert principal.user_id is not None
     service = _get_content_research_service(request)
     try:
         return await service.submit_presearch(
             seed_text=payload.seed_text,
             user_note=payload.user_note,
             thread_id=payload.thread_id,
-            user_id=x_user_id,
+            workspace_id=principal.workspace_id,
+            user_id=principal.user_id,
         )
     except Exception as exc:  # noqa: BLE001
         raise _content_research_error(exc) from exc

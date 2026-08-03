@@ -10,11 +10,13 @@ from app.content_research.presearch.service import PresearchService
 from app.content_research.service import ContentResearchService
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
 from app.services.llm.types import LLMResponse, TokenUsage
+from app.services.llm.failures import LLMProviderFailure
 
 
 class FakeRuntime:
     def __init__(self) -> None:
         self.calls: list[dict] = []
+        self.waiting = False
 
     async def start_presearch_run(self, *, thread_id: str, user_id: str, seed_text: str) -> str:
         self.calls.append({"thread_id": thread_id, "user_id": user_id, "seed_text": seed_text})
@@ -23,8 +25,22 @@ class FakeRuntime:
     async def mark_presearch_ready(self, workflow_run_id: str) -> None:
         self.calls.append({"workflow_run_id": workflow_run_id, "event": "presearch_ready"})
 
+    async def wait_for_presearch_recovery(self, workflow_run_id: str, reason: dict) -> dict:
+        self.waiting = True
+        self.calls.append({"workflow_run_id": workflow_run_id, "event": "wait_for_presearch_recovery", "reason": reason})
+        return {"workflow_run_id": workflow_run_id, "status": "waiting_user"}
+
+    async def restart_presearch_step(self, workflow_run_id: str) -> dict:
+        self.waiting = False
+        self.calls.append({"workflow_run_id": workflow_run_id, "event": "restart_presearch_step"})
+        return {"workflow_run_id": workflow_run_id, "status": "running"}
+
     async def get_runtime_snapshot(self, workflow_run_id: str) -> dict:
-        return {"run": {"run_id": workflow_run_id}, "steps": [], "child_tasks": []}
+        return {
+            "run": {"run_id": workflow_run_id, "status": "waiting_user" if self.waiting else "running"},
+            "steps": [{"step_name": "presearch", "status": "retrying", "attempt_count": 1, "max_attempts": 3}],
+            "child_tasks": [],
+        }
 
     async def list_events(self, workflow_run_id: str) -> list[dict]:
         return []
@@ -66,7 +82,7 @@ def store(tmp_path):
     return SQLiteContentResearchStore(str(tmp_path / "content_research.db"))
 
 
-def _service(store, llm=None, *, first_timeout=0.05, hard_cutoff=0.1):
+def _service(store, llm=None, *, first_timeout=0.05, hard_cutoff=0.1, runtime=None):
     return ContentResearchService(
         store=store,
         presearch=PresearchService(
@@ -74,7 +90,7 @@ def _service(store, llm=None, *, first_timeout=0.05, hard_cutoff=0.1):
             first_feedback_timeout_seconds=first_timeout,
             hard_cutoff_seconds=hard_cutoff,
         ),
-        workflow_runtime=FakeRuntime(),
+        workflow_runtime=runtime or FakeRuntime(),
     )
 
 
@@ -131,7 +147,7 @@ async def test_presearch_llm_failure_uses_fallback(store):
 
 
 @pytest.mark.asyncio
-async def test_presearch_malformed_llm_response_uses_fallback(store):
+async def test_presearch_malformed_llm_response_waits_for_configuration(store):
     service = _service(store, FakeLLM(content="not json"))
 
     response = await service.submit_presearch(
@@ -141,8 +157,62 @@ async def test_presearch_malformed_llm_response_uses_fallback(store):
         user_id="user_1",
     )
 
-    assert response.status == "fallback"
-    assert response.fallback_used is True
+    assert response.status == "waiting_model_config"
+    assert response.fallback_used is False
+    assert response.error_code == "llm_structured_output_invalid"
+
+
+class FailingLLM:
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+
+    async def generate(self, _request):
+        raise self.error
+
+
+class FailOnceThenSucceedLLM(FakeLLM):
+    def __init__(self) -> None:
+        super().__init__()
+        self.call_count = 0
+
+    async def generate(self, request):
+        self.call_count += 1
+        if self.call_count == 1:
+            raise LLMProviderFailure("llm_auth_invalid", "API Key 无效", True, 401,
+                provider="openai_compatible", model="model-x", configuration_source="user")
+        return await super().generate(request)
+
+
+@pytest.mark.asyncio
+async def test_provider_failure_waits_for_configuration_without_completing_presearch(store):
+    runtime = FakeRuntime()
+    service = _service(store, FailingLLM(
+        LLMProviderFailure("llm_account_unavailable", "模型账户不可用", True, 402)
+    ), runtime=runtime)
+
+    response = await service.submit_presearch(
+        seed_text="夏季通勤短裤", user_note=None, thread_id="thread_1", workspace_id="ws_1", user_id="user_1",
+    )
+
+    assert response.status == "waiting_model_config"
+    assert response.error_code == "llm_account_unavailable"
+    assert runtime.calls[-1]["event"] == "wait_for_presearch_recovery"
+    assert all(call.get("event") != "presearch_ready" for call in runtime.calls)
+
+
+@pytest.mark.asyncio
+async def test_retry_presearch_reuses_attempt_brief_and_run(store):
+    runtime = FakeRuntime()
+    service = _service(store, FailOnceThenSucceedLLM(), runtime=runtime)
+    first = await service.submit_presearch(
+        seed_text="夏季通勤短裤", user_note=None, thread_id="thread_1", workspace_id="ws_1", user_id="user_1",
+    )
+    retried = await service.retry_presearch(first.workflow_run_id)
+
+    assert retried.attempt_id == first.attempt_id
+    assert retried.brief_id == first.brief_id
+    assert retried.workflow_run_id == first.workflow_run_id
+    assert retried.status == "completed"
 
 
 @pytest.mark.asyncio

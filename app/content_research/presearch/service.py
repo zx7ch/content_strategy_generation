@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from app.services.llm.types import LLMCallContext, LLMRequest, LLMResponse
+from app.services.llm.failures import LLMProviderFailure
 
 from app.content_research.presearch.prompts import build_presearch_messages
 
@@ -23,6 +24,7 @@ class PresearchInput:
     thread_id: str
     workflow_run_id: str
     user_id: str
+    workspace_id: str = "default"
 
 
 @dataclass(frozen=True)
@@ -42,6 +44,10 @@ class PresearchOutcome:
     fallback_used: bool = False
     error_code: str | None = None
     error_message: str | None = None
+    recoverable: bool = False
+    provider: str | None = None
+    model: str | None = None
+    configuration_source: str | None = None
 
 
 class PresearchService:
@@ -127,18 +133,55 @@ class PresearchService:
                         session_id=request.thread_id,
                         step_name="presearch",
                         agent_name="content_research_presearch",
+                        tenant_id=request.workspace_id,
                         user_id=request.user_id,
                     ),
                 )
             ), timeout=self.hard_cutoff_seconds)
-            return PresearchOutcome(
-                status="completed",
-                checklist=self._parse_checklist(response.content),
-                fallback_used=False,
-            )
+            try:
+                checklist = self._parse_checklist(response.content)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                # A transport-successful but malformed structured response gets
+                # one bounded retry before asking the user for configuration.
+                retry_response = await asyncio.wait_for(self._llm.generate(
+                    LLMRequest(
+                        messages=build_presearch_messages(request.seed_text, request.user_note),
+                        task_type="content_research.presearch", model_policy="balanced",
+                        temperature=1.0, max_tokens=700,
+                        context=LLMCallContext(session_id=request.thread_id, step_name="presearch",
+                            agent_name="content_research_presearch", tenant_id=request.workspace_id,
+                            user_id=request.user_id),
+                    )
+                ), timeout=self.hard_cutoff_seconds)
+                try:
+                    checklist = self._parse_checklist(retry_response.content)
+                    response = retry_response
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    from app.content_research.presearch.fallback_templates import build_fallback_checklist
+                    return PresearchOutcome(
+                        status="waiting_model_config",
+                        checklist=build_fallback_checklist(request.seed_text, request.user_note),
+                        error_code="llm_structured_output_invalid",
+                        error_message="模型服务返回格式不兼容",
+                        recoverable=True, provider=retry_response.provider,
+                        model=retry_response.model,
+                        configuration_source=retry_response.configuration_source,
+                    )
+            return PresearchOutcome(status="completed", checklist=checklist, fallback_used=False,
+                provider=response.provider, model=response.model,
+                configuration_source=response.configuration_source)
         except asyncio.TimeoutError:
             # The caller owns the final-timeout state transition.
             raise
+        except LLMProviderFailure as exc:
+            from app.content_research.presearch.fallback_templates import build_fallback_checklist
+            return PresearchOutcome(
+                status="waiting_model_config",
+                checklist=build_fallback_checklist(request.seed_text, request.user_note),
+                fallback_used=False, error_code=exc.code, error_message=exc.public_message,
+                recoverable=exc.recoverable, provider=exc.provider, model=exc.model,
+                configuration_source=exc.configuration_source,
+            )
         except Exception as exc:  # noqa: BLE001 - presearch must fall back instead of blocking UX.
             return self.fallback(
                 request,

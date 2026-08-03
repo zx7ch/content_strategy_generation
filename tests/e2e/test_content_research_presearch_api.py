@@ -68,7 +68,7 @@ async def client(tmp_path):
 async def test_content_research_presearch_post_and_get(client):
     created = await client.post(
         "/content-research/presearch",
-        headers={"X-User-Id": "user-1"},
+        headers={"X-Workspace-Id": "ws-1", "X-User-Id": "user-1"},
         json={
             "seed_text": "Satisfy Running",
             "user_note": "关注竞品",

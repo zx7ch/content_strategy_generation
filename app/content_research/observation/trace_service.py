@@ -96,6 +96,10 @@ class ContentResearchTraceService:
             provider_operations=[_safe_provider_operation_dict(item) for item in provider_operations],
             usage_steps=[],
             usage_events=[],
+            llm_recovery=_llm_recovery_projection(
+                run_status=run_status, current_stage=current_stage,
+                runtime_steps=[_json_dict(step) for step in runtime_steps], brief=brief,
+            ),
         )
 
 
@@ -163,7 +167,7 @@ def _safe_workflow_event_dict(event: dict) -> dict:
 def _safe_runtime_step_dict(step: Any) -> dict:
     return _select_safe_fields(_json_dict(step), {
         "step_id", "step_name", "phase", "status", "attempt_count",
-        "max_attempts", "started_at", "completed_at",
+        "max_attempts", "started_at", "completed_at", "error_code",
     })
 
 
@@ -186,6 +190,24 @@ def _safe_runtime_child_task_dict(task: Any) -> dict:
         },
     }
     return safe
+
+
+def _llm_recovery_projection(
+    *, run_status: str, current_stage: str | None, runtime_steps: list[dict], brief: ResearchBriefRecord
+) -> dict:
+    presearch_step = next((step for step in runtime_steps if step.get("step_name") == "presearch"), {})
+    required = run_status == "waiting_user" and current_stage == "presearch"
+    error_code = presearch_step.get("error_code")
+    if not isinstance(error_code, str) or not error_code.startswith("llm_"):
+        error_code = None
+    payload = brief.payload
+    return {
+        "required": required,
+        "error_code": error_code,
+        "configuration_source": payload.get("configuration_source")
+        if payload.get("configuration_source") in {"user", "system_default"} else None,
+        "model": payload.get("model") if isinstance(payload.get("model"), str) else None,
+    }
 
 
 def _safe_provider_operation_dict(operation: dict) -> dict:
