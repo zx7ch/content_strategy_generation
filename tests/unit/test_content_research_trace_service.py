@@ -16,6 +16,7 @@ from app.content_research.service import (
 )
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
 from app.content_research.observation.trace_service import _project_timing
+from app.memory.workflow_store import WorkflowStore
 from app.services.llm.pricing import UsageCost
 from app.services.llm.types import LLMCallContext, LLMResponse, TokenUsage
 from app.services.llm.usage_tracker import LLMUsageEventInput, LLMUsageTracker
@@ -113,6 +114,25 @@ async def _confirmed_workflow(service):
         ),
     )
     return presearch
+
+
+async def _unconfirmed_workflow(service):
+    return await service.submit_presearch(
+        seed_text="徒步短裤",
+        user_note="关注异常边界",
+        thread_id="thread-confirm-boundary",
+        user_id="user-confirm-boundary",
+    )
+
+
+async def _step_timings(db_path: str, workflow_run_id: str) -> dict[str, dict]:
+    async with WorkflowStore(db_path) as workflow_store:
+        steps = await workflow_store.list_steps(workflow_run_id)
+    return {step.step_name: step.timing_json or {} for step in steps}
+
+
+def _assert_no_open_execution_span(timing: dict) -> None:
+    assert all(span.get("finished_at") for span in timing.get("execution_spans", []))
 
 
 async def _record_usage(db_path: str, workflow_run_id: str) -> None:
@@ -284,6 +304,78 @@ def test_trace_timing_does_not_project_stale_inactive_boundaries(status, stale_k
 
     assert timing["timing_source"] == "recorded"
     assert stale_key not in timing
+
+
+@pytest.mark.asyncio
+async def test_confirm_validation_failure_aborts_brief_execution_span(db_path, service):
+    presearch = await _unconfirmed_workflow(service)
+
+    with pytest.raises(ValueError, match="Unknown research directions"):
+        await service.confirm_brief(
+            brief_id=presearch.brief_id,
+            confirmation_request=ContentResearchBriefConfirmRequest(
+                confirmed_subject="徒步短裤",
+                subject_type="category",
+                selected_directions=["not_in_lite_catalog"],
+            ),
+        )
+
+    timings = await _step_timings(db_path, presearch.workflow_run_id)
+    _assert_no_open_execution_span(timings["brief_confirm"])
+    assert timings["plan_build"].get("execution_spans") in (None, [])
+
+
+@pytest.mark.asyncio
+async def test_plan_build_failure_aborts_plan_without_overlapping_brief(
+    db_path, service, monkeypatch
+):
+    presearch = await _unconfirmed_workflow(service)
+
+    def fail_plan_build(**_kwargs):
+        raise RuntimeError("plan build failed")
+
+    monkeypatch.setattr(service._plan_builder, "build", fail_plan_build)
+    with pytest.raises(RuntimeError, match="plan build failed"):
+        await service.confirm_brief(
+            brief_id=presearch.brief_id,
+            confirmation_request=ContentResearchBriefConfirmRequest(
+                confirmed_subject="徒步短裤",
+                subject_type="category",
+                selected_directions=["product_marketing"],
+            ),
+        )
+
+    timings = await _step_timings(db_path, presearch.workflow_run_id)
+    _assert_no_open_execution_span(timings["brief_confirm"])
+    _assert_no_open_execution_span(timings["plan_build"])
+    brief_span = timings["brief_confirm"]["execution_spans"][-1]
+    plan_span = timings["plan_build"]["execution_spans"][-1]
+    assert brief_span["finished_at"] <= plan_span["started_at"]
+
+
+@pytest.mark.asyncio
+async def test_confirmation_persistence_failure_aborts_plan_execution_span(
+    db_path, service, monkeypatch
+):
+    presearch = await _unconfirmed_workflow(service)
+
+    async def fail_persistence(*_args, **_kwargs):
+        raise RuntimeError("confirmation persistence failed")
+
+    monkeypatch.setattr(service._dispatch, "persist_confirmation", fail_persistence)
+    with pytest.raises(RuntimeError, match="confirmation persistence failed"):
+        await service.confirm_brief(
+            brief_id=presearch.brief_id,
+            confirmation_request=ContentResearchBriefConfirmRequest(
+                confirmed_subject="徒步短裤",
+                subject_type="category",
+                selected_directions=["product_marketing"],
+            ),
+        )
+
+    timings = await _step_timings(db_path, presearch.workflow_run_id)
+    _assert_no_open_execution_span(timings["brief_confirm"])
+    _assert_no_open_execution_span(timings["plan_build"])
 
 
 @pytest.mark.asyncio

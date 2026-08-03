@@ -119,6 +119,40 @@ async def test_recorded_step_boundary_brackets_work_before_state_transition(mana
 
 
 @pytest.mark.asyncio
+async def test_brief_and_plan_recorded_execution_spans_do_not_overlap(manager):
+    run = await manager.start_run(thread_id="thread-phases", user_id="user-phases")
+    await manager.initialize_steps(
+        run.run_id,
+        [
+            {"step_name": "brief_confirm", "phase": "intake", "max_attempts": 1},
+            {"step_name": "plan_build", "phase": "intake", "max_attempts": 1},
+            {"step_name": "formal_research", "phase": "retrieval", "max_attempts": 1},
+        ],
+    )
+    await manager.record_step_execution_started(run.run_id, "brief_confirm")
+    await manager.record_step_execution_finished(run.run_id, "brief_confirm")
+    await manager.record_step_execution_started(run.run_id, "plan_build")
+
+    async def no_op_writer(_conn, _child_ids):
+        return None
+
+    await manager.complete_brief_and_plan_atomically(
+        workflow_run_id=run.run_id,
+        task_specs=[{"task_type": "source_collect", "sequence_no": 1}],
+        confirmation_writer=no_op_writer,
+    )
+
+    async with WorkflowStore(manager.db_path) as store:
+        steps = {step.step_name: step for step in await store.list_steps(run.run_id)}
+    brief_span = steps["brief_confirm"].timing_json["execution_spans"][0]
+    plan_span = steps["plan_build"].timing_json["execution_spans"][0]
+    assert len(steps["brief_confirm"].timing_json["execution_spans"]) == 1
+    assert len(steps["plan_build"].timing_json["execution_spans"]) == 1
+    assert brief_span["finished_at"] <= plan_span["started_at"]
+    assert plan_span["finished_at"] is not None
+
+
+@pytest.mark.asyncio
 async def test_pause_boundary_closes_active_span(manager):
     run = await manager.start_run(thread_id="thread-paused", user_id="user-paused")
     step = (

@@ -180,7 +180,13 @@ class WorkflowRunManager:
         """Commit workflow transitions and confirmation facts in one transaction."""
 
         async def op() -> list[str]:
-            await self.start_step(workflow_run_id, "brief_confirm")
+            brief = await self._fetch_step_row(workflow_run_id, "brief_confirm")
+            brief_timing = _timing_from_row(brief)
+            await self.start_step(
+                workflow_run_id,
+                "brief_confirm",
+                record_execution=not bool(brief_timing.get("execution_spans")),
+            )
             await self.complete_step(
                 workflow_run_id,
                 "brief_confirm",
@@ -891,7 +897,12 @@ class WorkflowRunManager:
         return await self._transaction(op)
 
     async def start_step(
-        self, run_id: str, step_name: str, job_id: Optional[str] = None
+        self,
+        run_id: str,
+        step_name: str,
+        job_id: Optional[str] = None,
+        *,
+        record_execution: bool = True,
     ) -> WorkflowStep:
         async def op() -> WorkflowStep:
             assert self._conn is not None
@@ -903,7 +914,9 @@ class WorkflowRunManager:
             step = await self._fetch_step_row(run_id, step_name)
             if step["status"] not in {"pending", "retrying"}:
                 raise WorkflowTransitionError(f"start_step not allowed from {step['status']}")
-            timing = _start_timing_execution(_timing_from_row(step), _utc_timestamp())
+            timing = _timing_from_row(step)
+            if record_execution:
+                timing = _start_timing_execution(timing, _utc_timestamp())
             await self._conn.execute(
                 """
                 UPDATE workflow_steps
@@ -964,6 +977,28 @@ class WorkflowRunManager:
             return self._step(await self._fetch_step_row(run_id, step_name))
 
         return await self._transaction(op)
+
+    async def record_step_execution_finished(
+        self, run_id: str, step_name: str
+    ) -> WorkflowStep:
+        """Close pre-transition work without changing the workflow state."""
+
+        async def op() -> WorkflowStep:
+            assert self._conn is not None
+            await self._fetch_run_row(run_id)
+            step = await self._fetch_step_row(run_id, step_name)
+            timing = _stop_timing_execution(_timing_from_row(step), _utc_timestamp())
+            await self._conn.execute(
+                "UPDATE workflow_steps SET timing_json=?, updated_at=CURRENT_TIMESTAMP WHERE step_id=?",
+                (_timing_json(timing), step["step_id"]),
+            )
+            return self._step(await self._fetch_step_row(run_id, step_name))
+
+        return await self._transaction(op)
+
+    async def abort_step_execution(self, run_id: str, step_name: str) -> WorkflowStep:
+        """Abort an in-flight pre-transition span while leaving the step retryable."""
+        return await self.record_step_execution_finished(run_id, step_name)
 
     async def complete_step(
         self,

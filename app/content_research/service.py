@@ -154,6 +154,14 @@ class WorkflowRuntime(Protocol):
         self, workflow_run_id: str, step_name: str
     ) -> None: ...
 
+    async def record_step_execution_finished(
+        self, workflow_run_id: str, step_name: str
+    ) -> None: ...
+
+    async def abort_step_execution(
+        self, workflow_run_id: str, step_name: str
+    ) -> None: ...
+
     async def complete_brief_and_plan_atomically(
         self,
         *,
@@ -276,6 +284,18 @@ class WorkflowRunManagerRuntime:
     ) -> None:
         async with WorkflowRunManager(self._db_path) as manager:
             await manager.record_step_execution_started(workflow_run_id, step_name)
+
+    async def record_step_execution_finished(
+        self, workflow_run_id: str, step_name: str
+    ) -> None:
+        async with WorkflowRunManager(self._db_path) as manager:
+            await manager.record_step_execution_finished(workflow_run_id, step_name)
+
+    async def abort_step_execution(
+        self, workflow_run_id: str, step_name: str
+    ) -> None:
+        async with WorkflowRunManager(self._db_path) as manager:
+            await manager.abort_step_execution(workflow_run_id, step_name)
 
     async def complete_brief_and_plan_atomically(
         self,
@@ -670,27 +690,63 @@ class ContentResearchService:
         if brief is None:
             raise ContentResearchNotFoundError(f"Research brief not found: {brief_id}")
         await self._require_presearch_ready_for_confirmation(brief)
-        record_boundary = getattr(self._workflow_runtime, "record_step_execution_started", None)
+        record_boundary = getattr(
+            self._workflow_runtime, "record_step_execution_started", None
+        )
+        finish_boundary = getattr(
+            self._workflow_runtime, "record_step_execution_finished", None
+        )
+        abort_boundary = getattr(self._workflow_runtime, "abort_step_execution", None)
         if record_boundary is not None:
             await record_boundary(brief.workflow_run_id, "brief_confirm")
-        selected_direction_ids = self._direction_registry.canonicalize_many(
-            confirmation_request.selected_directions
-        )
-        if not set(selected_direction_ids).issubset(DIRECTION_CATALOG_V1):
-            raise ContentResearchValidationError(
-                "Selected directions must belong to the Lite direction catalog"
+        try:
+            selected_direction_ids = self._direction_registry.canonicalize_many(
+                confirmation_request.selected_directions
             )
-        directions = self._direction_registry.require_many(selected_direction_ids)
-        confirmation = BriefConfirmation(
-            confirmed_subject=confirmation_request.confirmed_subject.strip(),
-            subject_type=confirmation_request.subject_type.strip() or "unknown",
-            selected_competitors=_dedupe(confirmation_request.selected_competitors),
-            custom_competitors=_dedupe(confirmation_request.custom_competitors),
-            selected_directions=selected_direction_ids,
-            custom_research_question=confirmation_request.custom_research_question.strip(),
-        )
+            if not set(selected_direction_ids).issubset(DIRECTION_CATALOG_V1):
+                raise ContentResearchValidationError(
+                    "Selected directions must belong to the Lite direction catalog"
+                )
+            directions = self._direction_registry.require_many(selected_direction_ids)
+            confirmation = BriefConfirmation(
+                confirmed_subject=confirmation_request.confirmed_subject.strip(),
+                subject_type=confirmation_request.subject_type.strip() or "unknown",
+                selected_competitors=_dedupe(confirmation_request.selected_competitors),
+                custom_competitors=_dedupe(confirmation_request.custom_competitors),
+                selected_directions=selected_direction_ids,
+                custom_research_question=confirmation_request.custom_research_question.strip(),
+            )
+        except BaseException:
+            if abort_boundary is not None:
+                await abort_boundary(brief.workflow_run_id, "brief_confirm")
+            raise
+        if finish_boundary is not None:
+            await finish_boundary(brief.workflow_run_id, "brief_confirm")
         if record_boundary is not None:
             await record_boundary(brief.workflow_run_id, "plan_build")
+        try:
+            response = await self._build_and_persist_confirmed_plan(
+                brief=brief,
+                confirmation=confirmation,
+                directions=directions,
+                selected_direction_ids=selected_direction_ids,
+            )
+        except BaseException:
+            if abort_boundary is not None:
+                await abort_boundary(brief.workflow_run_id, "plan_build")
+            raise
+        if finish_boundary is not None:
+            await finish_boundary(brief.workflow_run_id, "plan_build")
+        return response
+
+    async def _build_and_persist_confirmed_plan(
+        self,
+        *,
+        brief: ResearchBriefRecord,
+        confirmation: BriefConfirmation,
+        directions: list[Any],
+        selected_direction_ids: list[str],
+    ) -> ContentResearchWorkflowSummaryResponse:
         plan_id = _new_id("rp")
         task_specs = self._task_router.build_task_specs(
             workflow_run_id=brief.workflow_run_id,
