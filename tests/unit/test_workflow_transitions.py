@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from app.memory.workflow_store import WorkflowStore
@@ -93,6 +95,56 @@ async def test_retry_fail_cancel_and_skip_step_transitions(manager):
 
     cancelled = await manager.cancel_step(run.run_id, "finalization.persist_artifacts")
     assert cancelled.status == WorkflowStepStatus.CANCELLED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("initial_status", "open_interval_key"),
+    [
+        ("pending", "queue_spans"),
+        ("running", "execution_spans"),
+        ("retrying", "retry_backoff_spans"),
+        ("paused", "pause_spans"),
+        ("retrying", "waiting_spans"),
+    ],
+)
+async def test_cancel_step_closes_every_open_interval_for_each_cancellable_state(
+    manager, initial_status, open_interval_key
+):
+    run = await manager.start_run(
+        thread_id=f"thread-cancel-{initial_status}-{open_interval_key}", user_id="user-1"
+    )
+    step = (
+        await manager.initialize_steps(
+            run.run_id,
+            [{"step_name": "formal_research", "phase": WorkflowPhase.RETRIEVAL}],
+        )
+    )[0]
+    open_at = "2026-08-03T01:00:00.000001+00:00"
+    assert manager._conn is not None
+    await manager._conn.execute(
+        "UPDATE workflow_steps SET status=?, timing_json=? WHERE step_id=?",
+        (
+            initial_status,
+            json.dumps(
+                {
+                    open_interval_key: [
+                        {"started_at": open_at, "finished_at": None}
+                    ]
+                }
+            ),
+            step.step_id,
+        ),
+    )
+    await manager._conn.commit()
+
+    cancelled = await manager.cancel_step(run.run_id, step.step_name)
+
+    assert cancelled.status == WorkflowStepStatus.CANCELLED
+    assert cancelled.completed_at is not None
+    assert cancelled.timing_json is not None
+    assert cancelled.timing_json[open_interval_key][0]["finished_at"] is not None
+    assert cancelled.timing_json[open_interval_key][0]["finished_at"].endswith("+00:00")
 
 
 @pytest.mark.asyncio

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 
 import httpx
@@ -166,6 +167,57 @@ async def test_content_research_trace_api_restores_runtime_observation_and_usage
     assert trace["usage_summary"] == {}
     assert trace["usage_steps"] == []
     assert trace["usage_events"] == []
+
+
+@pytest.mark.asyncio
+async def test_terminal_trace_timing_is_stable_across_repeated_reads(client_with_db):
+    client, db_path = client_with_db
+    presearch_response = await client.post(
+        "/content-research/presearch",
+        headers={"X-User-Id": "user-trace-terminal"},
+        json={
+            "seed_text": "Satisfy Running",
+            "user_note": "验证终态冻结",
+            "thread_id": "thread-trace-terminal",
+        },
+    )
+    assert presearch_response.status_code == 201
+    presearch = presearch_response.json()
+    confirm_response = await client.post(
+        f"/content-research/briefs/{presearch['brief_id']}/confirm",
+        json={
+            "confirmed_subject": "Satisfy Running",
+            "subject_type": "brand",
+            "selected_competitors": [],
+            "custom_competitors": [],
+            "selected_directions": ["product_marketing"],
+            "custom_research_question": "",
+        },
+    )
+    assert confirm_response.status_code == 200
+    async with WorkflowRunManager(db_path) as manager:
+        await manager.complete_run(presearch["workflow_run_id"])
+
+    first = (
+        await client.get(
+            f"/content-research/workflows/{presearch['workflow_run_id']}/trace"
+        )
+    ).json()
+    await asyncio.sleep(0.02)
+    second = (
+        await client.get(
+            f"/content-research/workflows/{presearch['workflow_run_id']}/trace"
+        )
+    ).json()
+
+    assert second["run_status"] == "succeeded"
+    assert second["duration_ms"] == first["duration_ms"]
+    assert [step["timing"] for step in second["runtime_steps"]] == [
+        step["timing"] for step in first["runtime_steps"]
+    ]
+    assert [task["timing"] for task in second["runtime_child_tasks"]] == [
+        task["timing"] for task in first["runtime_child_tasks"]
+    ]
 
 
 @pytest.mark.asyncio

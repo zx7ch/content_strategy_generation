@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import json
+from datetime import timedelta
+
 import pytest
 
+from app.content_research.observation.trace_service import _project_timing
 from app.content_research.service import WorkflowRunManagerRuntime
 from app.memory.thread_store import ThreadStore
 from app.memory.workflow_store import WorkflowStore
@@ -22,6 +26,74 @@ async def _event_types(db_path: str, run_id: str) -> list[str]:
     async with WorkflowStore(db_path) as store:
         events = await store.list_events(run_id)
     return [event.event_type for event in events]
+
+
+async def _seed_nonterminal_descendant_matrix(
+    manager: WorkflowRunManager, run_id: str
+) -> None:
+    steps = await manager.initialize_steps(
+        run_id,
+        [
+            {"step_name": f"matrix.{status}", "phase": "retrieval"}
+            for status in ("pending", "running", "retrying", "paused")
+        ],
+    )
+    children = await manager.create_child_tasks(
+        run_id=run_id,
+        step_id=steps[0].step_id,
+        tasks=[
+            {"task_type": f"matrix.{status}", "slot_index": index}
+            for index, status in enumerate(("pending", "running", "retrying", "paused"))
+        ],
+    )
+    interval_keys = {
+        "pending": ("queue_spans",),
+        "running": ("execution_spans",),
+        "retrying": ("retry_backoff_spans", "waiting_spans"),
+        "paused": ("pause_spans",),
+    }
+    assert manager._conn is not None
+    for table, id_column, records in (
+        ("workflow_steps", "step_id", steps),
+        ("workflow_child_tasks", "child_task_id", children),
+    ):
+        for status, record in zip(interval_keys, records, strict=True):
+            timing = {
+                key: [
+                    {
+                        "started_at": "2026-08-03T01:00:00.000001+00:00",
+                        "finished_at": None,
+                    }
+                ]
+                for key in interval_keys[status]
+            }
+            record_id = getattr(record, id_column)
+            await manager._conn.execute(
+                f"UPDATE {table} SET status=?, timing_json=? WHERE {id_column}=?",
+                (status, json.dumps(timing), record_id),
+            )
+    await manager._conn.commit()
+
+
+def _assert_terminal_timing_is_frozen_at(
+    records, *, expected_statuses: list[str], boundary
+) -> None:
+    assert [record.status.value for record in records] == expected_statuses
+    for record in records:
+        assert record.completed_at == boundary
+        assert record.timing_json is not None
+        for intervals in record.timing_json.values():
+            if isinstance(intervals, list):
+                assert {span["finished_at"] for span in intervals} == {
+                    boundary.isoformat()
+                }
+        first = _project_timing(
+            record.model_dump(mode="json"), as_of=boundary + timedelta(seconds=1)
+        )
+        second = _project_timing(
+            record.model_dump(mode="json"), as_of=boundary + timedelta(minutes=5)
+        )
+        assert second == first
 
 
 @pytest.mark.asyncio
@@ -275,6 +347,51 @@ async def test_resume_complete_and_fail_run_transitions_use_allowed_states(tmp_p
         assert failed.status == WorkflowRunStatus.FAILED
         assert failed.error_code == "BOOM"
         assert failed.error_message == "non recoverable"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("terminal_action", "run_status", "descendant_statuses"),
+    [
+        (
+            "complete",
+            WorkflowRunStatus.SUCCEEDED,
+            ["cancelled", "cancelled", "cancelled", "cancelled"],
+        ),
+        (
+            "fail",
+            WorkflowRunStatus.FAILED,
+            ["cancelled", "failed", "failed", "cancelled"],
+        ),
+    ],
+)
+async def test_terminal_run_atomically_converges_nonterminal_descendant_matrix(
+    manager, terminal_action, run_status, descendant_statuses
+):
+    run = await manager.start_run(
+        thread_id=f"thread-terminal-{terminal_action}", user_id="user-terminal"
+    )
+    await _seed_nonterminal_descendant_matrix(manager, run.run_id)
+
+    if terminal_action == "complete":
+        terminal_run = await manager.complete_run(run.run_id)
+        boundary = terminal_run.completed_at
+    else:
+        terminal_run = await manager.fail_run(run.run_id, "terminal failure")
+        boundary = terminal_run.failed_at
+
+    assert terminal_run.status == run_status
+    assert boundary is not None
+    assert boundary.isoformat().endswith("+00:00")
+    async with WorkflowStore(manager.db_path) as store:
+        steps = await store.list_steps(run.run_id)
+        children = await store.list_child_tasks(run.run_id)
+    _assert_terminal_timing_is_frozen_at(
+        steps, expected_statuses=descendant_statuses, boundary=boundary
+    )
+    _assert_terminal_timing_is_frozen_at(
+        children, expected_statuses=descendant_statuses, boundary=boundary
+    )
 
 
 @pytest.mark.asyncio
