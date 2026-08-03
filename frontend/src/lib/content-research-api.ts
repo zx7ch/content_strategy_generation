@@ -1,4 +1,4 @@
-import { getWorkspaceContext, RUNTIME_BASE_URL } from "./api.ts";
+import { getRuntimeAuthorizationHeader, getWorkspaceContext, RUNTIME_BASE_URL } from "./api.ts";
 
 type JsonObject = Record<string, unknown>;
 
@@ -443,6 +443,10 @@ async function contentResearchFetch<T>(
   }
   headers.set("X-Workspace-Id", workspaceId);
   headers.set("X-User-Id", userId);
+  const authorization = getRuntimeAuthorizationHeader();
+  if (authorization) {
+    headers.set("Authorization", authorization);
+  }
   if (options?.body !== undefined) {
     headers.set("Content-Type", "application/json");
   }

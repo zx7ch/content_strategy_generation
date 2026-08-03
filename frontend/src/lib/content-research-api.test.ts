@@ -93,6 +93,32 @@ test("model configuration requests are Workspace scoped and never expect a retur
   assert.equal("api_key" in result, false);
 });
 
+test("content research reuses the optional Bearer header without leaking it into the body", async () => {
+  const previousToken = process.env.NEXT_PUBLIC_XHS_AUTH_TOKEN;
+  process.env.NEXT_PUBLIC_XHS_AUTH_TOKEN = "frontend-auth-token";
+  setWorkspaceContext("ws_1", "user_1");
+  let requestHeaders = new Headers();
+  let requestBody = "";
+  globalThis.fetch = (async (_input, init) => {
+    requestHeaders = new Headers(init?.headers);
+    requestBody = String(init?.body ?? "");
+    return jsonResponse({
+      source: "user", status: "validated", base_url: "https://proxy.example/v1", model: "model-x",
+      api_key_configured: true, api_key_suffix: "1234", validated_at: "2026-08-03T00:00:00Z", error_code: null,
+    });
+  }) as typeof fetch;
+
+  try {
+    await saveLLMConfiguration({ base_url: "https://proxy.example/v1", model: "model-x", api_key: "model-key-1234" });
+  } finally {
+    if (previousToken === undefined) delete process.env.NEXT_PUBLIC_XHS_AUTH_TOKEN;
+    else process.env.NEXT_PUBLIC_XHS_AUTH_TOKEN = previousToken;
+  }
+
+  assert.equal(requestHeaders.get("Authorization"), "Bearer frontend-auth-token");
+  assert.equal(requestBody.includes("frontend-auth-token"), false);
+});
+
 test("retry presearch returns the same persisted identifiers", async () => {
   let requestBody = "";
   globalThis.fetch = (async (_input, init) => {

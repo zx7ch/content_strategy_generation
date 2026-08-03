@@ -70,3 +70,19 @@ async def test_configuration_validation_error_never_echoes_api_key(client, path,
 
     assert response.status_code == 422
     assert secret not in response.text
+
+
+@pytest.mark.asyncio
+async def test_configuration_put_cors_preflight_accepts_real_origin(client):
+    response = await client.options(
+        "/content-research/llm-config",
+        headers={
+            "Origin": "http://localhost:3000",
+            "Access-Control-Request-Method": "PUT",
+            "Access-Control-Request-Headers": "content-type,x-workspace-id,x-user-id",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "http://localhost:3000"
+    assert "PUT" in response.headers["access-control-allow-methods"]
