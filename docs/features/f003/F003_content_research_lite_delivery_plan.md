@@ -396,6 +396,7 @@ Lite 只交付结构化主题到可信采集的核心闭环，不扩展为通用
 - 明确延期：多核心对象自动拆分、可视化主题编辑器、embedding 相关性、动态全局预算、多语言 query expansion、复杂否定规划和多轮 LLM query 改写。
 
 - 完成记录：新 run 已冻结通用结构化主题、`query_relevance_v2` 与确定性 `2 + 1` 计划；Q3 仅在持久化主组覆盖不足时激活，恢复不会重复主组 operation。历史任务通过 append-only `relevance_revision` 从既有 packets 重放准入到发布，并校验 provider operation 与 packet ID 集合不变。安全 Trace 保持最近记录在上，仅投影短哈希、组数、阶段计数与稳定原因码。聚焦后端/API/Trace/前端验收 112 项、内容调研单元测试 270 项、前端 54 项及 production build 通过；浏览器自动化依赖缺失时不计为通过证据。
+- P0-3 真实新 run 验收（2026-08-04）：在 Creator 输入 `夏季凉感T恤`，配置的 OpenAI `gpt-4o-mini` 首次主题提议进入 `needs_confirmation`；用户通过结构化卡确认 `T恤｜凉感｜夏季`，同一 run `run_fdf41aa66a2245a6bf87635a6cf523a5` 未产生第二次模型提议。单选 `product_marketing` 后，冻结 2 个主 QueryGroup、0 个 Q3，完成 30 个 persisted packet、32 个 completed provider-operation checkpoint（2 次发现 + 30 次详情，符合 `detail_fetch_cap=30`），coverage 已满足且未触发 fallback。报告发布为 `complete_verified_report`，有 19 条 citation／finding；Creator 刷新后恢复同一完整报告。Trace REST 投影仅出现结构、计划和 coverage stage 名称，未出现 `complete_query`、`raw_input`、`note_id`、`api_key` 或 `prompt`。
 
 **通过条件**：预发布环境中新合同为唯一 Creator/report 合同；选择、scope、报告三态、恢复卡、citation drawer、模型配置与模型故障后的同 run 恢复均通过上述 API/浏览器验收。Gate 4A 不对正式用户发布，也不代表所有目录方向的采集能力已完成。
 

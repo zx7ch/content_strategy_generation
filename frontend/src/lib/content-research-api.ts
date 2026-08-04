@@ -184,7 +184,7 @@ export interface ContentResearchFormalResearchResponse {
 
 export interface ContentResearchWorkflowActionRequest {
   schema_version?: string;
-  action: "confirm_brief" | "start_formal_research" | "retry_formal_research" | "resume_formal_research" | "end_content_research" | "retry_presearch" | "clarify_subject";
+  action: "confirm_brief" | "start_formal_research" | "retry_formal_research" | "resume_formal_research" | "end_content_research" | "retry_presearch" | "clarify_subject" | "confirm_subject_structure" | "repair_from_persisted_packets";
   payload?: JsonObject;
 }
 
@@ -435,6 +435,30 @@ export async function clarifyContentResearchSubject(
   return runContentResearchWorkflowAction(workflowRunId, {
     action: "clarify_subject",
     payload: { clarification_text: clarificationText },
+  });
+}
+
+export async function confirmContentResearchSubjectStructure(
+  workflowRunId: string,
+  payload: {
+    subject_structure_hash: string;
+    core_object: string;
+    research_intent: string;
+    context_modifiers?: string;
+  },
+): Promise<ContentResearchWorkflowActionResponse<ContentResearchPresearchResponse>> {
+  return runContentResearchWorkflowAction(workflowRunId, {
+    action: "confirm_subject_structure",
+    payload,
+  });
+}
+
+export async function repairContentResearchFromPersistedPackets(
+  workflowRunId: string,
+): Promise<ContentResearchWorkflowActionResponse> {
+  return runContentResearchWorkflowAction(workflowRunId, {
+    action: "repair_from_persisted_packets",
+    payload: {},
   });
 }
 

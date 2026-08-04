@@ -7,17 +7,18 @@ CREATOR_PAGE = ROOT / "frontend/src/app/creator/page.tsx"
 CONTENT_RESEARCH_API = ROOT / "frontend/src/lib/content-research-api.ts"
 
 
-def test_subject_clarification_uses_the_normal_creator_composer() -> None:
+def test_subject_clarification_uses_structured_creator_card() -> None:
     source = CREATOR_PAGE.read_text(encoding="utf-8")
 
-    assert 'aria-label="调研主体"' not in source
-    assert "补充你要调研的具体对象……" in source
-    assert "clarifyContentResearchSubject(" in source
-    assert "核心对象：{coreObject}｜意图：{intents}｜场景：{contexts}" in source
+    assert 'aria-label="调研主体核心对象"' in source
+    assert 'aria-label="调研主体研究意图"' in source
+    assert 'aria-label="调研主体使用场景"' in source
+    assert "confirmContentResearchSubjectStructure(" in source
+    assert "补充你要调研的具体对象……" not in source
 
 
-def test_subject_clarification_posts_the_same_run_workflow_action() -> None:
+def test_subject_confirmation_posts_the_same_run_workflow_action() -> None:
     source = CONTENT_RESEARCH_API.read_text(encoding="utf-8")
 
-    assert 'action: "clarify_subject"' in source
-    assert "clarification_text: clarificationText" in source
+    assert 'action: "confirm_subject_structure"' in source
+    assert "subject_structure_hash: string" in source

@@ -32,6 +32,7 @@ from app.content_research.api_schemas import (
     ContentResearchSourceCollectionResponse,
     ContentResearchSubagentTaskResponse,
     ContentResearchSubjectClarificationRequest,
+    ContentResearchSubjectStructureConfirmationRequest,
     ContentResearchTraceResponse,
     ContentResearchWorkflowActionRequest,
     ContentResearchWorkflowActionResponse,
@@ -103,7 +104,11 @@ from app.content_research.sources.base import (
 )
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
 from app.content_research.subject_structure import (
+    SUBJECT_STRUCTURE_SCHEMA_VERSION,
+    SubjectEntity,
+    SubjectStructure,
     parse_subject_structure,
+    subject_structure_fingerprint,
     subject_structure_payload,
 )
 from app.content_research.workflow import (
@@ -894,6 +899,110 @@ class ContentResearchService:
             )
         return self._response_from_brief(updated)
 
+    async def confirm_subject_structure(
+        self,
+        *,
+        workflow_run_id: str,
+        confirmation: ContentResearchSubjectStructureConfirmationRequest,
+    ) -> ContentResearchPresearchResponse:
+        """Freeze an authoritative user correction without another model request."""
+        brief = self._store.get_brief_by_workflow(workflow_run_id)
+        if brief is None:
+            raise ContentResearchNotFoundError(
+                f"Content research workflow not found: {workflow_run_id}"
+            )
+        payload = brief.payload
+        if confirmation.subject_structure_hash != str(
+            payload.get("subject_structure_hash") or ""
+        ):
+            raise ContentResearchValidationError("stale subject structure")
+        if str(payload.get("status") or "") != "subject_needs_confirmation":
+            raise ContentResearchValidationError(
+                "Structured subject confirmation is not available for this run"
+            )
+
+        core_object = _normalized_subject_term(confirmation.core_object)
+        research_intent = _normalized_subject_term(confirmation.research_intent)
+        contexts = _normalized_subject_contexts(confirmation.context_modifiers)
+        if not core_object or not research_intent:
+            raise ContentResearchValidationError(
+                "core_object and research_intent are required"
+            )
+        if len(contexts) > 8:
+            raise ContentResearchValidationError("at most 8 context modifiers are allowed")
+        structure = SubjectStructure(
+            schema_version=SUBJECT_STRUCTURE_SCHEMA_VERSION,
+            canonical_subject=_normalized_subject_term(
+                str(payload.get("seed_text") or core_object)
+            ),
+            subject_type=str(
+                (payload.get("subject_structure") or {}).get("subject_type") or "unknown"
+            ),
+            core_entities=(
+                SubjectEntity(
+                    canonical_name=core_object,
+                    raw_mentions=(core_object,),
+                ),
+            ),
+            research_intents=(research_intent,),
+            context_modifiers=tuple(contexts),
+            synonym_groups=(),
+            ambiguities=(),
+            resolution_state="resolved",
+        )
+        structure_hash = subject_structure_fingerprint(structure)
+        updated = self._store.save_brief(
+            replace(
+                brief,
+                status="draft",
+                payload={
+                    **payload,
+                    "status": "completed",
+                    "subject_confirmation": f"已确认调研 {core_object} 的 {research_intent}。",
+                    "subject_structure": subject_structure_payload(structure),
+                    "subject_structure_hash": structure_hash,
+                    "subject_structure_state": "confirmed",
+                    "subject_structure_reason_codes": [],
+                    "subject_structure_authority": "user_confirmed",
+                    "subject_structure_history": [
+                        *list(payload.get("subject_structure_history") or []),
+                        {
+                            "structure_hash": payload.get("subject_structure_hash"),
+                            "state": payload.get("subject_structure_state"),
+                            "reason_codes": list(
+                                payload.get("subject_structure_reason_codes") or []
+                            ),
+                        },
+                    ],
+                },
+                updated_at=utcnow(),
+            )
+        )
+        now = utcnow()
+        self._store.save_stage_checkpoint(
+            StageCheckpointRecord(
+                id=f"scp_{canonical_fingerprint({'run': workflow_run_id, 'stage': 'subject_structure', 'structure': structure_hash})[:24]}",
+                schema_version="content_research_stage_checkpoint_v1",
+                payload={
+                    "schema_version": "content_research_subject_structure_checkpoint_v1",
+                    "structure_hash": structure_hash,
+                    "state": "confirmed",
+                    "reason_codes": [],
+                    "authority": "user_confirmed",
+                },
+                workflow_run_id=workflow_run_id,
+                subagent_task_id=f"presearch:{payload['attempt_id']}",
+                stage_name="subject_structure",
+                input_fingerprint=structure_hash,
+                status="completed",
+                started_at=now,
+                finished_at=now,
+            )
+        )
+        await self._workflow_runtime.resume_subject_clarification(workflow_run_id)
+        await self._workflow_runtime.mark_presearch_ready(workflow_run_id)
+        return self._response_from_brief(updated)
+
     async def confirm_brief(
         self,
         *,
@@ -1551,6 +1660,39 @@ class ContentResearchService:
             "report": report.model_dump(mode="json"),
         }
 
+    async def repair_from_persisted_packets(
+        self, workflow_run_id: str
+    ) -> dict[str, Any]:
+        """Offer packet-only recovery only for the eligible evidence-only report."""
+        report = await self.get_lite_report(workflow_run_id=workflow_run_id)
+        publication = report.publication
+        if (
+            publication.get("state") != "evidence_only_report"
+            or publication.get("publication_reason") != "query_subject_not_supported"
+        ):
+            raise ContentResearchValidationError(
+                "Persisted-packet repair is not available for this report"
+            )
+        tasks = self._store.list_subagent_tasks_for_workflow(workflow_run_id)
+        packets = [
+            item
+            for item in self._store.list_typed_records(DirectionalEvidencePacketRecord)
+            if item.workflow_run_id == workflow_run_id
+        ]
+        if not tasks or not packets:
+            raise ContentResearchValidationError(
+                "Persisted-packet repair requires completed selection and evidence packets"
+            )
+        recovery_lock = self._recovery_locks.setdefault(workflow_run_id, asyncio.Lock())
+        async with recovery_lock:
+            replay = await self.replay_downstream_from_persisted_packets(workflow_run_id)
+        return {
+            **replay,
+            "status": "completed",
+            "packet_count": len(packets),
+            "new_collection_count": 0,
+        }
+
     async def _replay_relevance_context(
         self,
         *,
@@ -2184,6 +2326,32 @@ class ContentResearchService:
                 status=response.status,
                 result=response.model_dump(mode="json"),
                 local_cache_id=response.brief_id,
+            )
+
+        if action == "confirm_subject_structure":
+            confirmation = ContentResearchSubjectStructureConfirmationRequest(
+                **request.payload
+            )
+            response = await self.confirm_subject_structure(
+                workflow_run_id=workflow_run_id,
+                confirmation=confirmation,
+            )
+            return self._action_response(
+                workflow_run_id=workflow_run_id,
+                action=action,
+                status=response.status,
+                result=response.model_dump(mode="json"),
+                local_cache_id=response.brief_id,
+            )
+
+        if action == "repair_from_persisted_packets":
+            result = await self.repair_from_persisted_packets(workflow_run_id)
+            return self._action_response(
+                workflow_run_id=workflow_run_id,
+                action=action,
+                status=str(result["status"]),
+                result=result,
+                local_cache_id=brief.id,
             )
 
         if action == "end_content_research":
@@ -3429,6 +3597,23 @@ class ContentResearchService:
 
 def _new_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex}"
+
+
+def _normalized_subject_term(value: str) -> str:
+    return " ".join(str(value or "").strip().split())
+
+
+def _normalized_subject_contexts(value: str | list[str]) -> list[str]:
+    raw_values = value.replace("、", ",").replace("，", ",").split(",") if isinstance(value, str) else value
+    contexts: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_values:
+        normalized = _normalized_subject_term(str(raw))
+        identity = normalized.casefold()
+        if normalized and identity not in seen:
+            seen.add(identity)
+            contexts.append(normalized)
+    return contexts
 
 
 def _subagent_task_response(task: SubagentTaskRecord) -> ContentResearchSubagentTaskResponse:

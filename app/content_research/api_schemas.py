@@ -18,6 +18,8 @@ P0_WORKFLOW_ACTIONS = (
     "end_content_research",
     "retry_presearch",
     "clarify_subject",
+    "confirm_subject_structure",
+    "repair_from_persisted_packets",
 )
 
 
@@ -276,6 +278,13 @@ class ContentResearchWorkflowActionRequest(BaseModel):
 
 class ContentResearchSubjectClarificationRequest(BaseModel):
     clarification_text: str = Field(min_length=1, max_length=2000)
+
+
+class ContentResearchSubjectStructureConfirmationRequest(BaseModel):
+    subject_structure_hash: str = Field(min_length=1)
+    core_object: str = Field(min_length=1, max_length=200)
+    research_intent: str = Field(min_length=1, max_length=200)
+    context_modifiers: str | list[str] = Field(default_factory=list)
 
 
 class ContentResearchWorkflowActionResponse(BaseModel):

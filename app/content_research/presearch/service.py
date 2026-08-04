@@ -151,36 +151,19 @@ class PresearchService:
                     response.content, request.seed_text, request.user_note
                 )
             except (TypeError, ValueError, json.JSONDecodeError):
-                # A transport-successful but malformed structured response gets
-                # one bounded retry before asking the user for configuration.
-                retry_response = await asyncio.wait_for(self._llm.generate(
-                    LLMRequest(
-                        messages=build_presearch_messages(request.seed_text, request.user_note),
-                        task_type="content_research.presearch", model_policy="balanced",
-                        temperature=1.0, max_tokens=700,
-                        context=LLMCallContext(session_id=request.thread_id, step_name="presearch",
-                            agent_name="content_research_presearch", tenant_id=request.workspace_id,
-                            user_id=request.user_id),
-                    )
-                ), timeout=self.hard_cutoff_seconds)
-                try:
-                    checklist = self._parse_checklist(
-                        retry_response.content, request.seed_text, request.user_note
-                    )
-                    response = retry_response
-                except (TypeError, ValueError, json.JSONDecodeError):
-                    from app.content_research.presearch.fallback_templates import (
-                        build_fallback_checklist,
-                    )
-                    return PresearchOutcome(
-                        status="waiting_model_config",
-                        checklist=build_fallback_checklist(request.seed_text, request.user_note),
-                        error_code="llm_structured_output_invalid",
-                        error_message="模型服务返回格式不兼容",
-                        recoverable=True, provider=retry_response.provider,
-                        model=retry_response.model,
-                        configuration_source=retry_response.configuration_source,
-                    )
+                from app.content_research.presearch.fallback_templates import (
+                    build_fallback_checklist,
+                )
+                return PresearchOutcome(
+                    status="waiting_model_config",
+                    checklist=build_fallback_checklist(request.seed_text, request.user_note),
+                    error_code="llm_structured_output_invalid",
+                    error_message="模型服务返回格式不兼容",
+                    recoverable=True,
+                    provider=response.provider,
+                    model=response.model,
+                    configuration_source=response.configuration_source,
+                )
             status = (
                 "completed"
                 if checklist.subject_structure_state == "confirmed"

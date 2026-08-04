@@ -243,9 +243,9 @@ async def test_presearch_returns_backend_validated_subject_structure(store):
                 "canonical_subject": "防晒服饰",
                 "subject_type": "category",
                 "core_entities": [
-                    {
-                        "canonical_name": "防晒服饰",
-                        "raw_mentions": ["防晒穿搭"],
+                        {
+                            "canonical_name": "防晒服饰",
+                            "raw_mentions": ["防晒"],
                     }
                 ],
                 "research_intents": ["穿搭"],
@@ -348,6 +348,59 @@ async def test_subject_clarification_reuses_run_without_model_recovery_or_spider
 
 
 @pytest.mark.asyncio
+async def test_structured_subject_confirmation_never_requests_a_second_model_response(store):
+    runtime = FakeRuntime()
+    llm = AmbiguousThenClarifiedLLM()
+    service = _service(store, llm, runtime=runtime)
+
+    first = await service.submit_presearch(
+        seed_text="苹果适合年轻人吗",
+        user_note=None,
+        thread_id="thread_structured_confirmation",
+        user_id="user_1",
+    )
+
+    action = await service.run_workflow_action(
+        workflow_run_id=first.workflow_run_id,
+        request=ContentResearchWorkflowActionRequest(
+            action="confirm_subject_structure",
+            payload={
+                "subject_structure_hash": first.subject_structure_hash,
+                "core_object": "Apple 品牌",
+                "research_intent": "年轻人偏好",
+                "context_modifiers": "大学生，日常使用",
+            },
+        ),
+    )
+
+    result = action.result
+    assert result["status"] == "completed"
+    assert result["subject_structure_state"] == "confirmed"
+    assert result["subject_structure"]["core_entities"] == [
+        {"canonical_name": "Apple 品牌", "raw_mentions": ["Apple 品牌"]}
+    ]
+    assert result["subject_structure"]["research_intents"] == ["年轻人偏好"]
+    assert result["subject_structure"]["context_modifiers"] == ["大学生", "日常使用"]
+    assert len(llm.requests) == 1
+    assert runtime.calls[-2]["event"] == "resume_subject_clarification"
+    assert runtime.calls[-1]["event"] == "presearch_ready"
+    assert all(item.stage_name != "operation" for item in store.list_typed_records(StageCheckpointRecord))
+
+    with pytest.raises(ContentResearchValidationError, match="stale subject structure"):
+        await service.run_workflow_action(
+            workflow_run_id=first.workflow_run_id,
+            request=ContentResearchWorkflowActionRequest(
+                action="confirm_subject_structure",
+                payload={
+                    "subject_structure_hash": first.subject_structure_hash,
+                    "core_object": "Apple 品牌",
+                    "research_intent": "年轻人偏好",
+                },
+            ),
+        )
+
+
+@pytest.mark.asyncio
 async def test_subject_clarification_does_not_increment_real_runtime_attempt_count(store):
     runtime = WorkflowRunManagerRuntime(store._db_path)
     service = _service(store, AmbiguousThenClarifiedLLM(), runtime=runtime)
@@ -401,7 +454,8 @@ async def test_presearch_llm_failure_waits_for_model_configuration(store):
 
 @pytest.mark.asyncio
 async def test_presearch_malformed_llm_response_waits_for_configuration(store):
-    service = _service(store, FakeLLM(content="not json"))
+    llm = FakeLLM(content="not json")
+    service = _service(store, llm)
 
     response = await service.submit_presearch(
         seed_text="露营灯",
@@ -413,6 +467,7 @@ async def test_presearch_malformed_llm_response_waits_for_configuration(store):
     assert response.status == "waiting_model_config"
     assert response.fallback_used is False
     assert response.error_code == "llm_structured_output_invalid"
+    assert len(llm.requests) == 1
 
 
 class FailingLLM:

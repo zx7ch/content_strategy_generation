@@ -75,6 +75,7 @@ def parse_subject_structure(
     normalized_input: str,
 ) -> SubjectStructureDecision:
     """Parse an LLM proposal; backend code owns the collection trust decision."""
+    raw_research_intents = data.get("research_intents")
     entities = tuple(
         SubjectEntity(
             canonical_name=_text(item.get("canonical_name")),
@@ -124,6 +125,35 @@ def parse_subject_structure(
         reason_codes.append("multiple_primary_entities")
     if structure.resolution_state != "resolved" or structure.ambiguities:
         reason_codes.append("unresolved_ambiguity")
+
+    if (
+        not isinstance(raw_research_intents, (list, tuple))
+        or not raw_research_intents
+        or not _text(raw_research_intents[0])
+    ):
+        reason_codes.append("primary_research_intent_missing")
+
+    role_terms = {
+        _matching_text(value)
+        for value in (*structure.research_intents, *structure.context_modifiers)
+        if _matching_text(value)
+    }
+    raw_mentions = tuple(
+        mention for entity in structure.core_entities for mention in entity.raw_mentions
+    )
+    if (
+        len(structure.core_entities) == 1
+        and len(raw_mentions) == 1
+        and _matching_text(raw_mentions[0]) == input_for_matching
+        and role_terms
+    ):
+        reason_codes.append("core_entity_is_complete_input")
+    elif any(
+        term in _matching_text(mention)
+        for mention in raw_mentions
+        for term in role_terms
+    ):
+        reason_codes.append("core_entity_overlaps_role")
 
     entity_names = {
         _matching_text(entity.canonical_name) for entity in structure.core_entities

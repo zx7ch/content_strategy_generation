@@ -12,7 +12,7 @@ def test_grounded_single_core_entity_is_confirmed_for_lite() -> None:
             "core_entities": [
                 {
                     "canonical_name": "防晒服饰",
-                    "raw_mentions": ["防晒穿搭"],
+                    "raw_mentions": ["防晒"],
                 }
             ],
             "research_intents": ["穿搭"],
@@ -29,7 +29,7 @@ def test_grounded_single_core_entity_is_confirmed_for_lite() -> None:
     assert decision.reason_codes == ()
     assert decision.structure is not None
     assert decision.structure.canonical_subject == "防晒服饰"
-    assert decision.structure.core_entities[0].raw_mentions == ("防晒穿搭",)
+    assert decision.structure.core_entities[0].raw_mentions == ("防晒",)
 
 
 def test_ungrounded_core_entity_needs_confirmation() -> None:
@@ -84,7 +84,7 @@ def test_synonym_groups_require_one_owner_and_unique_values() -> None:
             "canonical_subject": "防晒服饰",
             "subject_type": "category",
             "core_entities": [
-                {"canonical_name": "防晒服饰", "raw_mentions": ["防晒穿搭"]}
+                {"canonical_name": "防晒服饰", "raw_mentions": ["防晒"]}
             ],
             "research_intents": ["穿搭"],
             "context_modifiers": ["夏季"],
@@ -103,3 +103,64 @@ def test_synonym_groups_require_one_owner_and_unique_values() -> None:
         "orphan_synonym_group",
         "duplicate_synonym",
     )
+
+
+def test_complete_sentence_core_with_intent_and_context_needs_confirmation() -> None:
+    decision = parse_subject_structure(
+        {
+            "canonical_subject": "夏季凉感T恤",
+            "subject_type": "category",
+            "core_entities": [
+                {"canonical_name": "夏季凉感T恤", "raw_mentions": ["夏季凉感T恤"]}
+            ],
+            "research_intents": ["凉感"],
+            "context_modifiers": ["夏季"],
+            "synonym_groups": {},
+            "ambiguities": [],
+            "resolution_state": "resolved",
+        },
+        normalized_input="夏季凉感T恤",
+    )
+
+    assert decision.state == "needs_confirmation"
+    assert decision.reason_codes == ("core_entity_is_complete_input",)
+
+
+def test_core_raw_mention_overlapping_intent_needs_confirmation() -> None:
+    decision = parse_subject_structure(
+        {
+            "canonical_subject": "凉感T恤",
+            "subject_type": "category",
+            "core_entities": [
+                {"canonical_name": "T恤", "raw_mentions": ["凉感T恤"]}
+            ],
+            "research_intents": ["凉感"],
+            "context_modifiers": ["夏季"],
+            "synonym_groups": {},
+            "ambiguities": [],
+            "resolution_state": "resolved",
+        },
+        normalized_input="夏季凉感T恤",
+    )
+
+    assert decision.state == "needs_confirmation"
+    assert decision.reason_codes == ("core_entity_overlaps_role",)
+
+
+def test_first_empty_research_intent_needs_confirmation() -> None:
+    decision = parse_subject_structure(
+        {
+            "canonical_subject": "T恤",
+            "subject_type": "category",
+            "core_entities": [{"canonical_name": "T恤", "raw_mentions": ["T恤"]}],
+            "research_intents": ["", "凉感"],
+            "context_modifiers": ["夏季"],
+            "synonym_groups": {},
+            "ambiguities": [],
+            "resolution_state": "resolved",
+        },
+        normalized_input="夏季凉感T恤",
+    )
+
+    assert decision.state == "needs_confirmation"
+    assert decision.reason_codes == ("primary_research_intent_missing",)

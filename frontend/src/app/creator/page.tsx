@@ -23,7 +23,8 @@ import {
 import { useBrandContext } from "@/components/providers/BrandProvider";
 import {
   startContentResearchFormalResearch,
-  clarifyContentResearchSubject,
+  confirmContentResearchSubjectStructure,
+  repairContentResearchFromPersistedPackets,
   confirmContentResearchBrief,
   createContentResearchPresearch,
   endContentResearchWorkflow,
@@ -673,10 +674,12 @@ function liteDirectionLabel(value: string) {
 function ContentResearchIntentCard({
   intent,
   onConfirmed,
+  onPresearchUpdated,
   onError,
 }: {
   intent: ContentResearchIntentState;
   onConfirmed: (summary: ContentResearchWorkflowSummary) => void;
+  onPresearchUpdated: (presearch: ContentResearchPresearchResponse) => void;
   onError: (message: string) => void;
 }) {
   const structure = intent.presearch.subject_structure ?? {};
@@ -695,6 +698,15 @@ function ContentResearchIntentCard({
   const [extraCompetitors, setExtraCompetitors] = useState(intent.presearch.custom_competitor_input ?? "");
   const [customQuestion, setCustomQuestion] = useState(intent.presearch.custom_research_question ?? "");
   const [isConfirming, setIsConfirming] = useState(false);
+  const [coreObjectInput, setCoreObjectInput] = useState(
+    structure.core_entities?.[0]?.canonical_name?.trim() ?? "",
+  );
+  const [researchIntentInput, setResearchIntentInput] = useState(
+    structure.research_intents?.[0]?.trim() ?? "",
+  );
+  const [contextInput, setContextInput] = useState(
+    (structure.context_modifiers ?? []).filter(Boolean).join("，"),
+  );
   const confirmationInFlightRef = useRef(false);
 
   function toggleValue(value: string, selected: string[], setSelected: (next: string[]) => void) {
@@ -739,15 +751,48 @@ function ContentResearchIntentCard({
   }
 
   if (intent.presearch.status === "subject_needs_confirmation") {
+    async function confirmSubjectStructure() {
+      if (!coreObjectInput.trim() || !researchIntentInput.trim()) {
+        onError("请填写核心对象和研究意图。");
+        return;
+      }
+      setIsConfirming(true);
+      try {
+        const response = await confirmContentResearchSubjectStructure(
+          intent.presearch.workflow_run_id,
+          {
+            subject_structure_hash: intent.presearch.subject_structure_hash ?? "",
+            core_object: coreObjectInput,
+            research_intent: researchIntentInput,
+            context_modifiers: contextInput,
+          },
+        );
+        onPresearchUpdated(response.result);
+      } catch {
+        onError("主题确认失败，请刷新后重试。");
+      } finally {
+        setIsConfirming(false);
+      }
+    }
     return (
       <div className="flex justify-start">
         <div className="w-full max-w-[92%] rounded-2xl border border-amber-200 bg-amber-50 px-5 py-4 text-sm text-amber-950 shadow-sm">
           <p className="text-base font-semibold">还需要你确认调研主体</p>
           <p className="mt-2 leading-6">{intent.presearch.subject_confirmation}</p>
-          <p className="mt-3 rounded-xl bg-white/70 px-3 py-2 text-xs leading-5 text-slate-700">
-            核心对象：{coreObject}｜意图：{intents}｜场景：{contexts}
-          </p>
-          <p className="mt-3 text-xs text-amber-800">请直接在底部对话框补充说明；系统会在本次任务内重新确认，不会启动 Spider。</p>
+          <div className="mt-3 grid gap-3 rounded-xl bg-white/70 p-3">
+            <label className="grid gap-1 text-xs font-medium">核心对象 *
+              <input aria-label="调研主体核心对象" value={coreObjectInput} onChange={(event) => setCoreObjectInput(event.target.value)} placeholder="T恤" className="rounded-lg border border-line bg-white px-3 py-2 text-sm font-normal outline-none" />
+            </label>
+            <label className="grid gap-1 text-xs font-medium">研究意图 *
+              <input aria-label="调研主体研究意图" value={researchIntentInput} onChange={(event) => setResearchIntentInput(event.target.value)} placeholder="凉感" className="rounded-lg border border-line bg-white px-3 py-2 text-sm font-normal outline-none" />
+            </label>
+            <label className="grid gap-1 text-xs font-medium">使用场景
+              <input aria-label="调研主体使用场景" value={contextInput} onChange={(event) => setContextInput(event.target.value)} placeholder="夏季" className="rounded-lg border border-line bg-white px-3 py-2 text-sm font-normal outline-none" />
+            </label>
+            <button type="button" onClick={() => void confirmSubjectStructure()} disabled={isConfirming} className="justify-self-start rounded-lg bg-ink px-3 py-2 text-xs font-medium text-white disabled:opacity-40">
+              {isConfirming ? "确认中" : "确认调研主体"}
+            </button>
+          </div>
         </div>
       </div>
     );
@@ -920,10 +965,12 @@ function coverageReasonLabel(reason: string) {
 function ContentResearchReportMessage({
   report,
   onRecover,
+  onRepair,
   onOpenTrace,
 }: {
   report: ContentResearchLiteReportResponse;
   onRecover?: () => void;
+  onRepair?: () => void;
   onOpenTrace?: () => void;
 }) {
   const [selectedCitation, setSelectedCitation] = useState<Record<string, unknown> | null>(null);
@@ -1068,6 +1115,12 @@ function ContentResearchReportMessage({
             <p className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900">
               {stringField(report.publication, "publication_reason")}
             </p>
+          )}
+          {evidenceOnly && stringField(report.publication, "publication_reason") === "query_subject_not_supported" && onRepair && (
+            <section className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-3" aria-label="已有笔记重新处理">
+              <p className="text-xs text-amber-900">可复用已保存的笔记重新评估相关性，不会新增采集。</p>
+              <button type="button" onClick={onRepair} className="mt-2 rounded-lg bg-ink px-3 py-2 text-xs font-medium text-white">使用已有笔记重新处理</button>
+            </section>
           )}
 
           {findings.length > 0 && (
@@ -2114,6 +2167,17 @@ export default function CreatorPage() {
     }
   }
 
+  async function repairContentResearchForRun(workflowRunId: string) {
+    try {
+      await repairContentResearchFromPersistedPackets(workflowRunId);
+      const report = await pollContentResearchReport(workflowRunId, { requirePublication: true });
+      if (report) appendLiteReportMessage(report);
+      await refreshContentResearchTrace(workflowRunId);
+    } catch (error) {
+      appendMessage({ role: "system", text: `已有笔记重新处理失败：${error instanceof Error ? error.message : "未知错误"}` });
+    }
+  }
+
   async function modifyContentResearchDirections() {
     const run = contentResearchRun;
     if (!run || !activeThreadId) return;
@@ -2392,37 +2456,6 @@ export default function CreatorPage() {
       return;
     }
 
-    if (
-      contentResearchIntent
-      && !contentResearchRun
-      && ["subject_needs_confirmation", "completed"].includes(
-        contentResearchIntent.presearch.status,
-      )
-    ) {
-      try {
-        const clarified = await clarifyContentResearchSubject(
-          contentResearchIntent.presearch.workflow_run_id,
-          text,
-        );
-        setContentResearchIntent((current) => current
-          ? { ...current, presearch: clarified.result }
-          : current
-        );
-        appendMessage({
-          role: "assistant",
-          text: clarified.result.status === "subject_needs_confirmation"
-            ? clarified.result.subject_confirmation
-            : `已更新主题结构：${clarified.result.subject_confirmation}`,
-        });
-      } catch {
-        appendMessage({ role: "system", text: "主题补充处理失败，请检查模型配置后重试。" });
-      } finally {
-        setIsLoading(false);
-        inputRef.current?.focus();
-      }
-      return;
-    }
-
     if (contentResearchMode) {
       try {
         appendMessage({
@@ -2695,6 +2728,7 @@ export default function CreatorPage() {
                     <ContentResearchReportMessage
                       report={message.report}
                       onRecover={() => void resumeContentResearchForRun(message.report!.workflow_run_id)}
+                      onRepair={() => void repairContentResearchForRun(message.report!.workflow_run_id)}
                       onOpenTrace={() => setTraceExpanded(true)}
                     />
                   ) : (
@@ -2761,6 +2795,7 @@ export default function CreatorPage() {
               <ContentResearchIntentCard
                 intent={contentResearchIntent}
                 onConfirmed={(summary) => void handleContentResearchConfirmed(summary)}
+                onPresearchUpdated={(presearch) => setContentResearchIntent((current) => current ? { ...current, presearch } : current)}
                 onError={(message) => appendMessage({ role: "system", text: message })}
               />
             )}
@@ -2951,12 +2986,6 @@ export default function CreatorPage() {
               placeholder={
                 contentResearchMode
                   ? "输入品类、品牌或 SKU，发送后开始内容调研"
-                  : contentResearchIntent
-                      && !contentResearchRun
-                      && ["subject_needs_confirmation", "completed"].includes(
-                        contentResearchIntent.presearch.status,
-                      )
-                    ? "补充你要调研的具体对象……"
                   : isTaskRunning
                     ? "任务进行中，可继续补充要求..."
                     : "发消息..."

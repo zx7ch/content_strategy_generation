@@ -29,6 +29,7 @@ class FakeLLM:
     async def generate(self, request):
         user_prompt = request.messages[-1].content
         subject = "慢速调研" if "慢速调研" in user_prompt else "徒步短裤"
+        core_object = "调研" if subject == "慢速调研" else "短裤"
         return LLMResponse(
             content=json.dumps({
                 "subject_confirmation": subject,
@@ -40,10 +41,10 @@ class FakeLLM:
                     "schema_version": "content_research_subject_structure_v1",
                     "canonical_subject": subject,
                     "subject_type": "category",
-                    "core_entities": [{"canonical_name": subject, "raw_mentions": [subject]}],
+                    "core_entities": [{"canonical_name": core_object, "raw_mentions": [core_object]}],
                     "research_intents": ["产品营销"],
                     "context_modifiers": [],
-                    "synonym_groups": {subject: ["户外短裤"]},
+                    "synonym_groups": {core_object: ["户外短裤"]},
                     "ambiguities": [],
                     "resolution_state": "resolved",
                 },
