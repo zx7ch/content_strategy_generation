@@ -389,7 +389,7 @@ Lite 只交付结构化主题到可信采集的核心闭环，不扩展为通用
 - Task 5I 只做单方向核心：等价 normalized Q1/Q2 合并，同一方向内 canonical note 去重，并保留每个 QueryGroup/rank hit 的完整 lineage。跨方向原子 single-flight、共享 collection artifact/binding 和共享失败传播延期到 Gate 4B，在多个方向开放真实并发采集前完成。
 - 既有 `detail_fetch_cap=30` 明确为每方向“详情样本评估上限”；Task 5I 沿用现有单方向 operation 计数，不新增物理/逻辑双账本。Gate 4B 引入跨方向复用时再分别投影 physical call 与方向 evaluated count。
 - 新增安全逻辑 checkpoint：`subject_structure`、`query_plan`、`coverage_decision`、`fallback_decision`、`relevance_revision`。它们在现有倒序 Trace 内作为专家/预检索细节展示，不增加伪 workflow 阶段；Q3 不计为错误/重试。
-- `needs_confirmation` 是独立产品状态而非模型失败。Creator 复用底部正常对话输入框，将消息以同 run `clarify_subject` action 提交；Pre-research 卡片只显示澄清问题、结构摘要与确认状态，不增加输入框。澄清不消耗模型故障恢复预算、不调用 Spider；采集开始后修改主题必须新建 run。
+- `needs_confirmation` 是独立产品状态而非模型失败。原 Task 5I 使用底部对话框与 `clarify_subject`；P0 gap-closure 目标合同由 `docs/superpowers/specs/2026-08-04-f003-lite-e2e-gap-closure-design.md` 接替：模型只提出一次结构，失败后使用卡片内结构化字段和 `confirm_subject_structure`，不再调用模型或 Spider。采集开始后修改主题仍必须新建 run。
 - Task 5I 沿用现有单方向 auth/outcome-unknown/自动重试/note-unavailable 语义。公开 Trace 不返回完整 query、原始主题、note ID、Prompt、凭据、请求头或 provider 原始 payload。
 - Spider 返回数量不等于可用证据，必须分别记录 discovered、deduplicated、relevant、detail-eligible、admitted。现有候选和 packet 必须先耗尽/重放，再允许 Q3；任何下游修复不得为了重做 admission/report 重跑 Spider。
 - 最小验收覆盖：可信主题、对话澄清歧义/空主体、Q1/Q2 去重、同方向 note 去重、Q3 确定性激活、Trace 脱敏、显式重点未覆盖的 partial 语义，以及刷新/恢复不增加既有 provider operation。
@@ -399,6 +399,19 @@ Lite 只交付结构化主题到可信采集的核心闭环，不扩展为通用
 - P0-3 真实新 run 验收（2026-08-04）：在 Creator 输入 `夏季凉感T恤`，配置的 OpenAI `gpt-4o-mini` 首次主题提议进入 `needs_confirmation`；用户通过结构化卡确认 `T恤｜凉感｜夏季`，同一 run `run_fdf41aa66a2245a6bf87635a6cf523a5` 未产生第二次模型提议。单选 `product_marketing` 后，冻结 2 个主 QueryGroup、0 个 Q3，完成 30 个 persisted packet、32 个 completed provider-operation checkpoint（2 次发现 + 30 次详情，符合 `detail_fetch_cap=30`），coverage 已满足且未触发 fallback。报告发布为 `complete_verified_report`，有 19 条 citation／finding；Creator 刷新后恢复同一完整报告。Trace REST 投影仅出现结构、计划和 coverage stage 名称，未出现 `complete_query`、`raw_input`、`note_id`、`api_key` 或 `prompt`。
 
 **通过条件**：预发布环境中新合同为唯一 Creator/report 合同；选择、scope、报告三态、恢复卡、citation drawer、模型配置与模型故障后的同 run 恢复均通过上述 API/浏览器验收。Gate 4A 不对正式用户发布，也不代表所有目录方向的采集能力已完成。
+
+#### Task 5J — First-intent finding quality（P1，P0 闭环后的下一任务）
+
+Task 5J 只在 `docs/superpowers/specs/2026-08-04-f003-lite-e2e-gap-closure-design.md` 中 P0-1～P0-3 全部通过后开始；它是 Content Research 的下一交付任务，不插入当前 P0 修复批次。完整技术边界记录在该设计的 `Next Task: P1 First-Intent Finding Quality`。
+
+- 继续只执行 `research_intents[0]`，不新增 `required_qualifiers` 或第二个 Lite intent。
+- 在版本化 relevance/admission 合同中分别冻结核心对象 anchor 与第一 intent anchor。QueryGroup 命中谱系是必要条件，但不能替代允许字段 direct quote 对第一 intent 的支持。
+- 只有同时支持核心对象和第一 intent 的 candidate 才能成为 `main_findings`。只支持核心对象的 candidate 必须 rejected 或以 `first_intent_not_supported` 降级为 governed WeakSignal，Lite read model 不得自行推断或升级。
+- coverage 分别记录 `direct_core_support` 与 `direct_first_intent_support`；第一 intent 未覆盖时可按冻结计划触发一次 Q3，耗尽后发布真实 partial/insufficient 状态，不能用通用核心对象证据伪装完整覆盖。
+- `complete_verified_report` 除既有样本/独立作者门槛外，还要求第一 intent 有直接支持。其他已验证方向不因单一方向 intent 不足而丢失。
+- 历史恢复只允许从 persisted packets 重放 admission → publication；不得为了提高焦点质量重跑 Spider，重放前后 provider operation 与 packet ID 集合必须一致。
+
+**Task 5J 验收**：`夏季凉感T恤` 中同时支持 `T恤 + 凉感` 的 direct quote 可成为 finding；普通 T 恤、仅有 query lineage、或只支持 `凉感` 但不支持 T 恤的材料均不能成为 finding。对历史 `夏季防晒穿搭` packets 重放时，销售话术或泛防晒材料只有直接支持 `穿搭` 才能进入核心发现；Trace 分开显示核心对象与第一 intent 覆盖，且新增 Spider operation 为 0。
 
 ### Task 5：Lite 报告质量合同收口
 

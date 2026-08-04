@@ -216,10 +216,70 @@ Focused tests cover:
 - frontend refresh and browser interaction;
 - one real new-run acceptance and one historical packet-only acceptance.
 
-## Deferred Work
+## Next Task: P1 First-Intent Finding Quality
 
-This P0 closure does not make every admitted quote directly support the first
-intent, synthesize raw findings into higher-level conclusions, execute multiple
-research intents, add a category vocabulary, add embeddings, or implement
-cross-direction physical deduplication. Those remain separate report-quality or
-Gate 4B work.
+P1 starts only after P0-1 through P0-3 pass their acceptance criteria. It is the
+next Content Research delivery task, not part of the P0 implementation batch.
+
+P1 closes the remaining gap between "the source mentions the core object" and
+"the published finding directly supports what the user asked to research". It
+keeps `research_intents[0]` as the sole executable Lite intent and adds no new
+subject field.
+
+### P1 evidence contract
+
+- Freeze the normalized first-intent anchor beside the existing core-entity
+  anchors in the versioned relevance/admission contract.
+- QueryGroup provenance remains necessary but is not proof of intent support.
+  A direct allowed quote field must support both the frozen core object and the
+  frozen first intent before the candidate can become a Lite main finding.
+- A quote that supports the core object but not the first intent cannot appear
+  in `main_findings`. It is rejected or downgraded to a governed WeakSignal with
+  stable reason `first_intent_not_supported`; the Lite read model must not make
+  this decision itself.
+- A quote that supports the intent but not the core object remains rejected by
+  the existing `query_subject_not_supported` rule.
+- Direction coverage records core-object support and direct first-intent
+  support separately. Q3 may run once for an uncovered first intent; Q3
+  exhaustion publishes honest partial/insufficient state instead of promoting
+  generic core evidence.
+- Admission remains deterministic. P1 does not add an admission-time LLM,
+  embedding similarity, a fixed category vocabulary, or extra Spider calls
+  after persisted candidates and packets are exhausted.
+
+### P1 report contract
+
+- Every Lite core finding exposes a claim, admitted decision, direct quote,
+  core-support decision, first-intent-support decision, and frozen citation
+  identity from the same governed snapshot.
+- `complete_verified_report` requires the frozen sample/author policy plus
+  direct support for the first intent. Other verified directions may still
+  publish when one direction has `first_intent_not_supported`.
+- Core-only WeakSignals are clearly separated from findings and do not increase
+  finding or first-intent coverage counts.
+- Historical recovery may replay admission and publication from persisted
+  packets under the new versioned contract, but cannot rerun Spider merely to
+  improve report wording or focus quality.
+
+### P1 acceptance
+
+For `夏季凉感T恤`:
+
+- a direct quote supporting both `T恤` and `凉感` may become a finding;
+- a generic cotton or styling T-shirt quote without `凉感` cannot become a
+  finding;
+- a `凉感` quote without the T-shirt core object remains unrelated;
+- search/query lineage without a supporting direct quote remains insufficient;
+- coverage and Trace show core and first-intent support separately.
+
+The historical `夏季防晒穿搭` packets are also replayed as a regression: generic
+sales-script or sunscreen-product evidence cannot appear as a `穿搭` finding
+unless its frozen direct quote supports that first intent. Operation and packet
+identity sets must remain unchanged.
+
+## Later Deferred Work
+
+P1 does not synthesize raw findings into higher-level prose conclusions, execute
+multiple research intents, add a category vocabulary, add embeddings, or
+implement cross-direction physical deduplication. Those remain separate report
+quality or Gate 4B work.
