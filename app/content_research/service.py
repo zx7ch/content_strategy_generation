@@ -102,7 +102,10 @@ from app.content_research.sources.base import (
     DiscoverCandidatesRequest,
 )
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
-from app.content_research.subject_structure import parse_subject_structure
+from app.content_research.subject_structure import (
+    parse_subject_structure,
+    subject_structure_payload,
+)
 from app.content_research.workflow import (
     BriefConfirmation,
     ResearchDirectionRegistry,
@@ -1628,7 +1631,9 @@ class ContentResearchService:
                 raise ContentResearchValidationError(
                     "Historical relevance revision produced an invalid subject structure"
                 )
-            subject_structure = asdict(outcome.checklist.subject_structure)
+            subject_structure = subject_structure_payload(
+                outcome.checklist.subject_structure
+            )
 
         revised_relevance: dict[str, dict[str, Any]] = {}
         revised_contracts: dict[str, DirectionContract] = {}

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
 from datetime import datetime, timezone
 
@@ -8,7 +9,12 @@ import pytest
 from app.content_research.contracts import build_default_snapshot, policy_hash
 from app.content_research.models import ResearchBriefRecord
 from app.content_research.persistence_models import StageCheckpointRecord
-from app.content_research.presearch.service import PresearchService
+from app.content_research.presearch.service import (
+    PresearchChecklist,
+    PresearchOutcome,
+    PresearchService,
+)
+from app.content_research.subject_structure import parse_subject_structure
 from app.content_research.service import (
     ContentResearchService,
     ContentResearchValidationError,
@@ -138,6 +144,58 @@ async def test_legacy_relevance_revision_is_append_only_and_provider_free(tmp_pa
         for item in store.list_typed_records(StageCheckpointRecord)
         if item.stage_name == "operation"
     } == operations_before
+
+
+@pytest.mark.asyncio
+async def test_legacy_revision_serializes_model_generated_synonym_groups(tmp_path):
+    service, _store, brief, snapshot, contract = _legacy_context(tmp_path)
+    structure_payload = {
+        "schema_version": "content_research_subject_structure_v1",
+        "canonical_subject": "夏季防晒穿搭",
+        "subject_type": "category",
+        "core_entities": [{"canonical_name": "防晒服饰", "raw_mentions": ["防晒"]}],
+        "research_intents": ["穿搭"],
+        "context_modifiers": ["夏季"],
+        "synonym_groups": {"防晒服饰": ["防晒衣", "防晒服"]},
+        "ambiguities": [],
+        "resolution_state": "resolved",
+    }
+    structure = parse_subject_structure(
+        structure_payload,
+        normalized_input="夏季防晒穿搭",
+    ).structure
+    assert structure is not None
+
+    class GeneratedStructurePresearch:
+        async def create_llm_task(self, _request):
+            async def complete():
+                return PresearchOutcome(
+                    status="completed",
+                    checklist=PresearchChecklist(
+                        subject_confirmation="夏季防晒穿搭",
+                        competitor_tags=[],
+                        research_directions=["product_marketing"],
+                        subject_structure=structure,
+                        subject_structure_state="confirmed",
+                    ),
+                )
+
+            return asyncio.create_task(complete())
+
+    service._presearch = GeneratedStructurePresearch()
+    legacy_brief = replace(
+        brief,
+        payload={key: value for key, value in brief.payload.items() if key != "subject_structure"},
+    )
+
+    _revised_snapshot, revised_contracts = await service._replay_relevance_context(
+        brief=legacy_brief,
+        snapshot=snapshot,
+        contracts={"product_marketing": contract},
+    )
+
+    relevance = revised_contracts["product_marketing"].metadata["query_relevance"]
+    assert relevance["allowed_synonyms"] == {"防晒服饰": ["防晒服", "防晒衣"]}
 
 
 @pytest.mark.asyncio

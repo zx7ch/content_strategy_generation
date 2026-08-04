@@ -47,6 +47,29 @@ def test_lite_direction_states_normalize_requested_not_started_to_unavailable():
     }
 
 
+def test_lite_direction_states_do_not_present_rejected_candidates_as_direction_failure():
+    states = _direction_states(
+        {
+            "release": {"direction_ids": ["product_marketing"]},
+            "run_direction_states": [
+                {
+                    "direction": "product_marketing",
+                    "state": "formal_directional_result",
+                    "reason_codes": ["query_subject_not_supported"],
+                    "recovery_actions": [],
+                }
+            ],
+        }
+    )
+
+    assert states[0] == {
+        "direction": "product_marketing",
+        "state": "formal_directional_result",
+        "reason_code": None,
+        "recovery_action": None,
+    }
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("publication_state", "expected_status_strip"),

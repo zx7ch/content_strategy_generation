@@ -220,6 +220,8 @@ async def test_presearch_success_creates_workflow_brief_trace_and_observation(st
     assert "只输出一个合法 JSON 对象" in system_prompt
     assert "不要输出 Markdown" in system_prompt
     assert "competitor_tags" in system_prompt
+    assert "核心对象只保留可被调研的实体" in system_prompt
+    assert "不要把包含意图或场景修饰的完整用户句子直接复制为核心对象" in system_prompt
     assert store.get_brief(response.brief_id).payload["attempt_id"] == response.attempt_id
     traces = store.list_traces_for_workflow(response.workflow_run_id)
     assert len(traces) == 1

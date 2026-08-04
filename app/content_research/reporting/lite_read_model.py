@@ -333,6 +333,13 @@ def _direction_state_view(
             "reason_code": "collection_result_unavailable",
             "recovery_action": None,
         }
+    if state == "formal_directional_result":
+        return {
+            "direction": direction_id,
+            "state": state,
+            "reason_code": None,
+            "recovery_action": None,
+        }
     return {
         "direction": direction_id,
         "state": state,

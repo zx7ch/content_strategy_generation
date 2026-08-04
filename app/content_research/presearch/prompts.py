@@ -17,6 +17,10 @@ PRESEARCH_SYSTEM_PROMPT = (
     '- subject_structure: object，必须包含 schema_version、canonical_subject、subject_type、'
     'core_entities（每项包含 canonical_name、raw_mentions）、research_intents、'
     'context_modifiers、synonym_groups、ambiguities、resolution_state。raw_mentions 必须来自用户原文。\n'
+    "结构拆分规则：核心对象只保留可被调研的实体（品牌、品类、产品或型号）；"
+    "用户要研究的行为或问题放入 research_intents，季节、人群、地点、场合等放入 context_modifiers。\n"
+    "不要把包含意图或场景修饰的完整用户句子直接复制为核心对象。"
+    "raw_mentions 必须是用户原文中连续出现的实体片段；canonical_name 可对该片段做品类归一化。\n"
     "示例输出：\n"
     '{"subject_confirmation":"徒步短裤更可能是户外服饰品类，请确认。",'
     '"competitor_tags":["迪卡侬","凯乐石"],'
