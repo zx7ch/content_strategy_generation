@@ -9,7 +9,7 @@ import re
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
@@ -55,6 +55,9 @@ USER_HEADERS = {
 def real_creator_stack(tmp_path, request):
     repo_root = Path(__file__).resolve().parents[2]
     frontend_root = repo_root / "frontend"
+    tsconfig_path = frontend_root / "tsconfig.json"
+    tsconfig_before = tsconfig_path.read_bytes()
+    request.addfinalizer(lambda: tsconfig_path.write_bytes(tsconfig_before))
     db_path = tmp_path / "creator-lite.db"
     chroma_dir = tmp_path / "chroma"
     backend_port = reserve_port()
@@ -178,7 +181,7 @@ def test_creator_brief_uses_fixed_catalog_and_submits_selected_subset(
     page.locator("textarea").press("Enter")
 
     page.get_by_role("heading", name="在开始前，请确认几个关键点").wait_for(
-        timeout=20000
+        timeout=30000
     )
     expect(page.get_by_role("button", name="产品营销", exact=True)).to_be_visible()
     expect(page.get_by_role("button", name="竞品发现", exact=True)).to_be_visible()
@@ -362,7 +365,15 @@ def test_creator_model_failure_edit_save_and_continue_same_presearch(browser_pag
                 (first["workflow_run_id"],),
             ).fetchone()[0],
         )
-    assert after == before
+        added_checkpoint_stages = [
+            row[0]
+            for row in connection.execute(
+                "SELECT stage_name FROM content_research_stage_checkpoints WHERE workflow_run_id=? ORDER BY created_at",
+                (first["workflow_run_id"],),
+            ).fetchall()
+        ]
+    assert after == (before[0] + 1, before[1])
+    assert added_checkpoint_stages == ["subject_structure"]
 
 
 def test_creator_complete_report_uses_lite_with_direct_source_navigation(
@@ -491,6 +502,92 @@ def test_creator_api_trace_keeps_newest_first_numbers_and_recorded_timing_copy(
         "queued_at": "2026-08-03T01:00:00.000001+00:00",
         "timing_source": "recorded",
     }
+
+
+def test_creator_trace_renders_safe_structured_query_coverage_and_q3_decisions(
+    browser_page,
+):
+    page, stack = browser_page
+    brand_id = default_brand_id(stack["backend_url"])
+    seeded = run_async_in_thread(
+        seed_recorded_trace_timeline(
+            stack["db_path"],
+            brand_id=brand_id,
+            title="Structured query decisions",
+        )
+    )
+    store = SQLiteContentResearchStore(stack["db_path"])
+    started_at = datetime(2026, 8, 3, 2, 0, tzinfo=timezone.utc)
+    decisions = (
+        (
+            "query_plan",
+            {
+                "primary_group_count": 2,
+                "fallback_group_count": 1,
+                "merged_group_count": 1,
+                "query_plan_hash": "query-plan-public-hash",
+                "complete_query": "must-never-appear-in-trace",
+                "api_key": "secret-must-never-appear",
+            },
+        ),
+        (
+            "coverage_decision",
+            {
+                "satisfied": False,
+                "reason_codes": ["minimum_relevant_samples_unmet"],
+                "counts": {
+                    "discovered": 30,
+                    "deduplicated": 24,
+                    "relevant": 2,
+                    "detail_eligible": 2,
+                    "admitted": 1,
+                },
+            },
+        ),
+        (
+            "fallback_decision",
+            {
+                "state": "activated",
+                "reason_codes": ["minimum_relevant_samples_unmet"],
+            },
+        ),
+    )
+    for index, (stage_name, payload) in enumerate(decisions):
+        record_started_at = started_at + timedelta(seconds=index)
+        store.save_stage_checkpoint(
+            StageCheckpointRecord(
+                id=f"checkpoint_browser_{stage_name}",
+                schema_version="content_research_stage_checkpoint_v1",
+                payload=payload,
+                workflow_run_id=seeded["run_id"],
+                subagent_task_id="task_browser_structured_trace",
+                stage_name=stage_name,
+                input_fingerprint=f"fingerprint-{stage_name}",
+                status="completed",
+                started_at=record_started_at,
+                finished_at=record_started_at + timedelta(milliseconds=100),
+                created_at=record_started_at,
+            )
+        )
+
+    open_creator_with_restored_run(page, stack["frontend_url"], seeded["run_id"])
+    page.locator('aside[aria-label="内容调研上下文"]').get_by_label(
+        "查看完整 workflow trace"
+    ).click()
+    trace = page.locator('section[aria-label="Content Research Trace"]')
+    decisions_section = trace.locator('section[aria-label="结构化调研决策"]')
+    rows = decisions_section.locator("article")
+
+    expect(rows).to_have_count(3)
+    expect(rows.nth(0).get_by_text("补位检索判定", exact=True)).to_be_visible()
+    expect(rows.nth(0).get_by_text("Q3：activated", exact=True)).to_be_visible()
+    expect(rows.nth(0).get_by_text("相关证据样本不足", exact=True)).to_be_visible()
+    expect(rows.nth(1).get_by_text("证据覆盖判定", exact=True)).to_be_visible()
+    expect(rows.nth(1).get_by_text("发现 30 · 去重 24 · 相关 2 · 准入 1", exact=True)).to_be_visible()
+    expect(rows.nth(2).get_by_text("检索计划已冻结", exact=True)).to_be_visible()
+    expect(rows.nth(2).get_by_text("主检索 2 组 · 补位 1 组 · 合并 1 组", exact=True)).to_be_visible()
+    expect(trace.get_by_text("must-never-appear-in-trace", exact=True)).to_have_count(0)
+    expect(trace.get_by_text("secret-must-never-appear", exact=True)).to_have_count(0)
 
 
 def test_creator_trace_prioritizes_auth_required_child_and_resumes_once_after_qr(

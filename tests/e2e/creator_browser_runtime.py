@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from contextlib import asynccontextmanager
 
 import app.main as production
@@ -37,10 +38,16 @@ class DeterministicPresearchLLM:
                 model="deterministic-e2e",
                 configuration_source="user",
             )
+        user_prompt = next(
+            (message.content for message in reversed(request.messages) if message.role == "user"),
+            "",
+        )
+        seed_match = re.search(r"用户输入:\s*(.+)", user_prompt)
+        subject = seed_match.group(1).strip() if seed_match else "夏季通勤短裤"
         return LLMResponse(
             content=json.dumps(
                 {
-                    "subject_confirmation": "夏季通勤短裤",
+                    "subject_confirmation": subject,
                     "competitor_tags": ["迪卡侬"],
                     "research_directions": [
                         "product_marketing",
@@ -49,6 +56,19 @@ class DeterministicPresearchLLM:
                     ],
                     "custom_research_question": "",
                     "custom_competitor_input": "",
+                    "subject_structure": {
+                        "schema_version": "content_research_subject_structure_v1",
+                        "canonical_subject": subject,
+                        "subject_type": "category",
+                        "core_entities": [
+                            {"canonical_name": subject, "raw_mentions": [subject]}
+                        ],
+                        "research_intents": ["内容调研"],
+                        "context_modifiers": [],
+                        "synonym_groups": {},
+                        "ambiguities": [],
+                        "resolution_state": "resolved",
+                    },
                 },
                 ensure_ascii=False,
             ),

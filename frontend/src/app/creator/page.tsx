@@ -908,6 +908,15 @@ function recoveryReasonLabel(reason: string) {
   return "调研暂时中断";
 }
 
+function coverageReasonLabel(reason: string) {
+  if (reason === "minimum_relevant_samples_unmet") return "相关证据样本不足";
+  if (reason === "minimum_independent_authors_unmet") return "独立作者数不足";
+  if (reason === "direct_core_support_unmet") return "缺少核心对象直接证据";
+  if (reason === "explicit_user_focus_unmet") return "用户重点尚未覆盖";
+  if (reason === "replacement_capacity_exhausted") return "可替换样本已用尽";
+  return reason.replaceAll("_", " ");
+}
+
 function ContentResearchReportMessage({
   report,
   onRecover,
@@ -1517,10 +1526,12 @@ function ContentResearchTraceInspector({
                       : stage === "fallback_decision"
                         ? `Q3：${stringField(checkpoint, "state", "未启用")}`
                         : `状态：${stringField(checkpoint, "state", stringField(checkpoint, "status"))}`;
+                  const reasons = arrayField(checkpoint, "reason_codes").map(coverageReasonLabel);
                   return (
                     <article key={`${stage}-${index}`} className="rounded-xl border border-line bg-white px-3 py-2.5 text-xs">
                       <div className="flex items-center justify-between gap-3"><p className="font-medium text-ink">{title}</p><span className="text-quiet">{stringField(checkpoint, "status")}</span></div>
                       <p className="mt-1 leading-5 text-quiet">{detail}</p>
+                      {reasons.length > 0 && <p className="mt-1 leading-5 text-amber-700">{reasons.join("·")}</p>}
                     </article>
                   );
                 })}

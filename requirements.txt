@@ -30,6 +30,7 @@ loguru
 pytest
 pytest-asyncio
 pytest-cov
+playwright>=1.62.0
 black
 ruff
 mypy
