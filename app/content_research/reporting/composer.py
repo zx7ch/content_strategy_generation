@@ -14,7 +14,8 @@ from app.content_research.reporting.contracts import (
 )
 
 _GOVERNED_SNAPSHOT_SCHEMA = "content_research_governed_snapshot_v2"
-_COMPOSER_ALGORITHM_VERSION = "content_research_report_composer_v1"
+_COMPOSER_ALGORITHM_VERSION = "content_research_report_composer_v2"
+_MARKETING_TRACKS = ("need", "value", "message")
 
 
 class ResearchReportComposer:
@@ -34,6 +35,9 @@ class ResearchReportComposer:
         cross_records = _mapping_list(governed.get("cross_direction_records"), "cross_direction_records")
         aggregates = _mapping_list(governed.get("aggregate_claims"), "aggregate_claims")
         limitations = _mapping_list(governed.get("limitations_recovery"), "limitations_recovery")
+        marketing_conclusions = _mapping_list(
+            governed.get("marketing_conclusions") or [], "marketing_conclusions"
+        )
         compose_mode = str(policy_scope.get("report_compose_mode") or "prose")
         if compose_mode not in {"prose", "template_only"}:
             raise ValueError("invalid report_compose_mode")
@@ -44,6 +48,18 @@ class ResearchReportComposer:
             sections.append(self._conclusions(snapshot, claim_cards, claim_citations, policy_scope))
         sections.append(self._findings(snapshot, claim_cards, claim_citations, policy_scope))
         if compose_mode == "template_only":
+            if "product_marketing" in set(policy_scope.get("direction_ids") or []):
+                marketing_sections = self._marketing_sections(
+                    snapshot,
+                    marketing_conclusions,
+                    claim_cards,
+                    claim_citations,
+                    policy_scope,
+                )
+                sections.extend(marketing_sections)
+                sections.append(
+                    self._priority_action(snapshot, marketing_sections, policy_scope)
+                )
             weak = self._weak_signals(snapshot, weak_signals)
             if weak is not None:
                 sections.append(weak)
@@ -73,6 +89,66 @@ class ResearchReportComposer:
             policy_version=policy_version,
             algorithm_version=_COMPOSER_ALGORITHM_VERSION,
             sections=tuple(sections),
+        )
+
+    def _marketing_sections(
+        self,
+        snapshot: ResearchResultSnapshotRecord,
+        conclusions: list[dict[str, Any]],
+        claim_cards: list[dict[str, Any]],
+        claim_citations: dict[str, tuple[str, ...]],
+        policy_scope: dict[str, Any],
+    ) -> tuple[ReportSection, ...]:
+        cards_by_id = {
+            _required_string(card.get("claim_candidate_id"), "claim_candidate_id"): card
+            for card in claim_cards
+        }
+        return tuple(
+            _marketing_track_section(
+                snapshot,
+                track,
+                [item for item in conclusions if item.get("track") == track],
+                cards_by_id,
+                claim_citations,
+                policy_scope,
+            )
+            for track in _MARKETING_TRACKS
+        )
+
+    def _priority_action(
+        self,
+        snapshot: ResearchResultSnapshotRecord,
+        marketing_sections: tuple[ReportSection, ...],
+        policy_scope: dict[str, Any],
+    ) -> ReportSection:
+        conclusion_ids = tuple(
+            conclusion_id
+            for section in marketing_sections
+            if section.conclusion_state == "selected"
+            for conclusion_id in section.marketing_conclusion_ids
+        )
+        marketing_policy = policy_scope.get("marketing_conclusion_policy")
+        goal = (
+            str(marketing_policy.get("primary_marketing_goal") or "")
+            if isinstance(marketing_policy, dict)
+            else ""
+        ) or "content_seeding"
+        if goal != "content_seeding":
+            raise ValueError("unsupported primary marketing goal")
+        if conclusion_ids:
+            statement = "优先用已选结论组织首轮种草内容，并通过对应证据入口复核表达边界。"
+            structured_ids: tuple[str, ...] = ()
+        else:
+            statement = "先补足三条轨道的合格笔记与独立作者，再形成种草策略判断。"
+            structured_ids = (_scope_card_id(snapshot, policy_scope),)
+        return ReportSection(
+            section_id=_section_id(snapshot, "priority_action"),
+            section_kind="priority_action",
+            structured_card_ids=structured_ids,
+            action_label="建议",
+            action_statement=statement,
+            primary_marketing_goal=goal,
+            supporting_conclusion_ids=conclusion_ids,
         )
 
     def _conclusions(
@@ -275,6 +351,156 @@ def _claim_section(
         citation_group_ids=tuple(dict.fromkeys(group_ids)),
         citation_anchors=tuple(anchors),
     )
+
+
+def _marketing_track_section(
+    snapshot: ResearchResultSnapshotRecord,
+    track: str,
+    records: list[dict[str, Any]],
+    cards_by_id: dict[str, dict[str, Any]],
+    claim_citations: dict[str, tuple[str, ...]],
+    policy_scope: dict[str, Any],
+) -> ReportSection:
+    selected = [item for item in records if item.get("state") == "selected"]
+    qualified = [item for item in records if item.get("state") == "qualified"]
+    terminal = [
+        item
+        for item in records
+        if item.get("state")
+        in {
+            "insufficient_evidence",
+            "no_single_primary_conclusion",
+            "analysis_unavailable",
+        }
+    ]
+    if len(selected) > 1 or (selected and terminal) or len(terminal) > 1:
+        raise ValueError(f"marketing conclusion track {track} has ambiguous decisions")
+    section_id = _section_id(snapshot, f"marketing_{track}")
+    if selected:
+        decision = selected[0]
+        statement = _required_string(decision.get("statement"), "marketing conclusion statement")
+        claim_ids_value = decision.get("supporting_claim_ids")
+        if not isinstance(claim_ids_value, list) or not claim_ids_value:
+            raise ValueError("selected marketing conclusion requires supporting_claim_ids")
+        claim_ids = tuple(
+            _required_string(claim_id, "supporting claim id")
+            for claim_id in claim_ids_value
+        )
+        if len(claim_ids) != len(set(claim_ids)):
+            raise ValueError("selected marketing conclusion supporting claims must be unique")
+        for claim_id in claim_ids:
+            card = cards_by_id.get(claim_id)
+            if (
+                card is None
+                or card.get("admission_state") != "admitted"
+                or card.get("direction_id") != "product_marketing"
+                or claim_id not in claim_citations
+            ):
+                raise ValueError("selected marketing conclusion has invalid governed support")
+        citation_ids = tuple(
+            dict.fromkeys(
+                citation_id
+                for claim_id in claim_ids
+                for citation_id in claim_citations[claim_id]
+            )
+        )
+        conclusion_id = _marketing_conclusion_id(snapshot, decision)
+        additional_count_value = decision.get("additional_qualified_count")
+        additional_count = (
+            len(qualified)
+            if additional_count_value is None
+            else _nonnegative_int(
+                additional_count_value, "additional_qualified_count"
+            )
+        )
+        anchors = tuple(
+            CitationAnchor(
+                anchor_id=_stable_id(
+                    "rca",
+                    {
+                        "section": section_id,
+                        "conclusion": conclusion_id,
+                        "citation": citation_id,
+                    },
+                ),
+                section_id=section_id,
+                block_id="primary_conclusion",
+                text_start=0,
+                text_end=len(statement),
+                citation_group_id=citation_id,
+            )
+            for citation_id in citation_ids
+        )
+        return ReportSection(
+            section_id=section_id,
+            section_kind=f"marketing_{track}",
+            prose=statement,
+            claim_candidate_ids=claim_ids,
+            citation_group_ids=citation_ids,
+            citation_anchors=anchors,
+            marketing_conclusion_ids=(conclusion_id,),
+            conclusion_state="selected",
+            supporting_note_count=_nonnegative_int(
+                decision.get("supporting_note_count"), "supporting_note_count"
+            ),
+            independent_author_count=_nonnegative_int(
+                decision.get("independent_author_count"),
+                "independent_author_count",
+            ),
+            additional_qualified_count=additional_count,
+        )
+
+    decision = terminal[0] if terminal else {
+        "track": track,
+        "state": "analysis_unavailable",
+        "reason_codes": ["marketing_conclusion_unavailable"],
+    }
+    state = _required_string(decision.get("state"), "marketing conclusion state")
+    reason_codes_value = decision.get("reason_codes") or []
+    if not isinstance(reason_codes_value, list) or any(
+        not isinstance(item, str) or not item for item in reason_codes_value
+    ):
+        raise ValueError("marketing conclusion reason_codes must be a string list")
+    return ReportSection(
+        section_id=section_id,
+        section_kind=f"marketing_{track}",
+        marketing_conclusion_ids=(_marketing_conclusion_id(snapshot, decision),),
+        conclusion_state=state,
+        reason_codes=tuple(reason_codes_value),
+        verification_direction=_verification_direction(state),
+        structured_card_ids=(_scope_card_id(snapshot, policy_scope),),
+    )
+
+
+def _marketing_conclusion_id(
+    snapshot: ResearchResultSnapshotRecord, decision: dict[str, Any]
+) -> str:
+    candidate_id = decision.get("candidate_id")
+    if isinstance(candidate_id, str) and candidate_id:
+        return candidate_id
+    return _stable_id(
+        "rmc",
+        {
+            "snapshot": snapshot.id,
+            "track": decision.get("track"),
+            "state": decision.get("state"),
+            "reason_codes": decision.get("reason_codes") or [],
+        },
+    )
+
+
+def _nonnegative_int(value: object, field_name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"marketing conclusion {field_name} must be non-negative")
+    return value
+
+
+def _verification_direction(state: str) -> str:
+    return {
+        "insufficient_evidence": "补充至少 3 篇合格笔记，并覆盖至少 2 位独立作者后重新验证。",
+        "no_single_primary_conclusion": "增加能够区分候选结论的合格笔记后重新评估主结论。",
+        "analysis_unavailable": "恢复结论分析能力并继续本轮分析，不新增未经治理的判断。",
+    }[state]
 
 
 def _citation_ids_for_source_claims(

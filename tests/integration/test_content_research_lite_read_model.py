@@ -4,8 +4,8 @@ from dataclasses import replace
 
 import pytest
 
-from app.content_research.contracts import build_default_snapshot
 from app.content_research.bootstrap import _bootstrap_legacy_content_research_schema
+from app.content_research.contracts import build_default_snapshot
 from app.content_research.migrations import apply_content_research_migrations
 from app.content_research.models import ResearchBriefRecord
 from app.content_research.persistence_models import StageCheckpointRecord
@@ -205,6 +205,7 @@ async def _project_formal_cards(
     publication_state="complete_verified_report",
     artifact_payload_mutator=None,
     citation_group_ids=None,
+    marketing_conclusions=None,
 ):
     db_path = str(tmp_path / "lite-projection-guard.db")
     store = SQLiteContentResearchStore(db_path)
@@ -225,6 +226,21 @@ async def _project_formal_cards(
                     **governed["policy_scope"],
                     "direction_set_version": "direction_set_v1",
                     "direction_ids": ["product_marketing", "content_performance"],
+                    "report_compose_mode": compose_mode,
+                    **(
+                        {
+                            "marketing_conclusion_policy": {
+                                "primary_marketing_goal": "content_seeding",
+                                "tracks": ["need", "value", "message"],
+                                "minimum_notes_per_conclusion": 3,
+                                "minimum_independent_authors_per_conclusion": 2,
+                                "require_core_and_first_intent_support": True,
+                                "maximum_primary_conclusions_per_track": 1,
+                            }
+                        }
+                        if marketing_conclusions is not None
+                        else {}
+                    ),
                 },
                 "direction_results": [
                     {
@@ -238,6 +254,11 @@ async def _project_formal_cards(
                 "weak_signals": weak_signals or [],
                 "cross_direction_records": [],
                 "aggregate_claims": [],
+                **(
+                    {"marketing_conclusions": marketing_conclusions}
+                    if marketing_conclusions is not None
+                    else {}
+                ),
                 "claim_cards": claim_cards,
                 "citation_groups": citation_groups,
             },
@@ -252,7 +273,10 @@ async def _project_formal_cards(
     }
     if publication_state == "partial_verified_report":
         publication_changes["omitted_section_ids"] = ("sec_core",)
-    publication = replace(_publication(draft, decision), **publication_changes)
+    publication = replace(
+        _publication(draft, decision, compose_mode=compose_mode),
+        **publication_changes,
+    )
     store.save_result_snapshot(snapshot)
     store.save_report_draft(draft.to_record())
     store.save_report_faithfulness_decision(decision.to_record())
@@ -320,6 +344,88 @@ def _citation(
             }
         ],
     }
+
+
+@pytest.mark.asyncio
+async def test_lite_report_projects_only_primary_marketing_conclusion(tmp_path):
+    claim_cards = [
+        _card(f"cc_need_{index}", f"cad_need_{index}", claim_type="use_context")
+        for index in range(1, 4)
+    ]
+    citation_groups = [
+        _citation(
+            f"citation_need_{index}",
+            f"cc_need_{index}",
+            f"cad_need_{index}",
+            display_index=index,
+        )
+        for index in range(1, 4)
+    ]
+    marketing_conclusions = [
+        {
+            "track": "need",
+            "state": "selected",
+            "candidate_id": "mc_need_primary",
+            "statement": "高温通勤场景中的凉感需求…",
+            "supporting_claim_ids": [f"cc_need_{index}" for index in range(1, 4)],
+            "supporting_note_count": 3,
+            "independent_author_count": 2,
+            "reason_codes": [],
+        },
+        {
+            "track": "need",
+            "state": "qualified",
+            "candidate_id": "mc_need_secondary",
+            "statement": "次要合格结论不应出现在报告中",
+            "supporting_claim_ids": [f"cc_need_{index}" for index in range(1, 4)],
+            "supporting_note_count": 3,
+            "independent_author_count": 2,
+            "reason_codes": [],
+        },
+        {
+            "track": "value",
+            "state": "insufficient_evidence",
+            "candidate_id": None,
+            "statement": None,
+            "supporting_claim_ids": [],
+            "supporting_note_count": 0,
+            "independent_author_count": 0,
+            "reason_codes": ["conclusion_no_qualified_candidate"],
+        },
+        {
+            "track": "message",
+            "state": "no_single_primary_conclusion",
+            "candidate_id": None,
+            "statement": None,
+            "supporting_claim_ids": [],
+            "supporting_note_count": 3,
+            "independent_author_count": 2,
+            "reason_codes": [],
+        },
+    ]
+
+    report = await _project_formal_cards(
+        tmp_path,
+        claim_cards=claim_cards,
+        citation_groups=citation_groups,
+        marketing_conclusions=marketing_conclusions,
+    )
+    need = report["sections"]["marketing_conclusions"]["need"]
+
+    assert need["state"] == "selected"
+    assert need["statement"] == "高温通勤场景中的凉感需求…"
+    assert need["supporting_note_count"] == 3
+    assert need["independent_author_count"] == 2
+    assert need["additional_qualified_count"] == 1
+    assert len(need["citation_group_ids"]) == 3
+    assert "other_qualified_statements" not in need
+    assert set(report["sections"]["marketing_conclusions"]) == {
+        "need",
+        "value",
+        "message",
+    }
+    assert "statement" not in report["sections"]["marketing_conclusions"]["value"]
+    assert "statement" not in report["sections"]["marketing_conclusions"]["message"]
 
 
 @pytest.mark.asyncio

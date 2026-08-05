@@ -249,7 +249,14 @@ class _ConclusionLLM:
                             "supporting_claim_ids": [
                                 item["claim_id"] for item in payload["claims"]
                             ],
-                        }
+                        },
+                        {
+                            "track": "need",
+                            "statement": "另一条较弱但合格的需求结论",
+                            "supporting_claim_ids": [
+                                item["claim_id"] for item in payload["claims"][:3]
+                            ],
+                        },
                     ]
                 },
                 ensure_ascii=False,
@@ -293,7 +300,9 @@ async def test_conclusion_packet_replay_reuses_checkpoint_without_collection_del
         )
     )
     quote = "产品营销样本明确提到轻量透气"
-    for index, author_id in enumerate(("author-a", "author-a", "author-b"), start=1):
+    for index, author_id in enumerate(
+        ("author-a", "author-a", "author-b", "author-c"), start=1
+    ):
         source_id = f"source-{index}"
         packet_id = f"packet-{index}"
         claim_id = f"claim-{index}"
@@ -391,6 +400,10 @@ async def test_conclusion_packet_replay_reuses_checkpoint_without_collection_del
     decisions_after_first = store.list_marketing_conclusion_decisions(
         "run-conclusion-replay", "rp-conclusion-replay"
     )
+    selected_decision = next(
+        item for item in decisions_after_first if item.state == "selected"
+    )
+    assert selected_decision.payload["additional_qualified_count"] == 1
     replay = await service._govern_marketing_conclusions(
         workflow_run_id="run-conclusion-replay",
         research_plan_id="rp-conclusion-replay",

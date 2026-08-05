@@ -14,12 +14,15 @@ from app.content_research.reporting.composer import (
     _limitation_ids as _composed_limitation_ids,
 )
 from app.content_research.reporting.composer import (
+    _marketing_conclusion_id,
+    _scope_card_id,
+)
+from app.content_research.reporting.composer import (
     _recovery_ids as _composed_recovery_ids,
 )
-from app.content_research.reporting.composer import _scope_card_id
 from app.content_research.reporting.contracts import ReportDraft
-from app.services.llm.pricing import DEFAULT_PRICING, PricingCalculator
 from app.services.llm.failures import LLMProviderFailure
+from app.services.llm.pricing import DEFAULT_PRICING, PricingCalculator
 from app.services.llm.types import LLMRequest, Message
 
 
@@ -260,6 +263,11 @@ class ReportFaithfulnessEvaluator:
             if isinstance(item, dict)
         }
         limitations = _limitation_ids(snapshot, governed)
+        marketing_conclusions = [
+            item
+            for item in governed.get("marketing_conclusions", [])
+            if isinstance(item, dict)
+        ]
         reasons: list[str] = []
         affected: list[str] = []
         for section in draft.sections:
@@ -306,14 +314,29 @@ class ReportFaithfulnessEvaluator:
                 ):
                     section_reasons.append("aggregate_derivation_invalid")
             if section.prose:
-                allowed = {
-                    str(cards[item].get("statement"))
-                    for item in section.claim_candidate_ids
-                    if item in cards
-                }
-                material = [line for line in section.prose.split("\n") if line]
-                if not material or any(line not in allowed for line in material):
-                    section_reasons.append("prose_not_direct_admitted_statement")
+                if section.section_kind in {
+                    "marketing_need",
+                    "marketing_value",
+                    "marketing_message",
+                }:
+                    section_reasons.extend(
+                        _marketing_conclusion_reasons(
+                            snapshot,
+                            section,
+                            cards,
+                            citations,
+                            marketing_conclusions,
+                        )
+                    )
+                else:
+                    allowed = {
+                        str(cards[item].get("statement"))
+                        for item in section.claim_candidate_ids
+                        if item in cards
+                    }
+                    material = [line for line in section.prose.split("\n") if line]
+                    if not material or any(line not in allowed for line in material):
+                        section_reasons.append("prose_not_direct_admitted_statement")
                 if any(
                     term in section.prose.lower()
                     for term in ("导致", "造成", "因果", "therefore", "causes")
@@ -336,6 +359,56 @@ class ReportFaithfulnessEvaluator:
                 reasons.extend(section_reasons)
                 affected.append(section.section_id)
         return tuple(sorted(set(reasons))), tuple(sorted(set(affected)))
+
+
+def _marketing_conclusion_reasons(
+    snapshot: ResearchResultSnapshotRecord,
+    section: Any,
+    cards: dict[object, dict[str, Any]],
+    citations: dict[object, dict[str, Any]],
+    conclusions: list[dict[str, Any]],
+) -> list[str]:
+    track = section.section_kind.removeprefix("marketing_")
+    selected = [
+        item
+        for item in conclusions
+        if item.get("track") == track and item.get("state") == "selected"
+    ]
+    if len(selected) != 1:
+        return ["marketing_conclusion_decision_invalid"]
+    decision = selected[0]
+    expected_id = _marketing_conclusion_id(snapshot, decision)
+    expected_claim_ids = decision.get("supporting_claim_ids")
+    reasons: list[str] = []
+    if (
+        section.marketing_conclusion_ids != (expected_id,)
+        or section.conclusion_state != "selected"
+    ):
+        reasons.append("marketing_conclusion_decision_invalid")
+    if section.prose != decision.get("statement"):
+        reasons.append("marketing_conclusion_prose_mismatch")
+    if (
+        not isinstance(expected_claim_ids, list)
+        or not expected_claim_ids
+        or tuple(expected_claim_ids) != section.claim_candidate_ids
+        or any(
+            claim_id not in cards
+            or cards[claim_id].get("admission_state") != "admitted"
+            or cards[claim_id].get("direction_id") != "product_marketing"
+            for claim_id in expected_claim_ids
+        )
+    ):
+        reasons.append("marketing_conclusion_support_invalid")
+    cited_claim_ids = {
+        citations[citation_id].get("claim_candidate_id")
+        for citation_id in section.citation_group_ids
+        if citation_id in citations
+    }
+    if not isinstance(expected_claim_ids, list) or cited_claim_ids != set(
+        expected_claim_ids
+    ):
+        reasons.append("marketing_conclusion_citation_coverage_invalid")
+    return reasons
 
 
 def _is_direct_observation_draft(

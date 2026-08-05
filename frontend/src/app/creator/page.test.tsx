@@ -23,7 +23,7 @@ test("Brief confirmation requires an explicit marketing goal before enabling con
   const React = await import("react");
   const { act } = React;
   const { createRoot } = await import("react-dom/client");
-  const { ContentResearchIntentCard } = await import("./page.tsx");
+  const { ContentResearchIntentCard } = await import("./page-components.ts");
   const container = document.createElement("div");
   document.body.append(container);
   const root = createRoot(container);

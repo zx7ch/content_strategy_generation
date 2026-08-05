@@ -316,6 +316,14 @@ class SnapshotResponse(BaseModel):
     created_at: str
 
 
+class ContentResearchLiteSectionsResponse(BaseModel):
+    main_findings: list[dict] = Field(default_factory=list)
+    weak_signals: list[dict] = Field(default_factory=list)
+    limitations_scope: list[dict] = Field(default_factory=list)
+    marketing_conclusions: dict[str, dict] = Field(default_factory=dict)
+    priority_action: dict | None = None
+
+
 class ContentResearchLiteReportResponse(BaseModel):
     """Stable narrow projection of the formal F003 report contract."""
 
@@ -326,7 +334,9 @@ class ContentResearchLiteReportResponse(BaseModel):
     frozen_scope: dict = Field(default_factory=dict)
     collected_at: str | None = None
     publication: dict = Field(default_factory=dict)
-    sections: dict = Field(default_factory=dict)
+    sections: ContentResearchLiteSectionsResponse = Field(
+        default_factory=ContentResearchLiteSectionsResponse
+    )
     status_strip: dict = Field(default_factory=dict)
     citations: list[dict] = Field(default_factory=list)
     run_direction_states: list[dict] = Field(default_factory=list)

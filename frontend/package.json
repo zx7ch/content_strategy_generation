@@ -5,7 +5,7 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
-    "test": "node --test src/lib/*.test.ts",
+    "test": "node --import tsx --test src/lib/*.test.ts src/app/creator/page.test.tsx",
     "start": "next start",
     "lint": "next lint"
   },

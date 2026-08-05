@@ -10,6 +10,7 @@ from app.content_research.persistence_models import (
     ReportPublicationRecord,
     StageCheckpointRecord,
 )
+from app.content_research.reporting.contracts import _stable_id
 from app.content_research.reporting.read_model import (
     PublishedReportNotFoundError,
     PublishedReportReader,
@@ -103,7 +104,63 @@ class LiteReportReader:
                 # preserve the current contract's ordinary not-found result.
                 raise
             return await self._recoverable_projection(workflow_run_id)
+        report.update(self._governed_marketing_fields(report))
         return self._published_projection(report, citation_group_ids=citation_group_ids)
+
+    def _governed_marketing_fields(self, report: dict[str, Any]) -> dict[str, Any]:
+        publication = report.get("publication")
+        snapshot_id = (
+            publication.get("governed_snapshot_id")
+            if isinstance(publication, dict)
+            else None
+        )
+        snapshot = next(
+            (
+                item
+                for item in self._store.list_result_snapshots_for_workflow(
+                    str(report.get("workflow_run_id") or "")
+                )
+                if item.id == snapshot_id
+            ),
+            None,
+        )
+        governed = (
+            snapshot.metadata.get("governed_snapshot")
+            if snapshot is not None and isinstance(snapshot.metadata, dict)
+            else None
+        )
+        if not isinstance(governed, dict):
+            raise PublishedReportNotFoundError(
+                "published report governed marketing snapshot is missing"
+            )
+        conclusions = governed.get("marketing_conclusions") or []
+        if not isinstance(conclusions, list) or any(
+            not isinstance(item, dict) for item in conclusions
+        ):
+            raise PublishedReportNotFoundError(
+                "published report marketing conclusions are malformed"
+            )
+        policy_scope = governed.get("policy_scope")
+        marketing_policy = (
+            policy_scope.get("marketing_conclusion_policy")
+            if isinstance(policy_scope, dict)
+            else None
+        )
+        if not isinstance(marketing_policy, dict):
+            policy = self._store.get_run_policy_snapshot_for_workflow(
+                str(report.get("workflow_run_id") or "")
+            )
+            effective = policy.effective_policy if policy is not None else {}
+            marketing_policy = effective.get("marketing_conclusion_policy")
+        goal = (
+            marketing_policy.get("primary_marketing_goal")
+            if isinstance(marketing_policy, dict)
+            else None
+        )
+        return {
+            "marketing_conclusions": [dict(item) for item in conclusions],
+            "primary_marketing_goal": goal,
+        }
 
     def _published_projection(
         self,
@@ -173,6 +230,11 @@ class LiteReportReader:
         finding_cards = [item for item in findings if item["card_kind"] == "finding"]
         is_evidence_only = publication_state == "evidence_only_report"
         citations = _select_citations(all_citations, citation_group_ids)
+        marketing_conclusions, priority_action = _marketing_conclusion_projection(
+            report,
+            claim_cards=claim_cards,
+            citations_by_claim=citations_by_claim,
+        )
         return {
             "workflow_run_id": report["workflow_run_id"],
             "workflow_execution_state": report.get("workflow_terminal_state"),
@@ -188,6 +250,10 @@ class LiteReportReader:
                 "main_findings": [] if is_evidence_only else findings,
                 "weak_signals": [] if is_evidence_only else weak_signals,
                 "limitations_scope": list(report.get("limitations_recovery") or []),
+                "marketing_conclusions": (
+                    {} if is_evidence_only else marketing_conclusions
+                ),
+                "priority_action": None if is_evidence_only else priority_action,
             },
             "status_strip": (
                 {"saved_evidence_count": len(citations)}
@@ -234,7 +300,13 @@ class LiteReportReader:
             "frozen_scope": _policy_scope(policy.effective_policy if policy else {}),
             "collected_at": None,
             "publication": {"state": None},
-            "sections": {"main_findings": [], "weak_signals": [], "limitations_scope": []},
+            "sections": {
+                "main_findings": [],
+                "weak_signals": [],
+                "limitations_scope": [],
+                "marketing_conclusions": {},
+                "priority_action": None,
+            },
             "status_strip": {},
             "citations": [],
             "run_direction_states": _unavailable_direction_states(
@@ -274,6 +346,256 @@ def _frozen_scope(report: dict[str, Any]) -> dict[str, Any]:
         "direction_ids": list(release.get("direction_ids") or []),
         "report_compose_mode": publication.get("compose_mode") or "prose",
     }
+
+
+def _marketing_conclusion_projection(
+    report: dict[str, Any],
+    *,
+    claim_cards: list[dict[str, Any]],
+    citations_by_claim: dict[str, list[dict[str, Any]]],
+) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    if "product_marketing" not in set(_frozen_scope(report)["direction_ids"]):
+        return {}, {
+            "label": "建议",
+            "statement": "本轮未请求产品营销方向，不形成营销策略判断。",
+            "primary_marketing_goal": report.get("primary_marketing_goal"),
+            "supporting_conclusion_ids": [],
+        }
+    raw = report.get("marketing_conclusions") or []
+    if not isinstance(raw, list) or any(not isinstance(item, dict) for item in raw):
+        raise PublishedReportNotFoundError(
+            "published report marketing conclusions are malformed"
+        )
+    goal = report.get("primary_marketing_goal") or "content_seeding"
+    if goal != "content_seeding":
+        raise PublishedReportNotFoundError(
+            "published report primary marketing goal is invalid"
+        )
+    cards_by_id = {
+        str(card.get("claim_candidate_id")): card
+        for card in claim_cards
+        if isinstance(card.get("claim_candidate_id"), str)
+    }
+    result: dict[str, dict[str, Any]] = {}
+    selected_ids: list[str] = []
+    for track in ("need", "value", "message"):
+        records = [item for item in raw if item.get("track") == track]
+        selected = [item for item in records if item.get("state") == "selected"]
+        qualified = [item for item in records if item.get("state") == "qualified"]
+        terminal = [
+            item
+            for item in records
+            if item.get("state")
+            in {
+                "insufficient_evidence",
+                "no_single_primary_conclusion",
+                "analysis_unavailable",
+            }
+        ]
+        if len(selected) > 1 or (selected and terminal) or len(terminal) > 1:
+            raise PublishedReportNotFoundError(
+                f"published report {track} marketing decision is ambiguous"
+            )
+        if selected:
+            declared_additional_count = selected[0].get(
+                "additional_qualified_count"
+            )
+            if declared_additional_count is None:
+                additional_qualified_count = len(qualified)
+            elif (
+                isinstance(declared_additional_count, bool)
+                or not isinstance(declared_additional_count, int)
+                or declared_additional_count < 0
+            ):
+                raise PublishedReportNotFoundError(
+                    "published report additional qualified count is malformed"
+                )
+            else:
+                additional_qualified_count = declared_additional_count
+            projected = _selected_marketing_conclusion(
+                report,
+                selected[0],
+                cards_by_id=cards_by_id,
+                citations_by_claim=citations_by_claim,
+                additional_qualified_count=additional_qualified_count,
+            )
+            if not _marketing_section_verified(
+                report, track=track, decision=selected[0], projected=projected
+            ):
+                result[track] = {
+                    "state": "analysis_unavailable",
+                    "reason_codes": ["marketing_conclusion_not_verified"],
+                    "verification_direction": _marketing_verification_direction(
+                        "analysis_unavailable"
+                    ),
+                }
+                continue
+            result[track] = projected
+            selected_ids.append(str(projected["conclusion_id"]))
+            continue
+        decision = terminal[0] if terminal else {
+            "track": track,
+            "state": "analysis_unavailable",
+            "reason_codes": ["marketing_conclusion_unavailable"],
+        }
+        state = str(decision.get("state") or "")
+        reason_codes = decision.get("reason_codes") or []
+        if not isinstance(reason_codes, list) or any(
+            not isinstance(item, str) or not item for item in reason_codes
+        ):
+            raise PublishedReportNotFoundError(
+                f"published report {track} marketing reasons are malformed"
+            )
+        result[track] = {
+            "state": state,
+            "reason_codes": list(reason_codes),
+            "verification_direction": _marketing_verification_direction(state),
+        }
+    action_statement = (
+        "优先用已选结论组织首轮种草内容，并通过对应证据入口复核表达边界。"
+        if selected_ids
+        else "先补足三条轨道的合格笔记与独立作者，再形成种草策略判断。"
+    )
+    return result, {
+        "label": "建议",
+        "statement": action_statement,
+        "primary_marketing_goal": goal,
+        "supporting_conclusion_ids": selected_ids,
+    }
+
+
+def _marketing_section_verified(
+    report: dict[str, Any],
+    *,
+    track: str,
+    decision: dict[str, Any],
+    projected: dict[str, Any],
+) -> bool:
+    sections = report.get("sections")
+    if not isinstance(sections, list):
+        return False
+    matches = [
+        item
+        for item in sections
+        if isinstance(item, dict) and item.get("section_kind") == f"marketing_{track}"
+    ]
+    if len(matches) != 1:
+        return False
+    section = matches[0]
+    publication = report.get("publication")
+    omitted = set(
+        publication.get("omitted_section_ids") or []
+        if isinstance(publication, dict)
+        else []
+    )
+    return (
+        section.get("section_id") not in omitted
+        and section.get("conclusion_state") == "selected"
+        and section.get("prose") == decision.get("statement")
+        and section.get("claim_candidate_ids") == decision.get("supporting_claim_ids")
+        and section.get("citation_group_ids") == projected.get("citation_group_ids")
+        and section.get("marketing_conclusion_ids")
+        == [projected.get("conclusion_id")]
+    )
+
+
+def _selected_marketing_conclusion(
+    report: dict[str, Any],
+    decision: dict[str, Any],
+    *,
+    cards_by_id: dict[str, dict[str, Any]],
+    citations_by_claim: dict[str, list[dict[str, Any]]],
+    additional_qualified_count: int,
+) -> dict[str, Any]:
+    statement = decision.get("statement")
+    claim_ids = decision.get("supporting_claim_ids")
+    note_count = decision.get("supporting_note_count")
+    author_count = decision.get("independent_author_count")
+    if (
+        not isinstance(statement, str)
+        or not statement.strip()
+        or not isinstance(claim_ids, list)
+        or not claim_ids
+        or any(not isinstance(item, str) or not item for item in claim_ids)
+        or len(claim_ids) != len(set(claim_ids))
+        or isinstance(note_count, bool)
+        or not isinstance(note_count, int)
+        or isinstance(author_count, bool)
+        or not isinstance(author_count, int)
+        or note_count < 3
+        or author_count < 2
+        or author_count > note_count
+        or decision.get("reason_codes") not in ([], ())
+    ):
+        raise PublishedReportNotFoundError(
+            "published report selected marketing conclusion is malformed"
+        )
+    citations: list[dict[str, Any]] = []
+    for claim_id in claim_ids:
+        card = cards_by_id.get(claim_id)
+        claim_citations = citations_by_claim.get(claim_id) or []
+        if (
+            card is None
+            or card.get("admission_state") != "admitted"
+            or card.get("direction_id") != "product_marketing"
+            or not claim_citations
+        ):
+            raise PublishedReportNotFoundError(
+                "published report selected marketing support is invalid"
+            )
+        citations.extend(claim_citations)
+    citation_ids = list(
+        dict.fromkeys(str(item["citation_group_id"]) for item in citations)
+    )
+    note_ids = {
+        item.get("canonical_note_id")
+        for item in citations
+        if isinstance(item.get("canonical_note_id"), str)
+        and item.get("canonical_note_id")
+    }
+    if len(note_ids) != note_count:
+        raise PublishedReportNotFoundError(
+            "published report selected marketing note count is invalid"
+        )
+    conclusion_id = decision.get("candidate_id")
+    if not isinstance(conclusion_id, str) or not conclusion_id:
+        publication = report.get("publication")
+        snapshot_id = (
+            publication.get("governed_snapshot_id")
+            if isinstance(publication, dict)
+            else None
+        )
+        conclusion_id = _stable_id(
+            "rmc",
+            {
+                "snapshot": snapshot_id,
+                "track": decision.get("track"),
+                "state": decision.get("state"),
+                "reason_codes": decision.get("reason_codes") or [],
+            },
+        )
+    return {
+        "state": "selected",
+        "conclusion_id": conclusion_id,
+        "statement": statement,
+        "citation_group_ids": citation_ids,
+        "supporting_note_count": note_count,
+        "independent_author_count": author_count,
+        "additional_qualified_count": additional_qualified_count,
+    }
+
+
+def _marketing_verification_direction(state: str) -> str:
+    directions = {
+        "insufficient_evidence": "补充至少 3 篇合格笔记，并覆盖至少 2 位独立作者后重新验证。",
+        "no_single_primary_conclusion": "增加能够区分候选结论的合格笔记后重新评估主结论。",
+        "analysis_unavailable": "恢复结论分析能力并继续本轮分析，不新增未经治理的判断。",
+    }
+    if state not in directions:
+        raise PublishedReportNotFoundError(
+            "published report marketing conclusion state is invalid"
+        )
+    return directions[state]
 
 
 def _policy_scope(policy: dict[str, Any]) -> dict[str, Any]:
@@ -410,6 +732,7 @@ def _lite_citation_group(group: object) -> dict[str, Any] | None:
         "display_index": group.get("display_index"),
         "claim_candidate_id": group.get("claim_candidate_id"),
         "admission_decision_id": group.get("admission_decision_id"),
+        "canonical_note_id": next(iter(note_ids)),
         "navigation_state": navigation_state,
         "source_url": source_url if navigation_state == "available" else None,
         "evidence_refs": refs,

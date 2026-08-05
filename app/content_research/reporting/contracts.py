@@ -25,6 +25,10 @@ REPORT_SECTION_KINDS = frozenset(
         "weak_signals",
         "next_steps",
         "limitations_scope",
+        "marketing_need",
+        "marketing_value",
+        "marketing_message",
+        "priority_action",
     }
 )
 PUBLICATION_STATES = frozenset(
@@ -84,6 +88,17 @@ class ReportSection:
     limitation_ids: tuple[str, ...] = ()
     citation_group_ids: tuple[str, ...] = ()
     citation_anchors: tuple[CitationAnchor, ...] = ()
+    marketing_conclusion_ids: tuple[str, ...] = ()
+    conclusion_state: str | None = None
+    reason_codes: tuple[str, ...] = ()
+    supporting_note_count: int = 0
+    independent_author_count: int = 0
+    additional_qualified_count: int = 0
+    verification_direction: str | None = None
+    action_label: str | None = None
+    action_statement: str | None = None
+    primary_marketing_goal: str | None = None
+    supporting_conclusion_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         _require(self.section_id, self.section_kind)
@@ -99,8 +114,17 @@ class ReportSection:
             ("weak_signal_ids", self.weak_signal_ids),
             ("limitation_ids", self.limitation_ids),
             ("citation_group_ids", self.citation_group_ids),
+            ("marketing_conclusion_ids", self.marketing_conclusion_ids),
+            ("reason_codes", self.reason_codes),
+            ("supporting_conclusion_ids", self.supporting_conclusion_ids),
         ):
             _unique_nonempty(values, field_name)
+        if min(
+            self.supporting_note_count,
+            self.independent_author_count,
+            self.additional_qualified_count,
+        ) < 0:
+            raise ValueError("marketing conclusion counts cannot be negative")
         if not self.reference_ids:
             raise ValueError("report section requires governed-snapshot references")
         if self.prose is not None and not self.citation_group_ids:
@@ -134,6 +158,35 @@ class ReportSection:
             or (self.prose is None and self.structured_card_ids)
         ):
             raise ValueError("conclusion and finding sections require claim references")
+        if self.section_kind in {"marketing_need", "marketing_value", "marketing_message"}:
+            expected_track = self.section_kind.removeprefix("marketing_")
+            if not self.marketing_conclusion_ids or not self.conclusion_state:
+                raise ValueError("marketing conclusion section requires a governed decision")
+            if self.conclusion_state == "selected":
+                if not self.claim_candidate_ids or not self.citation_group_ids:
+                    raise ValueError("selected marketing conclusion requires governed support")
+                if self.verification_direction or self.reason_codes:
+                    raise ValueError("selected marketing conclusion cannot carry failure guidance")
+            elif self.conclusion_state in {
+                "insufficient_evidence",
+                "no_single_primary_conclusion",
+                "analysis_unavailable",
+            }:
+                if self.prose is not None or not self.verification_direction:
+                    raise ValueError("non-selected marketing conclusion cannot carry prose")
+            else:
+                raise ValueError(
+                    f"unsupported {expected_track} marketing conclusion state"
+                )
+        if self.section_kind == "priority_action":
+            if (
+                self.action_label != "建议"
+                or not self.action_statement
+                or not self.primary_marketing_goal
+            ):
+                raise ValueError("priority action requires a goal-aware 建议")
+            if self.prose is not None:
+                raise ValueError("priority action must remain a structured recommendation")
 
     @property
     def reference_ids(self) -> tuple[str, ...]:
@@ -145,6 +198,8 @@ class ReportSection:
             + self.weak_signal_ids
             + self.limitation_ids
             + self.citation_group_ids
+            + self.marketing_conclusion_ids
+            + self.supporting_conclusion_ids
         )
 
 

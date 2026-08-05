@@ -150,3 +150,221 @@ def test_citation_with_url_is_available_unless_runtime_marks_it_unavailable():
         _citation_ref({"field_path": "title", "source_url": None})["navigation_state"]
         == "missing_source_url"
     )
+
+
+def test_lite_projection_uses_only_selected_governed_marketing_conclusion():
+    reader = LiteReportReader(_StoreWithoutBrief(), ":memory:")
+    claim_cards = [
+        {
+            "claim_candidate_id": f"claim_{index}",
+            "admission_decision_id": f"admission_{index}",
+            "admission_state": "admitted",
+            "direction_id": "product_marketing",
+            "claim_type": "use_context",
+            "statement": f"raw claim {index} must not become the conclusion",
+            "scope": {"sample": "selected_packets"},
+        }
+        for index in range(1, 4)
+    ]
+    citation_groups = [
+        {
+            "citation_group_id": f"citation_{index}",
+            "display_index": index,
+            "claim_candidate_id": f"claim_{index}",
+            "admission_decision_id": f"admission_{index}",
+            "evidence_refs": [
+                {
+                    "canonical_note_id": f"note_{index}",
+                    "field_path": "content_text",
+                    "quote": f"frozen quote {index}",
+                    "text_start": 0,
+                    "text_end": len(f"frozen quote {index}"),
+                    "source_text_hash": str(index) * 64,
+                    "source_url": f"https://example.test/note/{index}",
+                }
+            ],
+        }
+        for index in range(1, 4)
+    ]
+    report = {
+        "workflow_run_id": "run_1",
+        "workflow_terminal_state": "succeeded",
+        "publication_state": "complete_verified_report",
+        "publication": {"compose_mode": "template_only"},
+        "release": {
+            "direction_set_version": "direction_set_v1",
+            "direction_ids": ["product_marketing"],
+        },
+        "claim_cards": claim_cards,
+        "weak_signals": [],
+        "citation_groups": citation_groups,
+        "run_direction_states": [
+            {"direction": "product_marketing", "state": "completed"}
+        ],
+        "limitations_recovery": [],
+        "primary_marketing_goal": "content_seeding",
+        "marketing_conclusions": [
+            {
+                "track": "need",
+                "state": "selected",
+                "candidate_id": "mc_need_primary",
+                "statement": "高温通勤场景中的凉感需求…",
+                "supporting_claim_ids": ["claim_1", "claim_2", "claim_3"],
+                "supporting_note_count": 3,
+                "independent_author_count": 2,
+                "reason_codes": [],
+            },
+            {
+                "track": "need",
+                "state": "qualified",
+                "candidate_id": "mc_need_secondary",
+                "statement": "另一条合格结论不得进入 Lite 报告",
+                "supporting_claim_ids": ["claim_1", "claim_2", "claim_3"],
+                "supporting_note_count": 3,
+                "independent_author_count": 2,
+                "reason_codes": [],
+            },
+            {
+                "track": "value",
+                "state": "insufficient_evidence",
+                "candidate_id": None,
+                "statement": None,
+                "supporting_claim_ids": [],
+                "supporting_note_count": 0,
+                "independent_author_count": 0,
+                "reason_codes": ["conclusion_no_qualified_candidate"],
+            },
+            {
+                "track": "message",
+                "state": "analysis_unavailable",
+                "candidate_id": None,
+                "statement": None,
+                "supporting_claim_ids": [],
+                "supporting_note_count": 0,
+                "independent_author_count": 0,
+                "reason_codes": ["marketing_analysis_unavailable"],
+            },
+        ],
+        "sections": [
+            {
+                "section_kind": "marketing_need",
+                "prose": "高温通勤场景中的凉感需求…",
+                "claim_candidate_ids": ["claim_1", "claim_2", "claim_3"],
+                "citation_group_ids": ["citation_1", "citation_2", "citation_3"],
+                "marketing_conclusion_ids": ["mc_need_primary"],
+                "conclusion_state": "selected",
+            }
+        ],
+    }
+
+    projected = reader._published_projection(report, citation_group_ids=None)
+    need = projected["sections"]["marketing_conclusions"]["need"]
+
+    assert need == {
+        "state": "selected",
+        "conclusion_id": "mc_need_primary",
+        "statement": "高温通勤场景中的凉感需求…",
+        "citation_group_ids": ["citation_1", "citation_2", "citation_3"],
+        "supporting_note_count": 3,
+        "independent_author_count": 2,
+        "additional_qualified_count": 1,
+    }
+    assert "other_qualified_statements" not in need
+    assert projected["sections"]["marketing_conclusions"]["value"] == {
+        "state": "insufficient_evidence",
+        "reason_codes": ["conclusion_no_qualified_candidate"],
+        "verification_direction": "补充至少 3 篇合格笔记，并覆盖至少 2 位独立作者后重新验证。",
+    }
+    assert "statement" not in projected["sections"]["marketing_conclusions"]["message"]
+    assert projected["sections"]["priority_action"]["label"] == "建议"
+    assert projected["sections"]["priority_action"]["supporting_conclusion_ids"] == [
+        "mc_need_primary"
+    ]
+
+
+def test_lite_projection_never_returns_withdrawn_marketing_conclusion_prose():
+    report = {
+        "workflow_run_id": "run_withdrawn",
+        "workflow_terminal_state": "succeeded",
+        "publication_state": "partial_verified_report",
+        "publication": {
+            "compose_mode": "template_only",
+            "omitted_section_ids": ["section_need"],
+        },
+        "release": {
+            "direction_set_version": "direction_set_v1",
+            "direction_ids": ["product_marketing"],
+        },
+        "claim_cards": [
+            {
+                "claim_candidate_id": f"claim_{index}",
+                "admission_decision_id": f"admission_{index}",
+                "admission_state": "admitted",
+                "direction_id": "product_marketing",
+                "claim_type": "use_context",
+                "statement": f"raw claim {index}",
+                "scope": {"sample": "selected_packets"},
+            }
+            for index in range(1, 4)
+        ],
+        "weak_signals": [],
+        "citation_groups": [
+            {
+                "citation_group_id": f"citation_{index}",
+                "display_index": index,
+                "claim_candidate_id": f"claim_{index}",
+                "admission_decision_id": f"admission_{index}",
+                "evidence_refs": [
+                    {
+                        "canonical_note_id": f"note_{index}",
+                        "field_path": "content_text",
+                        "quote": f"quote {index}",
+                        "text_start": 0,
+                        "text_end": len(f"quote {index}"),
+                        "source_text_hash": str(index) * 64,
+                        "source_url": f"https://www.xiaohongshu.com/explore/{index}",
+                    }
+                ],
+            }
+            for index in range(1, 4)
+        ],
+        "run_direction_states": [
+            {"direction": "product_marketing", "state": "completed"}
+        ],
+        "limitations_recovery": [],
+        "primary_marketing_goal": "content_seeding",
+        "marketing_conclusions": [
+            {
+                "track": "need",
+                "state": "selected",
+                "candidate_id": "mc_need",
+                "statement": "该结论已被审计撤回",
+                "supporting_claim_ids": ["claim_1", "claim_2", "claim_3"],
+                "supporting_note_count": 3,
+                "independent_author_count": 2,
+                "reason_codes": [],
+            }
+        ],
+        "sections": [
+            {
+                "section_id": "section_need",
+                "section_kind": "marketing_need",
+                "prose": None,
+                "claim_candidate_ids": ["claim_1", "claim_2", "claim_3"],
+                "citation_group_ids": ["citation_1", "citation_2", "citation_3"],
+                "marketing_conclusion_ids": ["mc_need"],
+                "conclusion_state": "selected",
+            }
+        ],
+    }
+
+    projected = LiteReportReader(_StoreWithoutBrief(), ":memory:")._published_projection(
+        report, citation_group_ids=None
+    )
+
+    need = projected["sections"]["marketing_conclusions"]["need"]
+    assert need["state"] == "analysis_unavailable"
+    assert "statement" not in need
+    assert "mc_need" not in projected["sections"]["priority_action"][
+        "supporting_conclusion_ids"
+    ]

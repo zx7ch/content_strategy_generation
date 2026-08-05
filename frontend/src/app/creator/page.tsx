@@ -675,7 +675,7 @@ function liteDirectionLabel(value: string) {
   return LITE_DIRECTION_CATALOG.find((item) => item.id === value)?.label ?? value;
 }
 
-export function ContentResearchIntentCard({
+function ContentResearchIntentCard({
   intent,
   onConfirmed,
   onPresearchUpdated,
@@ -982,6 +982,14 @@ function coverageReasonLabel(reason: string) {
   return reason.replaceAll("_", " ");
 }
 
+function marketingConclusionReasonLabel(reason: string) {
+  if (reason === "conclusion_no_qualified_candidate") return "现有证据尚未达到主结论门槛。";
+  if (reason === "conclusion_note_count_unmet") return "合格笔记数量不足。";
+  if (reason === "conclusion_author_count_unmet") return "独立作者数量不足。";
+  if (["marketing_analysis_unavailable", "marketing_conclusion_unavailable", "marketing_conclusion_not_verified"].includes(reason)) return "结论分析当前不可用。";
+  return reason.replaceAll("_", " ");
+}
+
 function ContentResearchReportMessage({
   report,
   onRecover,
@@ -1038,8 +1046,22 @@ function ContentResearchReportMessage({
   const evidenceOnly = publicationState === "evidence_only_report";
   const partial = publicationState === "partial_verified_report";
   const citations = recordList(report.citations);
+  const marketingTracks = ([
+    ["need", "场景与需求"],
+    ["value", "可被相信的产品卖点"],
+    ["message", "内容表达"],
+  ] as const).map(([id, label]) => ({
+    id,
+    label,
+    value: report.sections.marketing_conclusions?.[id] as Record<string, unknown> | undefined,
+  }));
+  const hasMarketingTracks = marketingTracks.every((item) => item.value);
+  const priorityAction = report.sections.priority_action as Record<string, unknown> | null | undefined;
   const allCards = recordList(report.sections.main_findings);
-  const findings = evidenceOnly ? [] : allCards.filter((item) => stringField(item, "card_kind") !== "observation");
+  const findings = evidenceOnly ? [] : allCards.filter((item) =>
+    stringField(item, "card_kind") !== "observation"
+    && !(hasMarketingTracks && stringField(item, "direction") === "product_marketing")
+  );
   const observations = evidenceOnly ? [] : allCards.filter((item) => stringField(item, "card_kind") === "observation");
   const leads = evidenceOnly ? [] : recordList(report.sections.weak_signals);
   const limitations = recordList(report.sections.limitations_scope);
@@ -1143,6 +1165,51 @@ function ContentResearchReportMessage({
             </section>
           )}
 
+          {!evidenceOnly && hasMarketingTracks && marketingTracks.map(({ id, label, value }) => {
+            const track = value as Record<string, unknown>;
+            const selected = stringField(track, "state") === "selected";
+            return (
+              <section key={id} aria-label={label} className="border-t border-line pt-4">
+                <h4 className="font-semibold">{label}</h4>
+                {selected ? (
+                  <div className="mt-3 rounded-xl border border-line bg-white px-3 py-3">
+                    <p className="font-medium leading-6">{stringField(track, "statement")}</p>
+                    <p className="mt-2 text-xs text-quiet">
+                      {numberField(track, "supporting_note_count")} 篇笔记 · {numberField(track, "independent_author_count")} 位独立作者
+                    </p>
+                    {numberField(track, "additional_qualified_count") > 0 && (
+                      <p className="mt-1 text-xs text-quiet">另有 {numberField(track, "additional_qualified_count")} 条合格结论</p>
+                    )}
+                    <div className="mt-3 flex flex-wrap gap-2">
+                      {arrayField(track, "citation_group_ids").map((citationId, citationIndex) => {
+                        const citation = citationsById.get(citationId);
+                        return citation ? citationButton(citation, citationIndex) : null;
+                      })}
+                    </div>
+                  </div>
+                ) : (
+                  <div className="mt-3 rounded-xl bg-slate-50 px-3 py-3 text-xs text-quiet">
+                    <p className="font-medium text-ink">暂无可验证结论</p>
+                    {arrayField(track, "reason_codes").map((reason) => (
+                      <p key={reason} className="mt-1">{marketingConclusionReasonLabel(reason)}</p>
+                    ))}
+                    <p className="mt-2">验证方向：{stringField(track, "verification_direction")}</p>
+                  </div>
+                )}
+              </section>
+            );
+          })}
+
+          {!evidenceOnly && hasMarketingTracks && priorityAction && (
+            <section aria-label="优先行动建议" className="border-t border-line pt-4">
+              <h4 className="font-semibold">优先行动建议</h4>
+              <div className="mt-3 rounded-xl border border-[#c7d5cc] bg-[#f4f8f5] px-3 py-3">
+                <p className="text-xs font-semibold text-[#4f6f5f]">{stringField(priorityAction, "label", "建议")}</p>
+                <p className="mt-1 leading-6">{stringField(priorityAction, "statement")}</p>
+              </div>
+            </section>
+          )}
+
           {findings.length > 0 && (
             <section aria-label="核心发现" className="border-t border-line pt-4">
               <h4 className="font-semibold">核心发现</h4>
@@ -1197,8 +1264,8 @@ function ContentResearchReportMessage({
           )}
 
           {!evidenceOnly && (
-            <section aria-label="研究限制" className="border-t border-line pt-4">
-              <h4 className="font-semibold">研究限制</h4>
+            <section aria-label="范围与限制" className="border-t border-line pt-4">
+              <h4 className="font-semibold">范围与限制</h4>
               <div className="mt-2 space-y-2 text-xs text-quiet">
                 {limitations.length
                   ? limitations.map((item, index) => <p key={`limitation-${index}`}>{firstString(item, ["message", "reason", "summary"])}</p>)
@@ -3099,3 +3166,5 @@ export default function CreatorPage() {
     </div>
   );
 }
+
+CreatorPage.ContentResearchIntentCard = ContentResearchIntentCard;

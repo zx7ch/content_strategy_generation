@@ -1984,6 +1984,7 @@ class ContentResearchService:
                 {
                     "track": track,
                     "state": decision.state,
+                    "candidate_id": decision.candidate_id,
                     "statement": (
                         str(candidate.payload.get("statement") or "")
                         if candidate is not None
@@ -1999,6 +2000,9 @@ class ContentResearchService:
                     ),
                     "independent_author_count": int(
                         decision.payload.get("independent_author_count") or 0
+                    ),
+                    "additional_qualified_count": int(
+                        decision.payload.get("additional_qualified_count") or 0
                     ),
                     "body_quote_note_count": int(
                         decision.payload.get("body_quote_note_count") or 0
@@ -3390,6 +3394,11 @@ class ContentResearchService:
         for candidate in generated:
             self._store.save_marketing_conclusion_candidate(candidate)
         for track, track_evaluation in evaluation.tracks.items():
+            additional_qualified_count = sum(
+                outcome.track == track
+                and outcome.candidate_id != track_evaluation.candidate_id
+                for outcome in evaluation.catalog
+            )
             decision_id = f"mcd_{canonical_fingerprint({'input': fingerprint, 'track': track, 'state': track_evaluation.state})[:24]}"
             self._store.save_marketing_conclusion_decision(
                 MarketingConclusionDecisionRecord(
@@ -3401,6 +3410,7 @@ class ContentResearchService:
                         "supporting_note_count": track_evaluation.supporting_note_count,
                         "independent_author_count": track_evaluation.independent_author_count,
                         "body_quote_note_count": track_evaluation.body_quote_note_count,
+                        "additional_qualified_count": additional_qualified_count,
                     },
                     workflow_run_id=workflow_run_id,
                     research_plan_id=research_plan_id,

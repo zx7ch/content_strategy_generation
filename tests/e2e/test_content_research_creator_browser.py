@@ -21,7 +21,7 @@ from app.content_research.contracts import (
     DIRECTION_CATALOG_V1,
     build_default_snapshot,
 )
-from app.content_research.models import ResearchBriefRecord, SubagentTaskRecord
+from app.content_research.models import ResearchBriefRecord
 from app.content_research.persistence_models import StageCheckpointRecord
 from app.content_research.reporting.composer import ResearchReportComposer
 from app.content_research.reporting.publication_materializer import (
@@ -441,6 +441,92 @@ def test_creator_complete_report_uses_lite_with_direct_source_navigation(
         url.endswith(f"/content-research/workflows/{seeded['run_id']}/report")
         for url in requested_urls
     )
+
+
+def test_creator_renders_three_marketing_tracks_and_evidence_strength(browser_page):
+    page, stack = browser_page
+    brand_id = default_brand_id(stack["backend_url"])
+    conclusions = [
+        {
+            "track": "need",
+            "state": "selected",
+            "candidate_id": "mc_need_primary",
+            "statement": "高温通勤场景中的凉感需求明确",
+            "supporting_claim_ids": [f"cc_need_{index}" for index in range(1, 4)],
+            "supporting_note_count": 3,
+            "independent_author_count": 2,
+            "reason_codes": [],
+        },
+        {
+            "track": "need",
+            "state": "qualified",
+            "candidate_id": "mc_need_secondary",
+            "statement": "不得展开的第二条合格需求结论",
+            "supporting_claim_ids": [f"cc_need_{index}" for index in range(1, 4)],
+            "supporting_note_count": 3,
+            "independent_author_count": 2,
+            "reason_codes": [],
+        },
+        {
+            "track": "value",
+            "state": "insufficient_evidence",
+            "candidate_id": None,
+            "statement": None,
+            "supporting_claim_ids": [],
+            "supporting_note_count": 0,
+            "independent_author_count": 0,
+            "reason_codes": ["conclusion_no_qualified_candidate"],
+        },
+        {
+            "track": "message",
+            "state": "selected",
+            "candidate_id": "mc_message_primary",
+            "statement": "内容表达应聚焦高温通勤的体感描述",
+            "supporting_claim_ids": [f"cc_need_{index}" for index in range(1, 4)],
+            "supporting_note_count": 3,
+            "independent_author_count": 2,
+            "reason_codes": [],
+        },
+    ]
+    seeded = run_async_in_thread(
+        seed_publication(
+            stack["db_path"],
+            brand_id=brand_id,
+            title="营销结论 Lite 报告",
+            publication_state="complete_verified_report",
+            requested_directions=("product_marketing",),
+            direction_results={
+                "product_marketing": {
+                    "state": "formal_directional_result",
+                    "limitations": [],
+                    "recovery_actions": [],
+                }
+            },
+            evidence_refs=all_navigation_evidence_refs(),
+            marketing_conclusions=conclusions,
+        )
+    )
+
+    open_creator_with_restored_run(page, stack["frontend_url"], seeded["run_id"])
+    report = published_report(page)
+    expect(report).to_be_visible(timeout=20000)
+    expect(report.get_by_role("heading", name="场景与需求")).to_be_visible()
+    expect(report.get_by_role("heading", name="可被相信的产品卖点")).to_be_visible()
+    expect(report.get_by_role("heading", name="内容表达")).to_be_visible()
+    expect(report.get_by_text("3 篇笔记 · 2 位独立作者").first).to_be_visible()
+    expect(report.get_by_text("暂无可验证结论")).to_be_visible()
+    expect(report.get_by_text("另有 1 条合格结论")).to_be_visible()
+    expect(report.get_by_role("heading", name="优先行动建议")).to_be_visible()
+    expect(report.get_by_text("建议", exact=True)).to_be_visible()
+    expect(report.get_by_text("不得展开的第二条合格需求结论")).to_have_count(0)
+    expect(report.get_by_text(re.compile("raw claim .* must not render"))).to_have_count(0)
+
+    page.locator('aside[aria-label="内容调研上下文"]').get_by_label(
+        "查看完整 workflow trace"
+    ).click()
+    trace = page.locator('section[aria-label="Content Research Trace"]')
+    expect(trace).to_be_visible()
+    expect(trace.get_by_text("可打开来源", exact=True)).to_have_count(0)
 
 
 def test_creator_api_trace_keeps_newest_first_numbers_and_recorded_timing_copy(
@@ -1188,6 +1274,7 @@ async def seed_publication(
     direction_results: dict[str, dict],
     evidence_refs: list[dict],
     publication_reason: str | None = None,
+    marketing_conclusions: list[dict] | None = None,
 ) -> dict[str, str]:
     async with ThreadStore(db_path) as thread_store:
         thread = await thread_store.create_thread(
@@ -1223,6 +1310,7 @@ async def seed_publication(
         direction_results=direction_results,
         evidence_refs=evidence_refs,
         publication_reason=publication_reason,
+        marketing_conclusions=marketing_conclusions,
     )
     return {
         "run_id": run.run_id,
@@ -1715,11 +1803,34 @@ async def save_publication(
     direction_results: dict[str, dict],
     evidence_refs: list[dict],
     publication_reason: str | None = None,
+    marketing_conclusions: list[dict] | None = None,
 ) -> str:
     base = governed_snapshot()
     governed = base.metadata["governed_snapshot"]
     citation_group = governed["citation_groups"][0]
     include_admitted_cards = publication_state != "partial_verified_report"
+    marketing_claim_cards = [
+        {
+            **governed["claim_cards"][0],
+            "claim_candidate_id": f"cc_need_{index}",
+            "admission_decision_id": f"cad_need_{index}",
+            "claim_type": "use_context",
+            "scope": {"sample": "selected_packets"},
+            "statement": f"raw claim {index} must not render as a conclusion",
+        }
+        for index in range(1, len(evidence_refs) + 1)
+    ]
+    marketing_citation_groups = [
+        {
+            **citation_group,
+            "citation_group_id": f"citation_need_{index}",
+            "display_index": index,
+            "claim_candidate_id": f"cc_need_{index}",
+            "admission_decision_id": f"cad_need_{index}",
+            "evidence_refs": [{**evidence_ref, "canonical_note_id": f"note-{index}"}],
+        }
+        for index, evidence_ref in enumerate(evidence_refs, start=1)
+    ]
     snapshot = replace(
         base,
         id=f"snapshot_{run_id}",
@@ -1735,6 +1846,20 @@ async def save_publication(
                     "direction_set_version": "direction_set_v1",
                     "direction_ids": list(requested_directions),
                     "report_compose_mode": "template_only",
+                    **(
+                        {
+                            "marketing_conclusion_policy": {
+                                "primary_marketing_goal": "content_seeding",
+                                "tracks": ["need", "value", "message"],
+                                "minimum_notes_per_conclusion": 3,
+                                "minimum_independent_authors_per_conclusion": 2,
+                                "require_core_and_first_intent_support": True,
+                                "maximum_primary_conclusions_per_track": 1,
+                            }
+                        }
+                        if marketing_conclusions is not None
+                        else {}
+                    ),
                 },
                 "citation_groups": [
                     {
@@ -1742,7 +1867,9 @@ async def save_publication(
                         "admission_decision_id": governed["claim_cards"][0]["admission_decision_id"],
                         "evidence_refs": evidence_refs,
                     }
-                ] if include_admitted_cards else [],
+                ] if include_admitted_cards and marketing_conclusions is None else (
+                    marketing_citation_groups if include_admitted_cards else []
+                ),
                 "claim_cards": [
                     {
                         **card,
@@ -1750,7 +1877,14 @@ async def save_publication(
                         "scope": {"sample": "selected_packets"},
                     }
                     for card in governed["claim_cards"]
-                ] if include_admitted_cards else [],
+                ] if include_admitted_cards and marketing_conclusions is None else (
+                    marketing_claim_cards if include_admitted_cards else []
+                ),
+                **(
+                    {"marketing_conclusions": marketing_conclusions}
+                    if marketing_conclusions is not None
+                    else {}
+                ),
                 "direction_results": [
                     {
                         "direction_id": direction_id,

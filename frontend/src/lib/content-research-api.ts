@@ -221,6 +221,29 @@ export async function getXHSQRLogin(attemptId: string): Promise<XHSQRLoginRespon
 }
 
 /** Narrow public projection from the immutable report publication. */
+export type ContentResearchMarketingConclusionTrack =
+  | {
+      state: "selected";
+      conclusion_id: string;
+      statement: string;
+      citation_group_ids: string[];
+      supporting_note_count: number;
+      independent_author_count: number;
+      additional_qualified_count: number;
+    }
+  | {
+      state: "insufficient_evidence" | "no_single_primary_conclusion" | "analysis_unavailable";
+      reason_codes: string[];
+      verification_direction: string;
+    };
+
+export interface ContentResearchPriorityAction {
+  label: "建议";
+  statement: string;
+  primary_marketing_goal: string;
+  supporting_conclusion_ids: string[];
+}
+
 export interface ContentResearchLiteReportResponse {
   schema_version: string;
   workflow_run_id: string;
@@ -233,6 +256,8 @@ export interface ContentResearchLiteReportResponse {
     main_findings: JsonObject[];
     weak_signals: JsonObject[];
     limitations_scope: JsonObject[];
+    marketing_conclusions: Partial<Record<"need" | "value" | "message", ContentResearchMarketingConclusionTrack>>;
+    priority_action?: ContentResearchPriorityAction | null;
   };
   status_strip: JsonObject;
   citations: JsonObject[];

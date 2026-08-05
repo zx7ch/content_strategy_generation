@@ -276,11 +276,7 @@ async def test_formal_workflow_public_api_e2e_is_packet_only_safe_and_replayable
     report = await client.get(f"/content-research/workflows/{workflow['workflow_run_id']}/lite-report")
     assert report.status_code == 200, report.text
     report_payload = report.json()
-    assert report_payload["publication"]["state"] in {
-        "complete_verified_report",
-        "partial_verified_report",
-        "evidence_only_report",
-    }
+    assert report_payload["publication"]["state"] == "complete_verified_report"
     assert all(
         ref["quote"] and ref["field_path"] and ref["source_text_hash"] and ref["source_url"]
         for group in report_payload["citations"] for ref in group["evidence_refs"]
@@ -295,6 +291,11 @@ async def test_formal_workflow_public_api_e2e_is_packet_only_safe_and_replayable
     assert selected["track"] == "need"
     assert selected["statement"] == "样本明确表达轻量透气需求"
     assert selected["supporting_claim_ids"]
+    assert selected["additional_qualified_count"] == 0
+    need = report_payload["sections"]["marketing_conclusions"]["need"]
+    assert need["state"] == "selected"
+    assert need["statement"] == "样本明确表达轻量透气需求"
+    assert need["additional_qualified_count"] == 0
 
     governance = await client.get(f"/content-research/workflows/{workflow['workflow_run_id']}/governance")
     assert governance.status_code == 200, governance.text

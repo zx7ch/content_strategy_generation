@@ -42,6 +42,162 @@ class UnknownCostSemanticLLM:
         )
 
 
+def _marketing_snapshot():
+    snapshot = _snapshot()
+    governed = snapshot.metadata["governed_snapshot"]
+    base_card = governed["claim_cards"][0]
+    base_group = governed["citation_groups"][0]
+    cards = [
+        {
+            **base_card,
+            "claim_candidate_id": f"cc_need_{index}",
+            "admission_decision_id": f"cad_need_{index}",
+            "admission_state": "admitted",
+            "direction_id": "product_marketing",
+            "statement": f"原始准入事实 {index}",
+            "scope": {"sample": "selected_packets"},
+        }
+        for index in range(1, 4)
+    ]
+    groups = [
+        {
+            **base_group,
+            "citation_group_id": f"citation_need_{index}",
+            "display_index": index,
+            "claim_candidate_id": f"cc_need_{index}",
+            "admission_decision_id": f"cad_need_{index}",
+        }
+        for index in range(1, 4)
+    ]
+    return replace(
+        snapshot,
+        metadata={
+            **snapshot.metadata,
+            "governed_snapshot": {
+                **governed,
+                "policy_scope": {
+                    **governed["policy_scope"],
+                    "direction_ids": ["product_marketing"],
+                    "report_compose_mode": "template_only",
+                    "marketing_conclusion_policy": {
+                        "primary_marketing_goal": "content_seeding",
+                        "tracks": ["need", "value", "message"],
+                        "minimum_notes_per_conclusion": 3,
+                        "minimum_independent_authors_per_conclusion": 2,
+                        "require_core_and_first_intent_support": True,
+                        "maximum_primary_conclusions_per_track": 1,
+                    },
+                },
+                "claim_cards": cards,
+                "citation_groups": groups,
+                "marketing_conclusions": [
+                    {
+                        "track": "need",
+                        "state": "selected",
+                        "candidate_id": "mc_need",
+                        "statement": "高温通勤场景中的凉感需求明确",
+                        "supporting_claim_ids": [
+                            "cc_need_1",
+                            "cc_need_2",
+                            "cc_need_3",
+                        ],
+                        "supporting_note_count": 3,
+                        "independent_author_count": 2,
+                        "reason_codes": [],
+                    },
+                    {
+                        "track": "value",
+                        "state": "insufficient_evidence",
+                        "reason_codes": ["conclusion_no_qualified_candidate"],
+                    },
+                    {
+                        "track": "message",
+                        "state": "analysis_unavailable",
+                        "reason_codes": ["marketing_analysis_unavailable"],
+                    },
+                ],
+            },
+        },
+    )
+
+
+def test_template_audit_accepts_exact_selected_governed_marketing_conclusion():
+    snapshot = _marketing_snapshot()
+    draft = ResearchReportComposer().compose(snapshot)
+
+    result = asyncio.run(
+        ReportFaithfulnessEvaluator().evaluate(snapshot, draft, AuditUnavailable())
+    )
+
+    assert result.passed is True
+    assert result.reason_codes == ()
+    assert result.semantic_result.state == "not_applicable"
+
+
+def test_template_audit_rejects_raw_claim_substitution_for_marketing_conclusion():
+    snapshot = _marketing_snapshot()
+    draft = ResearchReportComposer().compose(snapshot)
+    need = next(section for section in draft.sections if section.section_kind == "marketing_need")
+    raw_statement = snapshot.metadata["governed_snapshot"]["claim_cards"][0]["statement"]
+    substituted = replace(
+        need,
+        prose=raw_statement,
+        citation_anchors=tuple(
+            replace(anchor, text_end=len(raw_statement))
+            for anchor in need.citation_anchors
+        ),
+    )
+
+    result = asyncio.run(
+        ReportFaithfulnessEvaluator().evaluate(
+            snapshot,
+            replace(
+                draft,
+                sections=tuple(
+                    substituted if section.section_id == need.section_id else section
+                    for section in draft.sections
+                ),
+            ),
+            AuditUnavailable(),
+        )
+    )
+
+    assert result.passed is False
+    assert "marketing_conclusion_prose_mismatch" in result.reason_codes
+
+
+def test_template_audit_rejects_tampered_marketing_decision_support_and_citation_owner():
+    snapshot = _marketing_snapshot()
+    draft = ResearchReportComposer().compose(snapshot)
+    governed = snapshot.metadata["governed_snapshot"]
+    selected = governed["marketing_conclusions"][0]
+    tampered = replace(
+        snapshot,
+        metadata={
+            **snapshot.metadata,
+            "governed_snapshot": {
+                **governed,
+                "marketing_conclusions": [
+                    {**selected, "supporting_claim_ids": ["cc_need_1", "unknown_claim"]},
+                    *governed["marketing_conclusions"][1:],
+                ],
+                "citation_groups": [
+                    {**governed["citation_groups"][0], "claim_candidate_id": "other_claim"},
+                    *governed["citation_groups"][1:],
+                ],
+            },
+        },
+    )
+
+    result = asyncio.run(
+        ReportFaithfulnessEvaluator().evaluate(tampered, draft, AuditUnavailable())
+    )
+
+    assert result.passed is False
+    assert "marketing_conclusion_support_invalid" in result.reason_codes
+    assert "citation_claim_ownership_invalid" in result.reason_codes
+
+
 def test_direct_observation_uses_deterministic_identity_proof_without_llm_reinterpretation():
     snapshot = _snapshot()
     draft = ResearchReportComposer().compose(snapshot)
