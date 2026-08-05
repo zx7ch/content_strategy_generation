@@ -253,6 +253,7 @@ class StageCheckpointRecord(TypedPersistenceRecord):
             "admission",
             "reconcile",
             "aggregate",
+            "marketing_conclusion",
             "compose",
             "faithfulness",
         }:

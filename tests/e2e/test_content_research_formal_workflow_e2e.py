@@ -9,6 +9,11 @@ import httpx
 import pytest
 
 from app.api.routes.router import app
+from app.content_research.persistence_models import (
+    DirectionalEvidencePacketRecord,
+    ReportPublicationRecord,
+    StageCheckpointRecord,
+)
 from app.content_research.presearch.service import PresearchService
 from app.content_research.service import ContentResearchService, WorkflowRunManagerRuntime
 from app.content_research.sources import SourceAdapterRegistry
@@ -16,6 +21,7 @@ from app.content_research.sources.base import ProviderCapability, SourceOperatio
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
 from app.content_research.worker import ContentResearchDispatchWorker
 from app.memory.thread_store import ThreadStore
+from app.services.llm.failures import LLMProviderFailure
 from app.services.llm.types import LLMResponse, TokenUsage
 
 LITE_DIRECTIONS = [
@@ -26,7 +32,46 @@ LITE_DIRECTIONS = [
 
 
 class FakeLLM:
+    def __init__(self) -> None:
+        self.fail_marketing = False
+        self.marketing_calls = 0
+
     async def generate(self, request):
+        if request.task_type == "content_research.marketing_conclusion_analysis":
+            self.marketing_calls += 1
+            if self.fail_marketing:
+                raise LLMProviderFailure(
+                    "llm_model_unavailable",
+                    "模型不可用",
+                    True,
+                    404,
+                    provider="fake",
+                    model="fake",
+                )
+            payload = json.loads(request.messages[-1].content)
+            claim_ids = [item["claim_id"] for item in payload["claims"]]
+            return LLMResponse(
+                content=json.dumps(
+                    {
+                        "candidates": (
+                            [
+                                {
+                                    "track": "need",
+                                    "statement": "样本明确表达轻量透气需求",
+                                    "supporting_claim_ids": claim_ids,
+                                }
+                            ]
+                            if claim_ids
+                            else []
+                        )
+                    },
+                    ensure_ascii=False,
+                ),
+                provider="fake",
+                model="fake",
+                usage=TokenUsage(total_tokens=1),
+                latency_ms=1,
+            )
         user_prompt = request.messages[-1].content
         subject = "慢速调研" if "慢速调研" in user_prompt else "徒步短裤"
         core_object = "调研" if subject == "慢速调研" else "短裤"
@@ -123,7 +168,8 @@ class CapableFakeAdapter:
             items=[{
                 "provider": "xiaohongshu", "canonical_id": request.note_id, "source_url": request.note_url,
                 "source_kind": "note_detail", "author": f"note-author-{index}", "author_id": f"note-author-{index}",
-                "title": "迪卡侬 夏季徒步短裤上新", "content_text": "轻量透气的徒步短裤适合夏季通勤与户外。",
+                "title": "迪卡侬 夏季徒步短裤产品营销观察",
+                "content_text": "产品营销样本提到轻量透气的徒步短裤适合夏季通勤与户外。",
                 "tags": ["徒步", "夏季"], "note_type": "image_text", "metrics": {"likes": 100, "comments": 20},
                 "metrics_observed_at": "2026-07-01T00:00:00+00:00", "source_published_at": "2026-06-01T00:00:00+00:00",
                 "ip_location": "上海", "media": {"count": 3}, "competitor_names": ["迪卡侬"],
@@ -152,6 +198,8 @@ class CapableFakeAdapter:
 async def formal_client(tmp_path):
     original = getattr(app.state, "content_research_service", None)
     adapter = CapableFakeAdapter()
+    analysis_llm = FakeLLM()
+    adapter.analysis_llm = analysis_llm
     db_path = str(tmp_path / "cl10.db")
     dispatch_wake_event = asyncio.Event()
     app.state.content_research_service = ContentResearchService(
@@ -159,6 +207,7 @@ async def formal_client(tmp_path):
         presearch=PresearchService(FakeLLM(), first_feedback_timeout_seconds=0.05, hard_cutoff_seconds=0.1),
         workflow_runtime=WorkflowRunManagerRuntime(db_path),
         source_registry=SourceAdapterRegistry({"xiaohongshu": adapter}),
+        analysis_llm=analysis_llm,
         dispatch_wake_event=dispatch_wake_event,
     )
     dispatch_worker = ContentResearchDispatchWorker(
@@ -197,7 +246,7 @@ async def test_formal_workflow_public_api_e2e_is_packet_only_safe_and_replayable
     workflow = created.json()
     confirmed = await client.post(
         f"/content-research/briefs/{workflow['brief_id']}/confirm",
-        json={"confirmed_subject": "徒步短裤", "subject_type": "category", "selected_competitors": ["迪卡侬"], "custom_competitors": [], "selected_directions": ["product_marketing"], "custom_research_question": "请给出下一步建议"},
+        json={"confirmed_subject": "徒步短裤", "subject_type": "category", "selected_competitors": ["迪卡侬"], "custom_competitors": [], "selected_directions": ["product_marketing"], "custom_research_question": "请给出下一步建议", "primary_marketing_goal": "content_seeding"},
     )
     assert confirmed.status_code == 200, confirmed.text
 
@@ -218,7 +267,6 @@ async def test_formal_workflow_public_api_e2e_is_packet_only_safe_and_replayable
     else:
         pytest.fail("formal research did not publish after asynchronous dispatch")
     assert len(report_messages) == 1
-    await thread_store.close()
 
     assert {item["direction_id"] for item in summary["subagent_tasks"]} == {
         "product_marketing"
@@ -237,6 +285,16 @@ async def test_formal_workflow_public_api_e2e_is_packet_only_safe_and_replayable
         ref["quote"] and ref["field_path"] and ref["source_text_hash"] and ref["source_url"]
         for group in report_payload["citations"] for ref in group["evidence_refs"]
     )
+    published_snapshot = app.state.content_research_service._store.list_result_snapshots_for_workflow(
+        workflow["workflow_run_id"]
+    )[-1]
+    governed_conclusions = published_snapshot.metadata["governed_snapshot"][
+        "marketing_conclusions"
+    ]
+    selected = next(item for item in governed_conclusions if item["state"] == "selected")
+    assert selected["track"] == "need"
+    assert selected["statement"] == "样本明确表达轻量透气需求"
+    assert selected["supporting_claim_ids"]
 
     governance = await client.get(f"/content-research/workflows/{workflow['workflow_run_id']}/governance")
     assert governance.status_code == 200, governance.text
@@ -249,6 +307,57 @@ async def test_formal_workflow_public_api_e2e_is_packet_only_safe_and_replayable
     assert trace.status_code == 200, trace.text
     assert "raw_payload" not in trace.text and "access_token" not in trace.text
 
+    store = app.state.content_research_service._store
+    snapshots_before_packet_replay = store.list_result_snapshots_for_workflow(
+        workflow["workflow_run_id"]
+    )
+    publications_before_packet_replay = [
+        item
+        for item in store.list_typed_records(ReportPublicationRecord)
+        if item.workflow_run_id == workflow["workflow_run_id"]
+    ]
+    conclusion_calls_before_packet_replay = adapter.analysis_llm.marketing_calls
+    adapter_calls_before_packet_replay = list(adapter.calls)
+    operation_ids_before_packet_replay = {
+        item.id
+        for item in store.list_typed_records(StageCheckpointRecord)
+        if item.workflow_run_id == workflow["workflow_run_id"]
+        and item.stage_name == "operation"
+    }
+    packet_ids_before_packet_replay = {
+        item.id
+        for item in store.list_typed_records(DirectionalEvidencePacketRecord)
+        if item.workflow_run_id == workflow["workflow_run_id"]
+    }
+    await app.state.content_research_service.replay_downstream_from_persisted_packets(
+        workflow["workflow_run_id"]
+    )
+    replay_messages = await thread_store.get_thread_messages(creator_thread["id"])
+    assert len(
+        [item for item in replay_messages if item["message_type"] == "artifact_result"]
+    ) == 1
+    assert store.list_result_snapshots_for_workflow(
+        workflow["workflow_run_id"]
+    ) == snapshots_before_packet_replay
+    assert [
+        item
+        for item in store.list_typed_records(ReportPublicationRecord)
+        if item.workflow_run_id == workflow["workflow_run_id"]
+    ] == publications_before_packet_replay
+    assert adapter.analysis_llm.marketing_calls == conclusion_calls_before_packet_replay
+    assert adapter.calls == adapter_calls_before_packet_replay
+    assert {
+        item.id
+        for item in store.list_typed_records(StageCheckpointRecord)
+        if item.workflow_run_id == workflow["workflow_run_id"]
+        and item.stage_name == "operation"
+    } == operation_ids_before_packet_replay
+    assert {
+        item.id
+        for item in store.list_typed_records(DirectionalEvidencePacketRecord)
+        if item.workflow_run_id == workflow["workflow_run_id"]
+    } == packet_ids_before_packet_replay
+
     calls_before_replay = list(adapter.calls)
     replay = await client.post(
         f"/content-research/workflows/{workflow['workflow_run_id']}/actions",
@@ -258,6 +367,131 @@ async def test_formal_workflow_public_api_e2e_is_packet_only_safe_and_replayable
     assert adapter.calls == calls_before_replay
     rerun = (await client.get(f"/content-research/workflows/{workflow['workflow_run_id']}/lite-report")).json()
     assert rerun["citations"] == report_payload["citations"]
+    await thread_store.close()
+
+
+@pytest.mark.asyncio
+async def test_marketing_analysis_unavailable_waits_and_resumes_without_collection_delta(
+    formal_client,
+):
+    client, adapter, db_path = formal_client
+    adapter.analysis_llm.fail_marketing = True
+    thread_store = ThreadStore(db_path)
+    await thread_store.connect()
+    creator_thread = await thread_store.create_thread(title="marketing model recovery")
+    created = await client.post(
+        "/content-research/presearch",
+        json={"seed_text": "徒步短裤", "thread_id": creator_thread["id"]},
+    )
+    workflow = created.json()
+    confirmed = await client.post(
+        f"/content-research/briefs/{workflow['brief_id']}/confirm",
+        json={
+            "confirmed_subject": "徒步短裤",
+            "subject_type": "category",
+            "selected_competitors": [],
+            "custom_competitors": [],
+            "selected_directions": ["product_marketing"],
+            "custom_research_question": "",
+            "primary_marketing_goal": "content_seeding",
+        },
+    )
+    assert confirmed.status_code == 200, confirmed.text
+    started = await client.post(
+        f"/content-research/workflows/{workflow['workflow_run_id']}/actions",
+        json={
+            "action": "start_formal_research",
+            "payload": {"provider": "xiaohongshu", "limit": 20},
+        },
+    )
+    assert started.status_code == 200, started.text
+
+    for _ in range(150):
+        trace = (
+            await client.get(
+                f"/content-research/workflows/{workflow['workflow_run_id']}/trace"
+            )
+        ).json()
+        if trace["run_status"] == "waiting_user":
+            break
+        await asyncio.sleep(0.01)
+    else:
+        pytest.fail("marketing analysis failure did not reach waiting_user")
+
+    store = SQLiteContentResearchStore(db_path)
+    checkpoints = [
+        item
+        for item in store.list_typed_records(StageCheckpointRecord)
+        if item.workflow_run_id == workflow["workflow_run_id"]
+        and item.stage_name == "marketing_conclusion"
+    ]
+    assert len(checkpoints) == 1
+    assert checkpoints[0].status == "waiting_user"
+    assert checkpoints[0].payload == {
+        "schema_version": "content_research_marketing_conclusion_checkpoint_v1",
+        "reason_codes": ["marketing_analysis_unavailable"],
+        "recovery_action": "repair_model_configuration_and_resume",
+    }
+    assert not any(
+        key in json.dumps(checkpoints[0].payload, ensure_ascii=False)
+        for key in ("statement", "quote", "claim_id", "candidate_id")
+    )
+    messages = await thread_store.get_thread_messages(creator_thread["id"])
+    assert not [item for item in messages if item["message_type"] == "artifact_result"]
+    operation_ids_before = {
+        item.id
+        for item in store.list_typed_records(StageCheckpointRecord)
+        if item.workflow_run_id == workflow["workflow_run_id"]
+        and item.stage_name == "operation"
+    }
+    packet_ids_before = {
+        item.id
+        for item in store.list_typed_records(DirectionalEvidencePacketRecord)
+        if item.workflow_run_id == workflow["workflow_run_id"]
+    }
+    adapter_calls_before = list(adapter.calls)
+
+    adapter.analysis_llm.fail_marketing = False
+    retried = await client.post(
+        f"/content-research/workflows/{workflow['workflow_run_id']}/actions",
+        json={
+            "action": "retry_formal_research",
+            "payload": {"provider": "xiaohongshu", "limit": 20},
+        },
+    )
+    assert retried.status_code == 200, retried.text
+    for _ in range(150):
+        report = await client.get(
+            f"/content-research/workflows/{workflow['workflow_run_id']}/lite-report"
+        )
+        if report.status_code == 200:
+            break
+        await asyncio.sleep(0.01)
+    else:
+        pytest.fail("marketing analysis recovery did not publish")
+
+    assert adapter.analysis_llm.marketing_calls == 2
+    assert adapter.calls == adapter_calls_before
+    assert {
+        item.id
+        for item in store.list_typed_records(StageCheckpointRecord)
+        if item.workflow_run_id == workflow["workflow_run_id"]
+        and item.stage_name == "operation"
+    } == operation_ids_before
+    assert {
+        item.id
+        for item in store.list_typed_records(DirectionalEvidencePacketRecord)
+        if item.workflow_run_id == workflow["workflow_run_id"]
+    } == packet_ids_before
+    assert len(
+        [
+            item
+            for item in store.list_typed_records(StageCheckpointRecord)
+            if item.workflow_run_id == workflow["workflow_run_id"]
+            and item.stage_name == "marketing_conclusion"
+        ]
+    ) == 1
+    await thread_store.close()
 
 
 @pytest.mark.asyncio
@@ -282,6 +516,7 @@ async def test_auth_required_retry_requeues_the_same_run_once_and_publishes_once
             "custom_competitors": [],
             "selected_directions": ["product_marketing"],
             "custom_research_question": "",
+            "primary_marketing_goal": "content_seeding",
         },
     )
     assert confirmed.status_code == 200, confirmed.text
@@ -389,6 +624,7 @@ async def test_third_same_run_recovery_is_rejected_without_replaying_provider(fo
             "custom_competitors": [],
             "selected_directions": ["product_marketing"],
             "custom_research_question": "",
+            "primary_marketing_goal": "content_seeding",
         },
     )
     assert confirmed.status_code == 200, confirmed.text
@@ -474,6 +710,7 @@ async def test_detail_recovery_replays_failed_detail_without_repeating_discovery
             "custom_competitors": [],
             "selected_directions": ["product_marketing"],
             "custom_research_question": "",
+            "primary_marketing_goal": "content_seeding",
         },
     )
     assert confirmed.status_code == 200, confirmed.text
@@ -549,6 +786,7 @@ async def test_permanent_detail_failure_fails_run_without_publishing_report(form
             "custom_competitors": [],
             "selected_directions": ["product_marketing"],
             "custom_research_question": "",
+            "primary_marketing_goal": "content_seeding",
         },
     )
     assert confirmed.status_code == 200, confirmed.text
@@ -599,6 +837,7 @@ async def test_single_direction_workflow_publishes_a_cited_report_with_frozen_sc
             "custom_competitors": [],
             "selected_directions": ["product_marketing"],
             "custom_research_question": "",
+            "primary_marketing_goal": "content_seeding",
         },
     )
     assert confirmed.status_code == 200, confirmed.text
@@ -662,6 +901,7 @@ async def test_formal_action_returns_while_slow_collection_keeps_trace_readable(
             "custom_competitors": [],
             "selected_directions": ["product_marketing"],
             "custom_research_question": "",
+            "primary_marketing_goal": "content_seeding",
         },
     )
     assert confirmed.status_code == 200, confirmed.text

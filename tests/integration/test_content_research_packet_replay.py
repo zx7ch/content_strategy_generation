@@ -1,27 +1,36 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import replace
 from datetime import datetime, timezone
 
 import pytest
 
+from app.content_research.admission.candidates import source_text_hash
 from app.content_research.contracts import build_default_snapshot, policy_hash
 from app.content_research.models import ResearchBriefRecord
-from app.content_research.persistence_models import StageCheckpointRecord
+from app.content_research.persistence_models import (
+    CanonicalSourceRecord,
+    ClaimAdmissionDecisionRecord,
+    ClaimCandidateRecord,
+    DirectionalEvidencePacketRecord,
+    StageCheckpointRecord,
+)
 from app.content_research.presearch.service import (
     PresearchChecklist,
     PresearchOutcome,
     PresearchService,
 )
-from app.content_research.subject_structure import parse_subject_structure
 from app.content_research.service import (
     ContentResearchService,
     ContentResearchValidationError,
     WorkflowRunManagerRuntime,
 )
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
+from app.content_research.subject_structure import parse_subject_structure
 from app.content_research.workflow.directional_pipeline import compile_query_groups
+from app.services.llm.types import LLMResponse, TokenUsage
 
 
 def _legacy_context(tmp_path):
@@ -221,3 +230,192 @@ async def test_legacy_revision_rejects_mismatched_query_groups(tmp_path):
             snapshot=snapshot,
             contracts={"product_marketing": malformed},
         )
+
+
+class _ConclusionLLM:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def generate(self, request):
+        self.calls += 1
+        payload = json.loads(request.messages[-1].content)
+        return LLMResponse(
+            content=json.dumps(
+                {
+                    "candidates": [
+                        {
+                            "track": "need",
+                            "statement": "样本明确表达轻量透气需求",
+                            "supporting_claim_ids": [
+                                item["claim_id"] for item in payload["claims"]
+                            ],
+                        }
+                    ]
+                },
+                ensure_ascii=False,
+            ),
+            provider="fake",
+            model="fake",
+            usage=TokenUsage(total_tokens=1),
+            latency_ms=1,
+        )
+
+
+@pytest.mark.asyncio
+async def test_conclusion_packet_replay_reuses_checkpoint_without_collection_delta(
+    tmp_path,
+):
+    db_path = str(tmp_path / "marketing-conclusion-replay.db")
+    store = SQLiteContentResearchStore(db_path)
+    frozen_at = datetime(2026, 8, 5, tzinfo=timezone.utc)
+    snapshot, _policies, _contracts = build_default_snapshot(
+        snapshot_id="rps-conclusion-replay",
+        workflow_run_id="run-conclusion-replay",
+        brief_id="rb-conclusion-replay",
+        plan_id="rp-conclusion-replay",
+        run_as_of_at=frozen_at,
+        direction_ids=("product_marketing",),
+        primary_marketing_goal="content_seeding",
+    )
+    store.save_run_policy_snapshot(snapshot)
+    store.save_brief(
+        ResearchBriefRecord(
+            id="rb-conclusion-replay",
+            workflow_run_id="run-conclusion-replay",
+            thread_id="thread-conclusion-replay",
+            schema_version="content_research_brief_v1",
+            status="ready",
+            payload={
+                "schema_version": "content_research_brief_v1",
+                "workspace_id": "ws-1",
+                "user_id": "user-1",
+            },
+        )
+    )
+    quote = "产品营销样本明确提到轻量透气"
+    for index, author_id in enumerate(("author-a", "author-a", "author-b"), start=1):
+        source_id = f"source-{index}"
+        packet_id = f"packet-{index}"
+        claim_id = f"claim-{index}"
+        store.save_canonical_source(
+            CanonicalSourceRecord(
+                source_id,
+                "canonical-source-v1",
+                {},
+                platform="xiaohongshu",
+                platform_source_kind="note",
+                platform_source_id=f"note-{index}",
+            )
+        )
+        store.save_directional_evidence_packet(
+            DirectionalEvidencePacketRecord(
+                packet_id,
+                "directional-packet-v1",
+                {
+                    "field_projection": {
+                        "content_text": quote,
+                        "source_url": f"https://example.test/{index}",
+                        "author_id": author_id,
+                    },
+                    "field_availability": {"content_text": "present"},
+                },
+                workflow_run_id="run-conclusion-replay",
+                research_direction_id="product_marketing",
+                canonical_source_id=source_id,
+                field_projection_hash=f"projection-{index}",
+            )
+        )
+        store.save_claim_candidate(
+            ClaimCandidateRecord(
+                claim_id,
+                "claim-candidate-v1",
+                {
+                    "quote_refs": [
+                        {
+                            "field_path": "content_text",
+                            "quote": quote,
+                            "text_start": 0,
+                            "text_end": len(quote),
+                            "source_text_hash": source_text_hash(quote),
+                            "source_url": f"https://example.test/{index}",
+                        }
+                    ],
+                    "scope": {"sample": "selected_packets"},
+                },
+                workflow_run_id="run-conclusion-replay",
+                research_direction_id="product_marketing",
+                evidence_packet_id=packet_id,
+                statement=quote,
+                intent_id="value_proposition",
+                claim_type="product_value_expression",
+            )
+        )
+        store.save_claim_admission_decision(
+            ClaimAdmissionDecisionRecord(
+                f"decision-{index}",
+                "admission-decision-v1",
+                {
+                    "policy_snapshot_hash": snapshot.effective_policy_hash,
+                    "reason_codes": [],
+                },
+                research_direction_id="product_marketing",
+                claim_candidate_id=claim_id,
+                decision="admitted",
+                policy_snapshot_id=snapshot.id,
+            )
+        )
+
+    llm = _ConclusionLLM()
+    service = ContentResearchService(
+        store=store,
+        presearch=PresearchService(None),
+        workflow_runtime=WorkflowRunManagerRuntime(db_path),
+        analysis_llm=llm,
+    )
+    operation_ids_before = {
+        item.id
+        for item in store.list_typed_records(StageCheckpointRecord)
+        if item.stage_name == "operation"
+    }
+    packet_ids_before = {
+        item.id for item in store.list_typed_records(DirectionalEvidencePacketRecord)
+    }
+
+    first = await service._govern_marketing_conclusions(
+        workflow_run_id="run-conclusion-replay",
+        research_plan_id="rp-conclusion-replay",
+    )
+    candidates_after_first = store.list_marketing_conclusion_candidates(
+        "run-conclusion-replay", "rp-conclusion-replay"
+    )
+    decisions_after_first = store.list_marketing_conclusion_decisions(
+        "run-conclusion-replay", "rp-conclusion-replay"
+    )
+    replay = await service._govern_marketing_conclusions(
+        workflow_run_id="run-conclusion-replay",
+        research_plan_id="rp-conclusion-replay",
+    )
+
+    assert replay.id == first.id
+    assert llm.calls == 1
+    assert store.list_marketing_conclusion_candidates(
+        "run-conclusion-replay", "rp-conclusion-replay"
+    ) == candidates_after_first
+    assert store.list_marketing_conclusion_decisions(
+        "run-conclusion-replay", "rp-conclusion-replay"
+    ) == decisions_after_first
+    assert len(
+        [
+            item
+            for item in store.list_typed_records(StageCheckpointRecord)
+            if item.stage_name == "marketing_conclusion"
+        ]
+    ) == 1
+    assert {
+        item.id
+        for item in store.list_typed_records(StageCheckpointRecord)
+        if item.stage_name == "operation"
+    } == operation_ids_before
+    assert {
+        item.id for item in store.list_typed_records(DirectionalEvidencePacketRecord)
+    } == packet_ids_before

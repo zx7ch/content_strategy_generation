@@ -61,6 +61,11 @@ from app.content_research.evidence.governance_reader import (
     safe_public_projection,
 )
 from app.content_research.evidence.packet_reader import PacketEvidenceReader
+from app.content_research.marketing_conclusion_analysis import (
+    MarketingConclusionAnalysisError,
+    MarketingConclusionAnalysisService,
+)
+from app.content_research.marketing_conclusions import evaluate_marketing_conclusions
 from app.content_research.models import (
     ObservationEventRecord,
     ResearchBriefRecord,
@@ -77,6 +82,8 @@ from app.content_research.persistence_models import (
     ClaimCandidateRecord,
     DirectionalEvidencePacketRecord,
     DirectionResultDecisionRecord,
+    MarketingConclusionDecisionRecord,
+    ReportPublicationRecord,
     StageCheckpointRecord,
     WeakSignalRecord,
 )
@@ -129,6 +136,7 @@ from app.content_research.workflow.query_planner import (
 from app.memory.thread_store import ThreadStore
 from app.memory.workflow_store import WorkflowStore
 from app.models.workflow import WorkflowPhase
+from app.services.llm.failures import LLMProviderFailure
 from app.services.workflow_run_manager import WorkflowRunManager
 
 
@@ -574,6 +582,7 @@ class ContentResearchService:
         self._decision_advancement_service = DecisionAdvancementService(store=store)
         self._cross_direction_governance = CrossDirectionGovernanceService(store)
         self._report_execution = ReportExecutionService(store)
+        self._analysis_llm = analysis_llm
         self._dispatch = AsyncFormalResearchDispatchRepository(store._db_path)
         self._dispatch_wake_event = dispatch_wake_event
         self._recovery_locks: dict[str, asyncio.Lock] = {}
@@ -1928,6 +1937,75 @@ class ContentResearchService:
             for item in admitted
         ]
         citation_groups = _citation_groups(claim_cards)
+        conclusion_checkpoints = sorted(
+            (
+                item
+                for item in self._store.list_typed_records(StageCheckpointRecord)
+                if item.workflow_run_id == workflow_run_id
+                and item.stage_name == "marketing_conclusion"
+                and item.status in {"completed", "insufficient", "tied"}
+            ),
+            key=lambda item: (item.created_at, item.id),
+        )
+        conclusion_fingerprint = (
+            conclusion_checkpoints[-1].input_fingerprint
+            if conclusion_checkpoints
+            else None
+        )
+        conclusion_candidates = {
+            item.id: item
+            for item in (
+                self._store.list_marketing_conclusion_candidates(
+                    workflow_run_id, plan_id
+                )
+                if plan_id is not None
+                else []
+            )
+        }
+        conclusion_decisions = [
+            item
+            for item in (
+                self._store.list_marketing_conclusion_decisions(
+                    workflow_run_id, plan_id
+                )
+                if plan_id is not None
+                else []
+            )
+            if item.payload.get("input_fingerprint") == conclusion_fingerprint
+        ]
+        decision_by_track = {item.track: item for item in conclusion_decisions}
+        marketing_conclusions = []
+        for track in ("need", "value", "message"):
+            decision = decision_by_track.get(track)
+            if decision is None:
+                continue
+            candidate = conclusion_candidates.get(str(decision.candidate_id or ""))
+            marketing_conclusions.append(
+                {
+                    "track": track,
+                    "state": decision.state,
+                    "statement": (
+                        str(candidate.payload.get("statement") or "")
+                        if candidate is not None
+                        else None
+                    ),
+                    "supporting_claim_ids": (
+                        list(candidate.payload.get("supporting_claim_ids") or [])
+                        if candidate is not None
+                        else []
+                    ),
+                    "supporting_note_count": int(
+                        decision.payload.get("supporting_note_count") or 0
+                    ),
+                    "independent_author_count": int(
+                        decision.payload.get("independent_author_count") or 0
+                    ),
+                    "body_quote_note_count": int(
+                        decision.payload.get("body_quote_note_count") or 0
+                    ),
+                    "reason_codes": list(decision.payload.get("reason_codes") or []),
+                }
+            )
         report_section_refs = _report_section_refs(
             claim_cards=claim_cards,
             weak_signals=weak_signals,
@@ -2019,6 +2097,7 @@ class ContentResearchService:
             },
             "direction_results": direction_views,
             "claim_cards": claim_cards,
+            "marketing_conclusions": marketing_conclusions,
             "citation_groups": citation_groups,
             "weak_signals": [
                 _weak_signal_display(
@@ -2424,10 +2503,24 @@ class ContentResearchService:
                         "Completed Content Research runs cannot be retried."
                     )
                 if runtime_status == "waiting_user":
-                    child_task_ids = self._requeue_recoverable_tasks(
-                        workflow_run_id,
-                        provider=source_request.provider,
-                        runtime_child_tasks=list(runtime_snapshot.get("child_tasks") or []),
+                    marketing_recovery = any(
+                        checkpoint.workflow_run_id == workflow_run_id
+                        and checkpoint.stage_name == "marketing_conclusion"
+                        and checkpoint.status == "waiting_user"
+                        for checkpoint in self._store.list_typed_records(
+                            StageCheckpointRecord
+                        )
+                    )
+                    child_task_ids = (
+                        []
+                        if marketing_recovery
+                        else self._requeue_recoverable_tasks(
+                            workflow_run_id,
+                            provider=source_request.provider,
+                            runtime_child_tasks=list(
+                                runtime_snapshot.get("child_tasks") or []
+                            ),
+                        )
                     )
                     await self._workflow_runtime.restart_formal_research_step(
                         workflow_run_id=workflow_run_id,
@@ -3077,6 +3170,37 @@ class ContentResearchService:
             ]
         )
 
+        run_policy = self._store.get_run_policy_snapshot_for_workflow(
+            brief.workflow_run_id
+        )
+        if run_policy is not None and isinstance(
+            run_policy.effective_policy.get("marketing_conclusion_policy"), dict
+        ):
+            try:
+                await self._govern_marketing_conclusions(
+                    workflow_run_id=brief.workflow_run_id,
+                    research_plan_id=plans[-1].id,
+                )
+            except (LLMProviderFailure, MarketingConclusionAnalysisError):
+                await self._workflow_runtime.append_event(
+                    workflow_run_id=brief.workflow_run_id,
+                    thread_id=brief.thread_id,
+                    event_type="marketing_conclusion_analysis_unavailable",
+                    payload={
+                        "schema_version": "content_research_workflow_event_payload_v1",
+                        "reason_codes": ["marketing_analysis_unavailable"],
+                        "recovery_action": "repair_model_configuration_and_resume",
+                    },
+                )
+                await self._workflow_runtime.wait_for_user_recovery(
+                    workflow_run_id=brief.workflow_run_id,
+                    reason={
+                        "code": "marketing_analysis_unavailable",
+                        "message": "repair_model_configuration_and_resume",
+                    },
+                )
+                return
+
         if complete is not None:
             artifact_refs = _unique_artifact_refs(
                 [ref for outcome in outcomes for ref in outcome["artifact_refs"]] + governance_refs
@@ -3113,6 +3237,205 @@ class ContentResearchService:
                 },
             )
 
+    async def _govern_marketing_conclusions(
+        self,
+        *,
+        workflow_run_id: str,
+        research_plan_id: str,
+    ) -> StageCheckpointRecord:
+        """Analyze and evaluate only durable admitted product-marketing claims."""
+        policy = self._store.get_run_policy_snapshot_for_workflow(workflow_run_id)
+        if policy is None:
+            raise ContentResearchValidationError(
+                "Marketing conclusion governance requires the frozen run policy"
+            )
+        candidates_by_id = {
+            item.id: item
+            for item in self._store.list_claim_candidates(
+                workflow_run_id, "product_marketing"
+            )
+        }
+        admitted_claims = sorted(
+            (
+                (decision, candidates_by_id[decision.claim_candidate_id])
+                for decision in self._store.list_typed_records(
+                    ClaimAdmissionDecisionRecord
+                )
+                if decision.policy_snapshot_id == policy.id
+                and decision.research_direction_id == "product_marketing"
+                and decision.decision == "admitted"
+                and decision.claim_candidate_id in candidates_by_id
+            ),
+            key=lambda item: item[1].id,
+        )
+        fingerprint = canonical_fingerprint(
+            {
+                "workflow_run_id": workflow_run_id,
+                "research_plan_id": research_plan_id,
+                "policy": policy.effective_policy.get("marketing_conclusion_policy"),
+                "admitted_claims": [
+                    {
+                        "claim_id": claim.id,
+                        "quote_refs": claim.payload.get("quote_refs"),
+                    }
+                    for _decision, claim in admitted_claims
+                ],
+            }
+        )
+        checkpoint_id = f"scp_{canonical_fingerprint({'run': workflow_run_id, 'stage': 'marketing_conclusion', 'input': fingerprint})[:24]}"
+        existing = self._store.get_typed_record(StageCheckpointRecord, checkpoint_id)
+        if existing is not None and existing.status in {
+            "completed",
+            "insufficient",
+            "tied",
+        }:
+            return existing
+
+        started_at = utcnow()
+        retry_count = (existing.retry_count + 1) if existing is not None else 0
+        try:
+            if admitted_claims:
+                if self._analysis_llm is None:
+                    raise LLMProviderFailure(
+                        "llm_configuration_scope_missing",
+                        "模型配置作用域不可用",
+                        True,
+                        None,
+                        provider="unresolved",
+                        model="unresolved",
+                        configuration_source="unresolved",
+                    )
+                brief = self._store.get_brief_by_workflow(workflow_run_id)
+                if brief is None:
+                    raise ContentResearchValidationError(
+                        "Marketing conclusion analysis requires the run brief"
+                    )
+                generated = await MarketingConclusionAnalysisService(
+                    llm=self._analysis_llm,
+                    llm_scope={
+                        "llm_scope": {
+                            "workspace_id": str(
+                                brief.payload.get("workspace_id") or ""
+                            ),
+                            "user_id": str(brief.payload.get("user_id") or ""),
+                        }
+                    },
+                ).generate(
+                    workflow_run_id=workflow_run_id,
+                    research_plan_id=research_plan_id,
+                    policy=policy.effective_policy,
+                    admitted_claims=admitted_claims,
+                )
+            else:
+                generated = ()
+            packets = {
+                claim.evidence_packet_id: self._store.get_typed_record(
+                    DirectionalEvidencePacketRecord, claim.evidence_packet_id
+                )
+                for _decision, claim in admitted_claims
+            }
+            evaluation = evaluate_marketing_conclusions(
+                candidates=generated,
+                admitted_claims=admitted_claims,
+                packets={key: value for key, value in packets.items() if value is not None},
+                policy=policy.effective_policy,
+            )
+        except (LLMProviderFailure, MarketingConclusionAnalysisError) as exc:
+            failure_payload = {
+                "schema_version": "content_research_marketing_conclusion_checkpoint_v1",
+                "reason_codes": ["marketing_analysis_unavailable"],
+                "recovery_action": "repair_model_configuration_and_resume",
+            }
+            failure_checkpoint = StageCheckpointRecord(
+                checkpoint_id,
+                "content_research_stage_checkpoint_v1",
+                failure_payload,
+                workflow_run_id=workflow_run_id,
+                subagent_task_id=f"marketing-conclusion:{research_plan_id}",
+                stage_name="marketing_conclusion",
+                input_fingerprint=fingerprint,
+                status="waiting_user",
+                retry_count=retry_count,
+                started_at=started_at,
+                finished_at=utcnow(),
+            )
+            self._store.save_stage_checkpoint(failure_checkpoint)
+            for track in ("need", "value", "message"):
+                decision_id = f"mcd_{canonical_fingerprint({'input': fingerprint, 'track': track, 'state': 'analysis_unavailable'})[:24]}"
+                self._store.save_marketing_conclusion_decision(
+                    MarketingConclusionDecisionRecord(
+                        decision_id,
+                        "marketing_conclusion_decision_v1",
+                        {
+                            "input_fingerprint": fingerprint,
+                            "reason_codes": ["marketing_analysis_unavailable"],
+                            "recovery_action": "repair_model_configuration_and_resume",
+                        },
+                        workflow_run_id=workflow_run_id,
+                        research_plan_id=research_plan_id,
+                        candidate_id=None,
+                        track=track,
+                        state="analysis_unavailable",
+                    )
+                )
+            if isinstance(exc, MarketingConclusionAnalysisError):
+                raise LLMProviderFailure(
+                    "llm_protocol_incompatible",
+                    "模型响应格式不可用",
+                    True,
+                    None,
+                ) from exc
+            raise
+
+        for candidate in generated:
+            self._store.save_marketing_conclusion_candidate(candidate)
+        for track, track_evaluation in evaluation.tracks.items():
+            decision_id = f"mcd_{canonical_fingerprint({'input': fingerprint, 'track': track, 'state': track_evaluation.state})[:24]}"
+            self._store.save_marketing_conclusion_decision(
+                MarketingConclusionDecisionRecord(
+                    decision_id,
+                    "marketing_conclusion_decision_v1",
+                    {
+                        "input_fingerprint": fingerprint,
+                        "reason_codes": list(track_evaluation.reason_codes),
+                        "supporting_note_count": track_evaluation.supporting_note_count,
+                        "independent_author_count": track_evaluation.independent_author_count,
+                        "body_quote_note_count": track_evaluation.body_quote_note_count,
+                    },
+                    workflow_run_id=workflow_run_id,
+                    research_plan_id=research_plan_id,
+                    candidate_id=track_evaluation.candidate_id,
+                    track=track,
+                    state=track_evaluation.state,
+                )
+            )
+        track_states = {item.state for item in evaluation.tracks.values()}
+        status = (
+            "completed"
+            if "selected" in track_states
+            else "tied"
+            if "no_single_primary_conclusion" in track_states
+            else "insufficient"
+        )
+        checkpoint = StageCheckpointRecord(
+            checkpoint_id,
+            "content_research_stage_checkpoint_v1",
+            {
+                "schema_version": "content_research_marketing_conclusion_checkpoint_v1",
+                **evaluation.safe_trace_payload(),
+            },
+            workflow_run_id=workflow_run_id,
+            subagent_task_id=f"marketing-conclusion:{research_plan_id}",
+            stage_name="marketing_conclusion",
+            input_fingerprint=fingerprint,
+            status=status,
+            retry_count=retry_count,
+            started_at=started_at,
+            finished_at=utcnow(),
+        )
+        self._store.save_stage_checkpoint(checkpoint)
+        return checkpoint
+
     async def _publish_report_after_workflow_completion(
         self, *, workflow_run_id: str, thread_id: str
     ) -> dict[str, str] | None:
@@ -3126,6 +3449,55 @@ class ContentResearchService:
                 raise ContentResearchValidationError(
                     f"Creator thread is required to publish formal report: {thread_id}"
                 )
+        brief = self._store.get_brief_by_workflow(workflow_run_id)
+        plans = self._store.list_plans_for_brief(brief.id) if brief is not None else []
+        if not plans:
+            raise ContentResearchValidationError(
+                "Marketing conclusion governance requires a research plan"
+            )
+        policy = self._store.get_run_policy_snapshot_for_workflow(workflow_run_id)
+        if policy is not None and isinstance(
+            policy.effective_policy.get("marketing_conclusion_policy"), dict
+        ):
+            await self._govern_marketing_conclusions(
+                workflow_run_id=workflow_run_id,
+                research_plan_id=plans[-1].id,
+            )
+        direction_records = self._store.list_directions_for_plan(plans[-1].id)
+        governed = self._build_governed_snapshot(
+            workflow_run_id=workflow_run_id,
+            plan_id=plans[-1].id,
+            direction_records=direction_records,
+        )
+        governed_input_fingerprint = _governed_input_fingerprint(governed)
+        matching_snapshot_ids = {
+            item.id
+            for item in self._store.list_result_snapshots_for_workflow(workflow_run_id)
+            if item.metadata.get("governed_input_fingerprint")
+            == governed_input_fingerprint
+        }
+        existing_publication = next(
+            (
+                item
+                for item in reversed(
+                    self._store.list_typed_records(ReportPublicationRecord)
+                )
+                if item.workflow_run_id == workflow_run_id
+                and item.research_plan_id == plans[-1].id
+                and item.governed_snapshot_id in matching_snapshot_ids
+            ),
+            None,
+        )
+        if existing_publication is not None:
+            artifact = await ReportPublicationMaterializer(
+                self._store, self._store._db_path
+            ).materialize(existing_publication.id)
+            return {
+                "type": "content_research_report_publication",
+                "id": existing_publication.id,
+                "artifact_id": artifact.artifact_id,
+                "publication_state": existing_publication.publication_state,
+            }
         snapshot_response = self.create_result_snapshot(
             workflow_run_id, result_type="governed_research_report"
         )
@@ -3821,6 +4193,7 @@ def _governed_input_fingerprint(governed: dict[str, Any]) -> str:
             "research_plan_id": governed["research_plan_id"],
             "direction_results": governed["direction_results"],
             "claim_ids": [item["claim_candidate_id"] for item in governed["claim_cards"]],
+            "marketing_conclusions": governed.get("marketing_conclusions") or [],
             "weak_signal_ids": [item["weak_signal_id"] for item in governed["weak_signals"]],
             "cross_direction_ids": [
                 item["cross_direction_record_id"] for item in governed["cross_direction_records"]
