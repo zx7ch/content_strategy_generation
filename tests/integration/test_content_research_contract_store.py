@@ -101,6 +101,7 @@ def test_final_entity_schema_has_only_role_specific_columns(tmp_path):
             "0013",
             "0014",
             "0015",
+            "0016",
         ]
         for table in (
             "content_research_canonical_sources",

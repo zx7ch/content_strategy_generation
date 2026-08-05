@@ -405,6 +405,49 @@ CREATE TABLE content_research_llm_configurations (
 """
 
 
+_V16_SUPERSEDED_LITE_REPORT_TABLES = (
+    "content_research_report_publications",
+    "content_research_report_faithfulness_decisions",
+    "content_research_report_drafts",
+)
+_V16_MARKETING_CONCLUSION_SQL = """
+CREATE TABLE content_research_marketing_conclusion_candidates (
+    id TEXT PRIMARY KEY,
+    schema_version TEXT NOT NULL,
+    workflow_run_id TEXT NOT NULL,
+    research_plan_id TEXT NOT NULL,
+    track TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
+CREATE TABLE content_research_marketing_conclusion_decisions (
+    id TEXT PRIMARY KEY,
+    schema_version TEXT NOT NULL,
+    workflow_run_id TEXT NOT NULL,
+    research_plan_id TEXT NOT NULL,
+    candidate_id TEXT,
+    track TEXT NOT NULL,
+    state TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX idx_cr_marketing_conclusion_candidate_run_plan_track
+    ON content_research_marketing_conclusion_candidates(workflow_run_id, research_plan_id, track);
+CREATE INDEX idx_cr_marketing_conclusion_decision_run_plan_track
+    ON content_research_marketing_conclusion_decisions(workflow_run_id, research_plan_id, track);
+"""
+
+
+def _apply_0016(conn: sqlite3.Connection) -> None:
+    """Discard superseded Lite report artifacts before conclusion records exist."""
+    _apply_0014(conn)
+    for table in _V16_SUPERSEDED_LITE_REPORT_TABLES:
+        conn.execute(f"DELETE FROM {table}")
+    conn.executescript(_V16_MARKETING_CONCLUSION_SQL)
+
+
 def _apply_0015(conn: sqlite3.Connection) -> None:
     conn.execute(_V15_LLM_CONFIGURATION_SQL)
 
@@ -455,6 +498,7 @@ def _expected_checksums(migration_0002_sql: str, legacy_checksum: str) -> dict[s
         "0013": _checksum((_V13_LEGACY_TABLES, _V13_LEGACY_SNAPSHOT_COLUMN)),
         "0014": _checksum(_V14_REPORT_TABLES),
         "0015": hashlib.sha256(_V15_LLM_CONFIGURATION_SQL.encode("utf-8")).hexdigest(),
+        "0016": _checksum((_V16_SUPERSEDED_LITE_REPORT_TABLES, _V16_MARKETING_CONCLUSION_SQL)),
     }
 
 
@@ -639,6 +683,13 @@ def apply_content_research_migrations(
                 name="workspace_scoped_llm_configurations",
                 checksum=expected_checksums["0015"],
                 apply=lambda: _apply_0015(conn),
+            )
+            _apply_migration(
+                conn,
+                version="0016",
+                name="govern_lite_marketing_conclusions",
+                checksum=expected_checksums["0016"],
+                apply=lambda: _apply_0016(conn),
             )
         except Exception:
             conn.rollback()

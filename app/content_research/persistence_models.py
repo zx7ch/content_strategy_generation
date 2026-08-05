@@ -178,6 +178,46 @@ class AggregateClaimRecord(TypedPersistenceRecord):
             raise ValueError("invalid aggregate claim type")
 
 
+_MARKETING_CONCLUSION_TRACKS = {"need", "value", "message"}
+_MARKETING_CONCLUSION_DECISION_STATES = {
+    "selected",
+    "qualified",
+    "insufficient_evidence",
+    "no_single_primary_conclusion",
+    "analysis_unavailable",
+}
+
+
+@dataclass(frozen=True)
+class MarketingConclusionCandidateRecord(TypedPersistenceRecord):
+    workflow_run_id: str = ""
+    research_plan_id: str = ""
+    track: str = ""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        _required(self.workflow_run_id, self.research_plan_id, self.track)
+        if self.track not in _MARKETING_CONCLUSION_TRACKS:
+            raise ValueError("invalid marketing conclusion track")
+
+
+@dataclass(frozen=True)
+class MarketingConclusionDecisionRecord(TypedPersistenceRecord):
+    workflow_run_id: str = ""
+    research_plan_id: str = ""
+    candidate_id: str | None = None
+    track: str = ""
+    state: str = ""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        _required(self.workflow_run_id, self.research_plan_id, self.track, self.state)
+        if self.track not in _MARKETING_CONCLUSION_TRACKS:
+            raise ValueError("invalid marketing conclusion track")
+        if self.state not in _MARKETING_CONCLUSION_DECISION_STATES:
+            raise ValueError("invalid marketing conclusion decision state")
+
+
 @dataclass(frozen=True)
 class StageCheckpointRecord(TypedPersistenceRecord):
     workflow_run_id: str = ""

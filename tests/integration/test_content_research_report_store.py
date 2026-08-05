@@ -1,9 +1,12 @@
+import sqlite3
 from dataclasses import replace
 
 import pytest
 
 from app.content_research.models import ResearchResultSnapshotRecord
 from app.content_research.persistence_models import (
+    MarketingConclusionCandidateRecord,
+    MarketingConclusionDecisionRecord,
     ReportDraftRecord,
     ReportPublicationRecord,
 )
@@ -15,6 +18,56 @@ from app.content_research.reporting.contracts import (
     ReportSection,
 )
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
+
+
+def test_marketing_conclusion_records_round_trip_all_terminal_states(tmp_path):
+    store = SQLiteContentResearchStore(str(tmp_path / "marketing-conclusions.db"))
+    candidate = MarketingConclusionCandidateRecord(
+        "mc_1", "marketing_conclusion_candidate", {"statement": "样本表达凉感", "supporting_claim_ids": ["cc_1"]},
+        workflow_run_id="run_1", research_plan_id="rp_1", track="need",
+    )
+    assert store.save_marketing_conclusion_candidate(candidate) == candidate
+    assert store.list_marketing_conclusion_candidates("run_1", "rp_1") == [candidate]
+
+    decisions = [
+        MarketingConclusionDecisionRecord(
+            f"md_{state}", "marketing_conclusion_decision", {"reason_codes": []},
+            workflow_run_id="run_1", research_plan_id="rp_1", candidate_id="mc_1" if state in {"selected", "qualified"} else None,
+            track="need", state=state,
+        )
+        for state in (
+            "selected", "qualified", "insufficient_evidence",
+            "no_single_primary_conclusion", "analysis_unavailable",
+        )
+    ]
+    for decision in decisions:
+        assert store.save_marketing_conclusion_decision(decision) == decision
+    assert store.list_marketing_conclusion_decisions("run_1", "rp_1") == decisions
+
+
+def test_marketing_conclusion_migration_removes_superseded_lite_report_rows(tmp_path):
+    db_path = tmp_path / "marketing-conclusion-migration.db"
+    SQLiteContentResearchStore(str(db_path))
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("DROP TABLE content_research_marketing_conclusion_decisions")
+        conn.execute("DROP TABLE content_research_marketing_conclusion_candidates")
+        conn.execute("DELETE FROM content_research_schema_migrations WHERE version = '0016'")
+        conn.execute(
+            "INSERT INTO content_research_report_drafts "
+            "(id, schema_version, workflow_run_id, research_plan_id, governed_snapshot_id, "
+            "governed_snapshot_version, input_fingerprint, policy_version, algorithm_version, "
+            "payload_json, metadata_json, created_at) "
+            "VALUES ('old_draft', 'old', 'run_1', 'rp_1', 'snapshot', '1', 'fingerprint', "
+            "'policy', 'algorithm', '{}', '{}', '2026-08-05T00:00:00+00:00')"
+        )
+
+    SQLiteContentResearchStore(str(db_path))
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM content_research_report_drafts").fetchone() == (0,)
+        assert conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'content_research_marketing_conclusion_candidates'"
+        ).fetchone() == (1,)
 
 
 def _snapshot() -> ResearchResultSnapshotRecord:

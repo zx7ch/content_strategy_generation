@@ -33,6 +33,8 @@ from app.content_research.persistence_models import (
     DirectionalEvidencePacketRecord,
     DirectionResultDecisionRecord,
     DirectionSourceProjectionRecord,
+    MarketingConclusionCandidateRecord,
+    MarketingConclusionDecisionRecord,
     ReportDraftRecord,
     ReportFaithfulnessDecisionRecord,
     ReportPublicationRecord,
@@ -114,6 +116,8 @@ _TYPED_RECORD_TABLES: dict[type[TypedPersistenceRecord], tuple[str, tuple[str, .
     WeakSignalRecord: ("content_research_weak_signals", ("admission_decision_id",)),
     CrossDirectionRecord: ("content_research_cross_direction_records", ("research_plan_id", "record_type")),
     AggregateClaimRecord: ("content_research_aggregate_claims", ("research_plan_id", "aggregate_type")),
+    MarketingConclusionCandidateRecord: ("content_research_marketing_conclusion_candidates", ("workflow_run_id", "research_plan_id", "track")),
+    MarketingConclusionDecisionRecord: ("content_research_marketing_conclusion_decisions", ("workflow_run_id", "research_plan_id", "candidate_id", "track", "state")),
     StageCheckpointRecord: ("content_research_stage_checkpoints", ("workflow_run_id", "subagent_task_id", "stage_name", "input_fingerprint", "status", "retry_count", "started_at", "finished_at")),
     BudgetLedgerEntryRecord: ("content_research_budget_ledger_entries", ("research_plan_id", "research_direction_id", "idempotency_key", "reservation_status", "reserved_amount", "consumed_amount", "stage_checkpoint_id")),
     ReportDraftRecord: ("content_research_report_drafts", ("workflow_run_id", "research_plan_id", "governed_snapshot_id", "governed_snapshot_version", "input_fingerprint", "policy_version", "algorithm_version", "previous_version_id")),
@@ -957,6 +961,42 @@ class SQLiteContentResearchStore:
 
     def save_aggregate_claim(self, record: AggregateClaimRecord) -> AggregateClaimRecord:
         return self._save_typed_record("content_research_aggregate_claims", record, {"research_plan_id": record.research_plan_id, "aggregate_type": record.aggregate_type})  # type: ignore[return-value]
+
+    def save_marketing_conclusion_candidate(self, record: MarketingConclusionCandidateRecord) -> MarketingConclusionCandidateRecord:
+        return self._save_typed_record(
+            "content_research_marketing_conclusion_candidates",
+            record,
+            {"workflow_run_id": record.workflow_run_id, "research_plan_id": record.research_plan_id, "track": record.track},
+        )  # type: ignore[return-value]
+
+    def list_marketing_conclusion_candidates(self, workflow_run_id: str, research_plan_id: str) -> list[MarketingConclusionCandidateRecord]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM content_research_marketing_conclusion_candidates WHERE workflow_run_id = ? AND research_plan_id = ? ORDER BY created_at ASC, id ASC",
+                (workflow_run_id, research_plan_id),
+            ).fetchall()
+        return [
+            self._row_to_typed_record(row, MarketingConclusionCandidateRecord, ("workflow_run_id", "research_plan_id", "track"))
+            for row in rows
+        ]  # type: ignore[return-value]
+
+    def save_marketing_conclusion_decision(self, record: MarketingConclusionDecisionRecord) -> MarketingConclusionDecisionRecord:
+        return self._save_typed_record(
+            "content_research_marketing_conclusion_decisions",
+            record,
+            {"workflow_run_id": record.workflow_run_id, "research_plan_id": record.research_plan_id, "candidate_id": record.candidate_id, "track": record.track, "state": record.state},
+        )  # type: ignore[return-value]
+
+    def list_marketing_conclusion_decisions(self, workflow_run_id: str, research_plan_id: str) -> list[MarketingConclusionDecisionRecord]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM content_research_marketing_conclusion_decisions WHERE workflow_run_id = ? AND research_plan_id = ? ORDER BY created_at ASC, id ASC",
+                (workflow_run_id, research_plan_id),
+            ).fetchall()
+        return [
+            self._row_to_typed_record(row, MarketingConclusionDecisionRecord, ("workflow_run_id", "research_plan_id", "candidate_id", "track", "state"))
+            for row in rows
+        ]  # type: ignore[return-value]
 
     def save_stage_checkpoint(self, record: StageCheckpointRecord) -> StageCheckpointRecord:
         values = {
