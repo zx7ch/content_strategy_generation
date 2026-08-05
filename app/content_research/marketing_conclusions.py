@@ -6,8 +6,12 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 
+from app.content_research.admission.candidates import validate_candidate_packet
+from app.content_research.admission.quote_fields import quote_fields_for_claim
 from app.content_research.contracts import admission_author_identity
 from app.content_research.persistence_models import (
+    ClaimAdmissionDecisionRecord,
+    ClaimCandidateRecord,
     DirectionalEvidencePacketRecord,
     MarketingConclusionCandidateRecord,
 )
@@ -25,17 +29,6 @@ class MarketingConclusionProposal:
     track: str
     statement: str
     supporting_claim_ids: tuple[str, ...]
-
-
-@dataclass(frozen=True)
-class AdmittedMarketingClaim:
-    """The admitted, direction-scoped claim reference available to conclusion analysis."""
-
-    claim_id: str
-    research_direction_id: str
-    evidence_packet_id: str
-    admission_state: str = "admitted"
-    quote_field_path: str = "content_text"
 
 
 @dataclass(frozen=True)
@@ -96,10 +89,22 @@ class MarketingConclusionEvaluation:
 
 def _policy_value(policy: Mapping[str, object]) -> Mapping[str, object]:
     nested = policy.get("marketing_conclusion_policy")
-    return nested if isinstance(nested, Mapping) else policy
+    if not isinstance(nested, Mapping):
+        raise ValueError("marketing_conclusion_policy is required")
+    frozen_contract = {
+        "primary_marketing_goal": "content_seeding",
+        "tracks": ["need", "value", "message"],
+        "minimum_notes_per_conclusion": 3,
+        "minimum_independent_authors_per_conclusion": 2,
+        "require_core_and_first_intent_support": True,
+        "maximum_primary_conclusions_per_track": 1,
+    }
+    if dict(nested) != frozen_contract:
+        raise ValueError("marketing conclusion frozen contract is invalid")
+    return nested
 
 
-def _index_by_id(records: Iterable[object], attribute: str) -> dict[str, object]:
+def _index_by_id(records: Iterable[DirectionalEvidencePacketRecord], attribute: str) -> dict[str, DirectionalEvidencePacketRecord]:
     if isinstance(records, Mapping):
         return {str(key): value for key, value in records.items()}
     return {
@@ -123,11 +128,7 @@ def _proposal_reason(proposal: MarketingConclusionProposal, tracks: set[str]) ->
     return None
 
 
-def _proposal_from(
-    candidate: MarketingConclusionProposal | MarketingConclusionCandidateRecord,
-) -> MarketingConclusionProposal:
-    if isinstance(candidate, MarketingConclusionProposal):
-        return candidate
+def _proposal_from(candidate: MarketingConclusionCandidateRecord) -> MarketingConclusionProposal:
     support = candidate.payload.get("supporting_claim_ids")
     support_ids = support if isinstance(support, list | tuple) else ()
     return MarketingConclusionProposal(
@@ -138,11 +139,21 @@ def _proposal_from(
     )
 
 
+def _admitted_by_claim_id(
+    admitted_claims: Iterable[tuple[ClaimAdmissionDecisionRecord, ClaimCandidateRecord]],
+) -> dict[str, tuple[ClaimAdmissionDecisionRecord, ClaimCandidateRecord]]:
+    return {
+        claim.id: (decision, claim)
+        for decision, claim in admitted_claims
+    }
+
+
 def _evaluate_proposal(
     proposal: MarketingConclusionProposal,
     *,
-    admitted_by_id: Mapping[str, object],
-    packets_by_id: Mapping[str, object],
+    workflow_run_id: str,
+    admitted_by_id: Mapping[str, tuple[ClaimAdmissionDecisionRecord, ClaimCandidateRecord]],
+    packets_by_id: Mapping[str, DirectionalEvidencePacketRecord],
     tracks: set[str],
     minimum_notes: int,
     minimum_authors: int,
@@ -155,16 +166,42 @@ def _evaluate_proposal(
     author_ids: set[str] = set()
     body_quote_note_ids: set[str] = set()
     for claim_id in sorted(set(proposal.supporting_claim_ids)):
-        claim = admitted_by_id.get(claim_id)
-        if claim is None or getattr(claim, "admission_state", None) != "admitted":
+        admitted = admitted_by_id.get(claim_id)
+        if admitted is None:
             return MarketingConclusionOutcome(proposal.id, proposal.track, proposal.statement, 0, 0, 0, ("conclusion_claim_not_admitted",))
-        if getattr(claim, "research_direction_id", None) != "product_marketing":
+        decision, claim = admitted
+        if (
+            decision.decision != "admitted"
+            or decision.claim_candidate_id != claim.id
+            or not isinstance(decision.payload.get("policy_snapshot_hash"), str)
+            or not decision.payload["policy_snapshot_hash"]
+            or decision.payload.get("reason_codes") not in ([], ())
+        ):
+            return MarketingConclusionOutcome(proposal.id, proposal.track, proposal.statement, 0, 0, 0, ("conclusion_claim_not_admitted",))
+        if (
+            decision.research_direction_id != "product_marketing"
+            or claim.research_direction_id != "product_marketing"
+        ):
             return MarketingConclusionOutcome(proposal.id, proposal.track, proposal.statement, 0, 0, 0, ("conclusion_claim_direction_mismatch",))
-        packet = packets_by_id.get(str(getattr(claim, "evidence_packet_id", "")))
-        if not isinstance(packet, DirectionalEvidencePacketRecord):
+        if claim.workflow_run_id != workflow_run_id:
+            return MarketingConclusionOutcome(proposal.id, proposal.track, proposal.statement, 0, 0, 0, ("conclusion_claim_run_mismatch",))
+        packet = packets_by_id.get(claim.evidence_packet_id)
+        if packet is None:
             return MarketingConclusionOutcome(proposal.id, proposal.track, proposal.statement, 0, 0, 0, ("conclusion_packet_not_found",))
-        if packet.research_direction_id != "product_marketing":
+        if packet.workflow_run_id != workflow_run_id:
+            return MarketingConclusionOutcome(proposal.id, proposal.track, proposal.statement, 0, 0, 0, ("conclusion_packet_run_mismatch",))
+        if packet.research_direction_id != claim.research_direction_id:
             return MarketingConclusionOutcome(proposal.id, proposal.track, proposal.statement, 0, 0, 0, ("conclusion_packet_direction_mismatch",))
+        refs = claim.payload.get("quote_refs")
+        if not isinstance(refs, list) or len(refs) != 1 or not isinstance(refs[0], dict):
+            return MarketingConclusionOutcome(proposal.id, proposal.track, proposal.statement, 0, 0, 0, ("conclusion_quote_metadata_invalid",))
+        field_path = str(refs[0].get("field_path") or "")
+        if field_path not in quote_fields_for_claim("product_marketing", claim.claim_type):
+            return MarketingConclusionOutcome(proposal.id, proposal.track, proposal.statement, 0, 0, 0, ("conclusion_quote_field_not_allowed",))
+        try:
+            validate_candidate_packet(claim, packet)
+        except ValueError:
+            return MarketingConclusionOutcome(proposal.id, proposal.track, proposal.statement, 0, 0, 0, ("conclusion_quote_metadata_invalid",))
         note_id = packet.canonical_source_id.strip()
         if not note_id:
             return MarketingConclusionOutcome(proposal.id, proposal.track, proposal.statement, 0, 0, 0, ("conclusion_canonical_note_missing",))
@@ -173,7 +210,7 @@ def _evaluate_proposal(
             return MarketingConclusionOutcome(proposal.id, proposal.track, proposal.statement, 0, 0, 0, ("conclusion_author_identity_missing",))
         note_ids.add(note_id)
         author_ids.add(author_id)
-        if getattr(claim, "quote_field_path", "content_text") == "content_text":
+        if field_path == "content_text":
             body_quote_note_ids.add(note_id)
 
     reasons: list[str] = []
@@ -193,19 +230,21 @@ def _evaluate_proposal(
 
 
 def _deduplicated_outcomes(
-    candidates: Iterable[MarketingConclusionProposal | MarketingConclusionCandidateRecord],
+    candidates: Iterable[MarketingConclusionCandidateRecord],
     **kwargs: object,
 ) -> tuple[MarketingConclusionOutcome, ...]:
     outcomes: list[MarketingConclusionOutcome] = []
     seen: set[tuple[str, str, tuple[str, ...]]] = set()
-    for candidate in candidates:
-        proposal = _proposal_from(candidate)
+    for record in candidates:
+        proposal = _proposal_from(record)
         support = tuple(sorted(set(proposal.supporting_claim_ids)))
         key = (proposal.track, proposal.statement, support)
         if key in seen:
             continue
         seen.add(key)
-        outcomes.append(_evaluate_proposal(proposal, **kwargs))  # type: ignore[arg-type]
+        outcomes.append(
+            _evaluate_proposal(proposal, workflow_run_id=record.workflow_run_id, **kwargs)  # type: ignore[arg-type]
+        )
     return tuple(outcomes)
 
 
@@ -226,8 +265,8 @@ def _terminal_outcome(outcome: MarketingConclusionOutcome | None) -> MarketingCo
 
 def evaluate_marketing_conclusions(
     *,
-    candidates: Iterable[MarketingConclusionProposal | MarketingConclusionCandidateRecord],
-    admitted_claims: Iterable[AdmittedMarketingClaim] | Mapping[str, AdmittedMarketingClaim],
+    candidates: Iterable[MarketingConclusionCandidateRecord],
+    admitted_claims: Iterable[tuple[ClaimAdmissionDecisionRecord, ClaimCandidateRecord]],
     packets: Iterable[DirectionalEvidencePacketRecord] | Mapping[str, DirectionalEvidencePacketRecord],
     policy: Mapping[str, object],
 ) -> MarketingConclusionEvaluation:
@@ -236,14 +275,12 @@ def evaluate_marketing_conclusions(
     tracks_value = conclusion_policy.get("tracks")
     if tuple(tracks_value or ()) != MARKETING_CONCLUSION_TRACKS:
         raise ValueError("marketing conclusion policy tracks are invalid")
-    minimum_notes = int(conclusion_policy.get("minimum_notes_per_conclusion", 0))
-    minimum_authors = int(conclusion_policy.get("minimum_independent_authors_per_conclusion", 0))
-    if minimum_notes < 1 or minimum_authors < 1:
-        raise ValueError("marketing conclusion policy thresholds are invalid")
+    minimum_notes = 3
+    minimum_authors = 2
 
     outcomes = _deduplicated_outcomes(
         candidates,
-        admitted_by_id=_index_by_id(admitted_claims, "claim_id"),
+        admitted_by_id=_admitted_by_claim_id(admitted_claims),
         packets_by_id=_index_by_id(packets, "id"),
         tracks=set(MARKETING_CONCLUSION_TRACKS),
         minimum_notes=minimum_notes,
@@ -272,4 +309,7 @@ def evaluate_marketing_conclusions(
             winner.body_quote_note_count,
             (),
         )
-    return MarketingConclusionEvaluation(outcomes, MappingProxyType(track_evaluations))
+    return MarketingConclusionEvaluation(
+        tuple(outcome for outcome in outcomes if outcome.is_qualified),
+        MappingProxyType(track_evaluations),
+    )
