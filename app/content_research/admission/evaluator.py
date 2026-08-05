@@ -182,6 +182,7 @@ class ClaimAdmissionEvaluator:
                     "ugc_comment_sample_insufficient",
                     "comment_insight_evidence_boundary_violation",
                     "query_subject_not_supported",
+                    "first_intent_not_supported",
                 }
                 for reason in reasons
             ) else "downgraded"

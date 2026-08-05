@@ -174,7 +174,7 @@ test("structured subject confirmation stays on the same workflow run", async () 
   assert.equal(response.result.workflow_run_id, "run_1");
 });
 
-test("confirmContentResearchBrief posts selected directions", async () => {
+test("confirmContentResearchBrief posts selected directions and the chosen marketing goal", async () => {
   let requestUrl = "";
   let requestBody = "";
   globalThis.fetch = (async (input, init) => {
@@ -200,11 +200,13 @@ test("confirmContentResearchBrief posts selected directions", async () => {
     custom_competitors: ["凯乐石"],
     selected_directions: ["product_marketing"],
     custom_research_question: "轻量速干",
+    primary_marketing_goal: "content_seeding",
   });
 
   assert.ok(requestUrl.endsWith("/content-research/workflows/run_1/actions"));
   assert.match(requestBody, /"action":"confirm_brief"/);
   assert.match(requestBody, /"selected_directions":\["product_marketing"\]/);
+  assert.match(requestBody, /"primary_marketing_goal":"content_seeding"/);
   assert.equal(result.workflow_run_id, "run_1");
 });
 

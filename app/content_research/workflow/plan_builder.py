@@ -16,6 +16,7 @@ class BriefConfirmation:
     custom_competitors: list[str]
     selected_directions: list[str]
     custom_research_question: str
+    primary_marketing_goal: str
 
 
 class ResearchPlanBuilder:
@@ -51,6 +52,7 @@ class ResearchPlanBuilder:
             "custom_competitors": confirmation.custom_competitors,
             "selected_directions": confirmation.selected_directions,
             "custom_research_question": confirmation.custom_research_question,
+            "primary_marketing_goal": confirmation.primary_marketing_goal,
             "objective": _objective(confirmation),
             "strategy_summary": "P0 plan compiles selected directions into queued subagent task specs.",
             "directions_payload": direction_payloads,

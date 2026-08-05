@@ -94,6 +94,7 @@ class ContentResearchBriefConfirmRequest(BaseModel):
         description="Non-empty requested subset of the Lite direction catalog.",
     )
     custom_research_question: str = ""
+    primary_marketing_goal: str = Field(min_length=1)
 
 
 class ContentResearchDirectionResponse(BaseModel):

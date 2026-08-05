@@ -68,13 +68,13 @@ class FakeLLM:
                         "subject_type": "category",
                         "core_entities": [
                             {
-                                "canonical_name": "徒步短裤",
-                                "raw_mentions": ["徒步短裤"],
+                                "canonical_name": "短裤",
+                                "raw_mentions": ["短裤"],
                             }
                         ],
                         "research_intents": ["产品营销"],
                         "context_modifiers": [],
-                        "synonym_groups": {"徒步短裤": ["户外短裤"]},
+                        "synonym_groups": {"短裤": ["户外短裤"]},
                         "ambiguities": [],
                         "resolution_state": "resolved",
                     },
@@ -148,6 +148,7 @@ async def test_confirm_brief_creates_plan_directions_tasks_and_workflow_summary(
             "custom_competitors": ["凯乐石"],
             "selected_directions": ["product_marketing", "competitor_discovery"],
             "custom_research_question": "关注夏季轻量户外",
+            "primary_marketing_goal": "content_seeding",
         },
     )
 
@@ -161,6 +162,7 @@ async def test_confirm_brief_creates_plan_directions_tasks_and_workflow_summary(
     )
     assert payload["brief"]["payload"]["selected_competitors"] == ["迪卡侬"]
     assert payload["brief"]["payload"]["custom_competitors"] == ["凯乐石"]
+    assert payload["brief"]["payload"]["primary_marketing_goal"] == "content_seeding"
     assert payload["brief"]["payload"]["direction_catalog"] == [
         "product_marketing",
         "competitor_discovery",
@@ -191,6 +193,7 @@ async def test_confirm_brief_creates_plan_directions_tasks_and_workflow_summary(
     assert (
         payload["plan"]["payload"]["subject_structure_hash"] == presearch["subject_structure_hash"]
     )
+    assert payload["plan"]["payload"]["primary_marketing_goal"] == "content_seeding"
 
     fetched = await client.get(f"/content-research/workflows/{presearch['workflow_run_id']}")
     assert fetched.status_code == 200
@@ -208,6 +211,14 @@ async def test_confirm_brief_creates_plan_directions_tasks_and_workflow_summary(
         "competitor_discovery",
     ]
     assert snapshot_payload["effective_policy"]["report_compose_mode"] == "template_only"
+    assert snapshot_payload["effective_policy"]["marketing_conclusion_policy"] == {
+        "primary_marketing_goal": "content_seeding",
+        "tracks": ["need", "value", "message"],
+        "minimum_notes_per_conclusion": 3,
+        "minimum_independent_authors_per_conclusion": 2,
+        "require_core_and_first_intent_support": True,
+        "maximum_primary_conclusions_per_track": 1,
+    }
     assert (
         snapshot_payload["effective_policy"]["subject_structure_hash"]
         == presearch["subject_structure_hash"]
@@ -307,6 +318,7 @@ async def test_confirm_freezes_catalog_and_requested_subset(client, requested):
             "confirmed_subject": "徒步短裤",
             "subject_type": "category",
             "selected_directions": requested,
+            "primary_marketing_goal": "content_seeding",
         },
     )
 
@@ -320,6 +332,65 @@ async def test_confirm_freezes_catalog_and_requested_subset(client, requested):
 
 
 @pytest.mark.asyncio
+async def test_confirm_brief_freezes_one_primary_marketing_goal(client):
+    presearch = await _create_presearch(client)
+
+    response = await client.post(
+        f"/content-research/briefs/{presearch['brief_id']}/confirm",
+        json={
+            "confirmed_subject": "徒步短裤",
+            "subject_structure_hash": presearch["subject_structure_hash"],
+            "subject_type": "category",
+            "selected_competitors": [],
+            "custom_competitors": [],
+            "selected_directions": ["product_marketing"],
+            "custom_research_question": "",
+            "primary_marketing_goal": "content_seeding",
+        },
+    )
+
+    assert response.status_code == 200
+    policy_response = await client.get(
+        f"/content-research/workflows/{presearch['workflow_run_id']}/policy-snapshot"
+    )
+    assert policy_response.status_code == 200
+    policy = policy_response.json()["effective_policy"]
+    assert policy["marketing_conclusion_policy"] == {
+        "primary_marketing_goal": "content_seeding",
+        "tracks": ["need", "value", "message"],
+        "minimum_notes_per_conclusion": 3,
+        "minimum_independent_authors_per_conclusion": 2,
+        "require_core_and_first_intent_support": True,
+        "maximum_primary_conclusions_per_track": 1,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "primary_marketing_goal",
+    [None, "unknown_goal", ["content_seeding"]],
+)
+async def test_confirm_brief_rejects_missing_unknown_or_list_valued_marketing_goal(
+    client, primary_marketing_goal
+):
+    presearch = await _create_presearch(client)
+    confirmation = {
+        "confirmed_subject": "徒步短裤",
+        "subject_type": "category",
+        "selected_directions": ["product_marketing"],
+    }
+    if primary_marketing_goal is not None:
+        confirmation["primary_marketing_goal"] = primary_marketing_goal
+
+    response = await client.post(
+        f"/content-research/briefs/{presearch['brief_id']}/confirm",
+        json=confirmation,
+    )
+
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
 async def test_confirm_brief_rejects_empty_requested_direction_selection(client):
     presearch = await _create_presearch(client)
 
@@ -329,6 +400,7 @@ async def test_confirm_brief_rejects_empty_requested_direction_selection(client)
             "confirmed_subject": "徒步短裤",
             "subject_type": "category",
             "selected_directions": [],
+            "primary_marketing_goal": "content_seeding",
         },
     )
 
@@ -345,6 +417,7 @@ async def test_confirm_brief_rejects_direction_outside_lite_catalog(client):
             "confirmed_subject": "徒步短裤",
             "subject_type": "category",
             "selected_directions": ["comment_insight"],
+            "primary_marketing_goal": "content_seeding",
         },
     )
 
@@ -363,6 +436,7 @@ async def test_create_workflow_alias_confirms_brief(client):
             "confirmed_subject": "徒步短裤",
             "subject_type": "category",
             "selected_directions": ["product_marketing"],
+            "primary_marketing_goal": "content_seeding",
         },
     )
 
@@ -390,6 +464,7 @@ async def test_preview_off_rejects_every_confirmation_entry_before_persisting_pl
         "confirmed_subject": "徒步短裤",
         "subject_type": "category",
         "selected_directions": ["product_marketing"],
+        "primary_marketing_goal": "content_seeding",
     }
 
     if confirmation_endpoint == "brief":

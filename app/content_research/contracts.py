@@ -33,6 +33,7 @@ DIRECTION_CATALOG_V1 = (
     "content_performance",
 )
 DIRECTION_CATALOG_VERSION = "direction_catalog_v1"
+PRIMARY_MARKETING_GOAL_CATALOG = ("content_seeding",)
 ADMISSION_REASON_CODES = (
     "missing_blocking_field",
     "warning_field_unavailable",
@@ -40,6 +41,7 @@ ADMISSION_REASON_CODES = (
     "missing_comment_field",
     "capability_unavailable",
     "query_subject_not_supported",
+    "first_intent_not_supported",
 )
 
 AUTHOR_IDENTITY_SCHEMA_VERSION = "provider_author_identity_v1"
@@ -204,7 +206,11 @@ def build_query_relevance_contract(
     core_entity_anchors: list[str] = []
     legacy_category_anchors: list[str] = []
     allowed_synonyms: dict[str, list[str]] = {}
+    first_intent_anchor = ""
     if subject_structure:
+        research_intents = subject_structure.get("research_intents") or ()
+        if research_intents:
+            first_intent_anchor = normalize_relevance_text(str(research_intents[0]))
         for entity in subject_structure.get("core_entities") or ():
             if not isinstance(entity, Mapping):
                 continue
@@ -245,6 +251,7 @@ def build_query_relevance_contract(
         "core_entity_anchors": sorted(set(core_entity_anchors)),
         "category_anchors": sorted(set(legacy_category_anchors)),
         "allowed_synonyms": {key: allowed_synonyms[key] for key in sorted(allowed_synonyms)},
+        "first_intent_anchor": first_intent_anchor,
         "matching_mode": QUERY_RELEVANCE_MATCHING_MODE,
         "query_group_ids": list(frozen_query_group_ids),
         "claim_quote_fields": {
@@ -577,6 +584,7 @@ def build_default_snapshot(
     custom_research_question: str = "",
     subject_structure: Mapping[str, Any] | None = None,
     subject_structure_hash: str | None = None,
+    primary_marketing_goal: str | None = None,
 ) -> tuple[RunPolicySnapshot, list[SamplePolicy], list[DirectionContract]]:
     from app.content_research.admission.governance_keys import GOVERNANCE_POLICY_V1
     from app.content_research.workflow.direction_registry import ResearchDirectionRegistry
@@ -599,6 +607,14 @@ def build_default_snapshot(
             raise ValueError("requested direction ids contains a direction outside the catalog")
     if report_compose_mode not in {"prose", "template_only"}:
         raise ValueError("invalid report_compose_mode")
+    normalized_primary_marketing_goal = (
+        primary_marketing_goal.strip() if primary_marketing_goal is not None else None
+    )
+    if (
+        normalized_primary_marketing_goal is not None
+        and normalized_primary_marketing_goal not in PRIMARY_MARKETING_GOAL_CATALOG
+    ):
+        raise ValueError("primary_marketing_goal must be a Lite marketing goal")
     definitions = [definitions_by_id[direction_id] for direction_id in requested_ids]
     locked_query_plan: dict[str, Any] | None = None
     if query_groups_by_direction is not None:
@@ -685,6 +701,15 @@ def build_default_snapshot(
         policy |= {
             "direction_catalog_version": DIRECTION_CATALOG_VERSION,
             "requested_direction_ids": list(requested_ids),
+        }
+    if normalized_primary_marketing_goal is not None:
+        policy["marketing_conclusion_policy"] = {
+            "primary_marketing_goal": normalized_primary_marketing_goal,
+            "tracks": ["need", "value", "message"],
+            "minimum_notes_per_conclusion": 3,
+            "minimum_independent_authors_per_conclusion": 2,
+            "require_core_and_first_intent_support": True,
+            "maximum_primary_conclusions_per_track": 1,
         }
     policies = [
         SamplePolicy(

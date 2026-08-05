@@ -78,6 +78,19 @@ def query_relevance_reason(
     if str(ref.get("field_path") or "") not in allowed_fields:
         return reason
     quote = normalize_relevance_text(str(ref.get("quote") or ""))
+    if not quote:
+        return reason
+    first_intent_anchor = str(relevance.get("first_intent_anchor") or "")
+    if contract.direction_id == "product_marketing" and first_intent_anchor:
+        if not any(
+            str(anchor) in quote
+            for anchor in relevance.get("core_entity_anchors", ())
+            if anchor
+        ):
+            return reason
+        if first_intent_anchor not in quote:
+            return "first_intent_not_supported"
+        return None
     anchors = [
         *relevance.get("core_entity_anchors", ()),
         *relevance.get("subject_anchors", ()),
@@ -88,6 +101,6 @@ def query_relevance_reason(
             for synonym in synonyms
         ],
     ]
-    if not quote or not any(str(anchor) in quote for anchor in anchors if anchor):
+    if not any(str(anchor) in quote for anchor in anchors if anchor):
         return reason
     return None

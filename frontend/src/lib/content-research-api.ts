@@ -67,6 +67,7 @@ export interface ContentResearchBriefConfirmRequest {
   custom_competitors: string[];
   selected_directions: string[];
   custom_research_question: string;
+  primary_marketing_goal: string;
 }
 
 export interface ContentResearchWorkflowSummary {

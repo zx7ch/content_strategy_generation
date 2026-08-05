@@ -667,6 +667,10 @@ const LITE_DIRECTION_CATALOG = [
   { id: "content_performance", label: "内容表现" },
 ] as const;
 
+const LITE_MARKETING_GOAL_CATALOG = [
+  { id: "content_seeding", label: "内容种草" },
+] as const;
+
 function liteDirectionLabel(value: string) {
   return LITE_DIRECTION_CATALOG.find((item) => item.id === value)?.label ?? value;
 }
@@ -697,6 +701,7 @@ function ContentResearchIntentCard({
   const [selectedDirections, setSelectedDirections] = useState<string[]>([]);
   const [extraCompetitors, setExtraCompetitors] = useState(intent.presearch.custom_competitor_input ?? "");
   const [customQuestion, setCustomQuestion] = useState(intent.presearch.custom_research_question ?? "");
+  const [primaryMarketingGoal, setPrimaryMarketingGoal] = useState("");
   const [isConfirming, setIsConfirming] = useState(false);
   const [coreObjectInput, setCoreObjectInput] = useState(
     structure.core_entities?.[0]?.canonical_name?.trim() ?? "",
@@ -730,6 +735,7 @@ function ContentResearchIntentCard({
         custom_competitors: splitInlineList(extraCompetitors),
         selected_directions: selectedDirections,
         custom_research_question: customQuestion.trim(),
+        primary_marketing_goal: primaryMarketingGoal,
       });
       onConfirmed(summary);
     } catch {
@@ -903,11 +909,25 @@ function ContentResearchIntentCard({
             className="mt-4 h-11 w-full rounded-xl border border-line bg-white px-4 text-sm outline-none focus:border-[#789180]"
             placeholder="补充你的调研问题，例如：更关注小众品牌而不是大牌"
           />
+          <label className="mt-4 grid gap-2 text-sm font-medium text-ink">
+            请选择本轮产品营销目标 *
+            <select
+              aria-label="产品营销目标"
+              value={primaryMarketingGoal}
+              onChange={(event) => setPrimaryMarketingGoal(event.target.value)}
+              className="h-11 rounded-xl border border-line bg-white px-3 text-sm font-normal outline-none focus:border-[#789180]"
+            >
+              <option value="">请选择</option>
+              {LITE_MARKETING_GOAL_CATALOG.map((goal) => (
+                <option key={goal.id} value={goal.id}>{goal.label}</option>
+              ))}
+            </select>
+          </label>
           <div className="mt-4 flex justify-end gap-2">
             <button
               type="button"
               onClick={() => void confirmBrief()}
-              disabled={isConfirming || selectedDirections.length === 0}
+              disabled={isConfirming || selectedDirections.length === 0 || !primaryMarketingGoal}
               className="h-10 rounded-xl bg-ink px-5 text-sm font-medium text-white hover:bg-slate-800 disabled:opacity-40"
             >
               {isConfirming ? "确认中" : "确认并开始调研"}

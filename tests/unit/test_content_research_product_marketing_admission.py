@@ -6,6 +6,7 @@ import pytest
 
 from app.content_research.admission.candidates import ExtractedFact
 from app.content_research.admission.evaluator import ClaimAdmissionEvaluator
+from app.content_research.admission.relevance import query_relevance_reason
 from app.content_research.admission.product_marketing import (
     PRODUCT_MARKETING_CLAIM_INTENTS,
     build_product_marketing_candidate,
@@ -40,6 +41,46 @@ def _frozen_snapshot(*, snapshot_id: str = "rps_relevance"):
         run_as_of_at=frozen_at,
         direction_ids=("product_marketing",),
         confirmed_subject="速干徒步短裤",
+        query_groups_by_direction={
+            "product_marketing": tuple(
+                {
+                    "id": group.id,
+                    "direction_id": group.direction_id,
+                    "normalized_query": group.query,
+                    "priority": group.priority,
+                    "sort": group.sort,
+                    "time_window": dict(group.time_window or {}),
+                    "candidate_cap": group.candidate_limit,
+                }
+                for group in groups
+            )
+        },
+    )
+    return snapshot, policies, contracts, groups
+
+
+def _frozen_first_intent_snapshot():
+    frozen_at = datetime(2026, 7, 30, tzinfo=timezone.utc)
+    groups = compile_query_groups(
+        direction_id="product_marketing",
+        subject="夏季凉感T恤",
+        questions=["卖点"],
+        competitors=[],
+        run_as_of_at=frozen_at,
+    )
+    snapshot, policies, contracts = build_default_snapshot(
+        snapshot_id="rps_first_intent",
+        workflow_run_id="run_1",
+        brief_id="rb_1",
+        plan_id="rp_1",
+        run_as_of_at=frozen_at,
+        direction_ids=("product_marketing",),
+        confirmed_subject="夏季凉感T恤",
+        subject_structure={
+            "core_entities": [{"canonical_name": "T恤"}],
+            "research_intents": ["凉感"],
+        },
+        subject_structure_hash="subject_structure_1",
         query_groups_by_direction={
             "product_marketing": tuple(
                 {
@@ -93,6 +134,86 @@ def _packet_for_fact(
         canonical_source_id="cs_1",
         field_projection_hash="packet-hash",
     )
+
+
+def test_product_marketing_quote_requires_core_and_first_intent():
+    snapshot, _policies, contracts, groups = _frozen_first_intent_snapshot()
+    contract = next(item for item in contracts if item.direction_id == "product_marketing")
+
+    generic_fact = _fact("content_text", "纯棉T恤搭配牛仔裤")
+    generic_packet = _packet_for_fact(
+        fact=generic_fact,
+        snapshot=snapshot,
+        groups=groups,
+        availability={},
+    )
+    generic_candidate = build_product_marketing_candidate(
+        workflow_run_id="run_1",
+        direction_id="product_marketing",
+        claim_type="product_value_expression",
+        fact=generic_fact,
+    )
+    assert query_relevance_reason(
+        candidate=generic_candidate,
+        packet=generic_packet,
+        contract=contract,
+        policy_snapshot=snapshot,
+    ) == "first_intent_not_supported"
+
+    cooling_fact = _fact("content_text", "这件T恤穿上有明显凉感")
+    cooling_packet = _packet_for_fact(
+        fact=cooling_fact,
+        snapshot=snapshot,
+        groups=groups,
+        availability={},
+    )
+    cooling_candidate = build_product_marketing_candidate(
+        workflow_run_id="run_1",
+        direction_id="product_marketing",
+        claim_type="product_value_expression",
+        fact=cooling_fact,
+    )
+    assert query_relevance_reason(
+        candidate=cooling_candidate,
+        packet=cooling_packet,
+        contract=contract,
+        policy_snapshot=snapshot,
+    ) is None
+
+
+def test_evaluator_rejects_product_marketing_quote_without_first_intent():
+    snapshot, policies, contracts, groups = _frozen_first_intent_snapshot()
+    contract = next(item for item in contracts if item.direction_id == "product_marketing")
+    policy = next(item for item in policies if item.direction_id == "product_marketing")
+    fact = _fact("content_text", "纯棉T恤搭配牛仔裤")
+    packet = _packet_for_fact(
+        fact=fact,
+        snapshot=snapshot,
+        groups=groups,
+        availability={field: "present" for field in contract.required_note_fields},
+    )
+    candidate = build_product_marketing_candidate(
+        workflow_run_id="run_1",
+        direction_id="product_marketing",
+        claim_type="product_value_expression",
+        fact=fact,
+    )
+
+    result = ClaimAdmissionEvaluator().evaluate(
+        candidate=candidate,
+        packet=packet,
+        contract=contract,
+        sample_policy=policy,
+        policy_snapshot=snapshot,
+        selected_source_count=3,
+        relevance_qualified_source_count=3,
+        eligible_source_count=3,
+        independent_author_count=2,
+        admission_packet_identities=(("dep_1", "packet-hash"),),
+    ).record
+
+    assert result.decision == "rejected"
+    assert result.payload["reason_codes"] == ["first_intent_not_supported"]
 
 
 @pytest.mark.parametrize("claim_type,intent", PRODUCT_MARKETING_CLAIM_INTENTS.items())

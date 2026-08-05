@@ -46,6 +46,7 @@ from app.content_research.api_schemas import (
 from app.content_research.async_dispatch import AsyncFormalResearchDispatchRepository
 from app.content_research.contracts import (
     DIRECTION_CATALOG_V1,
+    PRIMARY_MARKETING_GOAL_CATALOG,
     QUERY_RELEVANCE_ALGORITHM_VERSION,
     DirectionContract,
     RunPolicySnapshot,
@@ -1035,6 +1036,11 @@ class ContentResearchService:
                     "Selected directions must belong to the Lite direction catalog"
                 )
             directions = self._direction_registry.require_many(selected_direction_ids)
+            primary_marketing_goal = confirmation_request.primary_marketing_goal.strip()
+            if primary_marketing_goal not in PRIMARY_MARKETING_GOAL_CATALOG:
+                raise ContentResearchValidationError(
+                    "primary_marketing_goal must be a Lite marketing goal"
+                )
             confirmation = BriefConfirmation(
                 confirmed_subject=confirmation_request.confirmed_subject.strip(),
                 subject_type=confirmation_request.subject_type.strip() or "unknown",
@@ -1042,6 +1048,7 @@ class ContentResearchService:
                 custom_competitors=_dedupe(confirmation_request.custom_competitors),
                 selected_directions=selected_direction_ids,
                 custom_research_question=confirmation_request.custom_research_question.strip(),
+                primary_marketing_goal=primary_marketing_goal,
             )
         except BaseException:
             if abort_boundary is not None:
@@ -1132,6 +1139,7 @@ class ContentResearchService:
                 "input_payload": {
                     **dict(spec.get("input_payload") or {}),
                     "query_plan_hash": compiled_plans[direction.id].plan_hash,
+                    "primary_marketing_goal": confirmation.primary_marketing_goal,
                 },
             }
             for spec, direction in zip(task_specs, directions, strict=True)
@@ -1156,6 +1164,7 @@ class ContentResearchService:
                 "selected_directions": confirmation.selected_directions,
                 "requested_direction_ids": confirmation.selected_directions,
                 "custom_research_question": confirmation.custom_research_question,
+                "primary_marketing_goal": confirmation.primary_marketing_goal,
             },
             updated_at=utcnow(),
         )
@@ -1195,6 +1204,7 @@ class ContentResearchService:
             custom_research_question=confirmation.custom_research_question,
             subject_structure=dict(brief.payload.get("subject_structure") or {}),
             subject_structure_hash=str(brief.payload.get("subject_structure_hash") or ""),
+            primary_marketing_goal=confirmation.primary_marketing_goal,
             query_groups_by_direction={
                 direction_id: tuple(
                     {
