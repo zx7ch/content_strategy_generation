@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import type { PointerEvent } from "react";
 import {
   appendThreadMessage,
@@ -675,7 +675,7 @@ function liteDirectionLabel(value: string) {
   return LITE_DIRECTION_CATALOG.find((item) => item.id === value)?.label ?? value;
 }
 
-function ContentResearchIntentCard({
+export function ContentResearchIntentCard({
   intent,
   onConfirmed,
   onPresearchUpdated,

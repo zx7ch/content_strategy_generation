@@ -190,6 +190,10 @@ async def test_confirm_brief_creates_plan_directions_tasks_and_workflow_summary(
         == presearch["subject_structure_hash"]
         for item in payload["subagent_tasks"]
     )
+    assert all(
+        item["payload"]["input_payload"]["primary_marketing_goal"] == "content_seeding"
+        for item in payload["subagent_tasks"]
+    )
     assert (
         payload["plan"]["payload"]["subject_structure_hash"] == presearch["subject_structure_hash"]
     )
@@ -294,6 +298,21 @@ async def test_confirm_brief_creates_plan_directions_tasks_and_workflow_summary(
     assert all(item.payload["primary_group_count"] <= 2 for item in checkpoints)
     assert all(item.payload["fallback_group_count"] <= 1 for item in checkpoints)
     assert all("normalized_query" not in str(item.payload) for item in checkpoints)
+
+    repeat_confirmation = await client.post(
+        f"/content-research/briefs/{presearch['brief_id']}/confirm",
+        json={
+            "confirmed_subject": "徒步短裤",
+            "subject_structure_hash": presearch["subject_structure_hash"],
+            "subject_type": "category",
+            "selected_competitors": [],
+            "custom_competitors": [],
+            "selected_directions": ["product_marketing"],
+            "custom_research_question": "",
+            "primary_marketing_goal": "content_seeding",
+        },
+    )
+    assert repeat_confirmation.status_code == 409
 
 
 @pytest.mark.asyncio
