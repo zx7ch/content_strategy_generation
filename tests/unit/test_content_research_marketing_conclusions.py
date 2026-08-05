@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import pytest
 
 from app.content_research.admission.candidates import source_text_hash
@@ -210,6 +212,27 @@ def test_evaluator_requires_durable_admission_claim_packet_lineage():
     )
     assert rejected.catalog == ()
     assert rejected.tracks["value"].reason_codes == ("conclusion_claim_not_admitted",)
+
+
+def test_evaluator_rejects_a_packet_shaped_object_that_is_not_a_durable_packet_record():
+    conclusion = candidate("value", ["c1"])
+    packet = packets_with_sources_and_authors(("c1", "note_1", "author_a"))[0]
+    impostor = SimpleNamespace(
+        id=packet.id,
+        workflow_run_id=packet.workflow_run_id,
+        research_direction_id=packet.research_direction_id,
+        canonical_source_id=packet.canonical_source_id,
+        field_projection_hash=packet.field_projection_hash,
+        payload=packet.payload,
+    )
+
+    evaluation = evaluate_marketing_conclusions(
+        candidates=[conclusion], admitted_claims=admitted_claims("c1"),
+        packets={packet.id: impostor}, policy=marketing_policy(),
+    )
+
+    assert evaluation.catalog == ()
+    assert evaluation.tracks["value"].reason_codes == ("conclusion_packet_not_typed",)
 
 
 def test_evaluator_derives_body_quote_rank_from_validated_quote_metadata():

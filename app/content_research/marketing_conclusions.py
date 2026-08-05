@@ -188,6 +188,8 @@ def _evaluate_proposal(
         packet = packets_by_id.get(claim.evidence_packet_id)
         if packet is None:
             return MarketingConclusionOutcome(proposal.id, proposal.track, proposal.statement, 0, 0, 0, ("conclusion_packet_not_found",))
+        if not isinstance(packet, DirectionalEvidencePacketRecord):
+            return MarketingConclusionOutcome(proposal.id, proposal.track, proposal.statement, 0, 0, 0, ("conclusion_packet_not_typed",))
         if packet.workflow_run_id != workflow_run_id:
             return MarketingConclusionOutcome(proposal.id, proposal.track, proposal.statement, 0, 0, 0, ("conclusion_packet_run_mismatch",))
         if packet.research_direction_id != claim.research_direction_id:
