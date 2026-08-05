@@ -151,6 +151,7 @@ async def test_content_research_trace_api_restores_runtime_observation_and_usage
             "custom_competitors": ["Salomon"],
             "selected_directions": ["product_marketing", "content_performance"],
             "custom_research_question": "关注跑步社群活动",
+            "primary_marketing_goal": "content_seeding",
         },
     )
     assert confirm_response.status_code == 200
@@ -185,6 +186,83 @@ async def test_content_research_trace_api_restores_runtime_observation_and_usage
 
 
 @pytest.mark.asyncio
+async def test_marketing_conclusion_trace_api_exposes_only_safe_checkpoint_contract(
+    client_with_db,
+):
+    client, db_path = client_with_db
+    presearch_response = await client.post(
+        "/content-research/presearch",
+        json={
+            "seed_text": "夏季凉感T恤",
+            "user_note": "验证营销结论 Trace",
+            "thread_id": "thread-marketing-conclusion-trace",
+        },
+    )
+    assert presearch_response.status_code == 201
+    workflow_run_id = presearch_response.json()["workflow_run_id"]
+    SQLiteContentResearchStore(db_path).save_stage_checkpoint(
+        StageCheckpointRecord(
+            id="checkpoint-marketing-conclusion-trace-api",
+            schema_version="content_research_stage_checkpoint_v1",
+            workflow_run_id=workflow_run_id,
+            subagent_task_id="marketing-conclusion:plan-trace-api",
+            stage_name="marketing_conclusion",
+            input_fingerprint="private-input-fingerprint",
+            status="waiting_user",
+            payload={
+                "reason_codes": ["marketing_analysis_unavailable", "secret-reason"],
+                "recovery_action": "repair_model_configuration_and_resume",
+                "replayed_from_persisted_packets": True,
+                "provider_operation_count_delta": 0,
+                "packet_count_delta": 0,
+                "query": "secret query",
+                "prompt": "secret prompt",
+                "quote": "secret quote",
+                "candidate_count": 3,
+                "note_id": "secret-note-id",
+                "author_id": "secret-author-id",
+                "provider_payload": {"response": "secret provider response"},
+                "api_key": "secret-api-key",
+            },
+        )
+    )
+
+    response = await client.get(
+        f"/content-research/workflows/{workflow_run_id}/trace"
+    )
+
+    assert response.status_code == 200
+    checkpoint = next(
+        item
+        for item in response.json()["logical_checkpoints"]
+        if item["stage"] == "marketing_conclusion"
+    )
+    assert checkpoint == {
+        "stage": "marketing_conclusion",
+        "status": "waiting_user",
+        "reason_codes": ["marketing_analysis_unavailable"],
+        "recovery_action": "repair_model_configuration_and_resume",
+        "replayed_from_persisted_packets": True,
+        "provider_operation_count_delta": 0,
+        "packet_count_delta": 0,
+    }
+    for forbidden in (
+        "query",
+        "prompt",
+        "quote",
+        "candidate_count",
+        "note_id",
+        "author_id",
+        "private-input-fingerprint",
+        "provider_payload",
+        "secret provider response",
+        "secret-api-key",
+        "secret-reason",
+    ):
+        assert forbidden not in response.text
+
+
+@pytest.mark.asyncio
 async def test_terminal_trace_timing_is_stable_across_repeated_reads(client_with_db):
     client, db_path = client_with_db
     presearch_response = await client.post(
@@ -207,6 +285,7 @@ async def test_terminal_trace_timing_is_stable_across_repeated_reads(client_with
             "custom_competitors": [],
             "selected_directions": ["product_marketing"],
             "custom_research_question": "",
+            "primary_marketing_goal": "content_seeding",
         },
     )
     assert confirm_response.status_code == 200
@@ -260,6 +339,7 @@ async def test_content_research_trace_api_keeps_running_parent_and_safe_auth_req
             "custom_competitors": [],
             "selected_directions": ["product_marketing"],
             "custom_research_question": "",
+            "primary_marketing_goal": "content_seeding",
         },
     )
     assert confirm_response.status_code == 200

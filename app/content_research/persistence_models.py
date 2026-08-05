@@ -178,14 +178,45 @@ class AggregateClaimRecord(TypedPersistenceRecord):
             raise ValueError("invalid aggregate claim type")
 
 
-_MARKETING_CONCLUSION_TRACKS = {"need", "value", "message"}
-_MARKETING_CONCLUSION_DECISION_STATES = {
-    "selected",
-    "qualified",
-    "insufficient_evidence",
-    "no_single_primary_conclusion",
-    "analysis_unavailable",
-}
+MARKETING_CONCLUSION_TRACKS = ("need", "value", "message")
+MARKETING_CONCLUSION_DECISION_STATES = frozenset(
+    {
+        "selected",
+        "qualified",
+        "insufficient_evidence",
+        "no_single_primary_conclusion",
+        "analysis_unavailable",
+    }
+)
+MARKETING_CONCLUSION_TRACE_REASON_CODES = frozenset(
+    {
+        "conclusion_author_count_unmet",
+        "conclusion_author_identity_missing",
+        "conclusion_canonical_note_missing",
+        "conclusion_claim_direction_mismatch",
+        "conclusion_claim_not_admitted",
+        "conclusion_claim_run_mismatch",
+        "conclusion_no_qualified_candidate",
+        "conclusion_note_count_unmet",
+        "conclusion_packet_direction_mismatch",
+        "conclusion_packet_not_found",
+        "conclusion_packet_not_typed",
+        "conclusion_packet_run_mismatch",
+        "conclusion_quote_field_not_allowed",
+        "conclusion_quote_metadata_invalid",
+        "conclusion_statement_empty",
+        "conclusion_statement_outcome_term_prohibited",
+        "conclusion_statement_too_long",
+        "conclusion_support_missing",
+        "conclusion_support_tied",
+        "conclusion_track_not_supported",
+        "first_intent_support_unmet",
+        "marketing_analysis_unavailable",
+    }
+)
+MARKETING_CONCLUSION_TRACE_RECOVERY_ACTIONS = frozenset(
+    {"repair_model_configuration_and_resume"}
+)
 
 
 @dataclass(frozen=True)
@@ -197,7 +228,7 @@ class MarketingConclusionCandidateRecord(TypedPersistenceRecord):
     def __post_init__(self) -> None:
         super().__post_init__()
         _required(self.workflow_run_id, self.research_plan_id, self.track)
-        if self.track not in _MARKETING_CONCLUSION_TRACKS:
+        if self.track not in MARKETING_CONCLUSION_TRACKS:
             raise ValueError("invalid marketing conclusion track")
 
 
@@ -212,9 +243,9 @@ class MarketingConclusionDecisionRecord(TypedPersistenceRecord):
     def __post_init__(self) -> None:
         super().__post_init__()
         _required(self.workflow_run_id, self.research_plan_id, self.track, self.state)
-        if self.track not in _MARKETING_CONCLUSION_TRACKS:
+        if self.track not in MARKETING_CONCLUSION_TRACKS:
             raise ValueError("invalid marketing conclusion track")
-        if self.state not in _MARKETING_CONCLUSION_DECISION_STATES:
+        if self.state not in MARKETING_CONCLUSION_DECISION_STATES:
             raise ValueError("invalid marketing conclusion decision state")
 
 

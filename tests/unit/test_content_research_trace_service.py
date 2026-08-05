@@ -162,6 +162,168 @@ def test_logical_checkpoint_projection_is_safe_and_newest_first(store):
     assert "API_KEY" not in serialized
 
 
+def test_marketing_conclusion_checkpoint_projects_only_actionable_facts(store):
+    store.save_stage_checkpoint(
+        StageCheckpointRecord(
+            id="scp-marketing-conclusion-safe",
+            schema_version="content_research_stage_checkpoint_v1",
+            payload={
+                "tracks": {
+                    "need": {
+                        "state": "selected",
+                        "supporting_note_count": 3,
+                        "independent_author_count": 2,
+                        "body_quote_note_count": 3,
+                        "candidate_count": 4,
+                        "statement": "private conclusion",
+                        "note_id": "secret-note-id",
+                        "author_id": "secret-author-id",
+                    },
+                    "value": {
+                        "state": "insufficient_evidence",
+                        "supporting_note_count": 2,
+                        "independent_author_count": 1,
+                        "reason_codes": [
+                            "conclusion_note_count_unmet",
+                            "conclusion_author_count_unmet",
+                        ],
+                    },
+                    "message": {
+                        "state": "no_single_primary_conclusion",
+                        "supporting_note_count": 9,
+                        "independent_author_count": 7,
+                        "reason_codes": ["conclusion_support_tied"],
+                    },
+                },
+                "candidate_count": 12,
+                "policy_hash": "secret-policy-hash",
+                "prompt": "secret prompt",
+            },
+            workflow_run_id="run-marketing-safe",
+            subagent_task_id="marketing-conclusion:plan-safe",
+            stage_name="marketing_conclusion",
+            input_fingerprint="private-input-fingerprint",
+            status="completed",
+        )
+    )
+
+    checkpoint = _logical_checkpoint_projection(store, "run-marketing-safe")[0]
+
+    assert checkpoint == {
+        "stage": "marketing_conclusion",
+        "status": "completed",
+        "tracks": {
+            "need": {
+                "state": "selected",
+                "supporting_note_count": 3,
+                "independent_author_count": 2,
+            },
+            "value": {
+                "state": "insufficient_evidence",
+                "supporting_note_count": 2,
+                "independent_author_count": 1,
+                "reason_codes": [
+                    "conclusion_note_count_unmet",
+                    "conclusion_author_count_unmet",
+                ],
+            },
+            "message": {
+                "state": "no_single_primary_conclusion",
+                "reason_codes": ["conclusion_support_tied"],
+            },
+        },
+    }
+    serialized = json.dumps(checkpoint, ensure_ascii=False)
+    for forbidden in (
+        "body_quote_note_count",
+        "candidate_count",
+        "statement",
+        "note_id",
+        "author_id",
+        "policy_hash",
+        "prompt",
+        "private-input-fingerprint",
+    ):
+        assert forbidden not in serialized
+
+
+def test_marketing_conclusion_checkpoint_projects_stable_recovery_only(store):
+    store.save_stage_checkpoint(
+        StageCheckpointRecord(
+            id="scp-marketing-conclusion-unavailable",
+            schema_version="content_research_stage_checkpoint_v1",
+            payload={
+                "reason_codes": ["marketing_analysis_unavailable", "secret-reason"],
+                "recovery_action": "repair_model_configuration_and_resume",
+                "provider_payload": {"error": "secret provider response"},
+                "api_key": "secret-api-key",
+            },
+            workflow_run_id="run-marketing-unavailable",
+            subagent_task_id="marketing-conclusion:plan-unavailable",
+            stage_name="marketing_conclusion",
+            input_fingerprint="private-input-fingerprint",
+            status="waiting_user",
+        )
+    )
+
+    checkpoint = _logical_checkpoint_projection(store, "run-marketing-unavailable")[0]
+
+    assert checkpoint == {
+        "stage": "marketing_conclusion",
+        "status": "waiting_user",
+        "reason_codes": ["marketing_analysis_unavailable"],
+        "recovery_action": "repair_model_configuration_and_resume",
+    }
+
+
+def test_marketing_conclusion_checkpoint_projects_packet_replay_deltas_only(store):
+    store.save_stage_checkpoint(
+        StageCheckpointRecord(
+            id="scp-marketing-conclusion-replay",
+            schema_version="content_research_stage_checkpoint_v1",
+            payload={
+                "tracks": {},
+                "replayed_from_persisted_packets": True,
+                "provider_operation_count_delta": 0,
+                "packet_count_delta": 0,
+                "query": "secret query",
+                "prompt": "secret prompt",
+                "quote": "secret quote",
+                "candidate_count": 3,
+                "note_id": "secret-note-id",
+                "author_id": "secret-author-id",
+            },
+            workflow_run_id="run-marketing-replay",
+            subagent_task_id="marketing-conclusion:plan-replay",
+            stage_name="marketing_conclusion",
+            input_fingerprint="private-input-fingerprint",
+            status="completed",
+        )
+    )
+
+    checkpoint = _logical_checkpoint_projection(store, "run-marketing-replay")[0]
+
+    assert checkpoint == {
+        "stage": "marketing_conclusion",
+        "status": "completed",
+        "tracks": {},
+        "replayed_from_persisted_packets": True,
+        "provider_operation_count_delta": 0,
+        "packet_count_delta": 0,
+    }
+    serialized = json.dumps(checkpoint, ensure_ascii=False)
+    for forbidden in (
+        "query",
+        "prompt",
+        "quote",
+        "candidate_count",
+        "note_id",
+        "author_id",
+        "private-input-fingerprint",
+    ):
+        assert forbidden not in serialized
+
+
 def test_final_timeout_recovery_keeps_a_safe_reload_boundary():
     brief = ResearchBriefRecord(
         id="brief_timeout",
@@ -234,6 +396,7 @@ async def _confirmed_workflow(service):
             custom_competitors=["凯乐石"],
             selected_directions=["product_marketing", "content_performance"],
             custom_research_question="关注轻量速干",
+            primary_marketing_goal="content_seeding",
         ),
     )
     return presearch
@@ -456,6 +619,7 @@ async def test_confirm_validation_failure_aborts_brief_execution_span(db_path, s
                 confirmed_subject="徒步短裤",
                 subject_type="category",
                 selected_directions=["not_in_lite_catalog"],
+                primary_marketing_goal="content_seeding",
             ),
         )
 
@@ -481,6 +645,7 @@ async def test_plan_build_failure_aborts_plan_without_overlapping_brief(
                 confirmed_subject="徒步短裤",
                 subject_type="category",
                 selected_directions=["product_marketing"],
+                primary_marketing_goal="content_seeding",
             ),
         )
 
@@ -509,6 +674,7 @@ async def test_confirmation_persistence_failure_aborts_plan_execution_span(
                 confirmed_subject="徒步短裤",
                 subject_type="category",
                 selected_directions=["product_marketing"],
+                primary_marketing_goal="content_seeding",
             ),
         )
 

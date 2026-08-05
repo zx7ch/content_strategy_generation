@@ -307,6 +307,42 @@ async def test_formal_workflow_public_api_e2e_is_packet_only_safe_and_replayable
     trace = await client.get(f"/content-research/workflows/{workflow['workflow_run_id']}/trace")
     assert trace.status_code == 200, trace.text
     assert "raw_payload" not in trace.text and "access_token" not in trace.text
+    marketing_checkpoint = next(
+        item
+        for item in trace.json()["logical_checkpoints"]
+        if item["stage"] == "marketing_conclusion"
+    )
+    assert marketing_checkpoint == {
+        "stage": "marketing_conclusion",
+        "status": "completed",
+        "tracks": {
+            "need": {
+                "state": "selected",
+                "supporting_note_count": 3,
+                "independent_author_count": 3,
+            },
+            "value": {
+                "state": "insufficient_evidence",
+                "reason_codes": ["conclusion_no_qualified_candidate"],
+            },
+            "message": {
+                "state": "insufficient_evidence",
+                "reason_codes": ["conclusion_no_qualified_candidate"],
+            },
+        },
+    }
+    assert not any(
+        forbidden in json.dumps(marketing_checkpoint, ensure_ascii=False)
+        for forbidden in (
+            "candidate_count",
+            "statement",
+            "quote",
+            "note_id",
+            "author_id",
+            "policy_hash",
+            "prompt",
+        )
+    )
 
     store = app.state.content_research_service._store
     snapshots_before_packet_replay = store.list_result_snapshots_for_workflow(
@@ -418,6 +454,18 @@ async def test_marketing_analysis_unavailable_waits_and_resumes_without_collecti
         await asyncio.sleep(0.01)
     else:
         pytest.fail("marketing analysis failure did not reach waiting_user")
+
+    public_checkpoint = next(
+        item
+        for item in trace["logical_checkpoints"]
+        if item["stage"] == "marketing_conclusion"
+    )
+    assert public_checkpoint == {
+        "stage": "marketing_conclusion",
+        "status": "waiting_user",
+        "reason_codes": ["marketing_analysis_unavailable"],
+        "recovery_action": "repair_model_configuration_and_resume",
+    }
 
     store = SQLiteContentResearchStore(db_path)
     checkpoints = [

@@ -140,7 +140,7 @@ export interface ContentResearchTrace {
     retryable: boolean;
     recovery_action?: string | null;
   }>;
-  logical_checkpoints: JsonObject[];
+  logical_checkpoints: Array<JsonObject | ContentResearchMarketingConclusionTraceCheckpoint>;
   usage_steps: JsonObject[];
   usage_events: JsonObject[];
   llm_recovery?: {
@@ -150,6 +150,24 @@ export interface ContentResearchTrace {
     configuration_source?: string | null;
     model?: string | null;
   };
+}
+
+export interface ContentResearchMarketingConclusionTraceTrack {
+  state: "selected" | "qualified" | "insufficient_evidence" | "no_single_primary_conclusion" | "analysis_unavailable";
+  supporting_note_count?: number;
+  independent_author_count?: number;
+  reason_codes?: string[];
+}
+
+export interface ContentResearchMarketingConclusionTraceCheckpoint {
+  stage: "marketing_conclusion";
+  status: string;
+  tracks?: Partial<Record<"need" | "value" | "message", ContentResearchMarketingConclusionTraceTrack>>;
+  reason_codes?: string[];
+  recovery_action?: "repair_model_configuration_and_resume";
+  replayed_from_persisted_packets?: true;
+  provider_operation_count_delta?: number;
+  packet_count_delta?: number;
 }
 
 export interface ContentResearchSourceCollectionRequest {

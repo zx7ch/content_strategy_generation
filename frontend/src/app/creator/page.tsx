@@ -986,8 +986,33 @@ function marketingConclusionReasonLabel(reason: string) {
   if (reason === "conclusion_no_qualified_candidate") return "现有证据尚未达到主结论门槛。";
   if (reason === "conclusion_note_count_unmet") return "合格笔记数量不足。";
   if (reason === "conclusion_author_count_unmet") return "独立作者数量不足。";
+  if (reason === "conclusion_support_tied") return "多个结论支持度相同，暂不指定唯一主结论。";
+  if (reason === "first_intent_support_unmet") return "首要营销目标的直接支持不足。";
   if (["marketing_analysis_unavailable", "marketing_conclusion_unavailable", "marketing_conclusion_not_verified"].includes(reason)) return "结论分析当前不可用。";
-  return reason.replaceAll("_", " ");
+  return "证据链未通过营销结论核验。";
+}
+
+function marketingConclusionStateLabel(state: string) {
+  if (state === "selected") return "已选定";
+  if (state === "qualified") return "已达到门槛";
+  if (state === "insufficient_evidence") return "证据不足";
+  if (state === "no_single_primary_conclusion") return "暂无唯一主结论";
+  if (state === "analysis_unavailable") return "分析不可用";
+  return "等待判定";
+}
+
+function marketingConclusionTrackLabel(track: string) {
+  if (track === "need") return "需求";
+  if (track === "value") return "价值";
+  if (track === "message") return "表达";
+  return "结论";
+}
+
+function marketingConclusionRecoveryRequired(trace: ContentResearchTrace | null) {
+  return recordList(trace?.logical_checkpoints).some((checkpoint) =>
+    stringField(checkpoint, "stage") === "marketing_conclusion"
+      && arrayField(checkpoint, "reason_codes").includes("marketing_analysis_unavailable")
+  );
 }
 
 function ContentResearchReportMessage({
@@ -1472,6 +1497,7 @@ function ContentResearchTraceInspector({
   const recovery = contentResearchRecoveryState(run);
   const childTasks = recordList(run.trace?.runtime_child_tasks);
   const logicalCheckpoints = recordList(run.trace?.logical_checkpoints);
+  const marketingModelRecoveryRequired = marketingConclusionRecoveryRequired(run.trace);
   const terminalPublished = run.report ? litePublicationState(run.report) !== null : false;
   const [expandedStepId, setExpandedStepId] = useState<string | null>(null);
   const refreshTraceRef = useRef(onRefresh);
@@ -1658,15 +1684,41 @@ function ContentResearchTraceInspector({
                         ? "证据覆盖判定"
                         : stage === "fallback_decision"
                           ? "补位检索判定"
-                          : "历史相关性修订";
+                          : stage === "marketing_conclusion"
+                            ? "营销结论判定"
+                            : "历史相关性修订";
+                  const marketingTracks = stage === "marketing_conclusion"
+                    ? Object.entries(checkpoint.tracks && typeof checkpoint.tracks === "object" && !Array.isArray(checkpoint.tracks)
+                      ? checkpoint.tracks as Record<string, unknown>
+                      : {}).flatMap(([track, value]) => {
+                        if (!value || typeof value !== "object" || Array.isArray(value)) return [];
+                        const outcome = value as Record<string, unknown>;
+                        const support = typeof outcome.supporting_note_count === "number" && typeof outcome.independent_author_count === "number"
+                          ? ` · ${outcome.supporting_note_count} 篇 / ${outcome.independent_author_count} 位作者`
+                          : "";
+                        return [`${marketingConclusionTrackLabel(track)}：${marketingConclusionStateLabel(stringField(outcome, "state"))}${support}`];
+                      })
+                    : [];
                   const detail = stage === "query_plan"
                     ? `主检索 ${numberField(checkpoint, "primary_group_count")} 组 · 补位 ${numberField(checkpoint, "fallback_group_count")} 组 · 合并 ${numberField(checkpoint, "merged_group_count")} 组`
                     : stage === "coverage_decision"
                       ? `发现 ${numberField(counts, "discovered")} · 去重 ${numberField(counts, "deduplicated")} · 相关 ${numberField(counts, "relevant")} · 准入 ${numberField(counts, "admitted")}`
                       : stage === "fallback_decision"
                         ? `Q3：${stringField(checkpoint, "state", "未启用")}`
-                        : `状态：${stringField(checkpoint, "state", stringField(checkpoint, "status"))}`;
-                  const reasons = arrayField(checkpoint, "reason_codes").map(coverageReasonLabel);
+                        : stage === "marketing_conclusion"
+                          ? marketingTracks.length > 0
+                            ? marketingTracks.join("；")
+                            : `状态：${marketingConclusionStateLabel(stringField(checkpoint, "status"))}`
+                          : `状态：${stringField(checkpoint, "state", stringField(checkpoint, "status"))}`;
+                  const trackReasons = stage === "marketing_conclusion"
+                    ? Object.values(checkpoint.tracks && typeof checkpoint.tracks === "object" && !Array.isArray(checkpoint.tracks)
+                      ? checkpoint.tracks as Record<string, unknown>
+                      : {}).flatMap((value) => value && typeof value === "object" && !Array.isArray(value)
+                      ? arrayField(value as Record<string, unknown>, "reason_codes")
+                      : [])
+                    : [];
+                  const reasonCodes = [...arrayField(checkpoint, "reason_codes"), ...trackReasons];
+                  const reasons = reasonCodes.map(stage === "marketing_conclusion" ? marketingConclusionReasonLabel : coverageReasonLabel);
                   return (
                     <article key={`${stage}-${index}`} className="rounded-xl border border-line bg-white px-3 py-2.5 text-xs">
                       <div className="flex items-center justify-between gap-3"><p className="font-medium text-ink">{title}</p><span className="text-quiet">{stringField(checkpoint, "status")}</span></div>
@@ -1726,7 +1778,7 @@ function ContentResearchTraceInspector({
             </section>
           )}
 
-          {recovery.recoverable && !recovery.authRequired && !terminalPublished && (
+          {recovery.recoverable && !recovery.authRequired && !marketingModelRecoveryRequired && !terminalPublished && (
             <div className="mt-4 flex justify-end">
               <button type="button" onClick={() => void resumeRun()} disabled={resuming} className="rounded-lg bg-ink px-3 py-1.5 text-xs font-medium text-white disabled:opacity-40">
                 {resuming ? "继续中" : "继续本轮调研"}
@@ -1884,7 +1936,12 @@ export default function CreatorPage() {
     durableRun: contentResearchRun
       ? {
           workflowRunId: contentResearchRun.workflowRunId,
-          llmRecovery: contentResearchRun.trace?.llm_recovery,
+          llmRecovery: marketingConclusionRecoveryRequired(contentResearchRun.trace)
+            ? {
+                required: true,
+                required_since: contentResearchRun.trace?.llm_recovery?.required_since ?? null,
+              }
+            : contentResearchRun.trace?.llm_recovery,
         }
       : null,
   });
@@ -2341,6 +2398,13 @@ export default function CreatorPage() {
   async function continueModelRecovery() {
     const workflowRunId = modelRecovery.workflowRunId;
     if (!workflowRunId) return;
+    if (
+      contentResearchRun?.workflowRunId === workflowRunId
+      && marketingConclusionRecoveryRequired(contentResearchRun.trace)
+    ) {
+      await resumeContentResearchForRun(workflowRunId);
+      return;
+    }
     const presearch = await retryContentResearchPresearch(workflowRunId);
     const durablePayload = contentResearchRun?.summary.brief.payload ?? {};
     const seed = contentResearchIntent?.seed

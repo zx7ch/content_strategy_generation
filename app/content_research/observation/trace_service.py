@@ -11,7 +11,13 @@ from pydantic import BaseModel
 
 from app.content_research.api_schemas import ContentResearchTraceResponse
 from app.content_research.models import ObservationEventRecord, ResearchBriefRecord, TraceRecord
-from app.content_research.persistence_models import StageCheckpointRecord
+from app.content_research.persistence_models import (
+    MARKETING_CONCLUSION_DECISION_STATES,
+    MARKETING_CONCLUSION_TRACE_REASON_CODES,
+    MARKETING_CONCLUSION_TRACE_RECOVERY_ACTIONS,
+    MARKETING_CONCLUSION_TRACKS,
+    StageCheckpointRecord,
+)
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
 from app.memory.workflow_store import WorkflowStore
 from app.services.llm.usage_tracker import LLMUsageSummary, LLMUsageTracker
@@ -543,6 +549,7 @@ def _logical_checkpoint_projection(
         "coverage_decision",
         "fallback_decision",
         "relevance_revision",
+        "marketing_conclusion",
     }
     records = [
         item
@@ -552,6 +559,9 @@ def _logical_checkpoint_projection(
     projected: list[dict[str, Any]] = []
     for record in sorted(records, key=lambda item: (item.created_at, item.id), reverse=True):
         payload = dict(record.payload or {})
+        if record.stage_name == "marketing_conclusion":
+            projected.append(_safe_marketing_conclusion_checkpoint(record, payload))
+            continue
         item: dict[str, Any] = {
             "stage": record.stage_name,
             "status": record.status,
@@ -598,6 +608,71 @@ def _logical_checkpoint_projection(
             }
         projected.append(item)
     return projected
+
+
+def _safe_marketing_conclusion_checkpoint(
+    record: StageCheckpointRecord, payload: dict[str, Any]
+) -> dict[str, Any]:
+    """Project the one public conclusion checkpoint without traversing its payload."""
+    item: dict[str, Any] = {
+        "stage": "marketing_conclusion",
+        "status": record.status,
+    }
+    tracks = payload.get("tracks")
+    if isinstance(tracks, dict):
+        safe_tracks: dict[str, dict[str, Any]] = {}
+        for track in MARKETING_CONCLUSION_TRACKS:
+            source = tracks.get(track)
+            if not isinstance(source, dict):
+                continue
+            state = source.get("state")
+            if state not in MARKETING_CONCLUSION_DECISION_STATES:
+                continue
+            safe_track: dict[str, Any] = {"state": state}
+            reason_codes = _safe_marketing_conclusion_reason_codes(
+                source.get("reason_codes")
+            )
+            explain_sample_threshold = bool(
+                {"conclusion_note_count_unmet", "conclusion_author_count_unmet"}
+                & set(reason_codes)
+            )
+            if state == "selected" or explain_sample_threshold:
+                for key in ("supporting_note_count", "independent_author_count"):
+                    value = source.get(key)
+                    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                        safe_track[key] = value
+            if reason_codes:
+                safe_track["reason_codes"] = reason_codes
+            safe_tracks[track] = safe_track
+        item["tracks"] = safe_tracks
+
+    reason_codes = _safe_marketing_conclusion_reason_codes(payload.get("reason_codes"))
+    if reason_codes:
+        item["reason_codes"] = reason_codes
+    recovery_action = payload.get("recovery_action")
+    if (
+        "marketing_analysis_unavailable" in reason_codes
+        and recovery_action in MARKETING_CONCLUSION_TRACE_RECOVERY_ACTIONS
+    ):
+        item["recovery_action"] = recovery_action
+
+    if payload.get("replayed_from_persisted_packets") is True:
+        item["replayed_from_persisted_packets"] = True
+        for key in ("provider_operation_count_delta", "packet_count_delta"):
+            value = payload.get(key)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                item[key] = value
+    return item
+
+
+def _safe_marketing_conclusion_reason_codes(value: Any) -> list[str]:
+    if not isinstance(value, list | tuple):
+        return []
+    return [
+        reason
+        for reason in value
+        if isinstance(reason, str) and reason in MARKETING_CONCLUSION_TRACE_REASON_CODES
+    ]
 
 
 def _json_safe(value: Any) -> Any:
