@@ -88,6 +88,42 @@ class FakeLLM:
         )
 
 
+class ProductMarketingFakeLLM:
+    async def generate(self, _request):
+        return LLMResponse(
+            content=json.dumps(
+                {
+                    "subject_confirmation": "夏季凉感 T 恤的产品营销调研，请确认。",
+                    "competitor_tags": [],
+                    "research_directions": ["产品营销"],
+                    "custom_research_question": "",
+                    "custom_competitor_input": "",
+                    "subject_structure": {
+                        "schema_version": "content_research_subject_structure_v1",
+                        "canonical_subject": "夏季凉感 T 恤",
+                        "subject_type": "category",
+                        "core_entities": [
+                            {
+                                "canonical_name": "T恤",
+                                "raw_mentions": ["T恤"],
+                            }
+                        ],
+                        "research_intents": ["凉感"],
+                        "context_modifiers": ["夏季"],
+                        "synonym_groups": {},
+                        "ambiguities": [],
+                        "resolution_state": "resolved",
+                    },
+                },
+                ensure_ascii=False,
+            ),
+            provider="fake",
+            model="fake-model",
+            usage=TokenUsage(total_tokens=10),
+            latency_ms=1,
+        )
+
+
 @pytest.fixture()
 async def client(tmp_path):
     original = getattr(app.state, "content_research_service", None)
@@ -111,13 +147,87 @@ async def client(tmp_path):
         app.state.content_research_service = original
 
 
-async def _create_presearch(client):
+@pytest.fixture()
+async def product_marketing_client(tmp_path):
+    original = getattr(app.state, "content_research_service", None)
+    app.state.content_research_service = ContentResearchService(
+        store=SQLiteContentResearchStore(str(tmp_path / "content_research.db")),
+        presearch=PresearchService(
+            ProductMarketingFakeLLM(), first_feedback_timeout_seconds=0.05, hard_cutoff_seconds=0.1
+        ),
+        workflow_runtime=FakeRuntime(str(tmp_path / "content_research.db")),
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://testserver",
+        headers=WORKSPACE_HEADERS,
+    ) as c:
+        yield c
+    if original is None:
+        delattr(app.state, "content_research_service")
+    else:
+        app.state.content_research_service = original
+
+
+async def _create_presearch(client, *, seed_text: str = "徒步短裤"):
     response = await client.post(
         "/content-research/presearch",
-        json={"seed_text": "徒步短裤", "thread_id": "thread-1"},
+        json={"seed_text": seed_text, "thread_id": "thread-1"},
     )
     assert response.status_code == 201
     return response.json()
+
+
+async def _confirm_product_marketing_brief(client, *, custom_research_question: str = ""):
+    presearch = await _create_presearch(client, seed_text="夏季凉感 T恤")
+    response = await client.post(
+        f"/content-research/briefs/{presearch['brief_id']}/confirm",
+        json={
+            "confirmed_subject": "夏季凉感 T 恤",
+            "subject_structure_hash": presearch["subject_structure_hash"],
+            "subject_type": "category",
+            "selected_directions": ["product_marketing"],
+            "custom_research_question": custom_research_question,
+            "primary_marketing_goal": "content_seeding",
+        },
+    )
+    assert response.status_code == 200
+    snapshot = await client.get(
+        f"/content-research/workflows/{presearch['workflow_run_id']}/policy-snapshot"
+    )
+    assert snapshot.status_code == 200
+    return snapshot.json()["effective_policy"]["locked_query_plan"]
+
+
+@pytest.mark.asyncio
+async def test_confirmed_product_marketing_plan_uses_goal_facet_with_subject_intent(
+    product_marketing_client,
+):
+    locked_plan = await _confirm_product_marketing_brief(product_marketing_client)
+
+    groups = locked_plan["directions"]["product_marketing"]["query_groups"]
+    primary_queries = [
+        group["normalized_query"] for group in groups if group["activation"] == "primary"
+    ]
+    assert primary_queries == ["T恤 凉感", "T恤 凉感 上身感受"]
+    assert all("识别营销话术和内容角度" not in query for query in primary_queries)
+
+
+@pytest.mark.asyncio
+async def test_confirmed_product_marketing_plan_prefers_custom_focus_over_goal_facet(
+    product_marketing_client,
+):
+    locked_plan = await _confirm_product_marketing_brief(
+        product_marketing_client,
+        custom_research_question="通勤",
+    )
+
+    groups = locked_plan["directions"]["product_marketing"]["query_groups"]
+    primary_queries = [
+        group["normalized_query"] for group in groups if group["activation"] == "primary"
+    ]
+    assert primary_queries == ["T恤 凉感", "T恤 凉感 通勤"]
 
 
 @pytest.mark.asyncio

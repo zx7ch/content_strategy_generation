@@ -1117,10 +1117,17 @@ class ContentResearchService:
                 subject_structure=structure_decision.structure,
                 explicit_focus=confirmation.custom_research_question,
                 second_facet=(
-                    direction.default_questions[1]
+                    ""
+                    if direction.id == "product_marketing"
+                    else direction.default_questions[1]
                     if len(direction.default_questions) > 1
                     else direction.default_questions[0]
                     if direction.default_questions
+                    else ""
+                ),
+                primary_marketing_goal=(
+                    confirmation.primary_marketing_goal
+                    if direction.id == "product_marketing"
                     else ""
                 ),
                 run_as_of_at=run_as_of_at,
