@@ -14,6 +14,7 @@ QUERY_COMPILER_VERSION = "content_research_query_compiler_v2"
 PRIMARY_QUERY_GROUP_CAP = 2
 COVERAGE_FALLBACK_QUERY_GROUP_CAP = 1
 QUERY_GROUP_CANDIDATE_CAP = 20
+PRODUCT_MARKETING_GOAL_FACETS = {"content_seeding": "上身感受"}
 
 
 @dataclass(frozen=True)
@@ -42,6 +43,7 @@ def compile_structured_query_plan(
     subject_structure: SubjectStructure,
     explicit_focus: str = "",
     second_facet: str = "",
+    primary_marketing_goal: str = "",
     run_as_of_at: datetime,
     provider: str = "xiaohongshu",
     sort: str = "likes",
@@ -71,25 +73,45 @@ def compile_structured_query_plan(
         ),
     )
 
-    focus = _display_term(explicit_focus)
-    role = "user_focus"
-    if not focus:
-        focus = _display_term(second_facet)
-        role = "direction_facet"
-    if focus:
+    if direction_id == "product_marketing":
+        focus = resolve_product_marketing_facet(
+            primary_marketing_goal=primary_marketing_goal,
+            custom_focus=explicit_focus,
+        )
+        role = "user_focus" if _display_term(explicit_focus) else "goal_facet"
         _append_or_merge(
             planned,
             _planned_group(
                 direction_id=direction_id,
                 role=role,
                 activation="primary",
-                terms=(core, focus),
+                terms=(core, primary_intent, focus),
                 priority=1,
                 provider=provider,
                 sort=sort,
                 run_as_of_at=run_as_of_at,
             ),
         )
+    else:
+        focus = _display_term(explicit_focus)
+        role = "user_focus"
+        if not focus:
+            focus = _display_term(second_facet)
+            role = "direction_facet"
+        if focus:
+            _append_or_merge(
+                planned,
+                _planned_group(
+                    direction_id=direction_id,
+                    role=role,
+                    activation="primary",
+                    terms=(core, focus),
+                    priority=1,
+                    provider=provider,
+                    sort=sort,
+                    run_as_of_at=run_as_of_at,
+                ),
+            )
     primary_groups = tuple(planned[:PRIMARY_QUERY_GROUP_CAP])
 
     synonym_groups = dict(subject_structure.synonym_groups)
@@ -126,6 +148,20 @@ def compile_structured_query_plan(
         fallback_group=fallback_group,
         plan_hash=canonical_fingerprint(plan_payload),
     )
+
+
+def resolve_product_marketing_facet(
+    *,
+    primary_marketing_goal: str,
+    custom_focus: str,
+) -> str:
+    focus = _display_term(custom_focus)
+    if focus:
+        return focus
+    try:
+        return PRODUCT_MARKETING_GOAL_FACETS[primary_marketing_goal]
+    except KeyError as exc:
+        raise ValueError("unknown product-marketing goal") from exc
 
 
 def _planned_group(
