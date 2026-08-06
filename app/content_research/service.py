@@ -2774,11 +2774,19 @@ class ContentResearchService:
             if isinstance(locked_plan, dict)
             else None
         )
-        requested_directions = {
-            str(item).strip()
-            for item in list(effective_policy.get("requested_direction_ids") or [])
-            if str(item).strip()
-        }
+        requested_directions_value = effective_policy.get("requested_direction_ids")
+        if (
+            not isinstance(requested_directions_value, list | tuple)
+            or not requested_directions_value
+            or any(
+                not isinstance(item, str) or not item.strip()
+                for item in requested_directions_value
+            )
+        ):
+            raise ContentResearchValidationError(
+                "Formal research dispatch requires valid frozen requested directions"
+            )
+        requested_directions = {item.strip() for item in requested_directions_value}
         if "product_marketing" not in requested_directions:
             return
 
