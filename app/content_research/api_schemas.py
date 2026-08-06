@@ -81,6 +81,13 @@ class ContentResearchPresearchResponse(BaseModel):
     subject_structure_hash: str | None = None
     subject_structure_state: str = "needs_confirmation"
     subject_structure_reason_codes: list[str] = Field(default_factory=list)
+    subject_structure_user_confirmed_fields: list[str] = Field(default_factory=list)
+
+
+class ContentResearchSubjectStructureConfirmationInput(BaseModel):
+    core_object: str = Field(min_length=1, max_length=200)
+    research_intent: str = Field(min_length=1, max_length=200)
+    context_modifiers: str | list[str] = Field(default_factory=list)
 
 
 class ContentResearchBriefConfirmRequest(BaseModel):
@@ -95,6 +102,7 @@ class ContentResearchBriefConfirmRequest(BaseModel):
     )
     custom_research_question: str = ""
     primary_marketing_goal: str = Field(min_length=1)
+    subject_structure_confirmation: ContentResearchSubjectStructureConfirmationInput | None = None
 
 
 class ContentResearchDirectionResponse(BaseModel):

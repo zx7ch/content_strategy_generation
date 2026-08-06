@@ -1090,6 +1090,11 @@ class ContentResearchService:
                     "Selected directions must belong to the Lite direction catalog"
                 )
             directions = self._direction_registry.require_many(selected_direction_ids)
+            if "product_marketing" in selected_direction_ids:
+                brief = self._apply_product_marketing_structure_confirmation(
+                    brief=brief,
+                    confirmation_request=confirmation_request,
+                )
             primary_marketing_goal = confirmation_request.primary_marketing_goal.strip()
             if primary_marketing_goal not in PRIMARY_MARKETING_GOAL_CATALOG:
                 raise ContentResearchValidationError(
@@ -1126,6 +1131,75 @@ class ContentResearchService:
         if finish_boundary is not None:
             await finish_boundary(brief.workflow_run_id, "plan_build")
         return response
+
+    def _apply_product_marketing_structure_confirmation(
+        self,
+        *,
+        brief: ResearchBriefRecord,
+        confirmation_request: ContentResearchBriefConfirmRequest,
+    ) -> ResearchBriefRecord:
+        required_fields = [
+            "core_entities[0]",
+            "research_intents[0]",
+            "context_modifiers",
+        ]
+        persisted_fields = list(
+            brief.payload.get("subject_structure_user_confirmed_fields") or []
+        )
+        if all(field in persisted_fields for field in required_fields):
+            return brief
+
+        submitted = confirmation_request.subject_structure_confirmation
+        if submitted is None:
+            raise ContentResearchValidationError(
+                "product_marketing requires explicit subject structure confirmation"
+            )
+
+        core_object = _normalized_subject_term(submitted.core_object)
+        research_intent = _normalized_subject_term(submitted.research_intent)
+        contexts = _normalized_subject_contexts(submitted.context_modifiers)
+        if not core_object or not research_intent:
+            raise ContentResearchValidationError(
+                "core_object and research_intent are required"
+            )
+        if len(contexts) > 8:
+            raise ContentResearchValidationError("at most 8 context modifiers are allowed")
+        structure = SubjectStructure(
+            schema_version=SUBJECT_STRUCTURE_SCHEMA_VERSION,
+            canonical_subject=_normalized_subject_term(
+                str(brief.payload.get("seed_text") or core_object)
+            ),
+            subject_type=str(
+                (brief.payload.get("subject_structure") or {}).get("subject_type")
+                or "unknown"
+            ),
+            core_entities=(
+                SubjectEntity(
+                    canonical_name=core_object,
+                    raw_mentions=(core_object,),
+                ),
+            ),
+            research_intents=(research_intent,),
+            context_modifiers=tuple(contexts),
+            synonym_groups=(),
+            ambiguities=(),
+            resolution_state="resolved",
+        )
+        structure_hash = subject_structure_fingerprint(structure)
+        return replace(
+            brief,
+            payload={
+                **brief.payload,
+                "subject_confirmation": f"已确认调研 {core_object} 的 {research_intent}。",
+                "subject_structure": subject_structure_payload(structure),
+                "subject_structure_hash": structure_hash,
+                "subject_structure_state": "confirmed",
+                "subject_structure_reason_codes": [],
+                "subject_structure_authority": "user_confirmed",
+                "subject_structure_user_confirmed_fields": required_fields,
+            },
+            updated_at=utcnow(),
+        )
 
     async def _build_and_persist_confirmed_plan(
         self,
@@ -4037,6 +4111,9 @@ class ContentResearchService:
             ),
             subject_structure_reason_codes=list(
                 payload.get("subject_structure_reason_codes") or []
+            ),
+            subject_structure_user_confirmed_fields=list(
+                payload.get("subject_structure_user_confirmed_fields") or []
             ),
             local_cache_id=brief.id,
         )

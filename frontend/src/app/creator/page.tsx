@@ -713,6 +713,14 @@ function ContentResearchIntentCard({
     (structure.context_modifiers ?? []).filter(Boolean).join("，"),
   );
   const confirmationInFlightRef = useRef(false);
+  const confirmedStructureFields = intent.presearch.subject_structure_user_confirmed_fields ?? [];
+  const hasConfirmedStructureFields = [
+    "core_entities[0]",
+    "research_intents[0]",
+    "context_modifiers",
+  ].every((field) => confirmedStructureFields.includes(field));
+  const needsProductStructureConfirmation = selectedDirections.includes("product_marketing")
+    && !hasConfirmedStructureFields;
 
   function toggleValue(value: string, selected: string[], setSelected: (next: string[]) => void) {
     setSelected(selected.includes(value) ? selected.filter((item) => item !== value) : [...selected, value]);
@@ -721,6 +729,10 @@ function ContentResearchIntentCard({
   async function confirmBrief() {
     if (!subjectConfirmed) {
       onError("请先确认调研主体是否准确。");
+      return;
+    }
+    if (needsProductStructureConfirmation && (!coreObjectInput.trim() || !researchIntentInput.trim())) {
+      onError("请选择产品营销时，请确认核心对象和研究意图。");
       return;
     }
     if (confirmationInFlightRef.current) return;
@@ -736,6 +748,15 @@ function ContentResearchIntentCard({
         selected_directions: selectedDirections,
         custom_research_question: customQuestion.trim(),
         primary_marketing_goal: primaryMarketingGoal,
+        ...(needsProductStructureConfirmation
+          ? {
+              subject_structure_confirmation: {
+                core_object: coreObjectInput,
+                research_intent: researchIntentInput,
+                context_modifiers: splitInlineList(contextInput),
+              },
+            }
+          : {}),
       });
       onConfirmed(summary);
     } catch {
@@ -909,6 +930,20 @@ function ContentResearchIntentCard({
             className="mt-4 h-11 w-full rounded-xl border border-line bg-white px-4 text-sm outline-none focus:border-[#789180]"
             placeholder="补充你的调研问题，例如：更关注小众品牌而不是大牌"
           />
+          {needsProductStructureConfirmation && (
+            <div className="mt-4 grid gap-3 rounded-xl bg-[#f4f7f5] p-3">
+              <p className="text-sm font-medium text-ink">请确认产品营销要检索的结构</p>
+              <label className="grid gap-1 text-xs font-medium">核心对象 *
+                <input aria-label="产品营销核心对象" value={coreObjectInput} onChange={(event) => setCoreObjectInput(event.target.value)} placeholder="T恤" className="rounded-lg border border-line bg-white px-3 py-2 text-sm font-normal outline-none" />
+              </label>
+              <label className="grid gap-1 text-xs font-medium">首要研究意图 *
+                <input aria-label="产品营销研究意图" value={researchIntentInput} onChange={(event) => setResearchIntentInput(event.target.value)} placeholder="凉感" className="rounded-lg border border-line bg-white px-3 py-2 text-sm font-normal outline-none" />
+              </label>
+              <label className="grid gap-1 text-xs font-medium">使用场景
+                <input aria-label="产品营销使用场景" value={contextInput} onChange={(event) => setContextInput(event.target.value)} placeholder="夏季" className="rounded-lg border border-line bg-white px-3 py-2 text-sm font-normal outline-none" />
+              </label>
+            </div>
+          )}
           <label className="mt-4 grid gap-2 text-sm font-medium text-ink">
             请选择本轮产品营销目标 *
             <select

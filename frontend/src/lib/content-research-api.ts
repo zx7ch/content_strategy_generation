@@ -54,6 +54,7 @@ export interface ContentResearchPresearchResponse {
   subject_structure_hash?: string | null;
   subject_structure_state: string;
   subject_structure_reason_codes: string[];
+  subject_structure_user_confirmed_fields?: string[];
 }
 
 export interface LLMConfigurationInput { base_url: string; model: string; api_key?: string | null; }
@@ -68,6 +69,11 @@ export interface ContentResearchBriefConfirmRequest {
   selected_directions: string[];
   custom_research_question: string;
   primary_marketing_goal: string;
+  subject_structure_confirmation?: {
+    core_object: string;
+    research_intent: string;
+    context_modifiers: string[];
+  };
 }
 
 export interface ContentResearchWorkflowSummary {
