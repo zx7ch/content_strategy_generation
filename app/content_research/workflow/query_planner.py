@@ -127,7 +127,11 @@ def compile_structured_query_plan(
     if aliases and COVERAGE_FALLBACK_QUERY_GROUP_CAP:
         fallback_focus = _first_term(subject_structure.context_modifiers)
         if not fallback_focus:
-            fallback_focus = focus or primary_intent
+            fallback_focus = (
+                primary_intent
+                if direction_id == "product_marketing"
+                else focus or primary_intent
+            )
         fallback_group = _planned_group(
             direction_id=direction_id,
             role="coverage_fallback",
