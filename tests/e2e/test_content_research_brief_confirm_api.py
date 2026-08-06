@@ -281,6 +281,44 @@ async def test_product_marketing_confirmation_freezes_explicit_structure_fields_
 
 
 @pytest.mark.asyncio
+async def test_product_marketing_confirmation_freezes_user_corrected_core_absent_from_seed(
+    product_marketing_client,
+):
+    presearch = await _create_presearch(product_marketing_client, seed_text="夏季凉感 T恤")
+
+    response = await product_marketing_client.post(
+        f"/content-research/briefs/{presearch['brief_id']}/confirm",
+        json={
+            "confirmed_subject": "夏季透气背心",
+            "subject_structure_hash": presearch["subject_structure_hash"],
+            "subject_type": "category",
+            "selected_directions": ["product_marketing"],
+            "primary_marketing_goal": "content_seeding",
+            "subject_structure_confirmation": {
+                "core_object": "背心",
+                "research_intent": "透气",
+                "context_modifiers": ["夏季"],
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["brief"]["payload"]["subject_structure"]["core_entities"] == [
+        {"canonical_name": "背心", "raw_mentions": ["背心"]}
+    ]
+    snapshot = await product_marketing_client.get(
+        f"/content-research/workflows/{presearch['workflow_run_id']}/policy-snapshot"
+    )
+    groups = snapshot.json()["effective_policy"]["locked_query_plan"]["directions"][
+        "product_marketing"
+    ]["query_groups"]
+    assert [group["normalized_query"] for group in groups if group["activation"] == "primary"] == [
+        "背心 透气",
+        "背心 透气 上身感受",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_product_marketing_confirmation_reuses_task_one_confirmed_fields_without_second_payload(
     product_marketing_client,
 ):

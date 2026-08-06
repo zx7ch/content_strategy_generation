@@ -1211,9 +1211,34 @@ class ContentResearchService:
     ) -> ContentResearchWorkflowSummaryResponse:
         plan_id = _new_id("rp")
         run_as_of_at = utcnow()
-        structure_decision = parse_subject_structure(
-            dict(brief.payload.get("subject_structure") or {}),
-            normalized_input=" ".join(
+        frozen_structure = dict(brief.payload.get("subject_structure") or {})
+        confirmed_fields = list(
+            brief.payload.get("subject_structure_user_confirmed_fields") or []
+        )
+        required_fields = {
+            "core_entities[0]",
+            "research_intents[0]",
+            "context_modifiers",
+        }
+        if (
+            brief.payload.get("subject_structure_authority") == "user_confirmed"
+            and required_fields.issubset(confirmed_fields)
+        ):
+            normalized_input = " ".join(
+                item
+                for item in (
+                    *(
+                        str(entity.get("canonical_name") or "").strip()
+                        for entity in frozen_structure.get("core_entities") or ()
+                        if isinstance(entity, dict)
+                    ),
+                    *(str(value).strip() for value in frozen_structure.get("research_intents") or ()),
+                    *(str(value).strip() for value in frozen_structure.get("context_modifiers") or ()),
+                )
+                if item
+            )
+        else:
+            normalized_input = " ".join(
                 item
                 for item in (
                     str(brief.payload.get("seed_text") or "").strip(),
@@ -1224,7 +1249,10 @@ class ContentResearchService:
                     ),
                 )
                 if item
-            ),
+            )
+        structure_decision = parse_subject_structure(
+            frozen_structure,
+            normalized_input=normalized_input,
         )
         if structure_decision.state != "confirmed" or structure_decision.structure is None:
             raise ContentResearchValidationError(
