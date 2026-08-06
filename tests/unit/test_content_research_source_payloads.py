@@ -66,3 +66,22 @@ def test_xhs_failure_payload_uses_same_required_shape():
     assert payload["failure_reason"] == "auth_required"
     assert payload["query_used"] == "徒步短裤"
     assert "raw_payload" not in payload
+
+
+def test_xhs_note_detail_declares_the_same_author_it_projects():
+    payload = XiaohongshuSourceNormalizer().normalize_note_detail(
+        _post(), required_fields=("title", "content_text", "author")
+    )
+
+    assert payload["author"] == "户外作者"
+    assert payload["field_availability"]["author"] == "present"
+
+
+def test_xhs_note_detail_declares_empty_projected_author_missing():
+    payload = XiaohongshuSourceNormalizer().normalize_note_detail(
+        _post().model_copy(update={"author": ""}),
+        required_fields=("title", "content_text", "author"),
+    )
+
+    assert payload["author"] == ""
+    assert payload["field_availability"]["author"] == "missing"

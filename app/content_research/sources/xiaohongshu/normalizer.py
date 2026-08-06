@@ -111,6 +111,7 @@ class XiaohongshuSourceNormalizer:
         availability_payload = {
             "title": post.title,
             "content_text": post.content,
+            "author": post.author,
             "tags": post.tags,
             "note_type": post.note_type,
             "metrics": metrics,
