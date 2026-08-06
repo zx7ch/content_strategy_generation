@@ -53,6 +53,20 @@ def test_product_marketing_custom_focus_replaces_only_the_facet() -> None:
     assert plan.primary_groups[1].role == "user_focus"
 
 
+def test_equivalent_product_marketing_intent_and_focus_merge_into_one_group() -> None:
+    plan = compile_structured_query_plan(
+        direction_id="product_marketing",
+        subject_structure=_structure(),
+        explicit_focus="穿搭！",
+        primary_marketing_goal="content_seeding",
+        run_as_of_at=datetime(2026, 8, 4, tzinfo=timezone.utc),
+    )
+
+    assert len(plan.primary_groups) == 1
+    assert plan.primary_groups[0].roles == ("core_intent", "user_focus")
+    assert plan.primary_groups[0].query_group.query == "防晒服饰 穿搭"
+
+
 def test_product_marketing_fallback_uses_primary_intent_when_context_is_absent() -> None:
     plan = compile_structured_query_plan(
         direction_id="product_marketing",

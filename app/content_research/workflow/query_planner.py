@@ -79,13 +79,18 @@ def compile_structured_query_plan(
             custom_focus=explicit_focus,
         )
         role = "user_focus" if _display_term(explicit_focus) else "goal_facet"
+        terms = (
+            (core, primary_intent)
+            if _identity_text(focus) == _identity_text(primary_intent)
+            else (core, primary_intent, focus)
+        )
         _append_or_merge(
             planned,
             _planned_group(
                 direction_id=direction_id,
                 role=role,
                 activation="primary",
-                terms=(core, primary_intent, focus),
+                terms=terms,
                 priority=1,
                 provider=provider,
                 sort=sort,
