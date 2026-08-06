@@ -370,7 +370,6 @@ async def test_confirmed_product_marketing_plan_uses_goal_facet_with_subject_int
         group["normalized_query"] for group in groups if group["activation"] == "primary"
     ]
     assert primary_queries == ["T恤 凉感", "T恤 凉感 上身感受"]
-    assert all("识别营销话术和内容角度" not in query for query in primary_queries)
 
 
 @pytest.mark.asyncio

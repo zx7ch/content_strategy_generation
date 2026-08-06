@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from app.content_research.subject_structure import parse_subject_structure
+from app.content_research.workflow.direction_registry import ResearchDirectionRegistry
 from app.content_research.workflow.query_planner import compile_structured_query_plan
 
 
@@ -23,6 +24,13 @@ def _structure(*, context_modifiers: list[str] | None = None):
     )
     assert decision.structure is not None
     return decision.structure
+
+
+def test_product_marketing_registry_exposes_only_the_product_value_proposition_question() -> None:
+    direction = ResearchDirectionRegistry().get("product_marketing")
+
+    assert direction is not None
+    assert direction.default_questions == ["提炼小红书产品卖点表达"]
 
 
 def test_product_marketing_q2_keeps_intent_and_uses_goal_facet() -> None:
@@ -136,7 +144,6 @@ def test_compilation_hash_and_order_are_stable_and_synonyms_are_not_primary() ->
         "direction_id": "product_marketing",
         "subject_structure": _structure(),
         "explicit_focus": "通勤",
-        "second_facet": "使用场景",
         "primary_marketing_goal": "content_seeding",
         "run_as_of_at": datetime(2026, 8, 4, tzinfo=timezone.utc),
     }

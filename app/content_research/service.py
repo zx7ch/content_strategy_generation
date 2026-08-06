@@ -1258,29 +1258,30 @@ class ContentResearchService:
             raise ContentResearchValidationError(
                 "Confirmed Brief requires a valid subject structure"
             )
-        compiled_plans: dict[str, CompiledQueryPlan] = {
-            direction.id: compile_structured_query_plan(
-                direction_id=direction.id,
-                subject_structure=structure_decision.structure,
-                explicit_focus=confirmation.custom_research_question,
+        compiled_plans: dict[str, CompiledQueryPlan] = {}
+        for direction in directions:
+            compile_kwargs = {
+                "direction_id": direction.id,
+                "subject_structure": structure_decision.structure,
+                "explicit_focus": confirmation.custom_research_question,
+                "run_as_of_at": run_as_of_at,
+            }
+            if direction.id == "product_marketing":
+                compiled_plans[direction.id] = compile_structured_query_plan(
+                    **compile_kwargs,
+                    primary_marketing_goal=confirmation.primary_marketing_goal,
+                )
+                continue
+            compiled_plans[direction.id] = compile_structured_query_plan(
+                **compile_kwargs,
                 second_facet=(
-                    ""
-                    if direction.id == "product_marketing"
-                    else direction.default_questions[1]
+                    direction.default_questions[1]
                     if len(direction.default_questions) > 1
                     else direction.default_questions[0]
                     if direction.default_questions
                     else ""
                 ),
-                primary_marketing_goal=(
-                    confirmation.primary_marketing_goal
-                    if direction.id == "product_marketing"
-                    else ""
-                ),
-                run_as_of_at=run_as_of_at,
             )
-            for direction in directions
-        }
         task_specs = self._task_router.build_task_specs(
             workflow_run_id=brief.workflow_run_id,
             brief_id=brief.id,

@@ -25,7 +25,7 @@ Task 1–3 已实施并验证；Task 4 的真实 canary 未验收。真实 run
 Spider。该状态不是“证据不足”，不得通过重试搜索规避。
 
 本计划的剩余 Task 4 被新的前置闭环取代：产品营销结构必须由用户确认后原子冻结，随后由唯一 compiler
-产生唯一 snapshot，最后才能 dispatch。旧的产品营销“识别营销话术和内容角度”规格必须删除而非兼容。
+产生唯一 snapshot，最后才能 dispatch。废弃的产品营销默认 query 规格必须删除而非兼容。
 完整的架构、删除范围、当前执行状态和恢复顺序见
 `docs/bugfix/20260807_f003_presearch_to_spider_closure.md`。
 
@@ -205,9 +205,6 @@ assert [item["normalized_query"] for item in primary_groups] == [
     "T恤 凉感",
     "T恤 凉感 上身感受",
 ]
-assert "识别营销话术和内容角度" not in " ".join(
-    item["normalized_query"] for item in direction_plan["query_groups"]
-)
 ```
 
 新增自定义焦点 `通勤` 用例，断言 Q2 是 `T恤 凉感 通勤`。测试使用 API 返回的冻结 plan，不调用 Spider。
@@ -268,7 +265,7 @@ T恤 凉感
 T恤 凉感 上身感受
 ```
 
-同时确认没有 `T恤 识别营销话术和内容角度`。
+同时确认产品营销 primary query 仅为上述两个冻结查询。
 
 - [ ] **Step 3: 验证真实 packet 的作者一致性**
 

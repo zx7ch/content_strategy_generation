@@ -68,6 +68,6 @@ packet 的 `field_projection.author` 非空时，`field_availability.author` 必
 1. detail payload 中有作者时，packet projection 与 availability 都声明作者存在；无作者时两者都为空/`missing`。
 2. `content_seeding`、`T恤`、`凉感`、无自定义焦点时，冻结主查询依次为 `T恤 凉感` 与 `T恤 凉感 上身感受`。
 3. 同一输入带自定义焦点 `通勤` 时，Q2 为 `T恤 凉感 通勤`。
-4. 任意产品营销 Q2 都包含确认的 core 与 first intent；旧文案“识别营销话术和内容角度”不再出现在产品营销冻结 query plan。
+4. 任意产品营销 Q2 都包含确认的 core 与 first intent；已废弃的默认营销 query 不参与冻结 query plan。
 5. 现有 query cap、排序、fallback 与非产品营销方向行为不变。
 6. 用真实 persisted packet 的 canary 证明：作者 availability 与投影一致；若仍无合格结论，报告准确归因为 quote-relevance 或样本门槛，而非作者缺失或 query 偏离。

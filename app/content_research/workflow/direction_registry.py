@@ -76,7 +76,7 @@ def _default_definitions() -> list[ResearchDirectionDefinition]:
             direction_type="content_pattern",
             agent_name="DirectionalExecutionPipeline",
             task_type="product_marketing_research",
-            default_questions=["提炼小红书产品卖点表达", "识别营销话术和内容角度"],
+            default_questions=["提炼小红书产品卖点表达"],
             expected_evidence_types=["post", "search_result", "metric_snapshot"],
             source_scope=["search_result"],
             priority=10,
