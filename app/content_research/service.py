@@ -47,6 +47,7 @@ from app.content_research.api_schemas import (
 from app.content_research.async_dispatch import AsyncFormalResearchDispatchRepository
 from app.content_research.contracts import (
     DIRECTION_CATALOG_V1,
+    LOCKED_QUERY_PLAN_SCHEMA_VERSION,
     PRIMARY_MARKETING_GOAL_CATALOG,
     QUERY_RELEVANCE_ALGORITHM_VERSION,
     DirectionContract,
@@ -2739,6 +2740,7 @@ class ContentResearchService:
                 error_code="CONTENT_RESEARCH_FORMAL_RESEARCH_NOT_READY",
                 suggested_action="先确认最终版调研 brief，再开始正式调研",
             )
+        self._require_frozen_product_marketing_dispatch_contract(brief)
         dispatch = await self._dispatch.enqueue(
             workflow_run_id=workflow_run_id,
             provider=request.provider,
@@ -2759,6 +2761,109 @@ class ContentResearchService:
             source_kind=request.source_kind,
             limit_per_specialist=request.limit,
         )
+
+    def _require_frozen_product_marketing_dispatch_contract(
+        self, brief: ResearchBriefRecord
+    ) -> None:
+        """Reject a marketing dispatch whose persisted frozen contract is incomplete."""
+        snapshot = self._store.get_run_policy_snapshot_for_workflow(brief.workflow_run_id)
+        effective_policy = dict(snapshot.effective_policy) if snapshot is not None else {}
+        locked_plan = effective_policy.get("locked_query_plan")
+        directions = (
+            locked_plan.get("directions")
+            if isinstance(locked_plan, dict)
+            else None
+        )
+        requested_directions = set(
+            str(item).strip()
+            for item in (
+                brief.payload.get("selected_directions")
+                or brief.payload.get("requested_direction_ids")
+                or ()
+            )
+            if str(item).strip()
+        )
+        if "product_marketing" not in requested_directions and not (
+            isinstance(directions, dict) and "product_marketing" in directions
+        ):
+            return
+
+        required_fields = [
+            "core_entities[0]",
+            "research_intents[0]",
+            "context_modifiers",
+        ]
+        structure = brief.payload.get("subject_structure")
+        if (
+            brief.payload.get("subject_structure_state") != "confirmed"
+            or brief.payload.get("subject_structure_user_confirmed_fields")
+            != required_fields
+            or not isinstance(structure, dict)
+        ):
+            raise ContentResearchValidationError(
+                "Product marketing dispatch requires the confirmed frozen subject structure"
+            )
+
+        core_entities = structure.get("core_entities")
+        research_intents = structure.get("research_intents")
+        if not isinstance(core_entities, list) or not isinstance(research_intents, list):
+            raise ContentResearchValidationError(
+                "Product marketing dispatch requires a valid frozen subject structure"
+            )
+        first_entity = core_entities[0] if core_entities else None
+        core = _normalized_subject_term(
+            str(first_entity.get("canonical_name") or "")
+            if isinstance(first_entity, dict)
+            else ""
+        )
+        first_intent = _normalized_subject_term(
+            str(research_intents[0] or "") if research_intents else ""
+        )
+        if not core or not first_intent:
+            raise ContentResearchValidationError(
+                "Product marketing dispatch requires frozen core and first intent"
+            )
+
+        if (
+            snapshot is None
+            or not isinstance(locked_plan, dict)
+            or locked_plan.get("schema_version") != LOCKED_QUERY_PLAN_SCHEMA_VERSION
+            or not isinstance(directions, dict)
+        ):
+            raise ContentResearchValidationError(
+                "Product marketing dispatch requires a valid locked query plan"
+            )
+        marketing_plan = directions.get("product_marketing")
+        groups = (
+            marketing_plan.get("query_groups")
+            if isinstance(marketing_plan, dict)
+            else None
+        )
+        if not isinstance(groups, list):
+            raise ContentResearchValidationError(
+                "Product marketing dispatch requires a valid locked query plan"
+            )
+        primary_groups = [
+            group
+            for group in groups
+            if isinstance(group, dict) and group.get("activation") == "primary"
+        ]
+        if len(primary_groups) != 2:
+            raise ContentResearchValidationError(
+                "Product marketing dispatch requires frozen Q1 and Q2 query groups"
+            )
+        normalized_core = core.casefold()
+        normalized_intent = first_intent.casefold()
+        for group in primary_groups:
+            query = _normalized_subject_term(str(group.get("normalized_query") or ""))
+            if (
+                group.get("direction_id") != "product_marketing"
+                or normalized_core not in query.casefold()
+                or normalized_intent not in query.casefold()
+            ):
+                raise ContentResearchValidationError(
+                    "Product marketing primary query groups must contain frozen core and first intent"
+                )
 
     async def _require_presearch_ready_for_confirmation(self, brief: ResearchBriefRecord) -> None:
         payload_status = str(brief.payload.get("status") or brief.status)

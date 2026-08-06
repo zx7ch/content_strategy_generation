@@ -9,6 +9,7 @@ import pytest
 
 from app.api.routes.router import app
 from app.config import settings
+from app.content_research.contracts import policy_hash
 from app.content_research.persistence_models import StageCheckpointRecord
 from app.content_research.presearch.service import PresearchService
 from app.content_research.service import ContentResearchService
@@ -188,8 +189,10 @@ def _shorts_structure_confirmation() -> dict:
     }
 
 
-async def _confirm_product_marketing_brief(client, *, custom_research_question: str = ""):
-    presearch = await _create_presearch(client, seed_text="夏季凉感 T恤")
+async def _confirm_product_marketing_brief(
+    client, *, presearch: dict | None = None, custom_research_question: str = ""
+):
+    presearch = presearch or await _create_presearch(client, seed_text="夏季凉感 T恤")
     response = await client.post(
         f"/content-research/briefs/{presearch['brief_id']}/confirm",
         json={
@@ -212,6 +215,135 @@ async def _confirm_product_marketing_brief(client, *, custom_research_question: 
     )
     assert snapshot.status_code == 200
     return snapshot.json()["effective_policy"]["locked_query_plan"]
+
+
+async def _dispatch_job_count(service) -> int:
+    async with aiosqlite.connect(service._store._db_path) as conn:
+        cursor = await conn.execute("SELECT COUNT(*) FROM content_research_dispatch_jobs")
+        row = await cursor.fetchone()
+    return int(row[0])
+
+
+async def _start_formal_research(client, workflow_run_id: str):
+    return await client.post(
+        f"/content-research/workflows/{workflow_run_id}/actions",
+        json={
+            "action": "start_formal_research",
+            "payload": {
+                "provider": "xiaohongshu",
+                "source_kind": "search_result",
+                "limit": 20,
+            },
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_product_marketing_dispatch_guard_rejects_missing_confirmed_fields_before_enqueue(
+    product_marketing_client,
+):
+    presearch = await _create_presearch(product_marketing_client, seed_text="夏季凉感 T恤")
+    confirmed = await product_marketing_client.post(
+        f"/content-research/briefs/{presearch['brief_id']}/confirm",
+        json={
+            "confirmed_subject": "夏季凉感 T 恤",
+            "subject_structure_hash": presearch["subject_structure_hash"],
+            "subject_type": "category",
+            "selected_directions": ["product_marketing"],
+            "primary_marketing_goal": "content_seeding",
+            "subject_structure_confirmation": {
+                "core_object": "T恤",
+                "research_intent": "凉感",
+                "context_modifiers": ["夏季"],
+            },
+        },
+    )
+    assert confirmed.status_code == 200
+
+    service = app.state.content_research_service
+    brief = service._store.get_brief(presearch["brief_id"])
+    assert brief is not None
+    service._store.save_brief(
+        replace(
+            brief,
+            payload={
+                **brief.payload,
+                "subject_structure_user_confirmed_fields": ["core_entities[0]"],
+            },
+        )
+    )
+
+    response = await _start_formal_research(
+        product_marketing_client, presearch["workflow_run_id"]
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error_code"] == "INVALID_CONTENT_RESEARCH_PAYLOAD"
+    assert await _dispatch_job_count(service) == 0
+
+
+@pytest.mark.asyncio
+async def test_product_marketing_dispatch_guard_rejects_tampered_q2_without_first_intent_before_enqueue(
+    product_marketing_client,
+):
+    presearch = await _create_presearch(product_marketing_client, seed_text="夏季凉感 T恤")
+    await _confirm_product_marketing_brief(
+        product_marketing_client, presearch=presearch
+    )
+    service = app.state.content_research_service
+    snapshot = service._store.get_run_policy_snapshot_for_workflow(
+        presearch["workflow_run_id"]
+    )
+    assert snapshot is not None
+    tampered_policy = json.loads(json.dumps(snapshot.effective_policy))
+    primary_groups = [
+        group
+        for group in tampered_policy["locked_query_plan"]["directions"]["product_marketing"][
+            "query_groups"
+        ]
+        if group["activation"] == "primary"
+    ]
+    assert len(primary_groups) == 2
+    primary_groups[1]["normalized_query"] = "T恤 上身感受"
+
+    async with aiosqlite.connect(service._store._db_path) as conn:
+        await conn.execute(
+            """UPDATE content_research_run_policy_snapshots
+               SET effective_policy_json = ?, effective_policy_hash = ?
+               WHERE id = ?""",
+            (
+                json.dumps(tampered_policy, ensure_ascii=False, sort_keys=True),
+                policy_hash(tampered_policy),
+                snapshot.id,
+            ),
+        )
+        await conn.commit()
+
+    response = await _start_formal_research(
+        product_marketing_client, presearch["workflow_run_id"]
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error_code"] == "INVALID_CONTENT_RESEARCH_PAYLOAD"
+    assert await _dispatch_job_count(service) == 0
+
+
+@pytest.mark.asyncio
+async def test_product_marketing_dispatch_guard_enqueues_valid_frozen_contract(
+    product_marketing_client,
+):
+    presearch = await _create_presearch(product_marketing_client, seed_text="夏季凉感 T恤")
+    await _confirm_product_marketing_brief(
+        product_marketing_client, presearch=presearch
+    )
+
+    response = await _start_formal_research(
+        product_marketing_client, presearch["workflow_run_id"]
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "queued"
+    assert await _dispatch_job_count(app.state.content_research_service) == 1
 
 
 @pytest.mark.asyncio
