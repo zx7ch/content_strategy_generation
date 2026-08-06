@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, replace
@@ -176,6 +177,13 @@ class WorkflowRuntime(Protocol):
 
     async def resume_subject_clarification(self, workflow_run_id: str) -> dict: ...
 
+    async def confirm_subject_structure_atomically(
+        self,
+        *,
+        workflow_run_id: str,
+        state_writer: Callable[[aiosqlite.Connection], Awaitable[None]],
+    ) -> dict: ...
+
     async def wait_for_presearch_recovery_atomically(
         self,
         workflow_run_id: str,
@@ -303,6 +311,23 @@ class WorkflowRunManagerRuntime:
         async with WorkflowRunManager(self._db_path) as manager:
             run = await manager.resume_run(workflow_run_id)
             await manager.start_step(workflow_run_id, "presearch")
+        return {
+            "workflow_run_id": workflow_run_id,
+            "status": run.status.value,
+            "recoverable": True,
+        }
+
+    async def confirm_subject_structure_atomically(
+        self,
+        *,
+        workflow_run_id: str,
+        state_writer: Callable[[aiosqlite.Connection], Awaitable[None]],
+    ) -> dict:
+        async with WorkflowRunManager(self._db_path) as manager:
+            run = await manager.confirm_subject_structure_atomically(
+                workflow_run_id=workflow_run_id,
+                state_writer=state_writer,
+            )
         return {
             "workflow_run_id": workflow_run_id,
             "status": run.status.value,
@@ -961,56 +986,76 @@ class ContentResearchService:
             resolution_state="resolved",
         )
         structure_hash = subject_structure_fingerprint(structure)
-        updated = self._store.save_brief(
-            replace(
-                brief,
-                status="draft",
-                payload={
-                    **payload,
-                    "status": "completed",
-                    "subject_confirmation": f"已确认调研 {core_object} 的 {research_intent}。",
-                    "subject_structure": subject_structure_payload(structure),
-                    "subject_structure_hash": structure_hash,
-                    "subject_structure_state": "confirmed",
-                    "subject_structure_reason_codes": [],
-                    "subject_structure_authority": "user_confirmed",
-                    "subject_structure_history": [
-                        *list(payload.get("subject_structure_history") or []),
-                        {
-                            "structure_hash": payload.get("subject_structure_hash"),
-                            "state": payload.get("subject_structure_state"),
-                            "reason_codes": list(
-                                payload.get("subject_structure_reason_codes") or []
-                            ),
-                        },
-                    ],
-                },
-                updated_at=utcnow(),
-            )
+        updated = replace(
+            brief,
+            status="draft",
+            payload={
+                **payload,
+                "status": "completed",
+                "subject_confirmation": f"已确认调研 {core_object} 的 {research_intent}。",
+                "subject_structure": subject_structure_payload(structure),
+                "subject_structure_hash": structure_hash,
+                "subject_structure_state": "confirmed",
+                "subject_structure_reason_codes": [],
+                "subject_structure_authority": "user_confirmed",
+                "subject_structure_user_confirmed_fields": [
+                    "core_entities[0]",
+                    "research_intents[0]",
+                    "context_modifiers",
+                ],
+                "subject_structure_history": [
+                    *list(payload.get("subject_structure_history") or []),
+                    {
+                        "structure_hash": payload.get("subject_structure_hash"),
+                        "state": payload.get("subject_structure_state"),
+                        "reason_codes": list(
+                            payload.get("subject_structure_reason_codes") or []
+                        ),
+                    },
+                ],
+            },
+            updated_at=utcnow(),
         )
         now = utcnow()
-        self._store.save_stage_checkpoint(
-            StageCheckpointRecord(
-                id=f"scp_{canonical_fingerprint({'run': workflow_run_id, 'stage': 'subject_structure', 'structure': structure_hash})[:24]}",
-                schema_version="content_research_stage_checkpoint_v1",
-                payload={
-                    "schema_version": "content_research_subject_structure_checkpoint_v1",
-                    "structure_hash": structure_hash,
-                    "state": "confirmed",
-                    "reason_codes": [],
-                    "authority": "user_confirmed",
-                },
-                workflow_run_id=workflow_run_id,
-                subagent_task_id=f"presearch:{payload['attempt_id']}",
-                stage_name="subject_structure",
-                input_fingerprint=structure_hash,
-                status="completed",
-                started_at=now,
-                finished_at=now,
-            )
+        checkpoint = StageCheckpointRecord(
+            id=f"scp_{canonical_fingerprint({'run': workflow_run_id, 'stage': 'subject_structure', 'structure': structure_hash})[:24]}",
+            schema_version="content_research_stage_checkpoint_v1",
+            payload={
+                "schema_version": "content_research_subject_structure_checkpoint_v1",
+                "structure_hash": structure_hash,
+                "state": "confirmed",
+                "reason_codes": [],
+                "authority": "user_confirmed",
+            },
+            workflow_run_id=workflow_run_id,
+            subagent_task_id=f"presearch:{payload['attempt_id']}",
+            stage_name="subject_structure",
+            input_fingerprint=structure_hash,
+            status="completed",
+            started_at=now,
+            finished_at=now,
         )
-        await self._workflow_runtime.resume_subject_clarification(workflow_run_id)
-        await self._workflow_runtime.mark_presearch_ready(workflow_run_id)
+
+        async def state_writer(conn: aiosqlite.Connection) -> None:
+            await self._dispatch.persist_subject_structure_confirmation(
+                conn,
+                brief=updated,
+                checkpoint=checkpoint,
+            )
+
+        try:
+            await self._workflow_runtime.confirm_subject_structure_atomically(
+                workflow_run_id=workflow_run_id,
+                state_writer=state_writer,
+            )
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
+                raise
+            raise ContentResearchStateConflictError(
+                "Subject structure confirmation is temporarily blocked by another local write.",
+                error_code="CONTENT_RESEARCH_SUBJECT_CONFIRMATION_CONFLICT",
+                suggested_action="稍后重试确认操作",
+            ) from exc
         return self._response_from_brief(updated)
 
     async def confirm_brief(

@@ -15,6 +15,7 @@ from app.content_research.models import (
     ResearchPlanRecord,
     SubagentTaskRecord,
 )
+from app.content_research.persistence_models import StageCheckpointRecord
 from app.content_research.stores.sqlite_store import _dumps, _dumps_any_list, _fmt_dt
 
 
@@ -50,6 +51,51 @@ class AsyncFormalResearchDispatchRepository:
                 _fmt_dt(brief.updated_at),
                 _dumps(brief.payload),
                 _dumps(brief.metadata),
+            ),
+        )
+
+    async def persist_subject_structure_confirmation(
+        self,
+        conn: aiosqlite.Connection,
+        *,
+        brief: ResearchBriefRecord,
+        checkpoint: StageCheckpointRecord,
+    ) -> None:
+        """Write subject confirmation records on a caller-owned transaction."""
+        await self.persist_brief(conn, brief)
+        await conn.execute(
+            """INSERT INTO content_research_stage_checkpoints
+               (id, schema_version, workflow_run_id, subagent_task_id, stage_name,
+                input_fingerprint, status, retry_count, started_at, finished_at,
+                payload_json, metadata_json, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(id) DO UPDATE SET
+                 schema_version=excluded.schema_version,
+                 workflow_run_id=excluded.workflow_run_id,
+                 subagent_task_id=excluded.subagent_task_id,
+                 stage_name=excluded.stage_name,
+                 input_fingerprint=excluded.input_fingerprint,
+                 status=excluded.status,
+                 retry_count=excluded.retry_count,
+                 started_at=excluded.started_at,
+                 finished_at=excluded.finished_at,
+                 payload_json=excluded.payload_json,
+                 metadata_json=excluded.metadata_json,
+                 created_at=excluded.created_at""",
+            (
+                checkpoint.id,
+                checkpoint.schema_version,
+                checkpoint.workflow_run_id,
+                checkpoint.subagent_task_id,
+                checkpoint.stage_name,
+                checkpoint.input_fingerprint,
+                checkpoint.status,
+                checkpoint.retry_count,
+                _fmt_dt(checkpoint.started_at) if checkpoint.started_at else None,
+                _fmt_dt(checkpoint.finished_at) if checkpoint.finished_at else None,
+                _dumps(checkpoint.payload),
+                _dumps(checkpoint.metadata),
+                _fmt_dt(checkpoint.created_at),
             ),
         )
 

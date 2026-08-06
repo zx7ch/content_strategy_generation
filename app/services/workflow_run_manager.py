@@ -229,6 +229,28 @@ class WorkflowRunManager:
 
         return await self._transaction(op)
 
+    async def confirm_subject_structure_atomically(
+        self,
+        *,
+        workflow_run_id: str,
+        state_writer: Callable[[aiosqlite.Connection], Awaitable[None]],
+    ) -> WorkflowRun:
+        """Persist a subject correction and resume presearch as one unit of work."""
+
+        async def op() -> WorkflowRun:
+            assert self._conn is not None
+            await state_writer(self._conn)
+            await self.resume_run(workflow_run_id)
+            await self.start_step(workflow_run_id, "presearch")
+            await self.complete_step(
+                workflow_run_id,
+                "presearch",
+                artifact_refs=[{"type": "content_research_brief_draft"}],
+            )
+            return await self.advance_to_next_step(workflow_run_id)
+
+        return await self._transaction(op)
+
     async def _fetch_run_row(self, run_id: str) -> aiosqlite.Row:
         assert self._conn is not None
         async with self._conn.execute(

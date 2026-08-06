@@ -8,12 +8,14 @@ import pytest
 
 from app.content_research.api_schemas import (
     ContentResearchBriefConfirmRequest,
+    ContentResearchSubjectStructureConfirmationRequest,
     ContentResearchWorkflowActionRequest,
 )
 from app.content_research.persistence_models import StageCheckpointRecord
 from app.content_research.presearch.service import PresearchService
 from app.content_research.service import (
     ContentResearchService,
+    ContentResearchStateConflictError,
     ContentResearchValidationError,
     WorkflowRunManagerRuntime,
 )
@@ -348,8 +350,8 @@ async def test_subject_clarification_reuses_run_without_model_recovery_or_spider
 
 
 @pytest.mark.asyncio
-async def test_structured_subject_confirmation_never_requests_a_second_model_response(store):
-    runtime = FakeRuntime()
+async def test_structured_subject_confirmation_atomically_updates_real_runtime(store):
+    runtime = WorkflowRunManagerRuntime(store._db_path)
     llm = AmbiguousThenClarifiedLLM()
     service = _service(store, llm, runtime=runtime)
 
@@ -381,10 +383,28 @@ async def test_structured_subject_confirmation_never_requests_a_second_model_res
     ]
     assert result["subject_structure"]["research_intents"] == ["年轻人偏好"]
     assert result["subject_structure"]["context_modifiers"] == ["大学生", "日常使用"]
+    persisted_brief = store.get_brief(first.brief_id)
+    assert persisted_brief is not None
+    assert persisted_brief.payload["subject_structure_user_confirmed_fields"] == [
+        "core_entities[0]",
+        "research_intents[0]",
+        "context_modifiers",
+    ]
     assert len(llm.requests) == 1
-    assert runtime.calls[-2]["event"] == "resume_subject_clarification"
-    assert runtime.calls[-1]["event"] == "presearch_ready"
-    assert all(item.stage_name != "operation" for item in store.list_typed_records(StageCheckpointRecord))
+
+    confirmed_checkpoints = [
+        item
+        for item in store.list_typed_records(StageCheckpointRecord)
+        if item.workflow_run_id == first.workflow_run_id
+        and item.stage_name == "subject_structure"
+        and item.payload.get("state") == "confirmed"
+    ]
+    assert len(confirmed_checkpoints) == 1
+    snapshot = await runtime.get_runtime_snapshot(first.workflow_run_id)
+    presearch_step = next(step for step in snapshot["steps"] if step["step_name"] == "presearch")
+    assert snapshot["run"]["status"] == "running"
+    assert snapshot["run"]["current_step"] == "brief_confirm"
+    assert presearch_step["status"] == "succeeded"
 
     with pytest.raises(ContentResearchValidationError, match="stale subject structure"):
         await service.run_workflow_action(
@@ -398,6 +418,67 @@ async def test_structured_subject_confirmation_never_requests_a_second_model_res
                 },
             ),
         )
+
+
+@pytest.mark.asyncio
+async def test_subject_confirmation_conflict_rolls_back_brief_checkpoint_and_runtime(store, monkeypatch):
+    runtime = WorkflowRunManagerRuntime(store._db_path)
+    service = _service(store, AmbiguousThenClarifiedLLM(), runtime=runtime)
+    first = await service.submit_presearch(
+        seed_text="苹果适合年轻人吗",
+        user_note=None,
+        thread_id="thread_subject_confirmation_conflict",
+        user_id="user_1",
+    )
+
+    brief_before = store.get_brief(first.brief_id)
+    checkpoints_before = store.list_typed_records(StageCheckpointRecord)
+    snapshot_before = await runtime.get_runtime_snapshot(first.workflow_run_id)
+
+    async def locked_confirmation_writer(conn, *, brief, checkpoint):
+        await conn.execute(
+            "UPDATE content_research_briefs SET status='draft' WHERE id=?",
+            (brief.id,),
+        )
+        await conn.execute(
+            """INSERT INTO content_research_stage_checkpoints
+               (id, schema_version, workflow_run_id, subagent_task_id, stage_name,
+                input_fingerprint, status, retry_count, payload_json, metadata_json, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, 'completed', 0, ?, '{}', CURRENT_TIMESTAMP)""",
+            (
+                "scp_lock_conflict",
+                checkpoint.schema_version,
+                checkpoint.workflow_run_id,
+                checkpoint.subagent_task_id,
+                checkpoint.stage_name,
+                checkpoint.input_fingerprint,
+                json.dumps(checkpoint.payload, ensure_ascii=False),
+            ),
+        )
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(
+        service._dispatch,
+        "persist_subject_structure_confirmation",
+        locked_confirmation_writer,
+        raising=False,
+    )
+
+    with pytest.raises(ContentResearchStateConflictError) as exc_info:
+        await service.confirm_subject_structure(
+            workflow_run_id=first.workflow_run_id,
+            confirmation=ContentResearchSubjectStructureConfirmationRequest(
+                subject_structure_hash=first.subject_structure_hash,
+                core_object="Apple 品牌",
+                research_intent="年轻人偏好",
+                context_modifiers="大学生，日常使用",
+            ),
+        )
+
+    assert exc_info.value.error_code == "CONTENT_RESEARCH_SUBJECT_CONFIRMATION_CONFLICT"
+    assert store.get_brief(first.brief_id) == brief_before
+    assert store.list_typed_records(StageCheckpointRecord) == checkpoints_before
+    assert await runtime.get_runtime_snapshot(first.workflow_run_id) == snapshot_before
 
 
 @pytest.mark.asyncio
