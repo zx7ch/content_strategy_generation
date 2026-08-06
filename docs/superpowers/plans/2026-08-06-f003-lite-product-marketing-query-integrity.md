@@ -18,9 +18,20 @@
 - packet 不得编造作者身份：仅传播 provider 返回的 `author`；空值必须声明为 `missing`。
 - 公共 Trace 不得增加原始 query、作者或 packet 内容。
 
+## Execution Closure — 2026-08-07
+
+Task 1–3 已实施并验证；Task 4 的真实 canary 未验收。真实 run
+`run_fabdc32b145c4a6b81dd3a8ec35d947d` 在主体结构确认阶段发生 SQLite 锁冲突，未启动
+Spider。该状态不是“证据不足”，不得通过重试搜索规避。
+
+本计划的剩余 Task 4 被新的前置闭环取代：产品营销结构必须由用户确认后原子冻结，随后由唯一 compiler
+产生唯一 snapshot，最后才能 dispatch。旧的产品营销“识别营销话术和内容角度”规格必须删除而非兼容。
+完整的架构、删除范围、当前执行状态和恢复顺序见
+`docs/bugfix/20260807_f003_presearch_to_spider_closure.md`。
+
 ---
 
-### Task 1: 修复笔记详情作者可用性元数据
+### Task 1: 修复笔记详情作者可用性元数据（已完成）
 
 **Files:**
 - Modify: `app/content_research/sources/xiaohongshu/normalizer.py:102-140`
@@ -73,7 +84,7 @@ git add app/content_research/sources/xiaohongshu/normalizer.py tests/unit/test_c
 git commit -m "fix(content-research): align XHS author availability"
 ```
 
-### Task 2: 为产品营销确定性编译带事实锚点的 Q2
+### Task 2: 为产品营销确定性编译带事实锚点的 Q2（已完成）
 
 **Files:**
 - Modify: `app/content_research/workflow/query_planner.py:39-112`
@@ -166,7 +177,7 @@ git add app/content_research/workflow/query_planner.py tests/unit/test_content_r
 git commit -m "fix(content-research): anchor product marketing Q2 intent"
 ```
 
-### Task 3: 将冻结营销目标传入正式计划，并验证 API 合约
+### Task 3: 将冻结营销目标传入正式计划，并验证 API 合约（已完成）
 
 **Files:**
 - Modify: `app/content_research/service.py:1114-1132`
@@ -234,7 +245,7 @@ git add app/content_research/service.py tests/e2e/test_content_research_brief_co
 git commit -m "fix(content-research): freeze goal-aware marketing queries"
 ```
 
-### Task 4: 使用真实笔记完成端到端 canary 与漏斗复核
+### Task 4: 使用真实笔记完成端到端 canary 与漏斗复核（已阻断，待前置闭环）
 
 **Files:**
 - No production code changes.
