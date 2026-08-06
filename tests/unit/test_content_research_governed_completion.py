@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from app.content_research.admission.candidates import build_claim_candidate, extract_facts
@@ -46,6 +48,54 @@ class CapturingRuntime:
     async def fail_formal_research(self, **kwargs) -> dict:
         self.failed.append(kwargs)
         return {"status": "failed", "recoverable": False}
+
+
+@pytest.mark.asyncio
+async def test_formal_execution_reuses_the_existing_workflow_trace(tmp_path):
+    store = SQLiteContentResearchStore(str(tmp_path / "formal-trace-reuse.db"))
+    brief = ResearchBriefRecord(
+        id="rb_trace", workflow_run_id="run_trace", thread_id="thread_trace",
+        schema_version="v1", status="confirmed", payload={"schema_version": "v1"},
+    )
+    task = SubagentTaskRecord(
+        id="sat_trace", workflow_run_id=brief.workflow_run_id, thread_id=brief.thread_id,
+        schema_version="v1", status="queued", plan_id="rp_trace", direction_id="product_marketing",
+        payload={"schema_version": "v1", "workflow_child_task_id": "child_trace"},
+    )
+    trace = TraceRecord(
+        id="trc_trace", workflow_run_id=brief.workflow_run_id, thread_id=brief.thread_id,
+        schema_version="v1", status="running", started_at=utcnow(),
+        payload={"schema_version": "v1"},
+    )
+    store.save_brief(brief)
+    store.save_subagent_task(task)
+    store.save_trace(trace)
+
+    class CapturingRouter:
+        def __init__(self) -> None:
+            self.trace_ids: list[str | None] = []
+
+        async def execute_task(self, received_task, **kwargs):
+            self.trace_ids.append(kwargs.get("trace_id"))
+            return replace(
+                received_task,
+                status="failed",
+                payload={
+                    **received_task.payload,
+                    "output_payload": {"error_message": "synthetic failure"},
+                },
+            )
+
+    runtime = CapturingRuntime()
+    service = ContentResearchService(store=store, presearch=None, workflow_runtime=runtime)
+    router = CapturingRouter()
+    service._task_router = router
+
+    await service._execute_formal_research(
+        brief=brief, provider="xiaohongshu", source_kind="search", limit=10,
+    )
+
+    assert router.trace_ids == ["trc_trace"]
 
 
 @pytest.mark.asyncio

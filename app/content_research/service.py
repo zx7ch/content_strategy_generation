@@ -3007,10 +3007,13 @@ class ContentResearchService:
         executable_tasks = [
             task for task in tasks if task.status in {"queued", "pending", "failed"}
         ]
+        workflow_traces = self._store.list_traces_for_workflow(brief.workflow_run_id)
+        trace_id = workflow_traces[0].id if workflow_traces else None
         terminals = await asyncio.gather(
             *(
                 self._task_router.execute_task(
                     task,
+                    trace_id=trace_id,
                     provider=provider,
                     source_kind=source_kind,
                     limit=limit,
