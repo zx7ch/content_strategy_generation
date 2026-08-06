@@ -2774,18 +2774,12 @@ class ContentResearchService:
             if isinstance(locked_plan, dict)
             else None
         )
-        requested_directions = set(
+        requested_directions = {
             str(item).strip()
-            for item in (
-                brief.payload.get("selected_directions")
-                or brief.payload.get("requested_direction_ids")
-                or ()
-            )
+            for item in list(effective_policy.get("requested_direction_ids") or [])
             if str(item).strip()
-        )
-        if "product_marketing" not in requested_directions and not (
-            isinstance(directions, dict) and "product_marketing" in directions
-        ):
+        }
+        if "product_marketing" not in requested_directions:
             return
 
         required_fields = [

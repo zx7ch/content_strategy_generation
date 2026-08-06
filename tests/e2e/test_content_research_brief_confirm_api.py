@@ -329,6 +329,57 @@ async def test_product_marketing_dispatch_guard_rejects_tampered_q2_without_firs
 
 
 @pytest.mark.asyncio
+async def test_product_marketing_dispatch_guard_uses_snapshot_requested_directions_and_fails_closed(
+    product_marketing_client,
+):
+    presearch = await _create_presearch(product_marketing_client, seed_text="夏季凉感 T恤")
+    await _confirm_product_marketing_brief(
+        product_marketing_client, presearch=presearch
+    )
+    service = app.state.content_research_service
+    brief = service._store.get_brief(presearch["brief_id"])
+    snapshot = service._store.get_run_policy_snapshot_for_workflow(
+        presearch["workflow_run_id"]
+    )
+    assert brief is not None
+    assert snapshot is not None
+
+    service._store.save_brief(
+        replace(
+            brief,
+            payload={
+                key: value
+                for key, value in brief.payload.items()
+                if key not in {"selected_directions", "requested_direction_ids"}
+            },
+        )
+    )
+    tampered_policy = json.loads(json.dumps(snapshot.effective_policy))
+    assert tampered_policy["requested_direction_ids"] == ["product_marketing"]
+    tampered_policy["locked_query_plan"].pop("directions")
+    async with aiosqlite.connect(service._store._db_path) as conn:
+        await conn.execute(
+            """UPDATE content_research_run_policy_snapshots
+               SET effective_policy_json = ?, effective_policy_hash = ?
+               WHERE id = ?""",
+            (
+                json.dumps(tampered_policy, ensure_ascii=False, sort_keys=True),
+                policy_hash(tampered_policy),
+                snapshot.id,
+            ),
+        )
+        await conn.commit()
+
+    response = await _start_formal_research(
+        product_marketing_client, presearch["workflow_run_id"]
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error_code"] == "INVALID_CONTENT_RESEARCH_PAYLOAD"
+    assert await _dispatch_job_count(service) == 0
+
+
+@pytest.mark.asyncio
 async def test_product_marketing_dispatch_guard_enqueues_valid_frozen_contract(
     product_marketing_client,
 ):
