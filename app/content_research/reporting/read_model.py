@@ -228,6 +228,16 @@ class PublishedReportReader:
         async with WorkflowStore(self._db_path) as workflow_store:
             run = await workflow_store.get_run(publication.workflow_run_id)
             artifacts = await workflow_store.list_artifacts(publication.workflow_run_id)
+        terminal_state = (
+            run.status.value
+            if run is not None and hasattr(run.status, "value")
+            else (str(run.status) if run else "unknown")
+        )
+        # A materialized artifact is an internal finalization product until the
+        # workflow commits success.  Exposing it earlier lets Creator render a
+        # completed report for a run that may still fail its publication step.
+        if terminal_state != "succeeded":
+            raise PublishedReportNotFoundError("published report is not ready")
         artifact = next(
             (
                 item
@@ -240,11 +250,6 @@ class PublishedReportReader:
         )
         if artifact is None:
             raise PublishedReportNotFoundError("published report artifact is missing")
-        terminal_state = (
-            run.status.value
-            if run is not None and hasattr(run.status, "value")
-            else (str(run.status) if run else "unknown")
-        )
         return artifact, terminal_state
 
 

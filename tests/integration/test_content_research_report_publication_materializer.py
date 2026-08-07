@@ -67,7 +67,7 @@ async def test_materializes_published_report_as_one_creator_snapshot_and_timelin
         store.save_report_faithfulness_decision(decision.to_record())
         store.save_report_publication(publication.to_record())
         async with WorkflowRunManager(db_path) as manager:
-            await manager.complete_run(run.run_id)
+            await manager.begin_report_finalization(run.run_id)
 
         materializer = ReportPublicationMaterializer(store, db_path)
         artifact = await materializer.materialize(publication.id)
@@ -234,7 +234,7 @@ async def test_pre_0013_gate2_evidence_survives_bundle_and_report_artifact_purge
                 ('["bundle_legacy"]', snapshot.id),
             )
         async with WorkflowRunManager(db_path) as manager:
-            await manager.complete_run(run.run_id)
+            await manager.begin_report_finalization(run.run_id)
 
         await ReportPublicationMaterializer(store, db_path).materialize(publication.id)
         apply_content_research_migrations(
@@ -287,7 +287,7 @@ async def test_materialization_rejects_publication_with_mismatched_lineage_befor
         store.save_report_faithfulness_decision(decision.to_record())
         store.save_report_publication(publication.to_record())
         async with WorkflowRunManager(db_path) as manager:
-            await manager.complete_run(run.run_id)
+            await manager.begin_report_finalization(run.run_id)
 
         with pytest.raises(ValueError, match="lineage mismatch"):
             await ReportPublicationMaterializer(store, db_path).materialize(publication.id)
@@ -300,8 +300,8 @@ async def test_materialization_rejects_publication_with_mismatched_lineage_befor
 
 
 @pytest.mark.asyncio
-async def test_materialization_requires_terminal_workflow_before_artifact_or_message(tmp_path):
-    db_path = str(tmp_path / "report-before-terminal.db")
+async def test_materialization_requires_report_finalization_before_artifact_or_message(tmp_path):
+    db_path = str(tmp_path / "report-before-finalization.db")
     store = SQLiteContentResearchStore(db_path)
     thread_store = ThreadStore(db_path)
     await thread_store.connect()
@@ -318,7 +318,7 @@ async def test_materialization_requires_terminal_workflow_before_artifact_or_mes
         store.save_report_faithfulness_decision(decision.to_record())
         store.save_report_publication(publication.to_record())
 
-        with pytest.raises(ValueError, match="before workflow completion"):
+        with pytest.raises(ValueError, match="finalizing_report"):
             await ReportPublicationMaterializer(store, db_path).materialize(publication.id)
         assert await thread_store.get_thread_messages(thread["id"]) == []
     finally:
@@ -344,7 +344,7 @@ async def test_materialized_report_preserves_exact_governed_citation_groups_and_
         store.save_report_faithfulness_decision(decision.to_record())
         store.save_report_publication(publication.to_record())
         async with WorkflowRunManager(db_path) as manager:
-            await manager.complete_run(run.run_id)
+            await manager.begin_report_finalization(run.run_id)
 
         artifact = await ReportPublicationMaterializer(store, db_path).materialize(publication.id)
 
@@ -382,7 +382,7 @@ async def test_materialization_rejects_incomplete_frozen_citation_before_artifac
         store.save_report_faithfulness_decision(decision.to_record())
         store.save_report_publication(publication.to_record())
         async with WorkflowRunManager(db_path) as manager:
-            await manager.complete_run(run.run_id)
+            await manager.begin_report_finalization(run.run_id)
 
         with pytest.raises(ValueError, match="evidence ref is incomplete"):
             await ReportPublicationMaterializer(store, db_path).materialize(publication.id)
@@ -565,7 +565,7 @@ async def test_migration_purges_legacy_report_lineage_but_preserves_same_run_non
         store.save_report_faithfulness_decision(decision.to_record())
         store.save_report_publication(publication.to_record())
         async with WorkflowRunManager(db_path) as manager:
-            await manager.complete_run(run.run_id)
+            await manager.begin_report_finalization(run.run_id)
         report_artifact = await ReportPublicationMaterializer(store, db_path).materialize(
             publication.id
         )

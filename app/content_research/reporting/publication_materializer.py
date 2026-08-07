@@ -43,8 +43,8 @@ class ReportPublicationMaterializer:
             run = await workflow_store.get_run(publication.workflow_run_id)
             if run is None:
                 raise ValueError("missing Creator workflow run for report publication")
-            if run.status.value != "succeeded":
-                raise ValueError("cannot materialize a report before workflow completion")
+            if run.status.value != "finalizing_report":
+                raise ValueError("cannot materialize a report outside finalizing_report")
             existing = await workflow_store.list_artifacts(publication.workflow_run_id)
 
         artifact = next(

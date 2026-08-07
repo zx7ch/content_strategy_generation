@@ -182,6 +182,10 @@ class ClaimAdmissionEvaluator:
                     "ugc_comment_sample_insufficient",
                     "comment_insight_evidence_boundary_violation",
                     "query_subject_not_supported",
+                    "invalid_query_relevance_contract",
+                    "invalid_query_provenance",
+                    "invalid_quote_reference",
+                    "core_entity_not_supported",
                     "first_intent_not_supported",
                 }
                 for reason in reasons

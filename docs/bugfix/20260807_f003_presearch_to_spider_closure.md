@@ -67,6 +67,12 @@ Q2 = core + first_intent + facet
 | Task 3：冻结营销目标接线 | 已完成 | API 直接验证 frozen plan 的默认与自定义 facet。 |
 | Task 4：真实 canary | 未验收 | run `run_fabdc32b145c4a6b81dd3a8ec35d947d` 在结构确认写入时被 SQLite 锁阻断；未启动 Spider，未产生 snapshot、packet、漏斗或报告。 |
 
+## Author packet 合同澄清（2026-08-07）
+
+真实 canary 的 packet `field_projection.author` 均由来源 payload 保留，独立作者计数也已参与 admission。先前看到的“缺少 author”是把 `field_availability.author` 当作投影字段：产品营销合同没有请求该 availability 标记，因此它不会出现在该 map 中。
+
+这不是 Spider、parser 或保存链路丢失作者信息。Lite 不把 `author` 加入产品营销 `required_note_fields`，避免为了元数据齐全额外淘汰证据；当某个方向明确请求 `author` 时，normalizer 仍必须将其 availability 声明为 `present` 或 `missing`。
+
 Task 4 不能通过重试来完成；它必须等待以下前置闭环。
 
 ## 缺口及其正确边界
@@ -105,3 +111,14 @@ dispatch 必须验证：
 ## 完成标准
 
 新 canary 必须证明以下顺序完整成立：用户确认的 `T恤 / 凉感 / 夏季` 原子冻结，随后 snapshot 中只有 `T恤 凉感` 与 `T恤 凉感 上身感受` 两个产品营销主查询，之后才允许 Spider 调用。
+
+## 后续离线 Bugfix 闭环（2026-08-07）
+
+在不重试 Spider、也不改写历史 canary 的约束下，本轮已完成以下可离线验证的修复：
+
+1. **报告生命周期与 404。** workflow 使用 `running → finalizing_report → succeeded`：治理、审计、publication、artifact 和唯一 timeline message 都在 `finalizing_report` 内完成。Lite reader 在该状态返回普通未就绪，不会把尚可能失败的 artifact 显示为完成报告；只有状态成功后才可读取。
+2. **高淘汰率的可解释性。** admission 不再把冻结 query 缺失、query provenance 非法、quote 引用非法、缺 core entity 和缺 first intent 都写成 `query_subject_not_supported`。每个 claim 保存唯一、可复现的拒绝原因，离线 trace/报告可直接读取既有 `reason_codes`，无需第二次 Spider。
+3. **作者合同。** 回归测试确认：不请求 `author` availability 时，packet 仍保留 author 投影；请求时才在 availability map 中声明 `present` / `missing`。这关闭了“作者字段丢失”的错误缺陷定义。
+4. **模型不可用时的恢复幂等性。** 同一 `workflow_run_id`、研究计划和输入指纹的模型暂不可用重试，会复用既有三条 `analysis_unavailable` 决策，仅更新可重试的 stage checkpoint；不会因重复插入稳定 decision id 触发 SQLite 唯一键错误。模型恢复后，原 packet 可继续完成结论治理，不需要重新 Spider。
+
+SQLite 同步/异步写入协调仍是明确的 P1，未在本轮改动，以免扩大当前 Lite bugfix 范围。

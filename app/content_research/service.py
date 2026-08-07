@@ -243,6 +243,8 @@ class WorkflowRuntime(Protocol):
         self, *, workflow_run_id: str, task_outcomes: list[dict], artifact_refs: list[dict]
     ) -> bool: ...
 
+    async def complete_report_publication(self, *, workflow_run_id: str) -> bool: ...
+
     async def wait_for_user_recovery(self, *, workflow_run_id: str, reason: dict) -> dict: ...
 
     async def fail_formal_research(self, *, workflow_run_id: str, reason: dict) -> dict: ...
@@ -405,7 +407,10 @@ class WorkflowRunManagerRuntime:
         # A successful formal run is immutable.  Retrying its public action is
         # a safe replay request, not permission to complete the runtime a
         # second time (which the workflow manager correctly rejects).
-        if str((snapshot.get("run") or {}).get("status") or "") == "succeeded":
+        if str((snapshot.get("run") or {}).get("status") or "") in {
+            "finalizing_report",
+            "succeeded",
+        }:
             return True
         child_by_id = {str(task["child_task_id"]): task for task in snapshot["child_tasks"]}
         expected_child_ids = set(child_by_id)
@@ -445,7 +450,12 @@ class WorkflowRunManagerRuntime:
             await manager.complete_step(
                 workflow_run_id, "formal_research", artifact_refs=artifact_refs
             )
-            await manager.complete_run(workflow_run_id)
+            await manager.begin_report_finalization(workflow_run_id)
+        return True
+
+    async def complete_report_publication(self, *, workflow_run_id: str) -> bool:
+        async with WorkflowRunManager(self._db_path) as manager:
+            await manager.complete_report_finalization(workflow_run_id)
         return True
 
     async def wait_for_user_recovery(
@@ -468,8 +478,14 @@ class WorkflowRunManagerRuntime:
         workflow_run_id: str,
         reason: dict,
     ) -> dict:
+        async with WorkflowStore(self._db_path) as store:
+            current_run = await store.get_run(workflow_run_id)
         async with WorkflowRunManager(self._db_path) as manager:
-            await manager.fail_step(workflow_run_id, "formal_research", reason)
+            # Report composition begins only after formal_research has already
+            # completed.  A finalization error must fail the parent directly;
+            # trying to fail that completed step would leave the run stuck.
+            if current_run is None or current_run.status.value != "finalizing_report":
+                await manager.fail_step(workflow_run_id, "formal_research", reason)
             run = await manager.fail_run(workflow_run_id, reason)
         return {
             "workflow_run_id": workflow_run_id,
@@ -503,7 +519,7 @@ class WorkflowRunManagerRuntime:
         async with WorkflowStore(self._db_path) as store:
             run = await store.get_run(workflow_run_id)
         status_value = run.status.value if run is not None else ""
-        if status_value in {"running", "pausing", "paused"}:
+        if status_value in {"running", "pausing", "paused", "finalizing_report"}:
             async with WorkflowRunManager(self._db_path) as manager:
                 cancelled = await manager.cancel_run(
                     workflow_run_id, reason="content_research_ended"
@@ -1727,6 +1743,7 @@ class ContentResearchService:
             if message in {
                 "published report not found",
                 "published report artifact is missing",
+                "published report is not ready",
             } or message.startswith("requested citation groups are absent"):
                 raise ContentResearchNotFoundError(message) from exc
             raise ContentResearchReportIntegrityError(message) from exc
@@ -3479,13 +3496,29 @@ class ContentResearchService:
                 task_outcomes=outcomes,
                 artifact_refs=artifact_refs,
             )
-            # Creator's terminal-run contract is deliberate: only after the
-            # workflow reaches a terminal success state may the final report
-            # artifact and its single timeline message become visible.
-            report_artifact_ref = await self._publish_report_after_workflow_completion(
-                workflow_run_id=brief.workflow_run_id,
-                thread_id=brief.thread_id,
-            )
+            try:
+                # The report artifact is produced while finalizing_report.  It
+                # is not publicly readable until complete_report_publication
+                # commits the workflow's succeeded state.
+                report_artifact_ref = await self._publish_report_after_workflow_completion(
+                    workflow_run_id=brief.workflow_run_id,
+                    thread_id=brief.thread_id,
+                )
+                if report_artifact_ref is not None:
+                    complete_report = getattr(
+                        self._workflow_runtime, "complete_report_publication", None
+                    )
+                    if complete_report is not None:
+                        await complete_report(workflow_run_id=brief.workflow_run_id)
+            except Exception as exc:
+                await self._workflow_runtime.fail_formal_research(
+                    workflow_run_id=brief.workflow_run_id,
+                    reason={
+                        "code": "report_publication_failed",
+                        "message": str(exc) or "Report publication failed.",
+                    },
+                )
+                raise
             if report_artifact_ref is not None:
                 artifact_refs = _unique_artifact_refs([*artifact_refs, report_artifact_ref])
             await self._workflow_runtime.append_event(
@@ -3631,22 +3664,36 @@ class ContentResearchService:
             self._store.save_stage_checkpoint(failure_checkpoint)
             for track in ("need", "value", "message"):
                 decision_id = f"mcd_{canonical_fingerprint({'input': fingerprint, 'track': track, 'state': 'analysis_unavailable'})[:24]}"
-                self._store.save_marketing_conclusion_decision(
-                    MarketingConclusionDecisionRecord(
-                        decision_id,
-                        "marketing_conclusion_decision_v1",
-                        {
-                            "input_fingerprint": fingerprint,
-                            "reason_codes": ["marketing_analysis_unavailable"],
-                            "recovery_action": "repair_model_configuration_and_resume",
-                        },
-                        workflow_run_id=workflow_run_id,
-                        research_plan_id=research_plan_id,
-                        candidate_id=None,
-                        track=track,
-                        state="analysis_unavailable",
-                    )
+                existing_decision = self._store.get_typed_record(
+                    MarketingConclusionDecisionRecord, decision_id
                 )
+                if existing_decision is None:
+                    self._store.save_marketing_conclusion_decision(
+                        MarketingConclusionDecisionRecord(
+                            decision_id,
+                            "marketing_conclusion_decision_v1",
+                            {
+                                "input_fingerprint": fingerprint,
+                                "reason_codes": ["marketing_analysis_unavailable"],
+                                "recovery_action": "repair_model_configuration_and_resume",
+                            },
+                            workflow_run_id=workflow_run_id,
+                            research_plan_id=research_plan_id,
+                            candidate_id=None,
+                            track=track,
+                            state="analysis_unavailable",
+                        )
+                    )
+                elif (
+                    existing_decision.workflow_run_id != workflow_run_id
+                    or existing_decision.research_plan_id != research_plan_id
+                    or existing_decision.track != track
+                    or existing_decision.state != "analysis_unavailable"
+                    or existing_decision.payload.get("input_fingerprint") != fingerprint
+                ):
+                    raise RuntimeError(
+                        "marketing conclusion unavailable decision identity conflict"
+                    )
             if isinstance(exc, MarketingConclusionAnalysisError):
                 raise LLMProviderFailure(
                     "llm_protocol_incompatible",
@@ -3714,10 +3761,10 @@ class ContentResearchService:
     async def _publish_report_after_workflow_completion(
         self, *, workflow_run_id: str, thread_id: str
     ) -> dict[str, str] | None:
-        """Publish only after Creator has recorded the terminal workflow state."""
+        """Materialize the report during the dedicated finalization boundary."""
         async with WorkflowStore(self._store._db_path) as workflow_store:
             run = await workflow_store.get_run(workflow_run_id)
-        if run is None or run.status.value != "succeeded":
+        if run is None or run.status.value != "finalizing_report":
             return None
         async with ThreadStore(self._store._db_path) as thread_store:
             if await thread_store.get_thread(thread_id) is None:
@@ -3729,14 +3776,6 @@ class ContentResearchService:
         if not plans:
             raise ContentResearchValidationError(
                 "Marketing conclusion governance requires a research plan"
-            )
-        policy = self._store.get_run_policy_snapshot_for_workflow(workflow_run_id)
-        if policy is not None and isinstance(
-            policy.effective_policy.get("marketing_conclusion_policy"), dict
-        ):
-            await self._govern_marketing_conclusions(
-                workflow_run_id=workflow_run_id,
-                research_plan_id=plans[-1].id,
             )
         direction_records = self._store.list_directions_for_plan(plans[-1].id)
         governed = self._build_governed_snapshot(

@@ -691,7 +691,7 @@ class WorkflowRunManager:
                 return self._run(row)
             if status in {WorkflowRunStatus.SUCCEEDED.value, WorkflowRunStatus.FAILED.value}:
                 raise WorkflowTransitionError(f"cancel_run not allowed from {status}")
-            if status not in {"running", "pausing", "paused"}:
+            if status not in {"running", "pausing", "paused", "finalizing_report"}:
                 raise WorkflowTransitionError(f"cancel_run not allowed from {status}")
             cancelled_jobs = await self._cancel_workflow_jobs_if_present(run_id, reason)
             await self._conn.execute(
@@ -903,13 +903,63 @@ class WorkflowRunManager:
 
         return await self._transaction(op)
 
+    async def begin_report_finalization(self, run_id: str) -> WorkflowRun:
+        async def op() -> WorkflowRun:
+            assert self._conn is not None
+            row = await self._fetch_run_row(run_id)
+            if row["status"] != WorkflowRunStatus.RUNNING.value:
+                raise WorkflowTransitionError(
+                    f"begin_report_finalization not allowed from {row['status']}"
+                )
+            await self._conn.execute(
+                "UPDATE workflow_runs SET status='finalizing_report', active_job_id=NULL, updated_at=CURRENT_TIMESTAMP WHERE run_id=?",
+                (run_id,),
+            )
+            await self._append_event(
+                run_id=run_id,
+                thread_id=row["thread_id"],
+                event_type="run_finalizing_report",
+                payload={},
+            )
+            return self._run(await self._fetch_run_row(run_id))
+
+        return await self._transaction(op)
+
+    async def complete_report_finalization(self, run_id: str) -> WorkflowRun:
+        async def op() -> WorkflowRun:
+            assert self._conn is not None
+            row = await self._fetch_run_row(run_id)
+            if row["status"] != WorkflowRunStatus.FINALIZING_REPORT.value:
+                raise WorkflowTransitionError(
+                    f"complete_report_finalization not allowed from {row['status']}"
+                )
+            completed_at = _utc_timestamp()
+            await self._converge_descendants_at_terminal_boundary(
+                run_id,
+                run_status=WorkflowRunStatus.SUCCEEDED.value,
+                boundary=completed_at,
+            )
+            await self._conn.execute(
+                "UPDATE workflow_runs SET status='succeeded', completed_at=?, active_job_id=NULL, updated_at=? WHERE run_id=?",
+                (completed_at, completed_at, run_id),
+            )
+            await self._append_event(
+                run_id=run_id,
+                thread_id=row["thread_id"],
+                event_type="run_succeeded",
+                payload={},
+            )
+            return self._run(await self._fetch_run_row(run_id))
+
+        return await self._transaction(op)
+
     async def fail_run(self, run_id: str, error: str | dict[str, Any]) -> WorkflowRun:
         async def op() -> WorkflowRun:
             assert self._conn is not None
             row = await self._fetch_run_row(run_id)
             status = row["status"]
             self._ensure_not_terminal(status, "fail_run")
-            if status not in {"running", "pausing"}:
+            if status not in {"running", "pausing", "finalizing_report"}:
                 raise WorkflowTransitionError(f"fail_run not allowed from {status}")
             code, message = self._normalize_error(error)
             failed_at = _utc_timestamp()

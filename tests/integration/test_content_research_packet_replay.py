@@ -30,6 +30,7 @@ from app.content_research.service import (
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
 from app.content_research.subject_structure import parse_subject_structure
 from app.content_research.workflow.directional_pipeline import compile_query_groups
+from app.services.llm.failures import LLMProviderFailure
 from app.services.llm.types import LLMResponse, TokenUsage
 
 
@@ -233,11 +234,20 @@ async def test_legacy_revision_rejects_mismatched_query_groups(tmp_path):
 
 
 class _ConclusionLLM:
-    def __init__(self) -> None:
+    def __init__(self, *, failures_remaining: int = 0) -> None:
         self.calls = 0
+        self.failures_remaining = failures_remaining
 
     async def generate(self, request):
         self.calls += 1
+        if self.failures_remaining:
+            self.failures_remaining -= 1
+            raise LLMProviderFailure(
+                "llm_service_unavailable",
+                "模型服务暂时不可用",
+                True,
+                None,
+            )
         payload = json.loads(request.messages[-1].content)
         return LLMResponse(
             content=json.dumps(
@@ -374,7 +384,7 @@ async def test_conclusion_packet_replay_reuses_checkpoint_without_collection_del
             )
         )
 
-    llm = _ConclusionLLM()
+    llm = _ConclusionLLM(failures_remaining=2)
     service = ContentResearchService(
         store=store,
         presearch=PresearchService(None),
@@ -388,6 +398,21 @@ async def test_conclusion_packet_replay_reuses_checkpoint_without_collection_del
     }
     packet_ids_before = {
         item.id for item in store.list_typed_records(DirectionalEvidencePacketRecord)
+    }
+
+    for _ in range(2):
+        with pytest.raises(LLMProviderFailure, match="llm_service_unavailable"):
+            await service._govern_marketing_conclusions(
+                workflow_run_id="run-conclusion-replay",
+                research_plan_id="rp-conclusion-replay",
+            )
+    unavailable = store.list_marketing_conclusion_decisions(
+        "run-conclusion-replay", "rp-conclusion-replay"
+    )
+    assert {(item.track, item.state) for item in unavailable} == {
+        ("message", "analysis_unavailable"),
+        ("need", "analysis_unavailable"),
+        ("value", "analysis_unavailable"),
     }
 
     first = await service._govern_marketing_conclusions(
@@ -410,7 +435,7 @@ async def test_conclusion_packet_replay_reuses_checkpoint_without_collection_del
     )
 
     assert replay.id == first.id
-    assert llm.calls == 1
+    assert llm.calls == 3
     assert store.list_marketing_conclusion_candidates(
         "run-conclusion-replay", "rp-conclusion-replay"
     ) == candidates_after_first

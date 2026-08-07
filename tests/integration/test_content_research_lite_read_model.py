@@ -24,6 +24,15 @@ from tests.integration.test_content_research_report_store import _decision, _pub
 from tests.unit.test_content_research_report_composer import _snapshot
 
 
+async def _materialize_completed_publication(store, db_path: str, run_id: str, publication_id: str):
+    async with WorkflowRunManager(db_path) as manager:
+        await manager.begin_report_finalization(run_id)
+    artifact = await ReportPublicationMaterializer(store, db_path).materialize(publication_id)
+    async with WorkflowRunManager(db_path) as manager:
+        await manager.complete_report_finalization(run_id)
+    return artifact
+
+
 def test_lite_direction_states_normalize_requested_not_started_to_unavailable():
     states = _direction_states(
         {
@@ -164,9 +173,7 @@ async def test_lite_reader_projects_each_formal_publication_without_writing(
         store.save_report_draft(draft.to_record())
         store.save_report_faithfulness_decision(decision.to_record())
         store.save_report_publication(publication.to_record())
-        async with WorkflowRunManager(db_path) as manager:
-            await manager.complete_run(run.run_id)
-        await ReportPublicationMaterializer(store, db_path).materialize(publication.id)
+        await _materialize_completed_publication(store, db_path, run.run_id, publication.id)
 
         reader = LiteReportReader(store, db_path)
         first = await reader.read(workflow_run_id=run.run_id)
@@ -281,9 +288,7 @@ async def _project_formal_cards(
     store.save_report_draft(draft.to_record())
     store.save_report_faithfulness_decision(decision.to_record())
     store.save_report_publication(publication.to_record())
-    async with WorkflowRunManager(db_path) as manager:
-        await manager.complete_run(run.run_id)
-    artifact = await ReportPublicationMaterializer(store, db_path).materialize(publication.id)
+    artifact = await _materialize_completed_publication(store, db_path, run.run_id, publication.id)
     if artifact_payload_mutator is not None:
         payload = artifact.payload_json
         artifact_payload_mutator(payload)
@@ -633,9 +638,7 @@ async def test_lite_reader_rejects_non_template_only_publication(tmp_path):
     store.save_report_draft(draft.to_record())
     store.save_report_faithfulness_decision(decision.to_record())
     store.save_report_publication(publication.to_record())
-    async with WorkflowRunManager(db_path) as manager:
-        await manager.complete_run(run.run_id)
-    await ReportPublicationMaterializer(store, db_path).materialize(publication.id)
+    await _materialize_completed_publication(store, db_path, run.run_id, publication.id)
 
     with pytest.raises(PublishedReportNotFoundError, match="unsupported compose mode"):
         await LiteReportReader(store, db_path).read(workflow_run_id=run.run_id)
@@ -856,9 +859,7 @@ async def test_lite_reader_never_turns_an_existing_corrupt_publication_into_reco
     store.save_report_draft(draft.to_record())
     store.save_report_faithfulness_decision(decision.to_record())
     store.save_report_publication(publication.to_record())
-    async with WorkflowRunManager(db_path) as manager:
-        await manager.complete_run(run.run_id)
-    await ReportPublicationMaterializer(store, db_path).materialize(publication.id)
+    await _materialize_completed_publication(store, db_path, run.run_id, publication.id)
     store.save_stage_checkpoint(
         StageCheckpointRecord(
             "checkpoint_corrupt",
@@ -883,10 +884,6 @@ async def test_lite_reader_never_turns_an_existing_corrupt_publication_into_reco
             "UPDATE workflow_artifacts SET payload_json = ? WHERE artifact_id = ?",
             (json.dumps(payload), row[0]),
         )
-        connection.execute(
-            "UPDATE workflow_runs SET status = 'paused' WHERE run_id = ?",
-            (run.run_id,),
-        )
 
     with pytest.raises(PublishedReportNotFoundError, match="artifact is malformed"):
         await LiteReportReader(store, db_path).read(workflow_run_id=run.run_id)
@@ -910,9 +907,7 @@ async def test_lite_reader_rejects_a_malformed_persisted_publication_without_rec
         store.save_report_draft(draft.to_record())
         store.save_report_faithfulness_decision(decision.to_record())
         store.save_report_publication(publication.to_record())
-        async with WorkflowRunManager(db_path) as manager:
-            await manager.complete_run(run.run_id)
-        await ReportPublicationMaterializer(store, db_path).materialize(publication.id)
+        await _materialize_completed_publication(store, db_path, run.run_id, publication.id)
         before_messages = await threads.get_thread_messages(thread["id"])
         with sqlite3.connect(db_path) as connection:
             connection.execute(
@@ -952,9 +947,7 @@ async def test_lite_reader_rejects_malformed_or_purged_legacy_publication_withou
         store.save_report_draft(draft.to_record())
         store.save_report_faithfulness_decision(decision.to_record())
         store.save_report_publication(publication.to_record())
-        async with WorkflowRunManager(db_path) as manager:
-            await manager.complete_run(run.run_id)
-        await ReportPublicationMaterializer(store, db_path).materialize(publication.id)
+        await _materialize_completed_publication(store, db_path, run.run_id, publication.id)
 
         apply_content_research_migrations(db_path, _bootstrap_legacy_content_research_schema)
 

@@ -25,7 +25,7 @@ def query_relevance_reason(
     """Return the mandatory relevance reason unless frozen provenance and quote anchors agree."""
     relevance = frozen_query_relevance(contract, policy_snapshot)
     if relevance is None:
-        return QUERY_SUBJECT_NOT_SUPPORTED
+        return "invalid_query_relevance_contract"
     reason = str(relevance["reason_code"])
     context = dict(packet.payload.get("retrieval_context") or {})
     packet_group_ids = [str(item) for item in context.get("query_group_ids", ()) if str(item)]
@@ -46,11 +46,11 @@ def query_relevance_reason(
         or not query_plan_hash
         or context.get("query_plan_hash") != query_plan_hash
     ):
-        return reason
+        return "invalid_query_provenance"
     normalized_hits: list[tuple[str, int]] = []
     for hit in query_hits:
         if not isinstance(hit, dict):
-            return reason
+            return "invalid_query_provenance"
         group_id = str(hit.get("query_group_id") or "")
         rank = hit.get("rank")
         if (
@@ -60,7 +60,7 @@ def query_relevance_reason(
             or isinstance(rank, bool)
             or rank < 1
         ):
-            return reason
+            return "invalid_query_provenance"
         normalized_hits.append((group_id, rank))
     if (
         not packet_group_ids
@@ -69,17 +69,17 @@ def query_relevance_reason(
         or packet_group_ids != [group_id for group_id, _ in normalized_hits]
         or normalized_hits != sorted(normalized_hits)
     ):
-        return reason
+        return "invalid_query_provenance"
     refs = list(candidate.payload.get("quote_refs") or [])
     if len(refs) != 1:
-        return reason
+        return "invalid_quote_reference"
     ref = refs[0]
     allowed_fields = set(relevance.get("claim_quote_fields", {}).get(candidate.claim_type, ()))
     if str(ref.get("field_path") or "") not in allowed_fields:
-        return reason
+        return "invalid_quote_reference"
     quote = normalize_relevance_text(str(ref.get("quote") or ""))
     if not quote:
-        return reason
+        return "invalid_quote_reference"
     first_intent_anchor = str(relevance.get("first_intent_anchor") or "")
     if contract.direction_id == "product_marketing" and first_intent_anchor:
         if not any(
@@ -87,7 +87,7 @@ def query_relevance_reason(
             for anchor in relevance.get("core_entity_anchors", ())
             if anchor
         ):
-            return reason
+            return "core_entity_not_supported"
         if first_intent_anchor not in quote:
             return "first_intent_not_supported"
         return None

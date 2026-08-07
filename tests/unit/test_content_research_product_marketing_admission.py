@@ -181,6 +181,39 @@ def test_product_marketing_quote_requires_core_and_first_intent():
     ) is None
 
 
+def test_product_marketing_quote_without_core_has_a_distinct_rejection_reason():
+    snapshot, _policies, contracts, groups = _frozen_first_intent_snapshot()
+    contract = next(item for item in contracts if item.direction_id == "product_marketing")
+    fact = _fact("content_text", "凉感面料穿着很舒适")
+    packet = _packet_for_fact(fact=fact, snapshot=snapshot, groups=groups, availability={})
+    candidate = build_product_marketing_candidate(
+        workflow_run_id="run_1", direction_id="product_marketing",
+        claim_type="product_value_expression", fact=fact,
+    )
+
+    assert query_relevance_reason(
+        candidate=candidate, packet=packet, contract=contract, policy_snapshot=snapshot,
+    ) == "core_entity_not_supported"
+
+
+def test_product_marketing_invalid_query_provenance_has_a_distinct_reason():
+    snapshot, _policies, contracts, groups = _frozen_first_intent_snapshot()
+    contract = next(item for item in contracts if item.direction_id == "product_marketing")
+    fact = _fact("content_text", "这件T恤穿上有明显凉感")
+    packet = _packet_for_fact(
+        fact=fact, snapshot=snapshot, groups=groups, availability={},
+        retrieval_context={"query_group_ids": [groups[0].id], "query_hits": []},
+    )
+    candidate = build_product_marketing_candidate(
+        workflow_run_id="run_1", direction_id="product_marketing",
+        claim_type="product_value_expression", fact=fact,
+    )
+
+    assert query_relevance_reason(
+        candidate=candidate, packet=packet, contract=contract, policy_snapshot=snapshot,
+    ) == "invalid_query_provenance"
+
+
 def test_evaluator_rejects_product_marketing_quote_without_first_intent():
     snapshot, policies, contracts, groups = _frozen_first_intent_snapshot()
     contract = next(item for item in contracts if item.direction_id == "product_marketing")
@@ -550,7 +583,7 @@ def test_evaluator_rejects_anchor_matching_quote_without_frozen_query_group_prov
     ).record
 
     assert result.decision == "rejected"
-    assert result.payload["reason_codes"] == ["query_subject_not_supported"]
+    assert result.payload["reason_codes"] == ["invalid_query_provenance"]
 
 
 def test_evaluator_fails_closed_when_a_legacy_snapshot_has_no_frozen_relevance_contract():
@@ -604,7 +637,7 @@ def test_evaluator_fails_closed_when_a_legacy_snapshot_has_no_frozen_relevance_c
     ).record
 
     assert result.decision == "rejected"
-    assert result.payload["reason_codes"] == ["query_subject_not_supported"]
+    assert result.payload["reason_codes"] == ["invalid_query_relevance_contract"]
 
 
 def test_evaluator_rejects_a_fabricated_quote_that_does_not_belong_to_the_packet():
@@ -703,4 +736,4 @@ def test_evaluator_rejects_id_only_query_provenance_from_an_otherwise_current_pa
     ).record
 
     assert result.decision == "rejected"
-    assert result.payload["reason_codes"] == ["query_subject_not_supported"]
+    assert result.payload["reason_codes"] == ["invalid_query_provenance"]

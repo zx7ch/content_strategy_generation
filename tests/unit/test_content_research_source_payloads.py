@@ -77,6 +77,15 @@ def test_xhs_note_detail_declares_the_same_author_it_projects():
     assert payload["field_availability"]["author"] == "present"
 
 
+def test_xhs_note_detail_keeps_author_when_the_direction_does_not_require_it():
+    payload = XiaohongshuSourceNormalizer().normalize_note_detail(
+        _post(), required_fields=("title", "content_text")
+    )
+
+    assert payload["author"] == "户外作者"
+    assert "author" not in payload["field_availability"]
+
+
 def test_xhs_note_detail_declares_empty_projected_author_missing():
     payload = XiaohongshuSourceNormalizer().normalize_note_detail(
         _post().model_copy(update={"author": ""}),

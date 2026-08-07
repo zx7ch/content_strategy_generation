@@ -408,6 +408,54 @@ async def test_terminal_state_rejects_illegal_transition(manager):
 
 
 @pytest.mark.asyncio
+async def test_report_finalization_commits_success_only_after_the_publication_boundary(manager):
+    run = await manager.start_run(thread_id="thread-report-finalization", user_id="user-1")
+
+    finalizing = await manager.begin_report_finalization(run.run_id)
+
+    assert finalizing.status == WorkflowRunStatus.FINALIZING_REPORT
+    with pytest.raises(WorkflowTransitionError, match="complete_run not allowed"):
+        await manager.complete_run(run.run_id)
+
+    completed = await manager.complete_report_finalization(run.run_id)
+
+    assert completed.status == WorkflowRunStatus.SUCCEEDED
+    assert await _event_types(manager.db_path, run.run_id) == [
+        "run_started",
+        "run_finalizing_report",
+        "run_succeeded",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_report_finalization_can_fail_or_cancel_without_becoming_stuck(manager):
+    failed_run = await manager.start_run(thread_id="thread-report-fail", user_id="user-1")
+    await manager.begin_report_finalization(failed_run.run_id)
+    failed = await manager.fail_run(failed_run.run_id, "report publication failed")
+    assert failed.status == WorkflowRunStatus.FAILED
+
+    cancelled_run = await manager.start_run(thread_id="thread-report-cancel", user_id="user-1")
+    await manager.begin_report_finalization(cancelled_run.run_id)
+    cancelled = await manager.cancel_run(cancelled_run.run_id)
+    assert cancelled.status == WorkflowRunStatus.CANCELLING
+
+
+@pytest.mark.asyncio
+async def test_formal_runtime_marks_a_finalizing_report_failure_without_reopening_the_step(tmp_path):
+    db_path = str(tmp_path / "finalizing-report-runtime-failure.db")
+    async with WorkflowRunManager(db_path) as manager:
+        run = await manager.start_run(thread_id="thread-report-runtime-fail", user_id="user-1")
+        await manager.begin_report_finalization(run.run_id)
+
+    result = await WorkflowRunManagerRuntime(db_path).fail_formal_research(
+        workflow_run_id=run.run_id,
+        reason={"code": "report_publication_failed", "message": "audit failed"},
+    )
+
+    assert result["status"] == "failed"
+
+
+@pytest.mark.asyncio
 async def test_repeated_pause_does_not_duplicate_event(manager):
     run = await manager.start_run(thread_id="thread-1", user_id="user-1")
 

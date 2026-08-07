@@ -47,8 +47,10 @@ async def test_reader_returns_only_materialized_publication_with_stable_paginate
             )
         )
         async with WorkflowRunManager(db_path) as manager:
-            await manager.complete_run(run.run_id)
+            await manager.begin_report_finalization(run.run_id)
         await ReportPublicationMaterializer(store, db_path).materialize(publication.id)
+        async with WorkflowRunManager(db_path) as manager:
+            await manager.complete_report_finalization(run.run_id)
 
         payload = await PublishedReportReader(store, db_path).read(
             workflow_run_id=run.run_id,
@@ -140,6 +142,7 @@ async def test_reader_rejects_cross_run_identity_and_marks_missing_source_url_un
                 },
                 summary_text="safe fixture",
             )
+            await manager.complete_run(run.run_id)
         assert artifact.artifact_id
         payload = await PublishedReportReader(store, db_path).read(workflow_run_id=run.run_id)
         assert payload["citation_groups"][0]["evidence_refs"][0]["jump_state"] == "unavailable"
@@ -184,10 +187,12 @@ async def test_reader_strictly_isolates_plans_and_keeps_old_publications_after_s
         new_draft, new_publication = await persist(plan_a_v2)
 
         async with WorkflowRunManager(db_path) as manager:
-            await manager.complete_run(run.run_id)
+            await manager.begin_report_finalization(run.run_id)
         materializer = ReportPublicationMaterializer(store, db_path)
         for publication in (old_publication, plan_b_publication, new_publication):
             await materializer.materialize(publication.id)
+        async with WorkflowRunManager(db_path) as manager:
+            await manager.complete_report_finalization(run.run_id)
 
         reader = PublishedReportReader(store, db_path)
         plan_a_old = await reader.read(workflow_run_id=run.run_id, publication_id=old_publication.id)

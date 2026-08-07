@@ -17,6 +17,7 @@ class WorkflowRunStatus(str, Enum):
     PAUSED = "paused"
     CANCELLING = "cancelling"
     CANCELLED = "cancelled"
+    FINALIZING_REPORT = "finalizing_report"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
 

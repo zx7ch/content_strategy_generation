@@ -1945,8 +1945,10 @@ async def save_publication(
     store.save_report_faithfulness_decision(decision.to_record())
     store.save_report_publication(publication.to_record())
     async with WorkflowRunManager(db_path) as manager:
-        await manager.complete_run(run_id)
+        await manager.begin_report_finalization(run_id)
     await ReportPublicationMaterializer(store, db_path).materialize(publication.id)
+    async with WorkflowRunManager(db_path) as manager:
+        await manager.complete_report_finalization(run_id)
     return publication.id
 
 

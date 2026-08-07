@@ -113,19 +113,23 @@ async def test_creator_timeline_api_exposes_one_materialized_report_result_and_r
         store.save_report_faithfulness_decision(decision.to_record())
         store.save_report_publication(publication.to_record())
         async with WorkflowRunManager(db_path) as manager:
-            await manager.complete_run(run.run_id)
+            await manager.begin_report_finalization(run.run_id)
 
         materializer = ReportPublicationMaterializer(store, db_path)
         artifact = await materializer.materialize(publication.id)
         await materializer.materialize(publication.id)
-        # A failed/paused run normally qualifies for recovery.  A committed
-        # publication must still block recovery when a caller provides a
-        # selector that does not resolve to it.
-        with sqlite3.connect(db_path) as connection:
-            connection.execute(
-                "UPDATE workflow_runs SET status = 'paused' WHERE run_id = ?",
-                (run.run_id,),
+        # The artifact is private until publication finalization commits the
+        # workflow.  A finalizing run must not look like a completed report.
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            finalizing_response = await client.get(
+                f"/content-research/workflows/{run.run_id}/lite-report"
             )
+        assert finalizing_response.status_code == 404, finalizing_response.text
+        async with WorkflowRunManager(db_path) as manager:
+            await manager.complete_report_finalization(run.run_id)
+        # A committed publication must not be replaced by a later failed
+        # checkpoint, and a selector that does not resolve to it stays absent.
         store.save_stage_checkpoint(
             StageCheckpointRecord(
                 id="checkpoint_existing_publication_selector_mismatch",
@@ -139,7 +143,6 @@ async def test_creator_timeline_api_exposes_one_materialized_report_result_and_r
             )
         )
 
-        transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
             response = await client.get(f"/threads/{thread['id']}/timeline")
             lite_response = await client.get(
