@@ -82,8 +82,8 @@ must:
 
 - combine all mutually supporting admitted claims that fit one narrow
   statement;
-- keep claim scope narrow rather than generalising across incompatible people,
-  scenarios, or product forms;
+- preserve material qualifiers already present in the supporting claims, such
+  as `儿童`, in the statement or its visible evidence detail;
 - use a `message_angle` claim only to support a content-expression statement,
   never a product-performance statement;
 - return no candidate when no coherent statement is possible; and
@@ -105,11 +105,11 @@ Existing backend verification stays mandatory and happens after aggregation:
 - a candidate may not become `selected` unless it satisfies `3 notes / 2
   authors` with no validation reason code.
 
-The first implementation does not claim deterministic semantic classification
-of audience or scenario: current claim `scope` is only `selected_packets`.
-The model prompt therefore uses conservative language. A later, separate
-project may freeze structured audience, scenario, and proposition facets at
-claim construction and use them as an additional deterministic cluster gate.
+This change deliberately permits evidence from different people or scenarios
+to appear in one candidate. The report keeps each source claim and citation
+visible, including qualifiers such as `儿童`, so the user can decide whether the
+combined direction applies to their product. Current claim `scope` is only
+`selected_packets`; no new audience or scenario gate is introduced.
 
 ## Decision Algorithm
 
@@ -193,7 +193,41 @@ idempotent way to evaluate historical packet sets under the new algorithm.
 
 ## Tests
 
-Focused coverage must prove:
+### 1. Deterministic decision matrix
+
+The evaluator test suite must use persisted claim/packet fixtures and cover
+every threshold outcome:
+
+| Valid candidate | Unique notes | Unique authors | Required state |
+| --- | ---: | ---: | --- |
+| none | 0 | 0 | `insufficient_evidence` |
+| one claim | 1 | 1 | `directional` |
+| two notes from one author | 2 | 1 | `directional` |
+| two notes from two authors | 2 | 2 | `directional` |
+| three notes from two authors | 3 | 2 | `selected` |
+| three claims from one note | 1 | 1 | `directional` |
+| three notes from three authors | 3 | 3 | `selected` |
+
+The fixtures must also prove that removing one valid quote, author identity,
+or packet/run relationship invalidates the affected candidate rather than
+preserving stale counts.
+
+### 2. LLM proposal protocol tests
+
+`MarketingConclusionAnalysisService` tests must inject a deterministic fake
+LLM. They must verify that the safe prompt contains only admitted claim IDs,
+claim type, intent, quote, and quote field; it must not expose author or
+provider identity. Fixed responses cover a one-claim proposal, a multi-claim
+proposal, an empty catalogue, unknown IDs, duplicate IDs, and more than one
+candidate for the same track. The parser must reject the invalid responses;
+the deterministic evaluator, not the fake LLM, supplies states and counts.
+
+A live-model run is an interoperability smoke test only. It must never be the
+stable oracle for semantic wording or decision state.
+
+### 3. Projection, publication, and UI tests
+
+Focused API, read-model, and browser coverage must prove:
 
 - the parser accepts multiple unique known support claim IDs and rejects
   unknown or duplicate IDs;
@@ -208,5 +242,21 @@ Focused coverage must prove:
   directional boundary and citation controls;
 - publication state is `directional_report` only when no selected track exists
   and at least one directional track exists;
-- the old run packet-only replay creates neither provider operations nor new
-  packets, and produces the expected partial report.
+- `partial_verified_report` has at least one selected track; and
+- `evidence_only_report` has neither selected nor directional tracks.
+
+The Creator browser test must assert that a `directional` card is not labelled
+`已验证结论`, does not receive a direct-investment recommendation, exposes its
+note and author gaps, and opens its evidence detail. A mixed-source card must
+retain visible qualifier text from its supporting claims, including `儿童` when
+that is present in a claim.
+
+### 4. Replay and decision-audit invariants
+
+Packet-only replay of the old run must create neither provider operation nor
+new packet and must produce the expected partial report. Running the same
+replay twice must preserve the report decision IDs, candidate IDs, counts,
+reason codes, and citation identities. Trace and Lite read-model projections
+must agree on every track's state, counts, and reason codes. Existing stored
+`insufficient_evidence` reports remain readable until that explicit replay;
+deployment does not silently rewrite them.
