@@ -35,6 +35,7 @@ _PROJECTABLE_CLAIM_TYPES = {
 _PUBLICATION_STATES = {
     "complete_verified_report",
     "partial_verified_report",
+    "directional_report",
     "evidence_only_report",
 }
 _RECOVERABLE_RUN_STATES = {"failed", "paused", "waiting_user", "running"}
@@ -381,6 +382,7 @@ def _marketing_conclusion_projection(
     for track in ("need", "value", "message"):
         records = [item for item in raw if item.get("track") == track]
         selected = [item for item in records if item.get("state") == "selected"]
+        directional = [item for item in records if item.get("state") == "directional"]
         qualified = [item for item in records if item.get("state") == "qualified"]
         terminal = [
             item
@@ -392,7 +394,7 @@ def _marketing_conclusion_projection(
                 "analysis_unavailable",
             }
         ]
-        if len(selected) > 1 or (selected and terminal) or len(terminal) > 1:
+        if len(selected) > 1 or len(directional) > 1 or (selected and (directional or terminal)) or (directional and terminal) or len(terminal) > 1:
             raise PublishedReportNotFoundError(
                 f"published report {track} marketing decision is ambiguous"
             )
@@ -432,6 +434,16 @@ def _marketing_conclusion_projection(
                 continue
             result[track] = projected
             selected_ids.append(str(projected["conclusion_id"]))
+            continue
+        if directional:
+            projected = _selected_marketing_conclusion(
+                report, directional[0], cards_by_id=cards_by_id,
+                citations_by_claim=citations_by_claim, additional_qualified_count=0,
+                directional=True,
+            )
+            if not _marketing_section_verified(report, track=track, decision=directional[0], projected=projected):
+                raise PublishedReportNotFoundError("published report directional marketing conclusion is not verified")
+            result[track] = projected
             continue
         decision = terminal[0] if terminal else {
             "track": track,
@@ -490,7 +502,7 @@ def _marketing_section_verified(
     )
     return (
         section.get("section_id") not in omitted
-        and section.get("conclusion_state") == "selected"
+        and section.get("conclusion_state") == decision.get("state")
         and section.get("prose") == decision.get("statement")
         and section.get("claim_candidate_ids") == decision.get("supporting_claim_ids")
         and section.get("citation_group_ids") == projected.get("citation_group_ids")
@@ -506,6 +518,7 @@ def _selected_marketing_conclusion(
     cards_by_id: dict[str, dict[str, Any]],
     citations_by_claim: dict[str, list[dict[str, Any]]],
     additional_qualified_count: int,
+    directional: bool = False,
 ) -> dict[str, Any]:
     statement = decision.get("statement")
     claim_ids = decision.get("supporting_claim_ids")
@@ -522,10 +535,10 @@ def _selected_marketing_conclusion(
         or not isinstance(note_count, int)
         or isinstance(author_count, bool)
         or not isinstance(author_count, int)
-        or note_count < 3
-        or author_count < 2
+        or note_count < (1 if directional else 3)
+        or author_count < (1 if directional else 2)
         or author_count > note_count
-        or decision.get("reason_codes") not in ([], ())
+        or (not directional and decision.get("reason_codes") not in ([], ()))
     ):
         raise PublishedReportNotFoundError(
             "published report selected marketing conclusion is malformed"
@@ -575,18 +588,25 @@ def _selected_marketing_conclusion(
             },
         )
     return {
-        "state": "selected",
+        "state": "directional" if directional else "selected",
         "conclusion_id": conclusion_id,
         "statement": statement,
         "citation_group_ids": citation_ids,
         "supporting_note_count": note_count,
         "independent_author_count": author_count,
         "additional_qualified_count": additional_qualified_count,
+        **({
+            "note_gap": max(0, 3 - note_count),
+            "author_gap": max(0, 2 - author_count),
+            "reason_codes": list(decision.get("reason_codes") or []),
+            "verification_direction": _marketing_verification_direction("directional"),
+        } if directional else {}),
     }
 
 
 def _marketing_verification_direction(state: str) -> str:
     directions = {
+        "directional": "该方向不可作为功效或投放定论；补足独立证据后重新验证。",
         "insufficient_evidence": "补充至少 3 篇合格笔记，并覆盖至少 2 位独立作者后重新验证。",
         "no_single_primary_conclusion": "增加能够区分候选结论的合格笔记后重新评估主结论。",
         "analysis_unavailable": "恢复结论分析能力并继续本轮分析，不新增未经治理的判断。",

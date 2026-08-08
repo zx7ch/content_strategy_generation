@@ -2236,7 +2236,17 @@ class ContentResearchService:
             and all(item.status in {"completed", "partial_completed", "failed"} for item in tasks)
             else "pending"
         )
-        publication_state = "partial_verified_report" if claim_cards else "evidence_only_report"
+        marketing_states = {
+            str(item.get("state") or "")
+            for item in marketing_conclusions
+        }
+        publication_state = (
+            "partial_verified_report"
+            if "selected" in marketing_states or claim_cards
+            else "directional_report"
+            if "directional" in marketing_states
+            else "evidence_only_report"
+        )
         limitations = [
             {
                 "direction_id": item["direction_id"],

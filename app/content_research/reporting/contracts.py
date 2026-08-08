@@ -32,7 +32,7 @@ REPORT_SECTION_KINDS = frozenset(
     }
 )
 PUBLICATION_STATES = frozenset(
-    {"complete_verified_report", "partial_verified_report", "evidence_only_report"}
+    {"complete_verified_report", "partial_verified_report", "directional_report", "evidence_only_report"}
 )
 _CORE_SECTION_KINDS = frozenset({"core_conclusions", "main_findings", "limitations_scope"})
 
@@ -162,11 +162,13 @@ class ReportSection:
             expected_track = self.section_kind.removeprefix("marketing_")
             if not self.marketing_conclusion_ids or not self.conclusion_state:
                 raise ValueError("marketing conclusion section requires a governed decision")
-            if self.conclusion_state == "selected":
+            if self.conclusion_state in {"selected", "directional"}:
                 if not self.claim_candidate_ids or not self.citation_group_ids:
-                    raise ValueError("selected marketing conclusion requires governed support")
-                if self.verification_direction or self.reason_codes:
+                    raise ValueError("supported marketing conclusion requires governed support")
+                if self.conclusion_state == "selected" and (self.verification_direction or self.reason_codes):
                     raise ValueError("selected marketing conclusion cannot carry failure guidance")
+                if self.conclusion_state == "directional" and not self.verification_direction:
+                    raise ValueError("directional marketing conclusion requires verification guidance")
             elif self.conclusion_state in {
                 "insufficient_evidence",
                 "no_single_primary_conclusion",
@@ -413,11 +415,11 @@ class ReportPublication:
                 raise ValueError("complete report cannot omit prose sections")
             if self.compose_mode == "prose" and not self.has_free_prose:
                 raise ValueError("complete report requires audited prose")
-        elif self.publication_state == "partial_verified_report":
+        elif self.publication_state in {"partial_verified_report", "directional_report"}:
             if not self.structured_card_section_ids:
-                raise ValueError("partial report requires verified structured cards")
+                raise ValueError("partial or directional report requires structured cards")
             if not self.omitted_section_ids:
-                raise ValueError("partial report requires omitted prose sections")
+                raise ValueError("partial or directional report requires omitted prose sections")
         elif self.has_free_prose:
             raise ValueError("evidence-only report cannot contain free prose")
 

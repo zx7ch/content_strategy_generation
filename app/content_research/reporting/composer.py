@@ -362,6 +362,7 @@ def _marketing_track_section(
     policy_scope: dict[str, Any],
 ) -> ReportSection:
     selected = [item for item in records if item.get("state") == "selected"]
+    directional = [item for item in records if item.get("state") == "directional"]
     qualified = [item for item in records if item.get("state") == "qualified"]
     terminal = [
         item
@@ -373,11 +374,12 @@ def _marketing_track_section(
             "analysis_unavailable",
         }
     ]
-    if len(selected) > 1 or (selected and terminal) or len(terminal) > 1:
+    if len(selected) > 1 or len(directional) > 1 or (selected and (directional or terminal)) or (directional and terminal) or len(terminal) > 1:
         raise ValueError(f"marketing conclusion track {track} has ambiguous decisions")
     section_id = _section_id(snapshot, f"marketing_{track}")
-    if selected:
-        decision = selected[0]
+    if selected or directional:
+        decision = (selected or directional)[0]
+        conclusion_state = str(decision["state"])
         statement = _required_string(decision.get("statement"), "marketing conclusion statement")
         claim_ids_value = decision.get("supporting_claim_ids")
         if not isinstance(claim_ids_value, list) or not claim_ids_value:
@@ -439,7 +441,7 @@ def _marketing_track_section(
             citation_group_ids=citation_ids,
             citation_anchors=anchors,
             marketing_conclusion_ids=(conclusion_id,),
-            conclusion_state="selected",
+            conclusion_state=conclusion_state,
             supporting_note_count=_nonnegative_int(
                 decision.get("supporting_note_count"), "supporting_note_count"
             ),
@@ -448,6 +450,12 @@ def _marketing_track_section(
                 "independent_author_count",
             ),
             additional_qualified_count=additional_count,
+            reason_codes=tuple(decision.get("reason_codes") or ()),
+            verification_direction=(
+                _verification_direction("directional")
+                if conclusion_state == "directional"
+                else None
+            ),
         )
 
     decision = terminal[0] if terminal else {
@@ -497,6 +505,7 @@ def _nonnegative_int(value: object, field_name: str) -> int:
 
 def _verification_direction(state: str) -> str:
     return {
+        "directional": "该方向不可作为功效或投放定论；补足独立证据后重新验证。",
         "insufficient_evidence": "补充至少 3 篇合格笔记，并覆盖至少 2 位独立作者后重新验证。",
         "no_single_primary_conclusion": "增加能够区分候选结论的合格笔记后重新评估主结论。",
         "analysis_unavailable": "恢复结论分析能力并继续本轮分析，不新增未经治理的判断。",

@@ -389,13 +389,13 @@ async def test_lite_report_projects_only_primary_marketing_conclusion(tmp_path):
         },
         {
             "track": "value",
-            "state": "insufficient_evidence",
-            "candidate_id": None,
-            "statement": None,
-            "supporting_claim_ids": [],
-            "supporting_note_count": 0,
-            "independent_author_count": 0,
-            "reason_codes": ["conclusion_no_qualified_candidate"],
+            "state": "directional",
+            "candidate_id": "mc_value_directional",
+            "statement": "轻薄垂感与凉感材质方向",
+            "supporting_claim_ids": ["cc_need_1"],
+            "supporting_note_count": 1,
+            "independent_author_count": 1,
+            "reason_codes": ["conclusion_note_count_unmet", "conclusion_author_count_unmet"],
         },
         {
             "track": "message",
@@ -429,7 +429,14 @@ async def test_lite_report_projects_only_primary_marketing_conclusion(tmp_path):
         "value",
         "message",
     }
-    assert "statement" not in report["sections"]["marketing_conclusions"]["value"]
+    value = report["sections"]["marketing_conclusions"]["value"]
+    assert value["state"] == "directional"
+    assert value["statement"] == "轻薄垂感与凉感材质方向"
+    assert value["supporting_note_count"] == 1
+    assert value["independent_author_count"] == 1
+    assert value["note_gap"] == 2
+    assert value["author_gap"] == 1
+    assert value["citation_group_ids"] == ["citation_need_1"]
     assert "statement" not in report["sections"]["marketing_conclusions"]["message"]
 
 
