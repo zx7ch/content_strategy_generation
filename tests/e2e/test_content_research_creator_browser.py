@@ -469,13 +469,13 @@ def test_creator_renders_three_marketing_tracks_and_evidence_strength(browser_pa
         },
         {
             "track": "value",
-            "state": "insufficient_evidence",
-            "candidate_id": None,
-            "statement": None,
-            "supporting_claim_ids": [],
-            "supporting_note_count": 0,
-            "independent_author_count": 0,
-            "reason_codes": ["conclusion_no_qualified_candidate"],
+            "state": "directional",
+            "candidate_id": "mc_value_directional",
+            "statement": "儿童与成人均可参考轻薄凉感表达",
+            "supporting_claim_ids": ["cc_need_1"],
+            "supporting_note_count": 1,
+            "independent_author_count": 1,
+            "reason_codes": ["conclusion_note_count_unmet", "conclusion_author_count_unmet"],
         },
         {
             "track": "message",
@@ -514,7 +514,11 @@ def test_creator_renders_three_marketing_tracks_and_evidence_strength(browser_pa
     expect(report.get_by_role("heading", name="可被相信的产品卖点")).to_be_visible()
     expect(report.get_by_role("heading", name="内容表达")).to_be_visible()
     expect(report.get_by_text("3 篇笔记 · 2 位独立作者").first).to_be_visible()
-    expect(report.get_by_text("暂无可验证结论")).to_be_visible()
+    expect(report.get_by_text("待验证方向", exact=True)).to_be_visible()
+    expect(report.get_by_text("儿童与成人均可参考轻薄凉感表达", exact=True)).to_be_visible()
+    expect(report.get_by_text("当前 1 篇 / 1 位作者", exact=True)).to_be_visible()
+    expect(report.get_by_text("还缺 2 篇独立笔记、1 位独立作者", exact=True)).to_be_visible()
+    expect(report.get_by_text("该方向不可作为功效或投放定论", exact=True)).to_be_visible()
     expect(report.get_by_text("另有 1 条合格结论")).to_be_visible()
     expect(report.get_by_role("heading", name="优先行动建议")).to_be_visible()
     expect(report.get_by_text("建议", exact=True)).to_be_visible()

@@ -88,14 +88,14 @@ interface ContentResearchRunState {
   reportError: string | null;
 }
 
-type LitePublicationState = "complete_verified_report" | "partial_verified_report" | "evidence_only_report";
+type LitePublicationState = "complete_verified_report" | "partial_verified_report" | "directional_report" | "evidence_only_report";
 
 const F003_LITE_PREVIEW_ENABLED =
   process.env.F003_LITE_PREVIEW_ENABLED === "true";
 
 function litePublicationState(report: ContentResearchLiteReportResponse): LitePublicationState | null {
   const state = stringField(report.publication, "state");
-  return state === "complete_verified_report" || state === "partial_verified_report" || state === "evidence_only_report"
+  return state === "complete_verified_report" || state === "partial_verified_report" || state === "directional_report" || state === "evidence_only_report"
     ? state
     : null;
 }
@@ -1228,6 +1228,7 @@ function ContentResearchReportMessage({
           {!evidenceOnly && hasMarketingTracks && marketingTracks.map(({ id, label, value }) => {
             const track = value as Record<string, unknown>;
             const selected = stringField(track, "state") === "selected";
+            const directional = stringField(track, "state") === "directional";
             return (
               <section key={id} aria-label={label} className="border-t border-line pt-4">
                 <h4 className="font-semibold">{label}</h4>
@@ -1240,6 +1241,20 @@ function ContentResearchReportMessage({
                     {numberField(track, "additional_qualified_count") > 0 && (
                       <p className="mt-1 text-xs text-quiet">另有 {numberField(track, "additional_qualified_count")} 条合格结论</p>
                     )}
+                    <div className="mt-3 flex flex-wrap gap-2">
+                      {arrayField(track, "citation_group_ids").map((citationId, citationIndex) => {
+                        const citation = citationsById.get(citationId);
+                        return citation ? citationButton(citation, citationIndex) : null;
+                      })}
+                    </div>
+                  </div>
+                ) : directional ? (
+                  <div className="mt-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-3 text-xs text-quiet">
+                    <p className="font-medium text-ink">待验证方向</p>
+                    <p className="mt-2 font-medium leading-6 text-ink">{stringField(track, "statement")}</p>
+                    <p className="mt-2">当前 {numberField(track, "supporting_note_count")} 篇 / {numberField(track, "independent_author_count")} 位作者</p>
+                    <p className="mt-1">还缺 {numberField(track, "note_gap")} 篇独立笔记、{numberField(track, "author_gap")} 位独立作者</p>
+                    <p className="mt-2 font-medium text-amber-900">该方向不可作为功效或投放定论</p>
                     <div className="mt-3 flex flex-wrap gap-2">
                       {arrayField(track, "citation_group_ids").map((citationId, citationIndex) => {
                         const citation = citationsById.get(citationId);

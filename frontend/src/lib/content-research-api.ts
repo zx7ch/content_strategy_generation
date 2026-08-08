@@ -256,6 +256,18 @@ export type ContentResearchMarketingConclusionTrack =
       additional_qualified_count: number;
     }
   | {
+      state: "directional";
+      conclusion_id: string;
+      statement: string;
+      citation_group_ids: string[];
+      supporting_note_count: number;
+      independent_author_count: number;
+      note_gap: number;
+      author_gap: number;
+      reason_codes: string[];
+      verification_direction: string;
+    }
+  | {
       state: "insufficient_evidence" | "no_single_primary_conclusion" | "analysis_unavailable";
       reason_codes: string[];
       verification_direction: string;
