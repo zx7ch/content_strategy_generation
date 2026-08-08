@@ -25,6 +25,9 @@ class MarketingConclusionAnalysisError(ValueError):
     """The bounded model response cannot be admitted as a proposal catalog."""
 
 
+_MESSAGE_ANGLE_PERFORMANCE_TERMS = ("偏好", "转化", "购买", "因果", "效果提升", "表现更好")
+
+
 class MarketingConclusionAnalysisService:
     """Ask the configured expert model for proposals without exposing source identity."""
 
@@ -51,6 +54,7 @@ class MarketingConclusionAnalysisService:
 
         safe_claims: list[dict[str, str]] = []
         known_claim_ids: set[str] = set()
+        claim_types_by_id: dict[str, str] = {}
         for decision, claim in admitted_claims:
             self._validate_admitted_claim(
                 decision=decision,
@@ -62,9 +66,12 @@ class MarketingConclusionAnalysisService:
             if claim_id in known_claim_ids:
                 raise ValueError("duplicate admitted claim")
             known_claim_ids.add(claim_id)
+            claim_types_by_id[claim_id] = claim.claim_type
             safe_claims.append(
                 {
                     "claim_id": claim_id,
+                    "claim_type": claim.claim_type,
+                    "intent_id": claim.intent_id,
                     "quote": str(quote_ref["quote"]),
                     "field_path": str(quote_ref["field_path"]),
                 }
@@ -130,6 +137,7 @@ class MarketingConclusionAnalysisService:
             workflow_run_id=workflow_run_id,
             research_plan_id=research_plan_id,
             known_claim_ids=known_claim_ids,
+            claim_types_by_id=claim_types_by_id,
         )
 
     @staticmethod
@@ -176,6 +184,7 @@ class MarketingConclusionAnalysisService:
         workflow_run_id: str,
         research_plan_id: str,
         known_claim_ids: set[str],
+        claim_types_by_id: Mapping[str, str],
     ) -> tuple[MarketingConclusionCandidateRecord, ...]:
         if not isinstance(payload, dict) or set(payload) != {"candidates"}:
             raise MarketingConclusionAnalysisError(
@@ -187,6 +196,7 @@ class MarketingConclusionAnalysisService:
                 "marketing conclusion candidates must be an array"
             )
         records: list[MarketingConclusionCandidateRecord] = []
+        seen_tracks: set[str] = set()
         for raw in raw_candidates:
             if not isinstance(raw, dict) or set(raw) != {
                 "track",
@@ -202,6 +212,10 @@ class MarketingConclusionAnalysisService:
             if not isinstance(track, str) or track not in MARKETING_CONCLUSION_TRACKS:
                 raise MarketingConclusionAnalysisError(
                     "marketing conclusion candidate has unknown track"
+                )
+            if track in seen_tracks:
+                raise MarketingConclusionAnalysisError(
+                    "marketing conclusion candidate has duplicate track"
                 )
             if not isinstance(statement, str) or not statement.strip():
                 raise MarketingConclusionAnalysisError(
@@ -223,8 +237,17 @@ class MarketingConclusionAnalysisService:
                 raise MarketingConclusionAnalysisError(
                     "marketing conclusion candidate references an unknown claim"
                 )
+            if (
+                track == "message"
+                and any(claim_types_by_id[claim_id] == "message_angle" for claim_id in supporting_claim_ids)
+                and any(term in statement for term in _MESSAGE_ANGLE_PERFORMANCE_TERMS)
+            ):
+                raise MarketingConclusionAnalysisError(
+                    "message-angle candidate cannot state product-performance outcome"
+                )
             normalized_statement = statement.strip()
             normalized_claim_ids = sorted(supporting_claim_ids)
+            seen_tracks.add(track)
             identity = canonical_fingerprint(
                 {
                     "workflow_run_id": workflow_run_id,

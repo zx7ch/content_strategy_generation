@@ -119,16 +119,22 @@ async def test_conclusion_analysis_receives_only_safe_admitted_claim_fields():
         "claims": [
             {
                 "claim_id": "claim_1",
+                "claim_type": "product_value_expression",
+                "intent_id": "value_proposition",
                 "quote": "样本明确提到轻量透气",
                 "field_path": "content_text",
             },
             {
                 "claim_id": "claim_2",
+                "claim_type": "product_value_expression",
+                "intent_id": "value_proposition",
                 "quote": "样本明确提到轻量透气",
                 "field_path": "content_text",
             },
             {
                 "claim_id": "claim_3",
+                "claim_type": "product_value_expression",
+                "intent_id": "value_proposition",
                 "quote": "样本明确提到轻量透气",
                 "field_path": "content_text",
             },
@@ -163,6 +169,10 @@ async def test_conclusion_analysis_receives_only_safe_admitted_claim_fields():
         ({"candidates": [{"track": "need", "statement": "x", "supporting_claim_ids": ["invented"]}]}, "unknown claim"),
         ({"candidates": [{"track": "need", "statement": "x", "supporting_claim_ids": ["claim_1", "claim_1"]}]}, "duplicate supporting claim"),
         ({"candidates": [{"track": "need", "statement": " ", "supporting_claim_ids": ["claim_1"]}]}, "empty statement"),
+        ({"candidates": [
+            {"track": "need", "statement": "x", "supporting_claim_ids": ["claim_1"]},
+            {"track": "need", "statement": "y", "supporting_claim_ids": ["claim_1"]},
+        ]}, "duplicate track"),
     ],
 )
 async def test_conclusion_analysis_rejects_untrusted_model_lineage(response, error):
@@ -201,3 +211,34 @@ async def test_conclusion_analysis_never_sends_identity_fields_from_forged_admis
         )
 
     assert llm.requests == []
+
+
+@pytest.mark.asyncio
+async def test_conclusion_analysis_rejects_product_performance_statement_from_message_angle_claim():
+    decision, claim = admitted_claim("message_claim", quote="儿童凉感T恤")
+    message_claim = replace(
+        claim,
+        intent_id="message_angle",
+        claim_type="message_angle",
+    )
+    service = MarketingConclusionAnalysisService(
+        llm=RecordingLLM(
+            {
+                "candidates": [
+                    {
+                        "track": "message",
+                        "statement": "儿童凉感T恤效果提升",
+                        "supporting_claim_ids": ["message_claim"],
+                    }
+                ]
+            }
+        )
+    )
+
+    with pytest.raises(ValueError, match="product-performance"):
+        await service.generate(
+            workflow_run_id="run_1",
+            research_plan_id="plan_1",
+            policy=marketing_policy(),
+            admitted_claims=[(decision, message_claim)],
+        )
