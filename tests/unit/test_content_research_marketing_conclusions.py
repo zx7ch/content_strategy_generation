@@ -146,9 +146,41 @@ def test_evaluator_does_not_count_multiple_claims_from_one_note_twice():
         policy=marketing_policy(),
     )
 
-    assert evaluation.tracks["value"].state == "insufficient_evidence"
+    assert evaluation.tracks["value"].state == "directional"
+    assert evaluation.tracks["value"].candidate_id == "mc_1"
     assert evaluation.tracks["value"].reason_codes == ("conclusion_note_count_unmet",)
     assert evaluation.catalog == ()
+
+
+@pytest.mark.parametrize(
+    ("sources", "expected_state", "expected_notes", "expected_authors"),
+    [
+        ([('c1', 'note_1', 'author_a')], 'directional', 1, 1),
+        ([('c1', 'note_1', 'author_a'), ('c2', 'note_2', 'author_a')], 'directional', 2, 1),
+        ([('c1', 'note_1', 'author_a'), ('c2', 'note_2', 'author_b')], 'directional', 2, 2),
+        ([('c1', 'note_1', 'author_a'), ('c2', 'note_2', 'author_a'), ('c3', 'note_3', 'author_b')], 'selected', 3, 2),
+        ([('c1', 'note_1', 'author_a'), ('c2', 'note_1', 'author_a'), ('c3', 'note_1', 'author_a')], 'directional', 1, 1),
+    ],
+)
+def test_evaluator_classifies_valid_candidate_by_unique_source_threshold(
+    sources, expected_state, expected_notes, expected_authors,
+):
+    claim_ids = [item[0] for item in sources]
+    result = evaluate_marketing_conclusions(
+        candidates=[candidate('need', claim_ids)],
+        admitted_claims=admitted_claims(*claim_ids),
+        packets=packets_with_sources_and_authors(*sources),
+        policy=marketing_policy(),
+    )
+
+    track = result.tracks['need']
+    assert (track.state, track.supporting_note_count, track.independent_author_count) == (
+        expected_state,
+        expected_notes,
+        expected_authors,
+    )
+    if expected_state == 'directional':
+        assert track.candidate_id == 'mc_1'
 
 
 def test_evaluator_rejects_invalid_support_with_stable_reason_codes():
@@ -362,3 +394,25 @@ def test_safe_trace_payload_exposes_only_counts_and_reason_codes():
             },
         }
     }
+
+
+def test_safe_trace_payload_keeps_directional_candidate_identity_private():
+    evaluation = evaluate_marketing_conclusions(
+        candidates=[candidate("need", ["c1"], statement="儿童夏季闷汗方向")],
+        admitted_claims=admitted_claims("c1"),
+        packets=packets_with_sources_and_authors(("c1", "note_private", "author_private")),
+        policy=marketing_policy(),
+    )
+
+    payload = evaluation.safe_trace_payload()
+    assert payload["tracks"]["need"] == {
+        "state": "directional",
+        "supporting_note_count": 1,
+        "independent_author_count": 1,
+        "body_quote_note_count": 1,
+        "reason_codes": ("conclusion_note_count_unmet", "conclusion_author_count_unmet"),
+    }
+    assert "mc_1" not in repr(payload)
+    assert "儿童" not in repr(payload)
+    assert "note_private" not in repr(payload)
+    assert "author_private" not in repr(payload)

@@ -183,6 +183,7 @@ MARKETING_CONCLUSION_DECISION_STATES = frozenset(
     {
         "selected",
         "qualified",
+        "directional",
         "insufficient_evidence",
         "no_single_primary_conclusion",
         "analysis_unavailable",

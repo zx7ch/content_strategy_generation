@@ -255,6 +255,23 @@ def _terminal_outcome(outcome: MarketingConclusionOutcome | None) -> MarketingCo
         return MarketingConclusionTrackEvaluation(
             "insufficient_evidence", None, 0, 0, 0, ("conclusion_no_qualified_candidate",)
         )
+    threshold_reasons = {
+        "conclusion_note_count_unmet",
+        "conclusion_author_count_unmet",
+    }
+    if (
+        outcome.supporting_note_count > 0
+        and outcome.independent_author_count > 0
+        and set(outcome.reason_codes).issubset(threshold_reasons)
+    ):
+        return MarketingConclusionTrackEvaluation(
+            "directional",
+            outcome.candidate_id,
+            outcome.supporting_note_count,
+            outcome.independent_author_count,
+            outcome.body_quote_note_count,
+            outcome.reason_codes,
+        )
     return MarketingConclusionTrackEvaluation(
         "insufficient_evidence",
         None,

@@ -32,11 +32,11 @@ def test_marketing_conclusion_records_round_trip_all_terminal_states(tmp_path):
     decisions = [
         MarketingConclusionDecisionRecord(
             f"md_{state}", "marketing_conclusion_decision", {"reason_codes": []},
-            workflow_run_id="run_1", research_plan_id="rp_1", candidate_id="mc_1" if state in {"selected", "qualified"} else None,
+            workflow_run_id="run_1", research_plan_id="rp_1", candidate_id="mc_1" if state in {"selected", "qualified", "directional"} else None,
             track="need", state=state,
         )
         for state in (
-            "selected", "qualified", "insufficient_evidence",
+            "selected", "qualified", "directional", "insufficient_evidence",
             "no_single_primary_conclusion", "analysis_unavailable",
         )
     ]
