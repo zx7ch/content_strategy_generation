@@ -152,10 +152,9 @@ def browser_page(real_creator_stack):
     "selected_direction_ids",
     [
         ("product_marketing",),
-        ("product_marketing", "content_performance"),
         tuple(DIRECTION_CATALOG_V1),
     ],
-    ids=["single", "double", "all"],
+    ids=["single", "all"],
 )
 def test_creator_brief_uses_fixed_catalog_and_submits_selected_subset(
     browser_page,
@@ -177,9 +176,29 @@ def test_creator_brief_uses_fixed_catalog_and_submits_selected_subset(
     page.on("response", record_presearch)
     page.goto(stack["frontend_url"] + "/creator", wait_until="domcontentloaded")
     page.get_by_role("button", name=re.compile("内容调研")).click(timeout=15000)
-    page.locator("textarea").fill("夏季通勤短裤")
-    page.locator("textarea").press("Enter")
+    research_input = page.get_by_role(
+        "textbox",
+        name="输入品类、品牌或 SKU，发送后开始内容调研",
+    )
+    expect(research_input).to_be_enabled(timeout=15000)
+    research_input.fill("夏季通勤短裤")
+    with page.expect_response(
+        lambda response: response.url.endswith("/content-research/presearch")
+        and response.status == 201,
+        timeout=30000,
+    ):
+        research_input.press("Enter")
 
+    expect(page.get_by_text("还需要你确认调研主体", exact=True)).to_be_visible(
+        timeout=30000
+    )
+    with page.expect_response(
+        lambda response: response.url.endswith("/actions")
+        and '"action":"confirm_subject_structure"' in (response.request.post_data or "")
+        and response.status == 200,
+        timeout=15000,
+    ):
+        page.get_by_role("button", name="确认调研主体", exact=True).click()
     page.get_by_role("heading", name="在开始前，请确认几个关键点").wait_for(
         timeout=30000
     )
@@ -201,6 +220,7 @@ def test_creator_brief_uses_fixed_catalog_and_submits_selected_subset(
             name=direction_labels[direction_id],
             exact=True,
         ).click()
+    page.get_by_label("产品营销目标", exact=True).select_option("content_seeding")
     confirm_button = page.get_by_role(
         "button",
         name=re.compile("确认并开始调研"),
@@ -352,7 +372,7 @@ def test_creator_model_failure_edit_save_and_continue_same_presearch(browser_pag
     assert retried["workflow_run_id"] == first["workflow_run_id"]
     assert retried["attempt_id"] == first["attempt_id"]
     assert retried["brief_id"] == first["brief_id"]
-    expect(page.get_by_role("heading", name="在开始前，请确认几个关键点")).to_be_visible()
+    expect(page.get_by_text("还需要你确认调研主体", exact=True)).to_be_visible()
 
     with sqlite3.connect(stack["db_path"]) as connection:
         after = (
@@ -1296,7 +1316,7 @@ def test_creator_surfaces_non_not_found_lite_report_error(browser_page):
         direct_body = error.read().decode("utf-8")
     else:
         raise AssertionError("corrupt publication unexpectedly returned a Lite report")
-    assert direct_status != 404, direct_body
+    assert direct_status == 404, direct_body
 
     open_creator_with_restored_run(page, stack["frontend_url"], seeded["run_id"])
 

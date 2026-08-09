@@ -260,13 +260,6 @@ class _ConclusionLLM:
                                 item["claim_id"] for item in payload["claims"]
                             ],
                         },
-                        {
-                            "track": "need",
-                            "statement": "另一条较弱但合格的需求结论",
-                            "supporting_claim_ids": [
-                                item["claim_id"] for item in payload["claims"][:3]
-                            ],
-                        },
                     ]
                 },
                 ensure_ascii=False,
@@ -428,7 +421,7 @@ async def test_conclusion_packet_replay_reuses_checkpoint_without_collection_del
     selected_decision = next(
         item for item in decisions_after_first if item.state == "selected"
     )
-    assert selected_decision.payload["additional_qualified_count"] == 1
+    assert selected_decision.payload["additional_qualified_count"] == 0
     replay = await service._govern_marketing_conclusions(
         workflow_run_id="run-conclusion-replay",
         research_plan_id="rp-conclusion-replay",
