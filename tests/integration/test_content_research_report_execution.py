@@ -1,4 +1,5 @@
 import asyncio
+from dataclasses import replace
 
 from app.content_research.persistence_models import (
     ReportDraftRecord,
@@ -20,6 +21,46 @@ class PassingAudit:
         return SemanticAuditResult("passed", model_version="fake", prompt_version="v1", usage={"total_tokens": 1})
 
 
+def _directional_marketing_snapshot():
+    snapshot = _snapshot()
+    governed = snapshot.metadata["governed_snapshot"]
+    return replace(
+        snapshot,
+        metadata={
+            **snapshot.metadata,
+            "governed_snapshot": {
+                **governed,
+                "policy_scope": {
+                    **governed["policy_scope"],
+                    "report_compose_mode": "template_only",
+                    "direction_ids": ["product_marketing"],
+                    "marketing_conclusion_policy": {
+                        "primary_marketing_goal": "content_seeding",
+                        "tracks": ["need", "value", "message"],
+                        "minimum_notes_per_conclusion": 3,
+                        "minimum_independent_authors_per_conclusion": 2,
+                    },
+                },
+                "marketing_conclusions": [
+                    {
+                        "track": "need",
+                        "state": "directional",
+                        "candidate_id": "mc_need_directional",
+                        "statement": "儿童夏季活动后的闷汗方向",
+                        "supporting_claim_ids": ["cc_1"],
+                        "supporting_note_count": 1,
+                        "independent_author_count": 1,
+                        "reason_codes": [
+                            "conclusion_note_count_unmet",
+                            "conclusion_author_count_unmet",
+                        ],
+                    }
+                ],
+            },
+        },
+    )
+
+
 def test_execution_persists_append_only_audit_publication_and_stage_checkpoints(tmp_path):
     store = SQLiteContentResearchStore(str(tmp_path / "report-execution.db"))
     snapshot = _snapshot()
@@ -35,6 +76,45 @@ def test_execution_persists_append_only_audit_publication_and_stage_checkpoints(
     assert asyncio.run(ReportExecutionService(store).execute(snapshot, audit)).id == publication.id
     assert audit.calls == 1
     assert len(store.list_typed_records(StageCheckpointRecord)) == 2
+
+
+def test_execution_publishes_directional_report_when_no_marketing_track_is_selected(tmp_path):
+    store = SQLiteContentResearchStore(str(tmp_path / "directional-report.db"))
+    snapshot = _directional_marketing_snapshot()
+    store.save_result_snapshot(snapshot)
+
+    publication = asyncio.run(ReportExecutionService(store).execute(snapshot, PassingAudit()))
+
+    assert publication.publication_state == "directional_report"
+    assert publication.has_free_prose is True
+
+
+def test_execution_publishes_partial_report_when_selected_and_directional_tracks_coexist(tmp_path):
+    store = SQLiteContentResearchStore(str(tmp_path / "mixed-marketing-report.db"))
+    directional = _directional_marketing_snapshot()
+    governed = directional.metadata["governed_snapshot"]
+    snapshot = replace(
+        directional,
+        metadata={
+            **directional.metadata,
+            "governed_snapshot": {
+                **governed,
+                "marketing_conclusions": [
+                    {
+                        "track": "need", "state": "selected", "candidate_id": "mc_need",
+                        "statement": "夏季凉感需求明确", "supporting_claim_ids": ["cc_1"],
+                        "supporting_note_count": 3, "independent_author_count": 2, "reason_codes": [],
+                    },
+                    {**governed["marketing_conclusions"][0], "track": "value"},
+                ],
+            },
+        },
+    )
+    store.save_result_snapshot(snapshot)
+
+    publication = asyncio.run(ReportExecutionService(store).execute(snapshot, PassingAudit()))
+
+    assert publication.publication_state == "partial_verified_report"
 
 
 class FailingAudit:

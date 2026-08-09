@@ -10,6 +10,7 @@ import {
   endContentResearchWorkflow,
   getContentResearchDecisions,
   getContentResearchLiteReport,
+  getContentResearchLiteReportWithRetry,
   getContentResearchWorkflow,
   retryContentResearchFormalResearch,
   resumeContentResearchFormalResearch,
@@ -38,6 +39,20 @@ test("report publication gaps remain pending instead of becoming permanent failu
     isContentResearchReportPending(new ContentResearchApiError("database unavailable", 500)),
     false
   );
+});
+
+test("retries a transient Lite report network failure but not an HTTP failure", async () => {
+  let calls = 0;
+  globalThis.fetch = (async () => {
+    calls += 1;
+    if (calls === 1) throw new TypeError("Failed to fetch");
+    return jsonResponse({ workflow_run_id: "run_1", publication: { state: "complete_verified_report" } });
+  }) as typeof fetch;
+
+  const report = await getContentResearchLiteReportWithRetry("run_1", [0]);
+
+  assert.equal(calls, 2);
+  assert.equal(report.workflow_run_id, "run_1");
 });
 
 test("createContentResearchPresearch posts seed to real P0 endpoint", async () => {

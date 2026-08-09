@@ -15,6 +15,18 @@ This design does not add a user-operated follow-up collection flow, does not
 change Spider execution, and does not weaken the existing verified-conclusion
 threshold of three independent notes and two independent authors.
 
+## Key Invariants and High-Risk Boundaries
+
+- **The LLM may propose a candidate only; the backend alone derives its state,
+  unique note/author counts, and publication eligibility from persisted
+  evidence.**
+- **`directional` must retain the same non-investment meaning across durable
+  decisions, Trace, report composition, the Lite API, and Creator. It must
+  never be rendered as a verified conclusion or direct seeding recommendation.**
+- **Packet-only replay may recompute derived decisions, but it must not create
+  a Spider/provider operation or evidence packet. Repeating an unchanged replay
+  must preserve candidate, decision, citation, count, and reason identities.**
+
 ## Current State
 
 `MarketingConclusionAnalysisService` receives only admitted product-marketing

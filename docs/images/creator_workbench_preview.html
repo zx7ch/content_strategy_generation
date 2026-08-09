@@ -1,0 +1,697 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>XHS Growth Agent Creator Workbench Preview</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --bg: #f3f5f7;
+        --ink: #1a1a1a;
+        --quiet: #6b7280;
+        --line: #e7ebef;
+        --danger: #cf1322;
+        --danger-bg: #fff1f0;
+        --emerald: #10b981;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        background:
+          radial-gradient(circle at top left, rgba(17, 24, 39, 0.06), transparent 26%),
+          radial-gradient(circle at bottom right, rgba(148, 163, 184, 0.12), transparent 28%),
+          linear-gradient(180deg, #fafbfd 0%, var(--bg) 100%);
+        color: var(--ink);
+        font-family:
+          Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+          "PingFang SC", "Microsoft YaHei", sans-serif;
+      }
+
+      .preview {
+        width: 1600px;
+        height: min(900px, 100vh);
+        overflow: hidden;
+        background: transparent;
+      }
+
+      .top-nav {
+        position: sticky;
+        top: 0;
+        z-index: 20;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.7);
+        background: rgba(255, 255, 255, 0.8);
+        backdrop-filter: blur(16px);
+      }
+
+      .top-inner {
+        height: 64px;
+        max-width: 1600px;
+        margin: 0 auto;
+        padding: 0 24px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+      }
+
+      .top-left,
+      .brand-select,
+      .top-right {
+        display: flex;
+        align-items: center;
+      }
+
+      .top-left {
+        gap: 24px;
+      }
+
+      .workspace-name {
+        font-size: 18px;
+        font-weight: 650;
+        letter-spacing: -0.01em;
+      }
+
+      .surface-tabs {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        padding: 4px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        background: #fff;
+        font-size: 14px;
+      }
+
+      .surface-tabs span {
+        padding: 6px 12px;
+        border-radius: 999px;
+        color: #475569;
+      }
+
+      .surface-tabs .active {
+        color: #fff;
+        background: var(--ink);
+      }
+
+      .brand-select {
+        gap: 12px;
+        color: #475569;
+        font-size: 14px;
+      }
+
+      .select-like {
+        padding: 4px 12px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        background: #fff;
+        color: var(--ink);
+      }
+
+      .top-right {
+        gap: 12px;
+      }
+
+      .scope {
+        padding: 4px 12px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        background: #fff;
+        color: var(--quiet);
+        font-size: 12px;
+      }
+
+      .user {
+        width: 36px;
+        height: 36px;
+        display: grid;
+        place-items: center;
+        border-radius: 999px;
+        background: #f1f5f9;
+        color: #64748b;
+        font-size: 14px;
+        font-weight: 600;
+      }
+
+      .shell {
+        max-width: 1600px;
+        height: calc(100% - 64px);
+        margin: 0 auto;
+        padding: 0 24px;
+      }
+
+      .creator {
+        height: 100%;
+        min-height: 640px;
+        display: flex;
+        overflow: hidden;
+        border-left: 1px solid var(--line);
+        border-right: 1px solid var(--line);
+        background: #fff;
+      }
+
+      .thread-sidebar {
+        width: 256px;
+        flex: 0 0 auto;
+        display: flex;
+        flex-direction: column;
+        border-right: 1px solid var(--line);
+        background: #f8fafc;
+      }
+
+      .thread-scroll {
+        flex: 1;
+        padding: 12px;
+        overflow: hidden;
+      }
+
+      .new-thread {
+        width: 100%;
+        height: 38px;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-bottom: 12px;
+        padding: 0 12px;
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        background: #fff;
+        color: var(--ink);
+        font-size: 14px;
+        font-weight: 500;
+      }
+
+      .thread-list {
+        display: grid;
+        gap: 2px;
+      }
+
+      .thread-item {
+        height: 36px;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 0 12px;
+        border-radius: 12px;
+        color: #64748b;
+        font-size: 14px;
+      }
+
+      .thread-item.active {
+        background: #fff;
+        color: var(--ink);
+        font-weight: 500;
+        box-shadow: 0 1px 3px rgba(15, 23, 42, 0.08);
+      }
+
+      .thread-item .title {
+        flex: 1;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .thread-item .menu {
+        color: #94a3b8;
+      }
+
+      .chat-pane {
+        min-width: 0;
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+      }
+
+      .feed {
+        flex: 1;
+        overflow: hidden;
+        padding: 14px 24px;
+      }
+
+      .messages {
+        width: 100%;
+        max-width: 768px;
+        margin: 0 auto;
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+      }
+
+      .message {
+        display: flex;
+      }
+
+      .message.user-message {
+        justify-content: flex-end;
+      }
+
+      .bubble {
+        position: relative;
+        max-width: 80%;
+        padding: 9px 14px;
+        border-radius: 16px;
+        font-size: 14px;
+        line-height: 1.5;
+        white-space: normal;
+      }
+
+      .assistant-bubble {
+        background: #f0f2f5;
+        color: var(--ink);
+      }
+
+      .user-bubble {
+        background: var(--ink);
+        color: #fff;
+      }
+
+      .system-bubble {
+        border: 1px solid var(--line);
+        background: #fff;
+        color: var(--quiet);
+        font-size: 12px;
+      }
+
+      .task-card {
+        width: 80%;
+        padding: 9px 14px;
+        border-radius: 16px;
+        background: #f0f2f5;
+        color: var(--ink);
+        font-size: 14px;
+      }
+
+      .task-head {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 16px;
+      }
+
+      .task-title {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-bottom: 5px;
+        font-weight: 500;
+      }
+
+      .pulse {
+        width: 8px;
+        height: 8px;
+        border-radius: 999px;
+        background: var(--emerald);
+      }
+
+      .task-meta {
+        display: grid;
+        gap: 1px;
+        color: var(--quiet);
+        font-size: 12px;
+        line-height: 1.5;
+      }
+
+      .status-pill {
+        flex: 0 0 auto;
+        padding: 4px 10px;
+        border-radius: 999px;
+        background: #fff;
+        color: var(--quiet);
+        font-size: 12px;
+      }
+
+      .progress-track {
+        height: 6px;
+        margin-top: 9px;
+        overflow: hidden;
+        border-radius: 999px;
+        background: #fff;
+      }
+
+      .progress-fill {
+        height: 100%;
+        width: 100%;
+        border-radius: inherit;
+        background: var(--emerald);
+      }
+
+      .pipeline {
+        margin-top: 9px;
+      }
+
+      .pipeline-title {
+        margin-bottom: 4px;
+        color: var(--quiet);
+        font-size: 12px;
+        font-weight: 500;
+      }
+
+      .pipeline-lines {
+        display: grid;
+        gap: 4px;
+      }
+
+      .pipeline-line {
+        display: flex;
+        align-items: flex-start;
+        gap: 8px;
+        color: #64748b;
+        font-size: 12px;
+        line-height: 1.42;
+      }
+
+      .pipeline-line.latest {
+        color: var(--ink);
+      }
+
+      .pipeline-line .step-mark {
+        width: 16px;
+        flex: 0 0 auto;
+        color: var(--emerald);
+        font-weight: 700;
+      }
+
+      .artifact-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        margin-top: 9px;
+      }
+
+      .artifact-chip {
+        border: 1px solid rgba(16, 185, 129, 0.18);
+        border-radius: 999px;
+        background: #ecfdf5;
+        padding: 3px 8px;
+        color: #047857;
+        font-size: 11px;
+      }
+
+      .task-actions {
+        display: flex;
+        gap: 8px;
+        margin-top: 12px;
+      }
+
+      .task-actions button {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: #fff;
+        padding: 6px 12px;
+        color: var(--ink);
+        font: inherit;
+        font-size: 12px;
+        font-weight: 500;
+      }
+
+      .task-actions .cancel {
+        border-color: rgba(207, 19, 34, 0.3);
+        background: var(--danger-bg);
+        color: var(--danger);
+      }
+
+      .result-card {
+        width: 92%;
+        padding: 12px;
+        border-radius: 16px;
+        background: #f0f2f5;
+        color: var(--ink);
+        font-size: 14px;
+      }
+
+      .strategy-box,
+      .note-box {
+        border: 1px solid rgba(231, 235, 239, 0.8);
+        border-radius: 12px;
+        background: #fff;
+        padding: 9px 12px;
+      }
+
+      .strategy-box {
+        margin-bottom: 10px;
+      }
+
+      .eyebrow {
+        margin: 0 0 4px;
+        color: var(--quiet);
+        font-size: 10px;
+        font-weight: 700;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+
+      .strategy-box p:last-child,
+      .note-box p {
+        margin: 0;
+      }
+
+      .note-stack {
+        display: grid;
+        gap: 8px;
+      }
+
+      .note-title {
+        margin: 0 0 3px;
+        font-weight: 500;
+      }
+
+      .note-body {
+        color: var(--quiet);
+        font-size: 12px;
+        line-height: 1.48;
+      }
+
+      .tags {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 4px;
+        margin-top: 6px;
+      }
+
+      .tag {
+        padding: 2px 8px;
+        border-radius: 999px;
+        background: #f1f5f9;
+        color: var(--quiet);
+        font-size: 11px;
+      }
+
+      .complete-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        margin-top: 10px;
+      }
+
+      .complete-row p {
+        margin: 0;
+        color: var(--quiet);
+        font-size: 12px;
+      }
+
+      .complete-row button {
+        flex: 0 0 auto;
+        border: 0;
+        border-radius: 12px;
+        background: var(--ink);
+        color: #fff;
+        padding: 8px 16px;
+        font: inherit;
+        font-size: 14px;
+        font-weight: 500;
+      }
+
+      .input-area {
+        border-top: 1px solid var(--line);
+        background: #fff;
+        padding: 10px 24px;
+      }
+
+      .composer {
+        max-width: 768px;
+        margin: 0 auto;
+        display: flex;
+        align-items: flex-end;
+        gap: 12px;
+      }
+
+      .textarea-like {
+        min-height: 44px;
+        flex: 1;
+        display: flex;
+        align-items: center;
+        border: 1px solid var(--line);
+        border-radius: 16px;
+        background: #f8fafc;
+        padding: 10px 16px;
+        color: #94a3b8;
+        font-size: 14px;
+        line-height: 1.6;
+      }
+
+      .send-btn {
+        width: 44px;
+        height: 44px;
+        flex: 0 0 auto;
+        display: grid;
+        place-items: center;
+        border-radius: 12px;
+        background: var(--ink);
+        color: #fff;
+      }
+
+      .ghost-btn {
+        height: 44px;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        background: #fff;
+        padding: 0 14px;
+        color: var(--ink);
+        font-size: 14px;
+        font-weight: 500;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="preview">
+      <header class="top-nav">
+        <div class="top-inner">
+          <div class="top-left">
+            <div class="workspace-name">品牌增长实验室</div>
+            <nav class="surface-tabs" aria-label="工作区切换">
+              <span>工作台</span>
+              <span class="active">创作台</span>
+            </nav>
+            <div class="brand-select">
+              <span>品牌</span>
+              <span class="select-like">温和修护</span>
+            </div>
+          </div>
+          <div class="top-right">
+            <div class="scope">Workspace scoped</div>
+            <div class="user">U</div>
+          </div>
+        </div>
+      </header>
+
+      <div class="shell">
+        <div class="creator">
+          <aside class="thread-sidebar" aria-label="对话历史">
+            <div class="thread-scroll">
+              <div class="new-thread"><span>+</span><span>新建对话</span></div>
+              <div class="thread-list">
+                <div class="thread-item active">
+                  <span class="title">敏感肌换季护肤笔记</span>
+                  <span class="menu">···</span>
+                </div>
+                <div class="thread-item"><span class="title">通勤包内容选题</span></div>
+                <div class="thread-item"><span class="title">办公室瑜伽脚本</span></div>
+                <div class="thread-item"><span class="title">轻量户外装备测评</span></div>
+              </div>
+            </div>
+          </aside>
+
+          <section class="chat-pane" aria-label="创作对话">
+            <div class="feed">
+              <div class="messages">
+                <div class="message user-message">
+                  <div class="bubble user-bubble">
+                    帮我生成三篇敏感肌换季护肤笔记，风格偏干货，适合25-35岁女性
+                  </div>
+                </div>
+
+                <div class="message">
+                  <div class="task-card">
+                    <div class="task-head">
+                      <div>
+                        <div class="task-title"><span class="pulse"></span><span>后端处理流程</span></div>
+                        <div class="task-meta">
+                          <div>任务：敏感肌换季护肤笔记</div>
+                          <div>状态：已完成生成</div>
+                          <div>进度：19 / 19 · 100%</div>
+                        </div>
+                      </div>
+                      <span class="status-pill">已完成</span>
+                    </div>
+
+                    <div class="progress-track"><div class="progress-fill"></div></div>
+
+                    <div class="pipeline">
+                      <div class="pipeline-title">执行链路：</div>
+                      <div class="pipeline-lines">
+                        <div class="pipeline-line"><span class="step-mark">✓</span><span>解析需求：人群 25-35 岁女性，风格 干货型，主题 敏感肌换季护肤</span></div>
+                        <div class="pipeline-line"><span class="step-mark">✓</span><span>内容检索：搜索到 36 篇相关小红书内容，提取高频痛点与标题结构</span></div>
+                        <div class="pipeline-line"><span class="step-mark">✓</span><span>策略生成：确定“屏障修护 + 成分避坑 + 精简流程”的内容方向</span></div>
+                        <div class="pipeline-line latest"><span class="step-mark">✓</span><span>笔记生成：完成 3 篇小红书笔记，并附带标签与发布候选状态</span></div>
+                      </div>
+                    </div>
+
+                    <div class="artifact-row">
+                      <span class="artifact-chip">策略定位 1 份</span>
+                      <span class="artifact-chip">笔记草稿 3 篇</span>
+                      <span class="artifact-chip">标签建议 6 个</span>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="message">
+                  <div class="result-card">
+                    <div class="strategy-box">
+                      <p class="eyebrow">最终生成结果 / 内容策略定位</p>
+                      <p>围绕“换季屏障修护”建立干货型内容结构，用成分避坑和使用顺序降低敏感肌用户的决策焦虑。</p>
+                    </div>
+
+                    <div class="note-stack">
+                      <p class="eyebrow">生成笔记（3 篇）</p>
+                      <div class="note-box">
+                        <p class="note-title">换季敏感肌先稳住屏障</p>
+                        <p class="note-body">别急着叠加猛药成分，先判断泛红、刺痛和干痒是不是屏障在报警...</p>
+                        <div class="tags"><span class="tag">#敏感肌</span><span class="tag">#屏障修护</span></div>
+                      </div>
+                      <div class="note-box">
+                        <p class="note-title">精简护肤不是少用而是用对</p>
+                        <p class="note-body">换季期把护肤流程收窄到清洁、保湿、防晒三步，观察皮肤反馈再加功能产品...</p>
+                        <div class="tags"><span class="tag">#换季护肤</span><span class="tag">#精简护肤</span></div>
+                      </div>
+                      <div class="note-box">
+                        <p class="note-title">泛红期成分避坑清单</p>
+                        <p class="note-body">酸类、高浓度功效成分和频繁去角质都可能让泛红期更不稳定，先做低刺激修护...</p>
+                        <div class="tags"><span class="tag">#成分避坑</span><span class="tag">#干货笔记</span></div>
+                      </div>
+                    </div>
+
+                    <div class="complete-row">
+                      <p>3 篇笔记已生成，可继续追问修改方向，或确认进入发布候选。</p>
+                      <button>完成</button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="input-area">
+              <div class="composer">
+                <div class="textarea-like">继续输入修改要求，例如：标题更强、语气更像真实用户...</div>
+                <div class="send-btn" aria-label="发送">
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                    <line x1="22" y1="2" x2="11" y2="13"></line>
+                    <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+                  </svg>
+                </div>
+                <div class="ghost-btn">重新生成</div>
+              </div>
+            </div>
+          </section>
+        </div>
+      </div>
+    </div>
+  </body>
+</html>

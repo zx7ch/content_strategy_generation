@@ -251,10 +251,8 @@ class LiteReportReader:
                 "main_findings": [] if is_evidence_only else findings,
                 "weak_signals": [] if is_evidence_only else weak_signals,
                 "limitations_scope": list(report.get("limitations_recovery") or []),
-                "marketing_conclusions": (
-                    {} if is_evidence_only else marketing_conclusions
-                ),
-                "priority_action": None if is_evidence_only else priority_action,
+                "marketing_conclusions": marketing_conclusions,
+                "priority_action": priority_action,
             },
             "status_strip": (
                 {"saved_evidence_count": len(citations)}

@@ -443,6 +443,46 @@ def test_creator_complete_report_uses_lite_with_direct_source_navigation(
     )
 
 
+def test_creator_restores_published_report_after_transient_lite_network_failure(browser_page):
+    page, stack = browser_page
+    seeded = run_async_in_thread(seed_publication(
+        stack["db_path"], brand_id=default_brand_id(stack["backend_url"]), title="恢复报告",
+        publication_state="complete_verified_report", requested_directions=("product_marketing",),
+        direction_results={"product_marketing": {"state": "formal_directional_result", "limitations": [], "recovery_actions": []}},
+        evidence_refs=all_navigation_evidence_refs()[:1],
+    ))
+    attempts = {"count": 0}
+
+    def interrupt_once(route):
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            route.abort()
+        else:
+            route.continue_()
+
+    page.route(f"**/content-research/workflows/{seeded['run_id']}/lite-report", interrupt_once)
+    open_creator_with_restored_run(page, stack["frontend_url"], seeded["run_id"])
+
+    expect(published_report(page)).to_be_visible(timeout=20000)
+    expect(page.get_by_text("正式报告暂不可读取", exact=False)).to_have_count(0)
+    assert attempts["count"] >= 2
+
+
+def test_creator_direct_run_restore_ignores_current_brand_filter(browser_page):
+    page, stack = browser_page
+    seeded = run_async_in_thread(seed_publication(
+        stack["db_path"], brand_id=None, title="无品牌历史调研",
+        publication_state="complete_verified_report", requested_directions=("product_marketing",),
+        direction_results={"product_marketing": {"state": "formal_directional_result", "limitations": [], "recovery_actions": []}},
+        evidence_refs=all_navigation_evidence_refs()[:1],
+    ))
+
+    open_creator_with_restored_run(page, stack["frontend_url"], seeded["run_id"])
+
+    expect(published_report(page)).to_be_visible(timeout=20000)
+    expect(page.get_by_text("该内容调研所属对话不可访问", exact=True)).to_have_count(0)
+
+
 def test_creator_renders_three_marketing_tracks_and_evidence_strength(browser_page):
     page, stack = browser_page
     brand_id = default_brand_id(stack["backend_url"])
@@ -524,6 +564,14 @@ def test_creator_renders_three_marketing_tracks_and_evidence_strength(browser_pa
     expect(report.get_by_text("建议", exact=True)).to_be_visible()
     expect(report.get_by_text("不得展开的第二条合格需求结论")).to_have_count(0)
     expect(report.get_by_text(re.compile("raw claim .* must not render"))).to_have_count(0)
+
+    directional_card = report.get_by_text(
+        "儿童与成人均可参考轻薄凉感表达", exact=True
+    ).locator("xpath=..")
+    directional_card.get_by_role("button", name="证据详情").click()
+    drawer = report.locator('aside[aria-label="Content Research citation evidence"]')
+    expect(drawer).to_be_visible()
+    expect(drawer.get_by_text("可打开来源", exact=True)).to_be_visible()
 
     page.locator('aside[aria-label="内容调研上下文"]').get_by_label(
         "查看完整 workflow trace"
@@ -994,6 +1042,19 @@ def test_creator_evidence_only_report_shows_saved_evidence_and_reason_only(
             },
             evidence_refs=all_navigation_evidence_refs()[:1],
             publication_reason="insufficient_admitted_evidence",
+            marketing_conclusions=[
+                {
+                    "track": track,
+                    "state": "insufficient_evidence",
+                    "candidate_id": None,
+                    "statement": None,
+                    "supporting_claim_ids": [],
+                    "supporting_note_count": 0,
+                    "independent_author_count": 0,
+                    "reason_codes": ["conclusion_no_qualified_candidate"],
+                }
+                for track in ("need", "value", "message")
+            ],
         )
     )
 
@@ -1005,13 +1066,17 @@ def test_creator_evidence_only_report_shows_saved_evidence_and_reason_only(
         report.get_by_text("insufficient_admitted_evidence", exact=True)
     ).to_be_visible()
     expect(report.get_by_role("heading", name="已保存依据", exact=True)).to_be_visible()
-    report.get_by_role("button", name="证据详情").first.click()
-    expect(
-        report.locator('aside[aria-label="Content Research citation evidence"]').get_by_text(
-            "可打开来源",
-            exact=True,
-        )
-    ).to_be_visible()
+    for heading in ("场景与需求", "可被相信的产品卖点", "内容表达"):
+        section = report.locator(f'section[aria-label="{heading}"]')
+        expect(section).to_be_visible()
+        expect(section.get_by_text("暂无可验证结论", exact=True)).to_be_visible()
+        expect(
+            section.get_by_text(
+                "验证方向：补充至少 3 篇合格笔记，并覆盖至少 2 位独立作者后重新验证。",
+                exact=True,
+            )
+        ).to_be_visible()
+        expect(section.get_by_role("button", name="证据详情")).to_have_count(0)
     for hidden_section in ("核心发现", "样本观察", "线索", "方向状态", "研究限制"):
         expect(report.locator(f'section[aria-label="{hidden_section}"]')).to_have_count(0)
 

@@ -134,6 +134,37 @@ def test_template_audit_accepts_exact_selected_governed_marketing_conclusion():
     assert result.semantic_result.state == "not_applicable"
 
 
+def test_template_audit_accepts_exact_directional_governed_marketing_conclusion():
+    selected_snapshot = _marketing_snapshot()
+    governed = selected_snapshot.metadata["governed_snapshot"]
+    selected = governed["marketing_conclusions"][0]
+    snapshot = replace(
+        selected_snapshot,
+        metadata={
+            **selected_snapshot.metadata,
+            "governed_snapshot": {
+                **governed,
+                "marketing_conclusions": [
+                    {
+                        **selected,
+                        "state": "directional",
+                        "reason_codes": ["conclusion_note_count_unmet"],
+                    },
+                    *governed["marketing_conclusions"][1:],
+                ],
+            },
+        },
+    )
+    draft = ResearchReportComposer().compose(snapshot)
+
+    result = asyncio.run(
+        ReportFaithfulnessEvaluator().evaluate(snapshot, draft, AuditUnavailable())
+    )
+
+    assert result.passed is True
+    assert result.reason_codes == ()
+
+
 def test_template_audit_rejects_raw_claim_substitution_for_marketing_conclusion():
     snapshot = _marketing_snapshot()
     draft = ResearchReportComposer().compose(snapshot)

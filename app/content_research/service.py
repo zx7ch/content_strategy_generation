@@ -2242,9 +2242,11 @@ class ContentResearchService:
         }
         publication_state = (
             "partial_verified_report"
-            if "selected" in marketing_states or claim_cards
+            if "selected" in marketing_states
             else "directional_report"
             if "directional" in marketing_states
+            else "partial_verified_report"
+            if claim_cards
             else "evidence_only_report"
         )
         limitations = [

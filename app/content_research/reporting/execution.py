@@ -118,7 +118,22 @@ class ReportExecutionService:
             self._store.save_report_faithfulness_decision(decision.to_record())
             self._checkpoint(snapshot, "faithfulness", decision.id, attempt, faithfulness_started_at, faithfulness_finished_at)
             if evaluation.passed:
-                state = "partial_verified_report" if withdrawn_section_ids else "complete_verified_report"
+                if _has_directional(draft):
+                    omitted = tuple(
+                        section.section_id
+                        for section in draft.sections
+                        if section.prose and section.conclusion_state != "directional"
+                    )
+                    draft = self._withdraw_prose(draft, omitted)
+                    self._store.save_report_draft(draft.to_record())
+                    state = (
+                        "partial_verified_report"
+                        if _has_selected(draft)
+                        else "directional_report"
+                    )
+                    withdrawn_section_ids = omitted
+                else:
+                    state = "partial_verified_report" if withdrawn_section_ids else "complete_verified_report"
                 publication = self._publication(
                     draft, decision.id, state, withdrawn_section_ids, state != "evidence_only_report", str(policy.get("report_compose_mode") or "prose")
                 )
@@ -221,6 +236,22 @@ class ReportExecutionService:
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _marketing_conclusion_states(draft: ReportDraft) -> set[str | None]:
+    return {
+        section.conclusion_state
+        for section in draft.sections
+        if section.section_kind.startswith("marketing_")
+    }
+
+
+def _has_directional(draft: ReportDraft) -> bool:
+    return "directional" in _marketing_conclusion_states(draft)
+
+
+def _has_selected(draft: ReportDraft) -> bool:
+    return "selected" in _marketing_conclusion_states(draft)
 
 
 def _has_admitted_cited_evidence(snapshot: ResearchResultSnapshotRecord) -> bool:

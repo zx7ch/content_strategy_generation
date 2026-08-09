@@ -159,7 +159,7 @@ export interface ContentResearchTrace {
 }
 
 export interface ContentResearchMarketingConclusionTraceTrack {
-  state: "selected" | "qualified" | "insufficient_evidence" | "no_single_primary_conclusion" | "analysis_unavailable";
+  state: "selected" | "directional" | "qualified" | "insufficient_evidence" | "no_single_primary_conclusion" | "analysis_unavailable";
   supporting_note_count?: number;
   independent_author_count?: number;
   reason_codes?: string[];
@@ -420,6 +420,20 @@ export async function getContentResearchLiteReport(
   }
   const suffix = query.size ? `?${query.toString()}` : "";
   return contentResearchFetch(`/content-research/workflows/${encodeURIComponent(workflowRunId)}/lite-report${suffix}`);
+}
+
+export async function getContentResearchLiteReportWithRetry(
+  workflowRunId: string,
+  retryDelaysMs: readonly number[] = [500, 1000, 2000],
+): Promise<ContentResearchLiteReportResponse> {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await getContentResearchLiteReport(workflowRunId);
+    } catch (error) {
+      if (!(error instanceof TypeError) || attempt >= retryDelaysMs.length) throw error;
+      await new Promise<void>((resolve) => setTimeout(resolve, retryDelaysMs[attempt]));
+    }
+  }
 }
 
 export async function submitContentResearchBrandDecision(

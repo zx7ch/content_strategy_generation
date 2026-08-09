@@ -369,20 +369,21 @@ def _marketing_conclusion_reasons(
     conclusions: list[dict[str, Any]],
 ) -> list[str]:
     track = section.section_kind.removeprefix("marketing_")
-    selected = [
+    supported = [
         item
         for item in conclusions
-        if item.get("track") == track and item.get("state") == "selected"
+        if item.get("track") == track
+        and item.get("state") in {"selected", "directional"}
     ]
-    if len(selected) != 1:
+    if len(supported) != 1:
         return ["marketing_conclusion_decision_invalid"]
-    decision = selected[0]
+    decision = supported[0]
     expected_id = _marketing_conclusion_id(snapshot, decision)
     expected_claim_ids = decision.get("supporting_claim_ids")
     reasons: list[str] = []
     if (
         section.marketing_conclusion_ids != (expected_id,)
-        or section.conclusion_state != "selected"
+        or section.conclusion_state != decision.get("state")
     ):
         reasons.append("marketing_conclusion_decision_invalid")
     if section.prose != decision.get("statement"):

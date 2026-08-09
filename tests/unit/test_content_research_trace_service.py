@@ -180,7 +180,7 @@ def test_marketing_conclusion_checkpoint_projects_only_actionable_facts(store):
                         "author_id": "secret-author-id",
                     },
                     "value": {
-                        "state": "insufficient_evidence",
+                        "state": "directional",
                         "supporting_note_count": 2,
                         "independent_author_count": 1,
                         "reason_codes": [
@@ -219,7 +219,7 @@ def test_marketing_conclusion_checkpoint_projects_only_actionable_facts(store):
                 "independent_author_count": 2,
             },
             "value": {
-                "state": "insufficient_evidence",
+                "state": "directional",
                 "supporting_note_count": 2,
                 "independent_author_count": 1,
                 "reason_codes": [

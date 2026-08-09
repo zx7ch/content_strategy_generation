@@ -411,6 +411,7 @@ class ReportPublicationRecord(TypedPersistenceRecord):
         if self.publication_state not in {
             "complete_verified_report",
             "partial_verified_report",
+            "directional_report",
             "evidence_only_report",
         }:
             raise ValueError("invalid report publication state")

@@ -32,6 +32,7 @@ import {
   getCurrentXHSQRLogin,
   isContentResearchReportPending,
   getContentResearchLiteReport,
+  getContentResearchLiteReportWithRetry,
   getContentResearchWorkflow,
   retryContentResearchFormalResearch,
   retryContentResearchPresearch,
@@ -1225,7 +1226,7 @@ function ContentResearchReportMessage({
             </section>
           )}
 
-          {!evidenceOnly && hasMarketingTracks && marketingTracks.map(({ id, label, value }) => {
+          {hasMarketingTracks && marketingTracks.map(({ id, label, value }) => {
             const track = value as Record<string, unknown>;
             const selected = stringField(track, "state") === "selected";
             const directional = stringField(track, "state") === "directional";
@@ -1275,7 +1276,7 @@ function ContentResearchReportMessage({
             );
           })}
 
-          {!evidenceOnly && hasMarketingTracks && priorityAction && (
+          {hasMarketingTracks && priorityAction && (
             <section aria-label="优先行动建议" className="border-t border-line pt-4">
               <h4 className="font-semibold">优先行动建议</h4>
               <div className="mt-3 rounded-xl border border-[#c7d5cc] bg-[#f4f8f5] px-3 py-3">
@@ -2031,7 +2032,10 @@ export default function CreatorPage() {
       }
 
       try {
-        const items = await listThreads(selectedBrandId);
+        // A direct run link is authoritative: its thread may predate brand
+        // scoping and therefore have no brand_id. The normal Creator landing
+        // page keeps the selected-brand filter for its history list.
+        const items = await listThreads(workflowRunId ? null : selectedBrandId);
         if (cancelled) return;
         setThreads(items);
         // A user can create/send while the initial list is still in flight.
@@ -2211,7 +2215,7 @@ export default function CreatorPage() {
         : current
     );
     try {
-      const report = await getContentResearchLiteReport(workflowRunId);
+      const report = await getContentResearchLiteReportWithRetry(workflowRunId);
       appendLiteReportMessage(report);
       setContentResearchRun((current) =>
         current && current.workflowRunId === workflowRunId
@@ -2486,7 +2490,7 @@ export default function CreatorPage() {
         const reports = await Promise.all(history.map(async (message) => {
           if (message.message_type !== "artifact_result" || !message.run_id) return null;
           try {
-            return { messageId: message.message_id, report: await getContentResearchLiteReport(message.run_id) };
+            return { messageId: message.message_id, report: await getContentResearchLiteReportWithRetry(message.run_id) };
           } catch (error) {
             return { messageId: message.message_id, workflowRunId: message.run_id, error: error instanceof Error ? error.message : "报告读取失败" };
           }
@@ -2527,7 +2531,7 @@ export default function CreatorPage() {
           }
           if (!latestReport && !latestFailure) {
             try {
-              const projection = await getContentResearchLiteReport(runIdForThread);
+              const projection = await getContentResearchLiteReportWithRetry(runIdForThread);
               if (
                 litePublicationState(projection)
                 || (projection.publication.state === null && projection.recovery_projection)

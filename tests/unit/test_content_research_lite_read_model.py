@@ -282,6 +282,64 @@ def test_lite_projection_uses_only_selected_governed_marketing_conclusion():
     ]
 
 
+def test_lite_projection_keeps_terminal_marketing_tracks_for_evidence_only_report():
+    reader = LiteReportReader(_StoreWithoutBrief(), ":memory:")
+    report = {
+        "workflow_run_id": "run_evidence_only",
+        "workflow_terminal_state": "succeeded",
+        "publication_state": "evidence_only_report",
+        "publication": {"compose_mode": "template_only"},
+        "release": {
+            "direction_set_version": "direction_set_v1",
+            "direction_ids": ["product_marketing"],
+        },
+        "claim_cards": [],
+        "weak_signals": [],
+        "citation_groups": [],
+        "run_direction_states": [
+            {"direction": "product_marketing", "state": "unavailable"}
+        ],
+        "limitations_recovery": [],
+        "primary_marketing_goal": "content_seeding",
+        "marketing_conclusions": [
+            {
+                "track": track,
+                "state": "insufficient_evidence",
+                "candidate_id": None,
+                "statement": None,
+                "supporting_claim_ids": [],
+                "supporting_note_count": 0,
+                "independent_author_count": 0,
+                "reason_codes": ["conclusion_no_qualified_candidate"],
+            }
+            for track in ("need", "value", "message")
+        ],
+        "sections": [],
+    }
+
+    projected = reader._published_projection(report, citation_group_ids=None)
+
+    assert set(projected["sections"]["marketing_conclusions"]) == {
+        "need",
+        "value",
+        "message",
+    }
+    for track in projected["sections"]["marketing_conclusions"].values():
+        assert track == {
+            "state": "insufficient_evidence",
+            "reason_codes": ["conclusion_no_qualified_candidate"],
+            "verification_direction": "补充至少 3 篇合格笔记，并覆盖至少 2 位独立作者后重新验证。",
+        }
+    assert projected["sections"]["priority_action"] == {
+        "label": "建议",
+        "statement": "先补足三条轨道的合格笔记与独立作者，再形成种草策略判断。",
+        "primary_marketing_goal": "content_seeding",
+        "supporting_conclusion_ids": [],
+    }
+    assert projected["sections"]["main_findings"] == []
+    assert projected["sections"]["weak_signals"] == []
+
+
 def test_lite_projection_never_returns_withdrawn_marketing_conclusion_prose():
     report = {
         "workflow_run_id": "run_withdrawn",

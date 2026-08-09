@@ -246,7 +246,21 @@ async def test_formal_workflow_public_api_e2e_is_packet_only_safe_and_replayable
     workflow = created.json()
     confirmed = await client.post(
         f"/content-research/briefs/{workflow['brief_id']}/confirm",
-        json={"confirmed_subject": "徒步短裤", "subject_type": "category", "selected_competitors": ["迪卡侬"], "custom_competitors": [], "selected_directions": ["product_marketing"], "custom_research_question": "请给出下一步建议", "primary_marketing_goal": "content_seeding"},
+        json={
+            "confirmed_subject": "徒步短裤",
+            "subject_structure_hash": workflow["subject_structure_hash"],
+            "subject_type": "category",
+            "selected_competitors": ["迪卡侬"],
+            "custom_competitors": [],
+            "selected_directions": ["product_marketing"],
+            "custom_research_question": "请给出下一步建议",
+            "primary_marketing_goal": "content_seeding",
+            "subject_structure_confirmation": {
+                "core_object": "短裤",
+                "research_intent": "产品营销",
+                "context_modifiers": [],
+            },
+        },
     )
     assert confirmed.status_code == 200, confirmed.text
 
