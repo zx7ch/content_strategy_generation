@@ -63,8 +63,11 @@ active record before creating the Spider client. The Spider client's auth
 provider therefore starts authenticated after restart without another QR scan.
 
 LLM configuration retains its existing local SQLite storage and safe masked
-read model. Neither LLM keys nor Xiaohongshu cookies are stored in the release
-ZIP or returned to the frontend after save.
+read model. The same stable user-data database stores both the LLM
+configuration and Xiaohongshu credential, so both survive a Runtime restart
+and replacement upgrade without being entered again. Neither LLM keys nor
+Xiaohongshu cookies are stored in the release ZIP or returned to the frontend
+after save.
 
 ## Runtime package boundary
 
@@ -113,4 +116,5 @@ error strings.
   masked persisted status.
 - Packaging tests run the built Runtime with a clean temporary HOME, verify no
   user database is created inside the bundle, then restart it and verify both
-  LLM configuration and Xiaohongshu login status persist.
+  the saved LLM configuration and Xiaohongshu login status persist. Replacing
+  the extracted Runtime folder must preserve the same two local settings.
