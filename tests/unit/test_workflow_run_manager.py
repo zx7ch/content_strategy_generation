@@ -441,6 +441,20 @@ async def test_report_finalization_can_fail_or_cancel_without_becoming_stuck(man
 
 
 @pytest.mark.asyncio
+async def test_report_publication_retry_rejects_other_terminal_failures(manager):
+    run = await manager.start_run(thread_id="thread-other-fail", user_id="user-1")
+    await manager.fail_run(
+        run.run_id, {"code": "provider_unavailable", "message": "provider failed"}
+    )
+
+    with pytest.raises(
+        WorkflowTransitionError,
+        match="requires a report publication failure",
+    ):
+        await manager.retry_failed_report_finalization(run.run_id)
+
+
+@pytest.mark.asyncio
 async def test_formal_runtime_marks_a_finalizing_report_failure_without_reopening_the_step(tmp_path):
     db_path = str(tmp_path / "finalizing-report-runtime-failure.db")
     async with WorkflowRunManager(db_path) as manager:

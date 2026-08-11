@@ -54,6 +54,9 @@ dev = [
     "mypy>=1.6.0",
 ]
 
+[tool.setuptools.packages.find]
+include = ["app*", "experiments*"]
+
 [tool.black]
 line-length = 100
 target-version = ['py310']

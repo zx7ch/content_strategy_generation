@@ -29,6 +29,11 @@ class FakeRuntime:
     async def mark_presearch_ready(self, workflow_run_id: str) -> None:
         return None
 
+    async def wait_for_subject_clarification(
+        self, workflow_run_id: str, reason: dict
+    ) -> None:
+        return None
+
     async def get_runtime_snapshot(self, workflow_run_id: str) -> dict:
         return {"run": {"run_id": workflow_run_id}, "steps": [], "child_tasks": []}
 
@@ -172,7 +177,7 @@ async def test_router_scope_selects_atomic_user_target_through_service_and_adapt
         json={"seed_text": "Satisfy Running", "thread_id": "thread-real"},
     )
 
-    assert response.status_code == 201
+    assert response.status_code == 201, response.text
     assert adapter.calls == [{
         "workspace_id": "workspace-real",
         "user_id": "user-real",

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import re
 from collections.abc import Awaitable, Callable
 from typing import TypeVar
@@ -117,6 +118,7 @@ class XiaohongshuSourceAdapter:
                 SOURCE_KIND_SEARCH_RESULT,
                 _classify_transient_error(str(exc)),
                 automatic_retry_count=_retry_count(exc),
+                diagnostic_message=str(exc),
             )
         except SpiderPermanentError as exc:
             return self._operation_failure(
@@ -124,6 +126,7 @@ class XiaohongshuSourceAdapter:
                 SOURCE_KIND_SEARCH_RESULT,
                 _classify_permanent_error(str(exc)),
                 automatic_retry_count=_retry_count(exc),
+                diagnostic_message=str(exc),
             )
         if not posts:
             return SourceOperationResult(
@@ -228,6 +231,7 @@ class XiaohongshuSourceAdapter:
                 SOURCE_KIND_NOTE_DETAIL,
                 _classify_transient_error(str(exc)),
                 automatic_retry_count=_retry_count(exc),
+                diagnostic_message=str(exc),
             )
         except SpiderPermanentError as exc:
             return self._operation_failure(
@@ -235,6 +239,7 @@ class XiaohongshuSourceAdapter:
                 SOURCE_KIND_NOTE_DETAIL,
                 _classify_permanent_error(str(exc)),
                 automatic_retry_count=_retry_count(exc),
+                diagnostic_message=str(exc),
             )
         try:
             item = self._normalizer.normalize_note_detail(post, required_fields=request.required_fields)
@@ -289,6 +294,7 @@ class XiaohongshuSourceAdapter:
                 SOURCE_KIND_COMMENT,
                 _classify_transient_error(str(exc)),
                 automatic_retry_count=_retry_count(exc),
+                diagnostic_message=str(exc),
             )
         except SpiderPermanentError as exc:
             return self._operation_failure(
@@ -296,6 +302,7 @@ class XiaohongshuSourceAdapter:
                 SOURCE_KIND_COMMENT,
                 _classify_permanent_error(str(exc)),
                 automatic_retry_count=_retry_count(exc),
+                diagnostic_message=str(exc),
             )
         try:
             items = [self._normalizer.normalize_comment(item, parent_note_id=request.parent_note_id) for item in comments[:request.limit]]
@@ -328,8 +335,34 @@ class XiaohongshuSourceAdapter:
         truncated = has_more or len(comments) > request.limit
         return SourceOperationResult(SOURCE_PROVIDER, "collect_comments", SOURCE_KIND_COMMENT, STATUS_PARTIAL_COMPLETED if truncated else STATUS_COMPLETED, items, cookie_status=COOKIE_STATUS_VALID, next_cursor=next_cursor, completeness="truncated_by_cap" if truncated else "complete", metadata={"parent_note_id": request.parent_note_id, "operation_fingerprint": _operation_fingerprint(request), "automatic_retry_count": automatic_retry_count, "automatic_retry_limit": self._automatic_retry_limit})
 
-    def _operation_failure(self, operation: str, source_kind: str, reason: str, *, cookie_status: str = COOKIE_STATUS_UNKNOWN, automatic_retry_count: int = 0) -> SourceOperationResult:
-        return SourceOperationResult(SOURCE_PROVIDER, operation, source_kind, STATUS_FAILED, [], reason, COOKIE_STATUS_INVALID if reason == FAILURE_AUTH_REQUIRED else cookie_status, completeness="unavailable", retryable=reason in {FAILURE_TIMEOUT, FAILURE_TRANSIENT_ERROR, FAILURE_RATE_LIMITED}, metadata={"automatic_retry_count": automatic_retry_count, "automatic_retry_limit": self._automatic_retry_limit})
+    def _operation_failure(
+        self,
+        operation: str,
+        source_kind: str,
+        reason: str,
+        *,
+        cookie_status: str = COOKIE_STATUS_UNKNOWN,
+        automatic_retry_count: int = 0,
+        diagnostic_message: str | None = None,
+    ) -> SourceOperationResult:
+        metadata = {
+            "automatic_retry_count": automatic_retry_count,
+            "automatic_retry_limit": self._automatic_retry_limit,
+        }
+        if diagnostic_message:
+            metadata["failure_diagnostic"] = _failure_diagnostic(diagnostic_message)
+        return SourceOperationResult(
+            SOURCE_PROVIDER,
+            operation,
+            source_kind,
+            STATUS_FAILED,
+            [],
+            reason,
+            COOKIE_STATUS_INVALID if reason == FAILURE_AUTH_REQUIRED else cookie_status,
+            completeness="unavailable",
+            retryable=reason in {FAILURE_TIMEOUT, FAILURE_TRANSIENT_ERROR, FAILURE_RATE_LIMITED},
+            metadata=metadata,
+        )
 
 
 def _classify_permanent_error(message: str) -> str:
@@ -353,6 +386,15 @@ def _classify_permanent_error(message: str) -> str:
     )):
         return FAILURE_NOTE_UNAVAILABLE
     return FAILURE_PROVIDER_PERMANENT_ERROR
+
+
+def _failure_diagnostic(message: str) -> dict[str, str]:
+    """Keep a correlatable provider error signal without retaining provider text."""
+    normalized = " ".join(message.split())
+    return {
+        "kind": "provider_message_fingerprint",
+        "value": hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16],
+    }
 
 
 async def _run_with_automatic_retries(

@@ -723,8 +723,15 @@ function ContentResearchIntentCard({
   const needsProductStructureConfirmation = selectedDirections.includes("product_marketing")
     && !hasConfirmedStructureFields;
 
-  function toggleValue(value: string, selected: string[], setSelected: (next: string[]) => void) {
-    setSelected(selected.includes(value) ? selected.filter((item) => item !== value) : [...selected, value]);
+  function toggleValue(
+    value: string,
+    setSelected: React.Dispatch<React.SetStateAction<string[]>>,
+  ) {
+    setSelected((selected) => (
+      selected.includes(value)
+        ? selected.filter((item) => item !== value)
+        : [...selected, value]
+    ));
   }
 
   async function confirmBrief() {
@@ -886,7 +893,7 @@ function ContentResearchIntentCard({
               <button
                 key={competitor}
                 type="button"
-                onClick={() => competitor !== "待补充竞品" && toggleValue(competitor, selectedCompetitors, setSelectedCompetitors)}
+                onClick={() => competitor !== "待补充竞品" && toggleValue(competitor, setSelectedCompetitors)}
                 disabled={competitor === "待补充竞品"}
                 className={[
                   "rounded-full px-4 py-2 text-sm font-medium transition",
@@ -915,7 +922,7 @@ function ContentResearchIntentCard({
               <button
                 key={direction}
                 type="button"
-                onClick={() => toggleValue(direction, selectedDirections, setSelectedDirections)}
+                onClick={() => toggleValue(direction, setSelectedDirections)}
                 className={[
                   "rounded-full px-4 py-2 text-sm font-medium transition",
                   selectedDirections.includes(direction) ? "bg-[#789180] text-white" : "bg-[#e8efe9] text-[#51665a] hover:bg-[#dfe8e1]",

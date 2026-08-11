@@ -66,6 +66,29 @@ class ReportPublicationMaterializer:
                     summary_text="内容调研报告已发布",
                 )
 
+        return artifact
+
+    async def publish_timeline_message(self, publication_id: str) -> None:
+        """Expose the final Creator message only after the run commits success."""
+        publication = self._require_publication(publication_id)
+        async with WorkflowStore(self._db_path) as workflow_store:
+            run = await workflow_store.get_run(publication.workflow_run_id)
+            if run is None:
+                raise ValueError("missing Creator workflow run for report publication")
+            if run.status.value != "succeeded":
+                raise ValueError("cannot publish a report timeline message before success")
+            artifacts = await workflow_store.list_artifacts(publication.workflow_run_id)
+        artifact = next(
+            (
+                item
+                for item in artifacts
+                if item.artifact_type == WorkflowArtifactType.FINAL_RESULT
+                and (item.payload_json or {}).get("report_publication_id") == publication.id
+            ),
+            None,
+        )
+        if artifact is None:
+            raise ValueError("missing materialized report artifact")
         async with ThreadStore(self._db_path) as thread_store:
             await thread_store.append_artifact_result_message(
                 thread_id=run.thread_id,
@@ -81,7 +104,6 @@ class ReportPublicationMaterializer:
                 text="内容调研报告已生成。",
                 idempotent=True,
             )
-        return artifact
 
     def _require_publication(self, publication_id: str) -> ReportPublicationRecord:
         publication = self._store.get_typed_record(ReportPublicationRecord, publication_id)

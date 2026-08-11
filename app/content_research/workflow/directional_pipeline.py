@@ -1621,7 +1621,10 @@ class DirectionalExecutionPipeline:
 
     def _blocking_operation_failure(self, task_id: str, selection_status: str) -> str | None:
         failures = [
-            str((item.payload.get("completion") or {}).get("failure_code") or "")
+            (
+                str(item.payload.get("operation") or ""),
+                str((item.payload.get("completion") or {}).get("failure_code") or ""),
+            )
             for item in self._store.list_typed_records(StageCheckpointRecord)
             if item.workflow_run_id == self._workflow_run_id
             and item.subagent_task_id == task_id
@@ -1634,11 +1637,13 @@ class DirectionalExecutionPipeline:
             "provider_access_rejected",
             "provider_permanent_error",
         }
-        for code in failures:
-            if code in terminal_codes or code in {"auth_required", "auth_expired"}:
+        for operation, code in failures:
+            if code in {"auth_required", "auth_expired", "provider_access_rejected"}:
+                return code
+            if operation != "detail" and code in terminal_codes:
                 return code
         if selection_status != "complete":
-            for code in failures:
+            for _operation, code in failures:
                 if code in {
                     "timeout",
                     "transient_error",
@@ -2114,6 +2119,16 @@ def _operation_terminal_status(failure_code: str | None) -> str:
 def _is_provider_wide_failure(result: SourceOperationResult) -> bool:
     if result.status in {"completed", "partial_completed", "empty"}:
         return False
+    if result.operation == "collect_note_detail":
+        return result.failure_reason in {
+            "auth_required",
+            "auth_expired",
+            "provider_access_rejected",
+            "timeout",
+            "transient_error",
+            "rate_limited",
+            "unavailable",
+        }
     return result.failure_reason not in {
         "invalid_candidate",
         "note_unavailable",
@@ -2168,6 +2183,17 @@ def _safe_operation_outcome(result: SourceOperationResult) -> dict[str, Any]:
         outcome["automatic_retry_count"] = automatic_retry_count
     if isinstance(automatic_retry_limit, int) and automatic_retry_limit >= 0:
         outcome["automatic_retry_limit"] = automatic_retry_limit
+    failure_diagnostic = result.metadata.get("failure_diagnostic")
+    if (
+        isinstance(failure_diagnostic, Mapping)
+        and failure_diagnostic.get("kind") == "provider_message_fingerprint"
+        and isinstance(failure_diagnostic.get("value"), str)
+        and len(failure_diagnostic["value"]) == 16
+    ):
+        outcome["failure_diagnostic"] = {
+            "kind": "provider_message_fingerprint",
+            "value": failure_diagnostic["value"],
+        }
     return outcome
 
 

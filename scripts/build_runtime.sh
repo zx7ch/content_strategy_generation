@@ -6,6 +6,20 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
+# Keep packaging tools tied to one interpreter.  A clean login shell may expose
+# python3 without bare pip/pyinstaller commands even when the project venv has
+# the required build dependencies.
+if [[ -n "${PYTHON_BIN:-}" ]]; then
+    PYTHON="$PYTHON_BIN"
+elif [[ -x "$ROOT/.venv/bin/python" ]]; then
+    PYTHON="$ROOT/.venv/bin/python"
+elif command -v python3 >/dev/null 2>&1; then
+    PYTHON="$(command -v python3)"
+else
+    echo "Python 3 is required to build the runtime." >&2
+    exit 1
+fi
+
 # ── optional clean ────────────────────────────────────────────────────────────
 if [[ "${1:-}" == "--clean" ]]; then
     echo "→ Cleaning previous build artifacts..."
@@ -15,20 +29,20 @@ fi
 # ── install package in editable mode ─────────────────────────────────────────
 # Required so importlib.metadata can read the version from pyproject.toml
 # and PyInstaller's copy_metadata() can include the dist-info in the bundle.
-echo "→ Installing package (pip install -e .)..."
-pip install -e . --quiet
+echo "→ Installing package ($PYTHON -m pip install -e .)..."
+"$PYTHON" -m pip install -e . --quiet
 
 # ── check pyinstaller ─────────────────────────────────────────────────────────
-if ! command -v pyinstaller &>/dev/null; then
+if ! "$PYTHON" -c "import PyInstaller" >/dev/null 2>&1; then
     echo "PyInstaller not found. Installing..."
-    pip install pyinstaller
+    "$PYTHON" -m pip install pyinstaller
 fi
 
 # ── pre-download embedding model for local build smoke checks ────────────────
 # This warms the builder's HuggingFace cache only. The model is not bundled into
 # the release archive; end-user runtimes download/load it into HF_HOME on first use.
 echo "→ Pre-downloading embedding model for local cache (BAAI/bge-base-zh-v1.5)..."
-python - <<'EOF'
+"$PYTHON" - <<'EOF'
 from sentence_transformers import SentenceTransformer
 SentenceTransformer("BAAI/bge-base-zh-v1.5")
 print("  Model cached.")
@@ -36,7 +50,7 @@ EOF
 
 # ── build ─────────────────────────────────────────────────────────────────────
 echo "→ Running PyInstaller..."
-pyinstaller runtime_main.spec
+"$PYTHON" -m PyInstaller --noconfirm runtime_main.spec
 
 # ── zip for distribution ──────────────────────────────────────────────────────
 echo "→ Packaging into xhs-runtime.zip..."

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Iterable, Mapping
 
@@ -18,14 +19,20 @@ from app.content_research.persistence_models import (
     MarketingConclusionCandidateRecord,
 )
 from app.content_research.runtime import canonical_fingerprint
+from app.services.llm.failures import LLMProviderFailure
 from app.services.llm.types import LLMCallContext, LLMRequest, Message
 
 
 class MarketingConclusionAnalysisError(ValueError):
     """The bounded model response cannot be admitted as a proposal catalog."""
 
+    def __init__(self, message: str, *, detail_code: str) -> None:
+        super().__init__(message)
+        self.detail_code = detail_code
+
 
 _MESSAGE_ANGLE_PERFORMANCE_TERMS = ("偏好", "转化", "购买", "因果", "效果提升", "表现更好")
+_DEFAULT_MODEL_TIMEOUT_SECONDS = 90.0
 
 
 class MarketingConclusionAnalysisService:
@@ -36,9 +43,13 @@ class MarketingConclusionAnalysisService:
         *,
         llm: DirectionalAnalysisLLM,
         llm_scope: Mapping[str, object] | None = None,
+        timeout_seconds: float = _DEFAULT_MODEL_TIMEOUT_SECONDS,
     ) -> None:
+        if timeout_seconds <= 0:
+            raise ValueError("marketing conclusion model timeout must be positive")
         self._llm = llm
         self._llm_scope = llm_scope
+        self._timeout_seconds = timeout_seconds
 
     async def generate(
         self,
@@ -85,7 +96,8 @@ class MarketingConclusionAnalysisService:
                     content=(
                         "You are a bounded product-marketing analyst. Return JSON only with exactly "
                         "candidates, an array of objects containing exactly track, statement, and "
-                        "supporting_claim_ids. Use only the supplied claims; never infer new evidence."
+                        "supporting_claim_ids. A track may have multiple proposals; use only the "
+                        "supplied claims and never infer new evidence."
                     ),
                 ),
                 Message(
@@ -125,12 +137,23 @@ class MarketingConclusionAnalysisService:
                 )
             ),
         )
-        response = await self._llm.generate(request)
+        try:
+            response = await asyncio.wait_for(
+                self._llm.generate(request), timeout=self._timeout_seconds
+            )
+        except asyncio.TimeoutError as exc:
+            raise LLMProviderFailure(
+                "llm_service_unavailable",
+                "模型服务响应超时",
+                True,
+                None,
+            ) from exc
         try:
             payload = json.loads(response.content)
         except (TypeError, json.JSONDecodeError) as exc:
             raise MarketingConclusionAnalysisError(
-                "marketing conclusion response must be valid JSON"
+                "marketing conclusion response must be valid JSON",
+                detail_code="invalid_json",
             ) from exc
         return self._parse_candidates(
             payload,
@@ -188,15 +211,16 @@ class MarketingConclusionAnalysisService:
     ) -> tuple[MarketingConclusionCandidateRecord, ...]:
         if not isinstance(payload, dict) or set(payload) != {"candidates"}:
             raise MarketingConclusionAnalysisError(
-                "marketing conclusion response has invalid shape"
+                "marketing conclusion response has invalid shape",
+                detail_code="invalid_top_level_shape",
             )
         raw_candidates = payload["candidates"]
         if not isinstance(raw_candidates, list):
             raise MarketingConclusionAnalysisError(
-                "marketing conclusion candidates must be an array"
+                "marketing conclusion candidates must be an array",
+                detail_code="invalid_candidates_shape",
             )
         records: list[MarketingConclusionCandidateRecord] = []
-        seen_tracks: set[str] = set()
         for raw in raw_candidates:
             if not isinstance(raw, dict) or set(raw) != {
                 "track",
@@ -204,22 +228,21 @@ class MarketingConclusionAnalysisService:
                 "supporting_claim_ids",
             }:
                 raise MarketingConclusionAnalysisError(
-                    "marketing conclusion candidate has invalid shape"
+                    "marketing conclusion candidate has invalid shape",
+                    detail_code="invalid_candidate_shape",
                 )
             track = raw["track"]
             statement = raw["statement"]
             supporting_claim_ids = raw["supporting_claim_ids"]
             if not isinstance(track, str) or track not in MARKETING_CONCLUSION_TRACKS:
                 raise MarketingConclusionAnalysisError(
-                    "marketing conclusion candidate has unknown track"
-                )
-            if track in seen_tracks:
-                raise MarketingConclusionAnalysisError(
-                    "marketing conclusion candidate has duplicate track"
+                    "marketing conclusion candidate has unknown track",
+                    detail_code="unknown_track",
                 )
             if not isinstance(statement, str) or not statement.strip():
                 raise MarketingConclusionAnalysisError(
-                    "marketing conclusion candidate has empty statement"
+                    "marketing conclusion candidate has empty statement",
+                    detail_code="empty_statement",
                 )
             if (
                 not isinstance(supporting_claim_ids, list)
@@ -227,15 +250,18 @@ class MarketingConclusionAnalysisService:
                 or any(not isinstance(item, str) or not item for item in supporting_claim_ids)
             ):
                 raise MarketingConclusionAnalysisError(
-                    "marketing conclusion candidate has invalid supporting claims"
+                    "marketing conclusion candidate has invalid supporting claims",
+                    detail_code="invalid_supporting_claim_ids",
                 )
             if len(set(supporting_claim_ids)) != len(supporting_claim_ids):
                 raise MarketingConclusionAnalysisError(
-                    "marketing conclusion candidate has duplicate supporting claim IDs"
+                    "marketing conclusion candidate has duplicate supporting claim IDs",
+                    detail_code="duplicate_supporting_claim_ids",
                 )
             if not set(supporting_claim_ids).issubset(known_claim_ids):
                 raise MarketingConclusionAnalysisError(
-                    "marketing conclusion candidate references an unknown claim"
+                    "marketing conclusion candidate references an unknown claim",
+                    detail_code="unknown_supporting_claim_id",
                 )
             if (
                 track == "message"
@@ -243,11 +269,11 @@ class MarketingConclusionAnalysisService:
                 and any(term in statement for term in _MESSAGE_ANGLE_PERFORMANCE_TERMS)
             ):
                 raise MarketingConclusionAnalysisError(
-                    "message-angle candidate cannot state product-performance outcome"
+                    "message-angle candidate cannot state product-performance outcome",
+                    detail_code="message_angle_performance_statement",
                 )
             normalized_statement = statement.strip()
             normalized_claim_ids = sorted(supporting_claim_ids)
-            seen_tracks.add(track)
             identity = canonical_fingerprint(
                 {
                     "workflow_run_id": workflow_run_id,

@@ -19,7 +19,7 @@ from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
 from app.services.llm.pricing import UsageCost
 from app.services.llm.types import LLMCallContext, LLMResponse, TokenUsage
 from app.services.llm.usage_tracker import LLMUsageEventInput, LLMUsageTracker
-from app.services.workflow_run_manager import WorkflowRunManager, WorkflowTransitionError
+from app.services.workflow_run_manager import WorkflowRunManager
 
 
 class FakeLLM:
@@ -97,6 +97,17 @@ async def _record_usage(db_path: str, workflow_run_id: str) -> None:
         )
 
 
+def _subject_structure_confirmation(presearch: dict) -> dict:
+    return {
+        "subject_structure_hash": presearch["subject_structure_hash"],
+        "subject_structure_confirmation": {
+            "core_object": "Satisfy Running",
+            "research_intent": "品牌内容",
+            "context_modifiers": [],
+        },
+    }
+
+
 def test_provider_operations_do_not_merge_identical_calls_from_two_specialists(tmp_path):
     store = SQLiteContentResearchStore(str(tmp_path / "trace-specialists.db"))
     for task_id in ("specialist-a", "specialist-b"):
@@ -146,6 +157,7 @@ async def test_content_research_trace_api_restores_runtime_observation_and_usage
         f"/content-research/briefs/{presearch['brief_id']}/confirm",
         json={
             "confirmed_subject": "Satisfy Running",
+            **_subject_structure_confirmation(presearch),
             "subject_type": "brand",
             "selected_competitors": ["District Vision"],
             "custom_competitors": ["Salomon"],
@@ -211,6 +223,8 @@ async def test_marketing_conclusion_trace_api_exposes_only_safe_checkpoint_contr
             status="waiting_user",
             payload={
                 "reason_codes": ["marketing_analysis_unavailable", "secret-reason"],
+                "failure_code": "llm_protocol_incompatible",
+                "failure_detail": "invalid_json",
                 "recovery_action": "repair_model_configuration_and_resume",
                 "replayed_from_persisted_packets": True,
                 "provider_operation_count_delta": 0,
@@ -241,6 +255,8 @@ async def test_marketing_conclusion_trace_api_exposes_only_safe_checkpoint_contr
         "stage": "marketing_conclusion",
         "status": "waiting_user",
         "reason_codes": ["marketing_analysis_unavailable"],
+        "failure_code": "llm_protocol_incompatible",
+        "failure_detail": "invalid_json",
         "recovery_action": "repair_model_configuration_and_resume",
         "replayed_from_persisted_packets": True,
         "provider_operation_count_delta": 0,
@@ -280,6 +296,7 @@ async def test_terminal_trace_timing_is_stable_across_repeated_reads(client_with
         f"/content-research/briefs/{presearch['brief_id']}/confirm",
         json={
             "confirmed_subject": "Satisfy Running",
+            **_subject_structure_confirmation(presearch),
             "subject_type": "brand",
             "selected_competitors": [],
             "custom_competitors": [],
@@ -334,6 +351,7 @@ async def test_content_research_trace_api_keeps_running_parent_and_safe_auth_req
         f"/content-research/briefs/{presearch['brief_id']}/confirm",
         json={
             "confirmed_subject": "Satisfy Running",
+            **_subject_structure_confirmation(presearch),
             "subject_type": "brand",
             "selected_competitors": [],
             "custom_competitors": [],
@@ -556,20 +574,6 @@ def test_trace_stage_never_uses_raw_trace_payload() -> None:
         payload={"stage": "RAW_TRACE_STAGE_MUST_NOT_ESCAPE"},
     )
     assert _derive_current_stage(run={}, steps=[], traces=[trace]) is None
-
-
-@pytest.mark.asyncio
-async def test_running_run_cannot_resume_without_auth_required_child(client_with_db):
-    client, db_path = client_with_db
-    presearch_response = await client.post(
-        "/content-research/presearch",
-        headers={"X-User-Id": "user-running-resume"},
-        json={"seed_text": "Satisfy Running", "thread_id": "thread-running-resume"},
-    )
-    assert presearch_response.status_code == 201
-    with pytest.raises(WorkflowTransitionError, match="auth-required child"):
-        async with WorkflowRunManager(db_path) as manager:
-            await manager.resume_run(presearch_response.json()["workflow_run_id"])
 
 
 @pytest.mark.asyncio

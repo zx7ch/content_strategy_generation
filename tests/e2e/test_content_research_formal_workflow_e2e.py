@@ -15,6 +15,9 @@ from app.content_research.persistence_models import (
     StageCheckpointRecord,
 )
 from app.content_research.presearch.service import PresearchService
+from app.content_research.reporting.publication_materializer import (
+    ReportPublicationMaterializer,
+)
 from app.content_research.service import ContentResearchService, WorkflowRunManagerRuntime
 from app.content_research.sources import SourceAdapterRegistry
 from app.content_research.sources.base import ProviderCapability, SourceOperationResult
@@ -23,6 +26,7 @@ from app.content_research.worker import ContentResearchDispatchWorker
 from app.memory.thread_store import ThreadStore
 from app.services.llm.failures import LLMProviderFailure
 from app.services.llm.types import LLMResponse, TokenUsage
+from app.services.workflow_run_manager import WorkflowRunManager
 
 LITE_DIRECTIONS = [
     "product_marketing",
@@ -275,7 +279,12 @@ async def test_formal_workflow_public_api_e2e_is_packet_only_safe_and_replayable
         summary = (await client.get(f"/content-research/workflows/{workflow['workflow_run_id']}")).json()
         timeline_messages = await thread_store.get_thread_messages(creator_thread["id"])
         report_messages = [item for item in timeline_messages if item["message_type"] == "artifact_result"]
-        if {item["status"] for item in summary["subagent_tasks"]} <= {"completed", "partial_completed"} and report_messages:
+        if (
+            summary["runtime_run"]["status"] == "succeeded"
+            and {item["status"] for item in summary["subagent_tasks"]}
+            <= {"completed", "partial_completed"}
+            and report_messages
+        ):
             break
         await asyncio.sleep(0.01)
     else:
@@ -422,6 +431,101 @@ async def test_formal_workflow_public_api_e2e_is_packet_only_safe_and_replayable
 
 
 @pytest.mark.asyncio
+async def test_report_publication_failure_replays_persisted_results_without_external_calls(
+    formal_client, monkeypatch
+):
+    client, adapter, db_path = formal_client
+    thread_store = ThreadStore(db_path)
+    await thread_store.connect()
+    creator_thread = await thread_store.create_thread(title="publication retry")
+    created = await client.post(
+        "/content-research/presearch",
+        json={"seed_text": "徒步短裤", "thread_id": creator_thread["id"]},
+    )
+    workflow = created.json()
+    confirmed = await client.post(
+        f"/content-research/briefs/{workflow['brief_id']}/confirm",
+        json={
+            "confirmed_subject": "徒步短裤",
+            "subject_structure_hash": workflow["subject_structure_hash"],
+            "subject_type": "category",
+            "selected_competitors": [],
+            "custom_competitors": [],
+            "selected_directions": ["product_marketing"],
+            "custom_research_question": "",
+            "primary_marketing_goal": "content_seeding",
+            "subject_structure_confirmation": {
+                "core_object": "短裤",
+                "research_intent": "产品营销",
+                "context_modifiers": [],
+            },
+        },
+    )
+    assert confirmed.status_code == 200, confirmed.text
+
+    original_materialize = ReportPublicationMaterializer.materialize
+    materialization_failed = False
+
+    async def fail_first_materialization(self, publication_id):
+        nonlocal materialization_failed
+        if not materialization_failed:
+            materialization_failed = True
+            raise ValueError("faithfulness decision does not belong to report draft")
+        return await original_materialize(self, publication_id)
+
+    monkeypatch.setattr(
+        ReportPublicationMaterializer, "materialize", fail_first_materialization
+    )
+    started = await client.post(
+        f"/content-research/workflows/{workflow['workflow_run_id']}/actions",
+        json={
+            "action": "start_formal_research",
+            "payload": {"provider": "xiaohongshu", "limit": 20},
+        },
+    )
+    assert started.status_code == 200, started.text
+    for _ in range(100):
+        trace = (
+            await client.get(
+                f"/content-research/workflows/{workflow['workflow_run_id']}/trace"
+            )
+        ).json()
+        if trace["run_status"] == "failed":
+            break
+        await asyncio.sleep(0.01)
+    else:
+        pytest.fail("report materialization failure did not fail the run")
+    summary_after_failure = (
+        await client.get(f"/content-research/workflows/{workflow['workflow_run_id']}")
+    ).json()
+    assert summary_after_failure["runtime_run"]["error_code"] == "report_publication_failed"
+    source_calls_before_retry = list(adapter.calls)
+    marketing_calls_before_retry = adapter.analysis_llm.marketing_calls
+
+    retried = await client.post(
+        f"/content-research/workflows/{workflow['workflow_run_id']}/actions",
+        json={
+            "action": "retry_formal_research",
+            "payload": {"provider": "xiaohongshu", "limit": 20},
+        },
+    )
+    assert retried.status_code == 200, retried.text
+    for _ in range(100):
+        report = await client.get(
+            f"/content-research/workflows/{workflow['workflow_run_id']}/lite-report"
+        )
+        if report.status_code == 200:
+            break
+        await asyncio.sleep(0.01)
+    else:
+        pytest.fail("failed report publication did not recover")
+    assert adapter.calls == source_calls_before_retry
+    assert adapter.analysis_llm.marketing_calls == marketing_calls_before_retry
+    assert report.json()["publication"]["state"] == "complete_verified_report"
+    await thread_store.close()
+
+
+@pytest.mark.asyncio
 async def test_marketing_analysis_unavailable_waits_and_resumes_without_collection_delta(
     formal_client,
 ):
@@ -439,12 +543,18 @@ async def test_marketing_analysis_unavailable_waits_and_resumes_without_collecti
         f"/content-research/briefs/{workflow['brief_id']}/confirm",
         json={
             "confirmed_subject": "徒步短裤",
+            "subject_structure_hash": workflow["subject_structure_hash"],
             "subject_type": "category",
             "selected_competitors": [],
             "custom_competitors": [],
             "selected_directions": ["product_marketing"],
             "custom_research_question": "",
             "primary_marketing_goal": "content_seeding",
+            "subject_structure_confirmation": {
+                "core_object": "短裤",
+                "research_intent": "产品营销",
+                "context_modifiers": [],
+            },
         },
     )
     assert confirmed.status_code == 200, confirmed.text
@@ -478,6 +588,7 @@ async def test_marketing_analysis_unavailable_waits_and_resumes_without_collecti
         "stage": "marketing_conclusion",
         "status": "waiting_user",
         "reason_codes": ["marketing_analysis_unavailable"],
+        "failure_code": "llm_model_unavailable",
         "recovery_action": "repair_model_configuration_and_resume",
     }
 
@@ -493,6 +604,7 @@ async def test_marketing_analysis_unavailable_waits_and_resumes_without_collecti
     assert checkpoints[0].payload == {
         "schema_version": "content_research_marketing_conclusion_checkpoint_v1",
         "reason_codes": ["marketing_analysis_unavailable"],
+        "failure_code": "llm_model_unavailable",
         "recovery_action": "repair_model_configuration_and_resume",
     }
     assert not any(
@@ -513,6 +625,14 @@ async def test_marketing_analysis_unavailable_waits_and_resumes_without_collecti
         if item.workflow_run_id == workflow["workflow_run_id"]
     }
     adapter_calls_before = list(adapter.calls)
+
+    # A process may stop after the retry has resumed the runtime parent but
+    # before its marketing-only job reaches the durable waiting boundary.
+    # The next retry must recognize the persisted checkpoint rather than
+    # attempting a source-task recovery.
+    async with WorkflowRunManager(db_path) as manager:
+        await manager.resume_run(workflow["workflow_run_id"])
+        await manager.start_step(workflow["workflow_run_id"], "formal_research")
 
     adapter.analysis_llm.fail_marketing = False
     retried = await client.post(
@@ -574,12 +694,18 @@ async def test_auth_required_retry_requeues_the_same_run_once_and_publishes_once
         f"/content-research/briefs/{workflow['brief_id']}/confirm",
         json={
             "confirmed_subject": "徒步短裤",
+            "subject_structure_hash": workflow["subject_structure_hash"],
             "subject_type": "category",
             "selected_competitors": [],
             "custom_competitors": [],
             "selected_directions": ["product_marketing"],
             "custom_research_question": "",
             "primary_marketing_goal": "content_seeding",
+            "subject_structure_confirmation": {
+                "core_object": "短裤",
+                "research_intent": "产品营销",
+                "context_modifiers": [],
+            },
         },
     )
     assert confirmed.status_code == 200, confirmed.text
@@ -682,12 +808,18 @@ async def test_third_same_run_recovery_is_rejected_without_replaying_provider(fo
         f"/content-research/briefs/{workflow['brief_id']}/confirm",
         json={
             "confirmed_subject": "徒步短裤",
+            "subject_structure_hash": workflow["subject_structure_hash"],
             "subject_type": "category",
             "selected_competitors": [],
             "custom_competitors": [],
             "selected_directions": ["product_marketing"],
             "custom_research_question": "",
             "primary_marketing_goal": "content_seeding",
+            "subject_structure_confirmation": {
+                "core_object": "短裤",
+                "research_intent": "产品营销",
+                "context_modifiers": [],
+            },
         },
     )
     assert confirmed.status_code == 200, confirmed.text
@@ -768,12 +900,18 @@ async def test_detail_recovery_replays_failed_detail_without_repeating_discovery
         f"/content-research/briefs/{workflow['brief_id']}/confirm",
         json={
             "confirmed_subject": "徒步短裤",
+            "subject_structure_hash": workflow["subject_structure_hash"],
             "subject_type": "category",
             "selected_competitors": [],
             "custom_competitors": [],
             "selected_directions": ["product_marketing"],
             "custom_research_question": "",
             "primary_marketing_goal": "content_seeding",
+            "subject_structure_confirmation": {
+                "core_object": "短裤",
+                "research_intent": "产品营销",
+                "context_modifiers": [],
+            },
         },
     )
     assert confirmed.status_code == 200, confirmed.text
@@ -829,7 +967,7 @@ async def test_detail_recovery_replays_failed_detail_without_repeating_discovery
 
 
 @pytest.mark.asyncio
-async def test_permanent_detail_failure_fails_run_without_publishing_report(formal_client):
+async def test_unknown_permanent_detail_failures_publish_evidence_only_report(formal_client):
     client, adapter, db_path = formal_client
     adapter.detail_failure_reason = "provider_permanent_error"
     thread_store = ThreadStore(db_path)
@@ -844,38 +982,40 @@ async def test_permanent_detail_failure_fails_run_without_publishing_report(form
         f"/content-research/briefs/{workflow['brief_id']}/confirm",
         json={
             "confirmed_subject": "徒步短裤",
+            "subject_structure_hash": workflow["subject_structure_hash"],
             "subject_type": "category",
             "selected_competitors": [],
             "custom_competitors": [],
             "selected_directions": ["product_marketing"],
             "custom_research_question": "",
             "primary_marketing_goal": "content_seeding",
+            "subject_structure_confirmation": {
+                "core_object": "短裤",
+                "research_intent": "产品营销",
+                "context_modifiers": [],
+            },
         },
     )
     assert confirmed.status_code == 200, confirmed.text
-    await client.post(
+    started = await client.post(
         f"/content-research/workflows/{workflow['workflow_run_id']}/actions",
         json={
             "action": "start_formal_research",
             "payload": {"provider": "xiaohongshu", "limit": 20},
         },
     )
+    assert started.status_code == 200, started.text
     for _ in range(150):
-        trace = (
-            await client.get(
-                f"/content-research/workflows/{workflow['workflow_run_id']}/trace"
-            )
-        ).json()
-        if trace["run_status"] == "failed":
+        report = await client.get(
+            f"/content-research/workflows/{workflow['workflow_run_id']}/lite-report"
+        )
+        if report.status_code == 200:
             break
         await asyncio.sleep(0.01)
     else:
-        pytest.fail("permanent provider failure did not fail the workflow")
+        pytest.fail("candidate-level permanent failures did not publish a report")
 
-    report = await client.get(
-        f"/content-research/workflows/{workflow['workflow_run_id']}/lite-report"
-    )
-    assert report.status_code == 404
+    assert report.json()["publication"]["state"] == "evidence_only_report"
     await thread_store.close()
 
 
@@ -895,12 +1035,18 @@ async def test_single_direction_workflow_publishes_a_cited_report_with_frozen_sc
         f"/content-research/briefs/{workflow['brief_id']}/confirm",
         json={
             "confirmed_subject": "徒步短裤",
+            "subject_structure_hash": workflow["subject_structure_hash"],
             "subject_type": "category",
             "selected_competitors": [],
             "custom_competitors": [],
             "selected_directions": ["product_marketing"],
             "custom_research_question": "",
             "primary_marketing_goal": "content_seeding",
+            "subject_structure_confirmation": {
+                "core_object": "短裤",
+                "research_intent": "产品营销",
+                "context_modifiers": [],
+            },
         },
     )
     assert confirmed.status_code == 200, confirmed.text
@@ -959,12 +1105,18 @@ async def test_formal_action_returns_while_slow_collection_keeps_trace_readable(
         f"/content-research/briefs/{created.json()['brief_id']}/confirm",
         json={
             "confirmed_subject": "慢速调研",
+            "subject_structure_hash": created.json()["subject_structure_hash"],
             "subject_type": "category",
             "selected_competitors": [],
             "custom_competitors": [],
             "selected_directions": ["product_marketing"],
             "custom_research_question": "",
             "primary_marketing_goal": "content_seeding",
+            "subject_structure_confirmation": {
+                "core_object": "调研",
+                "research_intent": "产品营销",
+                "context_modifiers": [],
+            },
         },
     )
     assert confirmed.status_code == 200, confirmed.text

@@ -134,8 +134,23 @@ class ReportExecutionService:
                     withdrawn_section_ids = omitted
                 else:
                     state = "partial_verified_report" if withdrawn_section_ids else "complete_verified_report"
+                publication_decision = decision
+                if draft.id != decision.report_draft_id:
+                    publication_decision = replace(
+                        decision,
+                        report_draft_id=draft.id,
+                        previous_version_id=decision.id,
+                    )
+                    self._store.save_report_faithfulness_decision(
+                        publication_decision.to_record()
+                    )
                 publication = self._publication(
-                    draft, decision.id, state, withdrawn_section_ids, state != "evidence_only_report", str(policy.get("report_compose_mode") or "prose")
+                    draft,
+                    publication_decision.id,
+                    state,
+                    withdrawn_section_ids,
+                    state != "evidence_only_report",
+                    str(policy.get("report_compose_mode") or "prose"),
                 )
                 self._store.save_report_publication(publication.to_record())
                 return publication

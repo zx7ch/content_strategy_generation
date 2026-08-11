@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import asyncio
 from dataclasses import replace
 
 import pytest
 
 from app.content_research.admission.candidates import source_text_hash
 from app.content_research.marketing_conclusion_analysis import (
+    MarketingConclusionAnalysisError,
     MarketingConclusionAnalysisService,
 )
 from app.content_research.persistence_models import (
@@ -14,6 +16,7 @@ from app.content_research.persistence_models import (
     ClaimCandidateRecord,
 )
 from app.services.llm.types import LLMResponse, TokenUsage
+from app.services.llm.failures import LLMProviderFailure
 
 
 def marketing_policy() -> dict:
@@ -83,6 +86,11 @@ class RecordingLLM:
             usage=TokenUsage(total_tokens=1),
             latency_ms=1,
         )
+
+
+class HangingLLM:
+    async def generate(self, request):
+        await asyncio.Event().wait()
 
 
 @pytest.mark.asyncio
@@ -162,29 +170,82 @@ async def test_conclusion_analysis_receives_only_safe_admitted_claim_fields():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("response", "error"),
+    ("response", "error", "detail_code"),
     [
-        ("not-json", "valid JSON"),
-        ({"candidates": [{"track": "outcome", "statement": "x", "supporting_claim_ids": ["claim_1"]}]}, "unknown track"),
-        ({"candidates": [{"track": "need", "statement": "x", "supporting_claim_ids": ["invented"]}]}, "unknown claim"),
-        ({"candidates": [{"track": "need", "statement": "x", "supporting_claim_ids": ["claim_1", "claim_1"]}]}, "duplicate supporting claim"),
-        ({"candidates": [{"track": "need", "statement": " ", "supporting_claim_ids": ["claim_1"]}]}, "empty statement"),
-        ({"candidates": [
-            {"track": "need", "statement": "x", "supporting_claim_ids": ["claim_1"]},
-            {"track": "need", "statement": "y", "supporting_claim_ids": ["claim_1"]},
-        ]}, "duplicate track"),
+        ("not-json", "valid JSON", "invalid_json"),
+        ({"candidates": [{"track": "outcome", "statement": "x", "supporting_claim_ids": ["claim_1"]}]}, "unknown track", "unknown_track"),
+        ({"candidates": [{"track": "need", "statement": "x", "supporting_claim_ids": ["invented"]}]}, "unknown claim", "unknown_supporting_claim_id"),
+        ({"candidates": [{"track": "need", "statement": "x", "supporting_claim_ids": ["claim_1", "claim_1"]}]}, "duplicate supporting claim", "duplicate_supporting_claim_ids"),
+        ({"candidates": [{"track": "need", "statement": " ", "supporting_claim_ids": ["claim_1"]}]}, "empty statement", "empty_statement"),
     ],
 )
-async def test_conclusion_analysis_rejects_untrusted_model_lineage(response, error):
+async def test_conclusion_analysis_rejects_untrusted_model_lineage(
+    response, error, detail_code
+):
     service = MarketingConclusionAnalysisService(llm=RecordingLLM(response))
 
-    with pytest.raises(ValueError, match=error):
+    with pytest.raises(MarketingConclusionAnalysisError, match=error) as exc_info:
         await service.generate(
             workflow_run_id="run_1",
             research_plan_id="plan_1",
             policy=marketing_policy(),
             admitted_claims=[admitted_claim("claim_1")],
         )
+
+    assert exc_info.value.detail_code == detail_code
+
+
+@pytest.mark.asyncio
+async def test_conclusion_analysis_keeps_multiple_candidates_for_the_same_track():
+    service = MarketingConclusionAnalysisService(
+        llm=RecordingLLM(
+            {
+                "candidates": [
+                    {
+                        "track": "need",
+                        "statement": "样本描述高温通勤时的闷热感",
+                        "supporting_claim_ids": ["claim_1"],
+                    },
+                    {
+                        "track": "need",
+                        "statement": "样本提到出汗后的黏腻体验",
+                        "supporting_claim_ids": ["claim_1"],
+                    },
+                ]
+            }
+        )
+    )
+
+    records = await service.generate(
+        workflow_run_id="run_1",
+        research_plan_id="plan_1",
+        policy=marketing_policy(),
+        admitted_claims=[admitted_claim("claim_1")],
+    )
+
+    assert [record.track for record in records] == ["need", "need"]
+    assert [record.payload["statement"] for record in records] == [
+        "样本描述高温通勤时的闷热感",
+        "样本提到出汗后的黏腻体验",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_conclusion_analysis_times_out_a_stalled_model_call():
+    service = MarketingConclusionAnalysisService(
+        llm=HangingLLM(),
+        timeout_seconds=0.001,
+    )
+
+    with pytest.raises(LLMProviderFailure) as exc_info:
+        await service.generate(
+            workflow_run_id="run_1",
+            research_plan_id="plan_1",
+            policy=marketing_policy(),
+            admitted_claims=[admitted_claim("claim_1")],
+        )
+
+    assert exc_info.value.code == "llm_service_unavailable"
 
 
 @pytest.mark.asyncio

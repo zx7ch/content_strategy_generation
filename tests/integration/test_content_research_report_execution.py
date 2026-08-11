@@ -87,6 +87,11 @@ def test_execution_publishes_directional_report_when_no_marketing_track_is_selec
 
     assert publication.publication_state == "directional_report"
     assert publication.has_free_prose is True
+    decision = store.get_typed_record(
+        ReportFaithfulnessDecisionRecord, publication.faithfulness_decision_id
+    )
+    assert decision is not None
+    assert decision.report_draft_id == publication.report_draft_id
 
 
 def test_execution_publishes_partial_report_when_selected_and_directional_tracks_coexist(tmp_path):

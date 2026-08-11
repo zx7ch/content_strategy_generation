@@ -120,9 +120,15 @@ Zip and distribute the entire `dist/xhs-runtime/` folder. Users run:
 xhs-runtime\xhs-runtime.exe
 ```
 
-On first run the runtime creates `data/xhs_agent.db`, `data/xhs_agent_discovery.db`, and `data/chroma/` next to the executable.
+On first run the runtime creates its user-data directory outside the executable
+bundle: `~/Library/Application Support/xhs-growth-agent/` on macOS and Linux.
+It contains `xhs_agent.db`, `xhs_discovery.db`, `creator_threads.db`, `chroma/`,
+and the HuggingFace cache. This directory is preserved when the runtime folder
+is replaced during an upgrade.
 
-Users configure their API keys by placing a `.env` file next to the executable:
+Users configure their API keys in
+`~/Library/Application Support/xhs-growth-agent/config.env` (the runtime copies
+the bundled `config.env` template there on first launch):
 
 ```bash
 ANTHROPIC_API_KEY=sk-ant-...
@@ -141,4 +147,7 @@ CORS_ALLOWED_ORIGINS=https://content-strategy-generation.vercel.app
 
 - The output is a **folder** (`dist/xhs-runtime/`), not a single file. PyInstaller's `--onefile` mode is avoided because ChromaDB's native extensions do not extract reliably under some OS security policies.
 - Embedding model inference requires a CPU with AVX2 support (standard on any machine from ~2013 onward).
-- Data files (`data/`) are never inside the exe folder — they live next to it and persist across runtime upgrades.
+- User data and real configuration are never inside the runtime folder. The
+  bundled `config.env` is only a first-launch template; the existing user
+  `config.env` is retained across runtime upgrades, with newly introduced
+  template keys appended without replacing existing values.

@@ -308,6 +308,11 @@ async def test_unknown_permanent_error_does_not_fall_back_to_transient():
 
     assert result.failure_reason == "provider_permanent_error"
     assert result.retryable is False
+    assert result.metadata["failure_diagnostic"] == {
+        "kind": "provider_message_fingerprint",
+        "value": "f807a292b36d989e",
+    }
+    assert "recognized upstream permanent failure" not in repr(result.metadata)
 
 
 @pytest.mark.asyncio

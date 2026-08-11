@@ -15,6 +15,8 @@ from app.content_research.persistence_models import (
     MARKETING_CONCLUSION_DECISION_STATES,
     MARKETING_CONCLUSION_TRACE_REASON_CODES,
     MARKETING_CONCLUSION_TRACE_RECOVERY_ACTIONS,
+    MARKETING_CONCLUSION_TRACE_FAILURE_CODES,
+    MARKETING_CONCLUSION_TRACE_PROTOCOL_DETAILS,
     MARKETING_CONCLUSION_TRACKS,
     StageCheckpointRecord,
 )
@@ -649,6 +651,18 @@ def _safe_marketing_conclusion_checkpoint(
     reason_codes = _safe_marketing_conclusion_reason_codes(payload.get("reason_codes"))
     if reason_codes:
         item["reason_codes"] = reason_codes
+    failure_code = payload.get("failure_code")
+    if (
+        "marketing_analysis_unavailable" in reason_codes
+        and failure_code in MARKETING_CONCLUSION_TRACE_FAILURE_CODES
+    ):
+        item["failure_code"] = failure_code
+    failure_detail = payload.get("failure_detail")
+    if (
+        failure_code == "llm_protocol_incompatible"
+        and failure_detail in MARKETING_CONCLUSION_TRACE_PROTOCOL_DETAILS
+    ):
+        item["failure_detail"] = failure_detail
     recovery_action = payload.get("recovery_action")
     if (
         "marketing_analysis_unavailable" in reason_codes

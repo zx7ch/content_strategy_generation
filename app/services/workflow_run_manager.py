@@ -953,6 +953,51 @@ class WorkflowRunManager:
 
         return await self._transaction(op)
 
+    async def retry_failed_report_finalization(self, run_id: str) -> WorkflowRun:
+        """Reopen only a report-publication failure with completed research."""
+
+        async def op() -> WorkflowRun:
+            assert self._conn is not None
+            row = await self._fetch_run_row(run_id)
+            if (
+                row["status"] != WorkflowRunStatus.FAILED.value
+                or row["error_code"] != "report_publication_failed"
+            ):
+                raise WorkflowTransitionError(
+                    "retry_failed_report_finalization requires a report publication failure"
+                )
+            step = await self._fetch_step_row(run_id, "formal_research")
+            if step["status"] != WorkflowStepStatus.SUCCEEDED.value:
+                raise WorkflowTransitionError(
+                    "retry_failed_report_finalization requires completed formal research"
+                )
+            async with self._conn.execute(
+                "SELECT status FROM workflow_child_tasks WHERE run_id=?", (run_id,)
+            ) as cursor:
+                child_statuses = [str(item["status"]) for item in await cursor.fetchall()]
+            if any(status != WorkflowStepStatus.SUCCEEDED.value for status in child_statuses):
+                raise WorkflowTransitionError(
+                    "retry_failed_report_finalization requires completed child tasks"
+                )
+            await self._conn.execute(
+                """
+                UPDATE workflow_runs
+                SET status='finalizing_report', failed_at=NULL, error_code=NULL,
+                    error_message=NULL, active_job_id=NULL, updated_at=CURRENT_TIMESTAMP
+                WHERE run_id=?
+                """,
+                (run_id,),
+            )
+            await self._append_event(
+                run_id=run_id,
+                thread_id=row["thread_id"],
+                event_type="run_report_publication_retry_started",
+                payload={"reason": "report_publication_failed"},
+            )
+            return self._run(await self._fetch_run_row(run_id))
+
+        return await self._transaction(op)
+
     async def fail_run(self, run_id: str, error: str | dict[str, Any]) -> WorkflowRun:
         async def op() -> WorkflowRun:
             assert self._conn is not None

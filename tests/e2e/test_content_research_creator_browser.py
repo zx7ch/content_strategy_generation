@@ -225,6 +225,7 @@ def test_creator_brief_uses_fixed_catalog_and_submits_selected_subset(
         "button",
         name=re.compile("确认并开始调研"),
     )
+    expect(confirm_button).to_be_enabled()
     with page.expect_response(
         lambda response: response.url.endswith("/actions")
         and '"action":"confirm_brief"' in (response.request.post_data or ""),
@@ -1288,7 +1289,7 @@ def test_creator_surfaces_non_not_found_lite_report_error(browser_page):
             (json.dumps(artifact_payload), row[0]),
         )
         connection.execute(
-            "UPDATE workflow_runs SET status = 'paused' WHERE run_id = ?",
+            "UPDATE workflow_runs SET status = 'succeeded' WHERE run_id = ?",
             (seeded["run_id"],),
         )
     SQLiteContentResearchStore(stack["db_path"]).save_stage_checkpoint(
@@ -1316,7 +1317,7 @@ def test_creator_surfaces_non_not_found_lite_report_error(browser_page):
         direct_body = error.read().decode("utf-8")
     else:
         raise AssertionError("corrupt publication unexpectedly returned a Lite report")
-    assert direct_status == 404, direct_body
+    assert direct_status == 500, direct_body
 
     open_creator_with_restored_run(page, stack["frontend_url"], seeded["run_id"])
 

@@ -85,6 +85,8 @@ from app.content_research.persistence_models import (
     DirectionalEvidencePacketRecord,
     DirectionResultDecisionRecord,
     MarketingConclusionDecisionRecord,
+    ReportDraftRecord,
+    ReportFaithfulnessDecisionRecord,
     ReportPublicationRecord,
     StageCheckpointRecord,
     WeakSignalRecord,
@@ -244,6 +246,8 @@ class WorkflowRuntime(Protocol):
     ) -> bool: ...
 
     async def complete_report_publication(self, *, workflow_run_id: str) -> bool: ...
+
+    async def retry_failed_report_publication(self, *, workflow_run_id: str) -> bool: ...
 
     async def wait_for_user_recovery(self, *, workflow_run_id: str, reason: dict) -> dict: ...
 
@@ -456,6 +460,11 @@ class WorkflowRunManagerRuntime:
     async def complete_report_publication(self, *, workflow_run_id: str) -> bool:
         async with WorkflowRunManager(self._db_path) as manager:
             await manager.complete_report_finalization(workflow_run_id)
+        return True
+
+    async def retry_failed_report_publication(self, *, workflow_run_id: str) -> bool:
+        async with WorkflowRunManager(self._db_path) as manager:
+            await manager.retry_failed_report_finalization(workflow_run_id)
         return True
 
     async def wait_for_user_recovery(
@@ -2691,15 +2700,31 @@ class ContentResearchService:
                     raise ContentResearchValidationError(
                         "Completed Content Research runs cannot be retried."
                     )
-                if runtime_status == "waiting_user":
-                    marketing_recovery = any(
-                        checkpoint.workflow_run_id == workflow_run_id
-                        and checkpoint.stage_name == "marketing_conclusion"
-                        and checkpoint.status == "waiting_user"
-                        for checkpoint in self._store.list_typed_records(
-                            StageCheckpointRecord
-                        )
+                if (
+                    runtime_status == "failed"
+                    and str(runtime_run.get("error_code") or "")
+                    == "report_publication_failed"
+                ):
+                    formal_result = await self._retry_failed_report_publication(
+                        workflow_run_id=workflow_run_id,
+                        request=source_request,
                     )
+                    return self._action_response(
+                        workflow_run_id=workflow_run_id,
+                        action=action,
+                        status=formal_result.status,
+                        result=formal_result.model_dump(mode="json"),
+                        local_cache_id=brief.id,
+                    )
+                marketing_recovery = any(
+                    checkpoint.workflow_run_id == workflow_run_id
+                    and checkpoint.stage_name == "marketing_conclusion"
+                    and checkpoint.status == "waiting_user"
+                    for checkpoint in self._store.list_typed_records(
+                        StageCheckpointRecord
+                    )
+                )
+                if runtime_status == "waiting_user":
                     child_task_ids = (
                         []
                         if marketing_recovery
@@ -2714,6 +2739,16 @@ class ContentResearchService:
                     await self._workflow_runtime.restart_formal_research_step(
                         workflow_run_id=workflow_run_id,
                         child_task_ids=child_task_ids,
+                    )
+                elif marketing_recovery:
+                    # An interrupted recovery may already have resumed the
+                    # runtime parent before its marketing-only dispatch job
+                    # reaches its durable waiting boundary.  The checkpoint
+                    # is authoritative and no source task may be requeued.
+                    await self._workflow_runtime.restart_formal_research_step(
+                        workflow_run_id=workflow_run_id,
+                        child_task_ids=[],
+                        resume_parent=False,
                     )
                 else:
                     child_task_ids = self._requeue_recoverable_tasks(
@@ -2740,6 +2775,60 @@ class ContentResearchService:
             status=formal_result.status,
             result=formal_result.model_dump(mode="json"),
             local_cache_id=brief.id,
+        )
+
+    async def _retry_failed_report_publication(
+        self,
+        *,
+        workflow_run_id: str,
+        request: ContentResearchSourceCollectionRequest,
+    ) -> ContentResearchFormalResearchResponse:
+        """Re-materialize a report after a safe, terminal publication failure."""
+        await self._workflow_runtime.retry_failed_report_publication(
+            workflow_run_id=workflow_run_id
+        )
+        brief = self._store.get_brief_by_workflow(workflow_run_id)
+        if brief is None:
+            raise ContentResearchNotFoundError(
+                f"Content research workflow not found: {workflow_run_id}"
+            )
+        try:
+            report_artifact_ref = await self._publish_report_after_workflow_completion(
+                workflow_run_id=workflow_run_id,
+                thread_id=brief.thread_id,
+            )
+            if report_artifact_ref is None:
+                raise ContentResearchValidationError(
+                    "Report publication retry did not materialize a report"
+                )
+            await self._workflow_runtime.complete_report_publication(
+                workflow_run_id=workflow_run_id
+            )
+            await ReportPublicationMaterializer(
+                self._store, self._store._db_path
+            ).publish_timeline_message(report_artifact_ref["id"])
+        except Exception as exc:
+            await self._workflow_runtime.fail_formal_research(
+                workflow_run_id=workflow_run_id,
+                reason={
+                    "code": "report_publication_failed",
+                    "message": str(exc) or "Report publication failed.",
+                },
+            )
+            raise
+        tasks = self._store.list_subagent_tasks_for_workflow(workflow_run_id)
+        return ContentResearchFormalResearchResponse(
+            workflow_run_id=workflow_run_id,
+            status="completed",
+            task_count=len(tasks),
+            completed_task_count=sum(task.status == "completed" for task in tasks),
+            partial_completed_task_count=sum(
+                task.status == "partial_completed" for task in tasks
+            ),
+            failed_tasks=[],
+            provider=request.provider,
+            source_kind=request.source_kind,
+            limit_per_specialist=request.limit,
         )
 
     async def dispatch_formal_research(
@@ -3522,6 +3611,9 @@ class ContentResearchService:
                     )
                     if complete_report is not None:
                         await complete_report(workflow_run_id=brief.workflow_run_id)
+                        await ReportPublicationMaterializer(
+                            self._store, self._store._db_path
+                        ).publish_timeline_message(report_artifact_ref["id"])
             except Exception as exc:
                 await self._workflow_runtime.fail_formal_research(
                     workflow_run_id=brief.workflow_run_id,
@@ -3655,11 +3747,19 @@ class ContentResearchService:
                 policy=policy.effective_policy,
             )
         except (LLMProviderFailure, MarketingConclusionAnalysisError) as exc:
+            failure_code = (
+                exc.code
+                if isinstance(exc, LLMProviderFailure)
+                else "llm_protocol_incompatible"
+            )
             failure_payload = {
                 "schema_version": "content_research_marketing_conclusion_checkpoint_v1",
                 "reason_codes": ["marketing_analysis_unavailable"],
+                "failure_code": failure_code,
                 "recovery_action": "repair_model_configuration_and_resume",
             }
+            if isinstance(exc, MarketingConclusionAnalysisError):
+                failure_payload["failure_detail"] = exc.detail_code
             failure_checkpoint = StageCheckpointRecord(
                 checkpoint_id,
                 "content_research_stage_checkpoint_v1",
@@ -3811,6 +3911,7 @@ class ContentResearchService:
                 if item.workflow_run_id == workflow_run_id
                 and item.research_plan_id == plans[-1].id
                 and item.governed_snapshot_id in matching_snapshot_ids
+                and _publication_lineage_is_materializable(self._store, item)
             ),
             None,
         )
@@ -4529,6 +4630,20 @@ def _governed_input_fingerprint(governed: dict[str, Any]) -> str:
             ],
             "aggregate_ids": [item["aggregate_claim_id"] for item in governed["aggregate_claims"]],
         }
+    )
+
+
+def _publication_lineage_is_materializable(
+    store: SQLiteContentResearchStore, publication: ReportPublicationRecord
+) -> bool:
+    draft = store.get_typed_record(ReportDraftRecord, publication.report_draft_id)
+    decision = store.get_typed_record(
+        ReportFaithfulnessDecisionRecord, publication.faithfulness_decision_id
+    )
+    return (
+        draft is not None
+        and decision is not None
+        and decision.report_draft_id == draft.id
     )
 
 

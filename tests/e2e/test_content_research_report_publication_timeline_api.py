@@ -125,9 +125,17 @@ async def test_creator_timeline_api_exposes_one_materialized_report_result_and_r
             finalizing_response = await client.get(
                 f"/content-research/workflows/{run.run_id}/lite-report"
             )
+            finalizing_timeline = await client.get(f"/threads/{thread['id']}/timeline")
         assert finalizing_response.status_code == 404, finalizing_response.text
+        assert not [
+            message
+            for message in finalizing_timeline.json()["messages"]
+            if message["message_type"] == "artifact_result" and message["run_id"] == run.run_id
+        ]
         async with WorkflowRunManager(db_path) as manager:
             await manager.complete_report_finalization(run.run_id)
+        await materializer.publish_timeline_message(publication.id)
+        await materializer.publish_timeline_message(publication.id)
         # A committed publication must not be replaced by a later failed
         # checkpoint, and a selector that does not resolve to it stays absent.
         store.save_stage_checkpoint(

@@ -218,6 +218,31 @@ MARKETING_CONCLUSION_TRACE_REASON_CODES = frozenset(
 MARKETING_CONCLUSION_TRACE_RECOVERY_ACTIONS = frozenset(
     {"repair_model_configuration_and_resume"}
 )
+MARKETING_CONCLUSION_TRACE_FAILURE_CODES = frozenset(
+    {
+        "llm_account_unavailable",
+        "llm_auth_invalid",
+        "llm_configuration_scope_missing",
+        "llm_model_unavailable",
+        "llm_protocol_incompatible",
+        "llm_rate_limited",
+        "llm_service_unavailable",
+    }
+)
+MARKETING_CONCLUSION_TRACE_PROTOCOL_DETAILS = frozenset(
+    {
+        "invalid_json",
+        "invalid_top_level_shape",
+        "invalid_candidates_shape",
+        "invalid_candidate_shape",
+        "unknown_track",
+        "empty_statement",
+        "invalid_supporting_claim_ids",
+        "duplicate_supporting_claim_ids",
+        "unknown_supporting_claim_id",
+        "message_angle_performance_statement",
+    }
+)
 
 
 @dataclass(frozen=True)

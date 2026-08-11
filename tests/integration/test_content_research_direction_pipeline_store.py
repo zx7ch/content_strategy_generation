@@ -400,7 +400,7 @@ async def test_failed_detail_persists_its_provider_outcome(tmp_path):
     )
 
     assert result.selection.status == "insufficient_evidence"
-    assert result.blocking_failure_code == "parser_error"
+    assert result.blocking_failure_code is None
     terminal = [
         item for item in store.list_typed_records(StageCheckpointRecord)
         if item.stage_name == "operation" and item.payload.get("operation") == "detail"
@@ -2288,6 +2288,75 @@ async def test_detail_failure_backfills_in_frozen_order_and_appends_selection_re
     assert unavailable_operation.status == "failed"
     assert unavailable_operation.payload["completion"]["retryable"] is False
     assert unavailable_operation.payload["completion"]["recovery_action"] is None
+
+
+@pytest.mark.asyncio
+async def test_unknown_permanent_detail_failure_is_candidate_level_and_keeps_safe_diagnostic(tmp_path):
+    store = SQLiteContentResearchStore(str(tmp_path / "unknown-permanent-detail.db"))
+    pipeline = DirectionalEvidencePipeline(store)
+    calls: list[str] = []
+
+    async def discover(_group):
+        return [
+            {"canonical_id": "note-1", "source_kind": "search_result_minimal", "relevance": 3},
+            {"canonical_id": "note-2", "source_kind": "search_result_minimal", "relevance": 2},
+            {"canonical_id": "note-3", "source_kind": "search_result_minimal", "relevance": 1},
+        ]
+
+    async def detail(candidate):
+        calls.append(candidate["canonical_id"])
+        if candidate["canonical_id"] == "note-1":
+            return SourceOperationResult(
+                provider="xiaohongshu",
+                operation="collect_note_detail",
+                source_kind="note_detail",
+                status="failed",
+                items=[],
+                failure_reason="provider_permanent_error",
+                completeness="unavailable",
+                retryable=False,
+                metadata={
+                    "failure_diagnostic": {
+                        "kind": "provider_message_fingerprint",
+                        "value": "f807a292b36d989e",
+                    },
+                },
+            )
+        return {
+            "canonical_id": candidate["canonical_id"],
+            "source_kind": "note_detail",
+            "content_text": "body",
+            "author_id": candidate["canonical_id"],
+        }
+
+    result = await pipeline.execute(
+        subagent_task_id="sat-unknown-permanent-detail",
+        direction_id="product_marketing",
+        subject="短裤",
+        questions=["卖点"],
+        competitors=[],
+        author_cap=1,
+        minimum_samples=2,
+        minimum_independent_authors=2,
+        detail_fetch_cap=3,
+        discover=discover,
+        collect_detail=detail,
+    )
+
+    assert calls == ["note-1", "note-2", "note-3"]
+    assert result.selection.status == "complete"
+    assert result.blocking_failure_code is None
+    failed_operation = next(
+        item
+        for item in store.list_typed_records(StageCheckpointRecord)
+        if item.stage_name == "operation"
+        and (item.payload.get("completion") or {}).get("failure_code")
+        == "provider_permanent_error"
+    )
+    assert failed_operation.payload["completion"]["failure_diagnostic"] == {
+        "kind": "provider_message_fingerprint",
+        "value": "f807a292b36d989e",
+    }
 
 
 @pytest.mark.asyncio
