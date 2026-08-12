@@ -28,6 +28,7 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install -e ".[dev]"
+          pip check
 
       - name: Lint (ruff)
         run: >-
@@ -40,6 +41,7 @@ jobs:
           runtime_main.py
           tests/unit/test_runtime_config_migration.py
           tests/unit/test_runtime_launcher.py
+          tests/unit/test_package_metadata.py
           tests/unit/test_xhs_credentials.py
           tests/unit/test_xhs_qr_auth.py
           tests/e2e/test_xhs_login_api.py
@@ -47,6 +49,9 @@ jobs:
           tests/unit/test_content_research_*.py
           tests/e2e/test_content_research_*.py
           --output-format=github
+
+      - name: Collect all Python tests in a clean environment
+        run: pytest --collect-only tests/ -q
 
       - name: Unit tests
         run: >-
