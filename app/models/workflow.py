@@ -17,6 +17,7 @@ class WorkflowRunStatus(str, Enum):
     PAUSED = "paused"
     CANCELLING = "cancelling"
     CANCELLED = "cancelled"
+    FINALIZING_REPORT = "finalizing_report"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
 
@@ -36,6 +37,7 @@ class WorkflowStepStatus(str, Enum):
     PENDING = "pending"
     RUNNING = "running"
     RETRYING = "retrying"
+    PAUSED = "paused"
     SKIPPED = "skipped"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
@@ -105,6 +107,7 @@ class WorkflowStep(BaseModel):
     checkpoint_json: Optional[dict[str, Any]] = None
     output_artifact_refs_json: Optional[list[dict[str, Any]]] = None
     active_job_id: Optional[str] = None
+    timing_json: Optional[dict[str, Any]] = None
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
     next_retry_at: Optional[datetime] = None
@@ -128,6 +131,7 @@ class WorkflowChildTask(BaseModel):
     checkpoint_json: Optional[dict[str, Any]] = None
     output_artifact_refs_json: Optional[list[dict[str, Any]]] = None
     note_id: Optional[str] = None
+    timing_json: Optional[dict[str, Any]] = None
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
     error_code: Optional[str] = None

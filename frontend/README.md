@@ -69,7 +69,7 @@ NEXT_PUBLIC_XHS_AUTH_TOKEN=
 部署完成后，需要把 Vercel 生产域名加入本地后端 `.env`：
 
 ```bash
-XHS_CORS_ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:3000,https://your-app.vercel.app
+CORS_ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:3000,https://content-strategy-generation.vercel.app
 ```
 
 浏览器访问 Vercel 页面后，会从用户自己的机器访问 `http://127.0.0.1:8000`。因此 Vercel 服务端不能调用本地 runtime，依赖本地 runtime 的页面必须在浏览器端发起请求。

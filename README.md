@@ -55,6 +55,8 @@ Visit **https://content-strategy-generation.vercel.app** — the UI connects to 
 Download the new zip, unzip it next to the old folder (or replace it). Your data and config are stored separately and are **never overwritten by updates**:
 - Config & databases & model cache: `~/Library/Application Support/xhs-growth-agent/`
 
+If a new Runtime version adds config keys, startup appends the missing keys to your existing `config.env`, creates a `config.env.bak-*` backup, and prints a prompt to review them.
+
 ---
 </div>
 

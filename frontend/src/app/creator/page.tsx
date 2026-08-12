@@ -1,6 +1,7 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
+import type { PointerEvent } from "react";
 import {
   appendThreadMessage,
   completeThread,
@@ -20,6 +21,33 @@ import {
   type WorkflowRunSnapshot,
 } from "@/lib/api";
 import { useBrandContext } from "@/components/providers/BrandProvider";
+import {
+  startContentResearchFormalResearch,
+  confirmContentResearchSubjectStructure,
+  repairContentResearchFromPersistedPackets,
+  confirmContentResearchBrief,
+  createContentResearchPresearch,
+  endContentResearchWorkflow,
+  getContentResearchTrace,
+  getCurrentXHSQRLogin,
+  isContentResearchReportPending,
+  getContentResearchLiteReport,
+  getContentResearchLiteReportWithRetry,
+  getContentResearchWorkflow,
+  retryContentResearchFormalResearch,
+  retryContentResearchPresearch,
+  resumeContentResearchFormalResearch,
+  startXHSQRLogin,
+  type ContentResearchFormalResearchResponse,
+  type ContentResearchLiteReportResponse,
+  type ContentResearchPresearchResponse,
+  type ContentResearchTrace,
+  type ContentResearchWorkflowSummary,
+} from "@/lib/content-research-api";
+import { ModelServiceCard } from "@/components/content-research/ModelServiceCard";
+import { XiaohongshuLoginCard } from "@/components/content-research/XiaohongshuLoginCard";
+import { traceExecutionDurationText } from "@/lib/content-research-trace";
+import { resolveContentResearchModelRecovery } from "@/lib/content-research-recovery";
 
 type TaskStatus = "running" | "paused" | "failed" | "cancelled" | "completed";
 type MessageRole = "assistant" | "user" | "system";
@@ -33,6 +61,7 @@ interface ChatMessage {
   runId?: string | null;
   actionUrl?: string;
   actionLabel?: string;
+  report?: ContentResearchLiteReportResponse;
 }
 
 interface WorkflowTask {
@@ -45,14 +74,241 @@ interface WorkflowTask {
   currentStepLabel: string;
 }
 
+interface ContentResearchIntentState {
+  seed: string;
+  presearch: ContentResearchPresearchResponse;
+}
+
+interface ContentResearchRunState {
+  workflowRunId: string;
+  summary: ContentResearchWorkflowSummary;
+  trace: ContentResearchTrace | null;
+  formalResearch: ContentResearchFormalResearchResponse | null;
+  formalResearchStatus: "idle" | "collecting" | "completed" | "failed" | "invalid";
+  report: ContentResearchLiteReportResponse | null;
+  reportStatus: "idle" | "loading" | "ready" | "unavailable" | "failed";
+  reportError: string | null;
+}
+
+type LitePublicationState = "complete_verified_report" | "partial_verified_report" | "directional_report" | "evidence_only_report";
+
+function litePublicationState(report: ContentResearchLiteReportResponse): LitePublicationState | null {
+  const state = stringField(report.publication, "state");
+  return state === "complete_verified_report" || state === "partial_verified_report" || state === "directional_report" || state === "evidence_only_report"
+    ? state
+    : null;
+}
+
+function isExpectedLiteReportAbsence(error: unknown) {
+  return isContentResearchReportPending(error);
+}
+
 const WELCOME_MESSAGE: ChatMessage = {
   id: "msg-welcome",
   role: "assistant",
   text: "你好，我是品牌内容增长助手。描述你想生成的内容，直接发送就能开始。",
 };
+const CONTENT_RESEARCH_ACTIVE_RUNS_STORAGE_KEY = "xhs-growth-agent:content-research-active-runs-by-thread";
+
+function contentResearchRunsByThread(): Record<string, string> {
+  try {
+    const stored = window.localStorage.getItem(CONTENT_RESEARCH_ACTIVE_RUNS_STORAGE_KEY);
+    const parsed: unknown = stored ? JSON.parse(stored) : {};
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    return Object.fromEntries(
+      Object.entries(parsed).filter(([threadId, runId]) => typeof threadId === "string" && typeof runId === "string" && runId)
+    );
+  } catch {
+    return {};
+  }
+}
+
+function contentResearchRunForThread(threadId: string): string | null {
+  return contentResearchRunsByThread()[threadId] ?? null;
+}
+
+function contentResearchThreadForRun(workflowRunId: string): string | null {
+  return Object.entries(contentResearchRunsByThread())
+    .find(([, savedRunId]) => savedRunId === workflowRunId)?.[0] ?? null;
+}
+
+function saveContentResearchRunForThread(threadId: string, workflowRunId: string) {
+  const runs = contentResearchRunsByThread();
+  runs[threadId] = workflowRunId;
+  window.localStorage.setItem(CONTENT_RESEARCH_ACTIVE_RUNS_STORAGE_KEY, JSON.stringify(runs));
+}
+
+function removeContentResearchRunForThread(threadId: string) {
+  const runs = contentResearchRunsByThread();
+  if (!(threadId in runs)) return;
+  delete runs[threadId];
+  if (Object.keys(runs).length === 0) {
+    window.localStorage.removeItem(CONTENT_RESEARCH_ACTIVE_RUNS_STORAGE_KEY);
+  } else {
+    window.localStorage.setItem(CONTENT_RESEARCH_ACTIVE_RUNS_STORAGE_KEY, JSON.stringify(runs));
+  }
+}
 
 function createId(prefix: string) {
   return `${prefix}-${Math.random().toString(16).slice(2, 10)}`;
+}
+
+function formalResearchStatus(result: ContentResearchFormalResearchResponse | null): ContentResearchRunState["formalResearchStatus"] {
+  if (!result) return "idle";
+  if (result.status === "failed") return "failed";
+  return ["completed", "partial_completed", "succeeded"].includes(result.status)
+    ? "completed"
+    : "collecting";
+}
+
+function contentResearchStartFailure(detail: string): {
+  status: ContentResearchRunState["formalResearchStatus"];
+  message: string;
+} {
+  if (/Creator thread (is required|no longer exists)/i.test(detail)) {
+    return {
+      status: "invalid",
+      message: "本轮调研所属的 Creator 对话已不存在，无法继续。请在有效对话中重新发起一轮内容调研。",
+    };
+  }
+  return {
+    status: "failed",
+    message: `专家调研启动失败：${detail}。请检查来源登录态、采集服务和运行配置后继续。`,
+  };
+}
+
+function isUncertainContentResearchDispatchFailure(detail: string) {
+  // Confirmation has already atomically persisted the run and its queued
+  // dispatch job. A browser transport failure while asking the API to wake the
+  // dispatcher therefore does not establish that the formal run failed to
+  // start; the server may have accepted the request (or the recovery scan may
+  // claim the queued job) before the response became unavailable.
+  return /failed to fetch|networkerror|network request failed/i.test(detail);
+}
+
+function contentResearchRunWithReport(
+  workflowRunId: string,
+  summary: ContentResearchWorkflowSummary,
+  trace: ContentResearchTrace | null,
+  formalResearch: ContentResearchFormalResearchResponse | null,
+  report: ContentResearchLiteReportResponse | null
+): ContentResearchRunState {
+  return {
+    workflowRunId,
+    summary,
+    trace,
+    formalResearch,
+    formalResearchStatus: formalResearchStatus(formalResearch),
+    report,
+    reportStatus: report ? "ready" : "idle",
+    reportError: null,
+  };
+}
+
+function sourceFailureReasonText(reason: string | null | undefined) {
+  if (reason === "auth_required") return "需要登录小红书网页端";
+  if (reason === "rate_limited") return "当前访问过于频繁，请稍后再继续";
+  if (reason) return "采集服务暂时不可用，请检查服务状态后继续";
+  return "无";
+}
+
+function workflowStatusLabel(status: string) {
+  if (["completed", "succeeded", "success"].includes(status)) return "已完成";
+  if (["running", "collecting"].includes(status)) return "进行中";
+  if (status === "pending") return "等待开始";
+  if (status === "retrying") return "等待恢复";
+  if (status === "waiting_user") return "等待恢复";
+  if (status === "failed") return "未完成";
+  if (["cancelled", "cancelling"].includes(status)) return "已结束";
+  return "等待处理";
+}
+
+function contentResearchSubject(run: ContentResearchRunState): string {
+  const payload = run.summary.brief.payload;
+  return stringField(payload, "seed_text") ||
+    stringField(payload, "confirmed_subject") ||
+    stringField(payload, "subject_confirmation") ||
+    "本轮调研";
+}
+
+function displayChatText(text: string | null | undefined) {
+  // Timeline records from an older runtime can lack free text; an unavailable
+  // report must still render its explicit error state instead of crashing.
+  return (text ?? "").replace(
+    /(小红书采集未完成：)([a-z_]+)(。可在「查看调研过程」中重试。)/,
+    (_match, prefix, reason) => `${prefix}${sourceFailureReasonText(reason)}。`
+  ).replace(
+    /返回 (\d+) 条 search_result_minimal 素材/g,
+    "已采集 $1 条公开内容"
+  );
+}
+
+function claimStatusLabel(status: string) {
+  if (status === "supported") return "证据支持";
+  if (status === "evidence_insufficient") return "证据不足";
+  if (status === "unsupported") return "证据不足";
+  return status || "未知";
+}
+
+function evidenceStateLabel(value: string) {
+  if (value === "verified") return "已验证";
+  if (value === "partially_supported") return "部分支持";
+  if (value === "signal") return "线索";
+  if (value === "case_only") return "单案例";
+  if (value === "invalid") return "不可用";
+  return value || "未知";
+}
+
+function priorityLabel(value: string) {
+  if (value === "high_priority") return "优先执行";
+  if (value === "high_potential_needs_more_evidence") return "高潜力需补证";
+  if (value === "evidence_backed_reference") return "证据参考";
+  if (value === "useful_but_lower_priority") return "低优先级";
+  if (value === "do_not_prioritize") return "暂不推荐";
+  return value || "未知";
+}
+
+function roleLabel(role: string) {
+  if (role === "supporting_fact") return "支持证据";
+  if (role === "conflicting_fact") return "冲突证据";
+  if (role === "missing_evidence") return "缺失证据";
+  return role;
+}
+
+function readableClaimScope(value: string) {
+  if (/^use as a bounded research signal\.?$/i.test(value.trim())) {
+    return "可作为调研线索，需结合更多证据判断。";
+  }
+  return value;
+}
+
+function readableMissingEvidence(item: Record<string, unknown>) {
+  const message = stringField(item, "message", stringField(item, "reason", "暂未说明"));
+  if (/^need comment evidence before finalizing the claim\.?$/i.test(message.trim())) {
+    return "需补充用户评论证据后再确定该结论。";
+  }
+  return message;
+}
+
+function stringField(source: Record<string, unknown> | undefined | null, key: string, fallback = "") {
+  const value = source?.[key];
+  return typeof value === "string" ? value : fallback;
+}
+
+function firstString(source: Record<string, unknown> | undefined | null, keys: string[], fallback = "") {
+  return keys.map((key) => stringField(source, key)).find(Boolean) || fallback;
+}
+
+function arrayField(source: Record<string, unknown> | undefined | null, key: string): string[] {
+  const value = source?.[key];
+  return Array.isArray(value) ? value.map(String).filter(Boolean) : [];
+}
+
+function decisionStatusLabel(status: string) {
+  if (status === "selected") return "已选择";
+  if (status === "watchlist") return "观察中";
+  if (status === "rejected") return "已拒绝";
+  return status || "未决策";
 }
 
 // Map raw backend event messages → user-readable Chinese.
@@ -296,19 +552,11 @@ function versionChainFor(ref: WorkflowArtifactRef, allRefs: WorkflowArtifactRef[
 }
 
 function ArtifactVersionBadges({ ref, current = false }: { ref: WorkflowArtifactRef; current?: boolean }) {
-  const mode = ref.artifact?.payload_mode ?? "snapshot";
-  const parentId = ref.parent_artifact_id ?? ref.artifact?.parent_artifact_id;
   return (
-    <div className="mt-2 flex flex-wrap items-center gap-1.5 text-[10px] font-medium uppercase tracking-wide">
-      {current && <span className="rounded-full bg-ink px-2 py-0.5 text-white">current</span>}
+    <div className="mt-2 flex flex-wrap items-center gap-1.5 text-[10px] font-medium tracking-wide">
+      {current && <span className="rounded-full bg-ink px-2 py-0.5 text-white">当前版本</span>}
       <span className="rounded-full bg-slate-100 px-2 py-0.5 text-slate-600">{versionLabel(ref)}</span>
       <span className="rounded-full bg-slate-100 px-2 py-0.5 text-slate-600">{artifactStatusLabel(ref)}</span>
-      <span className="rounded-full bg-slate-100 px-2 py-0.5 text-slate-600">{mode}</span>
-      {parentId && (
-        <span className="rounded-full bg-slate-100 px-2 py-0.5 text-slate-600">
-          parent {shortArtifactId(parentId)}
-        </span>
-      )}
     </div>
   );
 }
@@ -347,7 +595,7 @@ function VersionChainView({ current, allRefs }: { current: WorkflowArtifactRef; 
           );
         })}
         {parentId && chain.length === 1 && (
-          <p className="text-[11px] text-quiet">父版本 {shortArtifactId(parentId)} 尚未出现在当前时间线引用中。</p>
+          <p className="text-[11px] text-quiet">上一版本暂未加载。</p>
         )}
       </div>
     </details>
@@ -405,12 +653,1307 @@ function ArtifactRefsView({ refs, allRefs }: { refs: WorkflowArtifactRef[]; allR
   );
 }
 
+function splitInlineList(value: string) {
+  return value
+    .split(/[,，、\n]/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+const LITE_DIRECTION_CATALOG = [
+  { id: "product_marketing", label: "产品营销" },
+  { id: "competitor_discovery", label: "竞品发现" },
+  { id: "content_performance", label: "内容表现" },
+] as const;
+
+const LITE_MARKETING_GOAL_CATALOG = [
+  { id: "content_seeding", label: "内容种草" },
+] as const;
+
+function liteDirectionLabel(value: string) {
+  return LITE_DIRECTION_CATALOG.find((item) => item.id === value)?.label ?? value;
+}
+
+function ContentResearchIntentCard({
+  intent,
+  onConfirmed,
+  onPresearchUpdated,
+  onError,
+}: {
+  intent: ContentResearchIntentState;
+  onConfirmed: (summary: ContentResearchWorkflowSummary) => void;
+  onPresearchUpdated: (presearch: ContentResearchPresearchResponse) => void;
+  onError: (message: string) => void;
+}) {
+  const structure = intent.presearch.subject_structure ?? {};
+  const subject = structure.canonical_subject?.trim() || intent.seed || "本轮调研";
+  const coreObject = structure.core_entities?.[0]?.canonical_name?.trim() || subject;
+  const intents = (structure.research_intents ?? []).filter(Boolean).join("、") || "待确认";
+  const contexts = (structure.context_modifiers ?? []).filter(Boolean).join("、") || "无特定场景";
+  const presearchConclusion = intent.presearch.subject_confirmation.trim();
+  const initialCompetitors = intent.presearch.competitor_tags.length ? intent.presearch.competitor_tags : ["待补充竞品"];
+  const visibleDirections = LITE_DIRECTION_CATALOG
+    .filter((item) => intent.presearch.direction_catalog.includes(item.id))
+    .map((item) => item.id);
+  const [subjectConfirmed, setSubjectConfirmed] = useState<"yes" | "mostly" | "no" | null>(null);
+  const [selectedCompetitors, setSelectedCompetitors] = useState<string[]>([]);
+  const [selectedDirections, setSelectedDirections] = useState<string[]>([]);
+  const [extraCompetitors, setExtraCompetitors] = useState(intent.presearch.custom_competitor_input ?? "");
+  const [customQuestion, setCustomQuestion] = useState(intent.presearch.custom_research_question ?? "");
+  const [primaryMarketingGoal, setPrimaryMarketingGoal] = useState("");
+  const [isConfirming, setIsConfirming] = useState(false);
+  const [coreObjectInput, setCoreObjectInput] = useState(
+    structure.core_entities?.[0]?.canonical_name?.trim() ?? "",
+  );
+  const [researchIntentInput, setResearchIntentInput] = useState(
+    structure.research_intents?.[0]?.trim() ?? "",
+  );
+  const [contextInput, setContextInput] = useState(
+    (structure.context_modifiers ?? []).filter(Boolean).join("，"),
+  );
+  const confirmationInFlightRef = useRef(false);
+  const confirmedStructureFields = intent.presearch.subject_structure_user_confirmed_fields ?? [];
+  const hasConfirmedStructureFields = [
+    "core_entities[0]",
+    "research_intents[0]",
+    "context_modifiers",
+  ].every((field) => confirmedStructureFields.includes(field));
+  const needsProductStructureConfirmation = selectedDirections.includes("product_marketing")
+    && !hasConfirmedStructureFields;
+
+  function toggleValue(
+    value: string,
+    setSelected: React.Dispatch<React.SetStateAction<string[]>>,
+  ) {
+    setSelected((selected) => (
+      selected.includes(value)
+        ? selected.filter((item) => item !== value)
+        : [...selected, value]
+    ));
+  }
+
+  async function confirmBrief() {
+    if (!subjectConfirmed) {
+      onError("请先确认调研主体是否准确。");
+      return;
+    }
+    if (needsProductStructureConfirmation && (!coreObjectInput.trim() || !researchIntentInput.trim())) {
+      onError("请选择产品营销时，请确认核心对象和研究意图。");
+      return;
+    }
+    if (confirmationInFlightRef.current) return;
+    confirmationInFlightRef.current = true;
+    setIsConfirming(true);
+    try {
+      const summary = await confirmContentResearchBrief(intent.presearch.workflow_run_id, {
+        confirmed_subject: subject,
+        subject_structure_hash: intent.presearch.subject_structure_hash ?? "",
+        subject_type: "category",
+        selected_competitors: selectedCompetitors,
+        custom_competitors: splitInlineList(extraCompetitors),
+        selected_directions: selectedDirections,
+        custom_research_question: customQuestion.trim(),
+        primary_marketing_goal: primaryMarketingGoal,
+        ...(needsProductStructureConfirmation
+          ? {
+              subject_structure_confirmation: {
+                core_object: coreObjectInput,
+                research_intent: researchIntentInput,
+                context_modifiers: splitInlineList(contextInput),
+              },
+            }
+          : {}),
+      });
+      onConfirmed(summary);
+    } catch {
+      onError("确认调研 brief 失败，请检查 runtime 后重试。");
+    } finally {
+      confirmationInFlightRef.current = false;
+      setIsConfirming(false);
+    }
+  }
+
+  if (intent.presearch.status === "waiting_model_config") {
+    return (
+      <div className="flex justify-start">
+        <div className="w-full max-w-[92%] rounded-2xl border border-amber-200 bg-amber-50 px-5 py-4 text-sm text-amber-900">
+          模型服务配置需要更新。请在右侧保存并验证新配置后继续本次预检索。
+        </div>
+      </div>
+    );
+  }
+
+  if (intent.presearch.status === "subject_needs_confirmation") {
+    async function confirmSubjectStructure() {
+      if (!coreObjectInput.trim() || !researchIntentInput.trim()) {
+        onError("请填写核心对象和研究意图。");
+        return;
+      }
+      setIsConfirming(true);
+      try {
+        const response = await confirmContentResearchSubjectStructure(
+          intent.presearch.workflow_run_id,
+          {
+            subject_structure_hash: intent.presearch.subject_structure_hash ?? "",
+            core_object: coreObjectInput,
+            research_intent: researchIntentInput,
+            context_modifiers: contextInput,
+          },
+        );
+        onPresearchUpdated(response.result);
+      } catch {
+        onError("主题确认失败，请刷新后重试。");
+      } finally {
+        setIsConfirming(false);
+      }
+    }
+    return (
+      <div className="flex justify-start">
+        <div className="w-full max-w-[92%] rounded-2xl border border-amber-200 bg-amber-50 px-5 py-4 text-sm text-amber-950 shadow-sm">
+          <p className="text-base font-semibold">还需要你确认调研主体</p>
+          <p className="mt-2 leading-6">{intent.presearch.subject_confirmation}</p>
+          <div className="mt-3 grid gap-3 rounded-xl bg-white/70 p-3">
+            <label className="grid gap-1 text-xs font-medium">核心对象 *
+              <input aria-label="调研主体核心对象" value={coreObjectInput} onChange={(event) => setCoreObjectInput(event.target.value)} placeholder="T恤" className="rounded-lg border border-line bg-white px-3 py-2 text-sm font-normal outline-none" />
+            </label>
+            <label className="grid gap-1 text-xs font-medium">研究意图 *
+              <input aria-label="调研主体研究意图" value={researchIntentInput} onChange={(event) => setResearchIntentInput(event.target.value)} placeholder="凉感" className="rounded-lg border border-line bg-white px-3 py-2 text-sm font-normal outline-none" />
+            </label>
+            <label className="grid gap-1 text-xs font-medium">使用场景
+              <input aria-label="调研主体使用场景" value={contextInput} onChange={(event) => setContextInput(event.target.value)} placeholder="夏季" className="rounded-lg border border-line bg-white px-3 py-2 text-sm font-normal outline-none" />
+            </label>
+            <button type="button" onClick={() => void confirmSubjectStructure()} disabled={isConfirming} className="justify-self-start rounded-lg bg-ink px-3 py-2 text-xs font-medium text-white disabled:opacity-40">
+              {isConfirming ? "确认中" : "确认调研主体"}
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex justify-start">
+      <div className="w-full max-w-[92%] space-y-4">
+        <div className="flex items-start gap-3">
+          <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl bg-[#e9f0eb] text-2xl text-[#516f5f]">
+            ⌕
+          </div>
+          <div>
+            <h2 className="text-2xl font-semibold leading-tight text-ink">在开始前，请确认几个关键点</h2>
+            <p className="mt-1 text-sm text-quiet">这能帮助专家团队更精准地锁定调研范围</p>
+          </div>
+        </div>
+
+        <div className="rounded-2xl border border-line bg-white px-5 py-4 shadow-sm">
+          <p className="text-sm font-medium text-slate-400">你的需求</p>
+          <p className="mt-3 text-lg font-medium text-ink">{intent.seed}</p>
+        </div>
+
+        <div className="rounded-2xl border border-line bg-white px-5 py-4 shadow-sm">
+          <p className="mb-3 rounded-xl bg-[#f4f7f5] px-3 py-2 text-xs leading-5 text-slate-600">
+            核心对象：{coreObject}｜意图：{intents}｜场景：{contexts}
+          </p>
+          <p className="text-lg font-semibold leading-7 text-ink">
+            我们识别到你要调研的是「{subject}」。是否准确？
+          </p>
+          {presearchConclusion && (
+            <p className="mt-2 text-sm leading-6 text-quiet">预检索判断：{presearchConclusion}</p>
+          )}
+          <p className="mt-2 text-sm text-slate-400">若不准确，请直接在底部对话框补充说明。</p>
+          <div className="mt-4 flex flex-wrap gap-2">
+            {[
+              ["yes", "准确，继续"],
+              ["mostly", "大致准确，下面补充"],
+              ["no", "不准确，我在下方说明"],
+            ].map(([value, label]) => (
+              <button
+                key={value}
+                type="button"
+                onClick={() => setSubjectConfirmed(value as "yes" | "mostly" | "no")}
+                className={[
+                  "rounded-full px-4 py-2 text-sm font-medium transition",
+                  subjectConfirmed === value ? "bg-[#789180] text-white" : "bg-[#e8efe9] text-[#51665a] hover:bg-[#dfe8e1]",
+                ].join(" ")}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div className="rounded-2xl border border-line bg-white px-5 py-4 shadow-sm">
+          <p className="text-lg font-semibold leading-7 text-ink">
+            为「{subject}」自动发现了以下候选竞品，请勾选你希望重点对比的对象（可多选）：
+          </p>
+          <p className="mt-2 text-sm text-slate-400">勾选后会纳入本轮对比；是否能形成结论取决于可获得的公开证据。</p>
+          <div className="mt-4 flex flex-wrap gap-2">
+            {initialCompetitors.map((competitor) => (
+              <button
+                key={competitor}
+                type="button"
+                onClick={() => competitor !== "待补充竞品" && toggleValue(competitor, setSelectedCompetitors)}
+                disabled={competitor === "待补充竞品"}
+                className={[
+                  "rounded-full px-4 py-2 text-sm font-medium transition",
+                  selectedCompetitors.includes(competitor) ? "bg-[#789180] text-white" : "bg-[#e8efe9] text-[#51665a] hover:bg-[#dfe8e1]",
+                  competitor === "待补充竞品" ? "cursor-not-allowed opacity-50" : "",
+                ].join(" ")}
+              >
+                {competitor}
+              </button>
+            ))}
+          </div>
+          <div className="mt-4">
+            <input
+              value={extraCompetitors}
+              onChange={(event) => setExtraCompetitors(event.target.value)}
+              className="h-11 min-w-0 flex-1 rounded-xl border border-line bg-white px-4 text-sm outline-none focus:border-[#789180]"
+              placeholder="补充其他想调研的竞品，回车添加（可用逗号分隔多个）"
+            />
+          </div>
+        </div>
+
+        <div className="rounded-2xl border border-line bg-white px-5 py-4 shadow-sm">
+          <p className="text-lg font-semibold leading-7 text-ink">请选择本轮调研方向（可多选）：</p>
+          <div className="mt-4 flex flex-wrap gap-2">
+            {visibleDirections.map((direction) => (
+              <button
+                key={direction}
+                type="button"
+                onClick={() => toggleValue(direction, setSelectedDirections)}
+                className={[
+                  "rounded-full px-4 py-2 text-sm font-medium transition",
+                  selectedDirections.includes(direction) ? "bg-[#789180] text-white" : "bg-[#e8efe9] text-[#51665a] hover:bg-[#dfe8e1]",
+                ].join(" ")}
+              >
+                {liteDirectionLabel(direction)}
+              </button>
+            ))}
+          </div>
+          <input
+            value={customQuestion}
+            onChange={(event) => setCustomQuestion(event.target.value)}
+            className="mt-4 h-11 w-full rounded-xl border border-line bg-white px-4 text-sm outline-none focus:border-[#789180]"
+            placeholder="补充你的调研问题，例如：更关注小众品牌而不是大牌"
+          />
+          {needsProductStructureConfirmation && (
+            <div className="mt-4 grid gap-3 rounded-xl bg-[#f4f7f5] p-3">
+              <p className="text-sm font-medium text-ink">请确认产品营销要检索的结构</p>
+              <label className="grid gap-1 text-xs font-medium">核心对象 *
+                <input aria-label="产品营销核心对象" value={coreObjectInput} onChange={(event) => setCoreObjectInput(event.target.value)} placeholder="T恤" className="rounded-lg border border-line bg-white px-3 py-2 text-sm font-normal outline-none" />
+              </label>
+              <label className="grid gap-1 text-xs font-medium">首要研究意图 *
+                <input aria-label="产品营销研究意图" value={researchIntentInput} onChange={(event) => setResearchIntentInput(event.target.value)} placeholder="凉感" className="rounded-lg border border-line bg-white px-3 py-2 text-sm font-normal outline-none" />
+              </label>
+              <label className="grid gap-1 text-xs font-medium">使用场景
+                <input aria-label="产品营销使用场景" value={contextInput} onChange={(event) => setContextInput(event.target.value)} placeholder="夏季" className="rounded-lg border border-line bg-white px-3 py-2 text-sm font-normal outline-none" />
+              </label>
+            </div>
+          )}
+          <label className="mt-4 grid gap-2 text-sm font-medium text-ink">
+            请选择本轮产品营销目标 *
+            <select
+              aria-label="产品营销目标"
+              value={primaryMarketingGoal}
+              onChange={(event) => setPrimaryMarketingGoal(event.target.value)}
+              className="h-11 rounded-xl border border-line bg-white px-3 text-sm font-normal outline-none focus:border-[#789180]"
+            >
+              <option value="">请选择</option>
+              {LITE_MARKETING_GOAL_CATALOG.map((goal) => (
+                <option key={goal.id} value={goal.id}>{goal.label}</option>
+              ))}
+            </select>
+          </label>
+          <div className="mt-4 flex justify-end gap-2">
+            <button
+              type="button"
+              onClick={() => void confirmBrief()}
+              disabled={isConfirming || selectedDirections.length === 0 || !primaryMarketingGoal}
+              className="h-10 rounded-xl bg-ink px-5 text-sm font-medium text-white hover:bg-slate-800 disabled:opacity-40"
+            >
+              {isConfirming ? "确认中" : "确认并开始调研"}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function reportStateLabel(state: LitePublicationState) {
+  if (state === "complete_verified_report") return "已完整核验";
+  if (state === "partial_verified_report") return "部分内容已核验";
+  return "仅展示已验证证据";
+}
+
+function recordList(value: unknown): Record<string, unknown>[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object" && !Array.isArray(item))
+    : [];
+}
+
+function selectRequestedDirectionStates(report: ContentResearchLiteReportResponse) {
+  const requestedDirectionIds = new Set(arrayField(report.frozen_scope, "direction_ids"));
+  return recordList(report.run_direction_states).filter((item) =>
+    requestedDirectionIds.has(stringField(item, "direction"))
+  );
+}
+
+function numberField(source: Record<string, unknown>, key: string) {
+  const value = source[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+function liteCollectedDate(value: string | null | undefined) {
+  return value ? `截至 ${value.slice(0, 10)}` : "采集时间未公开";
+}
+
+function recoveryReasonLabel(reason: string) {
+  if (reason === "auth_expired" || reason === "auth_required") return "登录状态已失效";
+  if (reason === "rate_limited") return "来源访问频率受限";
+  return "调研暂时中断";
+}
+
+function coverageReasonLabel(reason: string) {
+  if (reason === "minimum_relevant_samples_unmet") return "相关证据样本不足";
+  if (reason === "minimum_independent_authors_unmet") return "独立作者数不足";
+  if (reason === "direct_core_support_unmet") return "缺少核心对象直接证据";
+  if (reason === "explicit_user_focus_unmet") return "用户重点尚未覆盖";
+  if (reason === "replacement_capacity_exhausted") return "可替换样本已用尽";
+  return reason.replaceAll("_", " ");
+}
+
+function marketingConclusionReasonLabel(reason: string) {
+  if (reason === "conclusion_no_qualified_candidate") return "现有证据尚未达到主结论门槛。";
+  if (reason === "conclusion_note_count_unmet") return "合格笔记数量不足。";
+  if (reason === "conclusion_author_count_unmet") return "独立作者数量不足。";
+  if (reason === "conclusion_support_tied") return "多个结论支持度相同，暂不指定唯一主结论。";
+  if (reason === "first_intent_support_unmet") return "首要营销目标的直接支持不足。";
+  if (["marketing_analysis_unavailable", "marketing_conclusion_unavailable", "marketing_conclusion_not_verified"].includes(reason)) return "结论分析当前不可用。";
+  return "证据链未通过营销结论核验。";
+}
+
+function marketingConclusionStateLabel(state: string) {
+  if (state === "selected") return "已选定";
+  if (state === "qualified") return "已达到门槛";
+  if (state === "insufficient_evidence") return "证据不足";
+  if (state === "no_single_primary_conclusion") return "暂无唯一主结论";
+  if (state === "analysis_unavailable") return "分析不可用";
+  return "等待判定";
+}
+
+function marketingConclusionTrackLabel(track: string) {
+  if (track === "need") return "需求";
+  if (track === "value") return "价值";
+  if (track === "message") return "表达";
+  return "结论";
+}
+
+function marketingConclusionRecoveryRequired(trace: ContentResearchTrace | null) {
+  return recordList(trace?.logical_checkpoints).some((checkpoint) =>
+    stringField(checkpoint, "stage") === "marketing_conclusion"
+      && arrayField(checkpoint, "reason_codes").includes("marketing_analysis_unavailable")
+  );
+}
+
+function ContentResearchReportMessage({
+  report,
+  onRecover,
+  onRepair,
+  onOpenTrace,
+}: {
+  report: ContentResearchLiteReportResponse;
+  onRecover?: () => void;
+  onRepair?: () => void;
+  onOpenTrace?: () => void;
+}) {
+  const [selectedCitation, setSelectedCitation] = useState<Record<string, unknown> | null>(null);
+  const publicationState = litePublicationState(report);
+  const recovery = report.recovery_projection && typeof report.recovery_projection === "object"
+    ? report.recovery_projection
+    : null;
+  const publicationIsNone = report.publication.state === null;
+
+  useEffect(() => {
+    setSelectedCitation(null);
+  }, [report.workflow_run_id, report.citations]);
+
+  if (!publicationState) {
+    if (!publicationIsNone || !recovery) return null;
+    const completedStages = arrayField(recovery, "completed_stages");
+    const actionable = stringField(recovery, "actionability") === "available";
+    const authenticationRequired = ["auth_expired", "auth_required"].includes(stringField(recovery, "reason_code"));
+    return (
+      <section
+        className="w-full max-w-[92%] rounded-2xl border border-amber-200 bg-amber-50 px-5 py-4 text-sm text-ink shadow-sm"
+        aria-label="Content Research recovery status"
+      >
+        <p className="text-[10px] font-semibold tracking-wider text-amber-700">研究运行</p>
+        <h3 className="mt-1 text-lg font-semibold">调研可继续</h3>
+        <p className="mt-2 text-sm text-amber-900">{recoveryReasonLabel(stringField(recovery, "reason_code"))}</p>
+        <p className="mt-2 text-xs text-quiet">
+          {completedStages.length ? `已保存阶段：${completedStages.join("、")}` : "尚无已完成阶段。"}
+        </p>
+        {actionable && stringField(recovery, "next_action") === "resume_run" && (
+          <button
+            type="button"
+            onClick={authenticationRequired ? onOpenTrace : onRecover}
+            className="mt-4 rounded-lg bg-ink px-3 py-2 text-xs font-medium text-white"
+          >
+            {authenticationRequired
+              ? "打开登录恢复"
+              : "继续调研"}
+          </button>
+        )}
+      </section>
+    );
+  }
+
+  const evidenceOnly = publicationState === "evidence_only_report";
+  const partial = publicationState === "partial_verified_report";
+  const citations = recordList(report.citations);
+  const marketingTracks = ([
+    ["need", "场景与需求"],
+    ["value", "可被相信的产品卖点"],
+    ["message", "内容表达"],
+  ] as const).map(([id, label]) => ({
+    id,
+    label,
+    value: report.sections.marketing_conclusions?.[id] as Record<string, unknown> | undefined,
+  }));
+  const hasMarketingTracks = marketingTracks.every((item) => item.value);
+  const priorityAction = report.sections.priority_action as Record<string, unknown> | null | undefined;
+  const allCards = recordList(report.sections.main_findings);
+  const findings = evidenceOnly ? [] : allCards.filter((item) =>
+    stringField(item, "card_kind") !== "observation"
+    && !(hasMarketingTracks && stringField(item, "direction") === "product_marketing")
+  );
+  const observations = evidenceOnly ? [] : allCards.filter((item) => stringField(item, "card_kind") === "observation");
+  const leads = evidenceOnly ? [] : recordList(report.sections.weak_signals);
+  const limitations = recordList(report.sections.limitations_scope);
+  const directionStates = evidenceOnly
+    ? []
+    : selectRequestedDirectionStates(report);
+  const statusStrip = report.status_strip;
+  const citationsById = new Map(citations.map((citation) => [stringField(citation, "citation_group_id"), citation]));
+  const statusText = evidenceOnly
+    ? `${numberField(statusStrip, "saved_evidence_count")} 条已保存依据`
+    : `${numberField(statusStrip, "completed_direction_count")} 个方向完成 · ${numberField(statusStrip, "admitted_finding_count")} 条已验证发现 · ${numberField(statusStrip, "observation_count")} 条样本观察 · ${numberField(statusStrip, "lead_count")} 条线索`;
+
+  const citationButton = (citation: Record<string, unknown>, index: number) => {
+    const displayIndex = String(citation.display_index ?? index + 1);
+    const navigationState = stringField(citation, "navigation_state", "missing_source_url");
+    const sourceUrl = stringField(citation, "source_url");
+    return (
+      <div
+        key={stringField(citation, "citation_group_id", String(index))}
+        className="flex flex-wrap gap-2"
+      >
+        {sourceUrl && navigationState === "available" && (
+          <a
+            className="rounded-lg border border-line bg-white px-2.5 py-1 text-xs hover:bg-slate-50"
+            href={sourceUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            查看原笔记
+          </a>
+        )}
+        <button
+          type="button"
+          className="rounded-lg border border-line bg-white px-2.5 py-1 text-xs hover:bg-slate-50"
+          onClick={() => setSelectedCitation(citation)}
+        >
+          证据详情
+        </button>
+      </div>
+    );
+  };
+
+  const card = (item: Record<string, unknown>, index: number, observation: boolean) => (
+    <details
+      key={`${observation ? "observation" : "finding"}-${index}`}
+      aria-label={observation ? "样本观察卡" : "核心发现卡"}
+      className="rounded-xl border border-line bg-white px-3 py-3"
+    >
+      <summary className="cursor-pointer font-medium">
+        {stringField(item, "statement", observation ? "已验证样本观察" : "已验证发现")}
+      </summary>
+      <dl className="mt-3 grid gap-2 text-xs text-quiet">
+        {stringField(item, "direction") && <div><dt className="font-medium text-ink">方向</dt><dd>{stringField(item, "direction")}</dd></div>}
+        {stringField(item, "sample_summary") && <div><dt className="font-medium text-ink">样本范围</dt><dd>{stringField(item, "sample_summary")}</dd></div>}
+        {stringField(item, "scope") && <div><dt className="font-medium text-ink">结论范围</dt><dd>{stringField(item, "scope")}</dd></div>}
+      </dl>
+      <div className="mt-3 flex flex-wrap gap-2">
+        {arrayField(item, "citation_group_ids").map((id, citationIndex) => {
+          const citation = citationsById.get(id);
+          return citation ? citationButton(citation, citationIndex) : null;
+        })}
+      </div>
+    </details>
+  );
+
+  const refs = selectedCitation ? recordList(selectedCitation.evidence_refs) : [];
+
+  return (
+    <div className="flex justify-start" data-report-publication-id={stringField(report.publication, "report_publication_id")}>
+      <article
+        className="w-full max-w-[92%] overflow-hidden rounded-2xl border border-line bg-white text-sm text-ink shadow-sm"
+        aria-label="Content Research published report"
+      >
+        <header className="border-b border-line bg-[#fbfcfb] px-5 py-4" aria-label="Content Research report header">
+          <p className="text-[10px] font-semibold tracking-wider text-[#4f6f5f]">研究结论</p>
+          <div className="mt-1 flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <h3 className="text-lg font-semibold leading-7">
+                {report.subject || "本轮调研"} · {evidenceOnly ? "已保存依据" : "调研结果"}
+              </h3>
+              <p className="mt-1 text-xs text-quiet">{liteCollectedDate(report.collected_at)}</p>
+            </div>
+            <span className="rounded-full bg-[#fff4df] px-2.5 py-1 text-xs font-medium text-[#a16207]">
+              {reportStateLabel(publicationState)}
+            </span>
+          </div>
+        </header>
+
+        <div className="space-y-5 px-5 py-5">
+          <p className="rounded-xl bg-slate-50 px-3 py-2 text-xs text-quiet">{statusText}</p>
+
+          {(partial || evidenceOnly) && stringField(report.publication, "publication_reason") && (
+            <p className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900">
+              {stringField(report.publication, "publication_reason")}
+            </p>
+          )}
+          {evidenceOnly && stringField(report.publication, "publication_reason") === "query_subject_not_supported" && onRepair && (
+            <section className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-3" aria-label="已有笔记重新处理">
+              <p className="text-xs text-amber-900">可复用已保存的笔记重新评估相关性，不会新增采集。</p>
+              <button type="button" onClick={onRepair} className="mt-2 rounded-lg bg-ink px-3 py-2 text-xs font-medium text-white">使用已有笔记重新处理</button>
+            </section>
+          )}
+
+          {hasMarketingTracks && marketingTracks.map(({ id, label, value }) => {
+            const track = value as Record<string, unknown>;
+            const selected = stringField(track, "state") === "selected";
+            const directional = stringField(track, "state") === "directional";
+            return (
+              <section key={id} aria-label={label} className="border-t border-line pt-4">
+                <h4 className="font-semibold">{label}</h4>
+                {selected ? (
+                  <div className="mt-3 rounded-xl border border-line bg-white px-3 py-3">
+                    <p className="font-medium leading-6">{stringField(track, "statement")}</p>
+                    <p className="mt-2 text-xs text-quiet">
+                      {numberField(track, "supporting_note_count")} 篇笔记 · {numberField(track, "independent_author_count")} 位独立作者
+                    </p>
+                    {numberField(track, "additional_qualified_count") > 0 && (
+                      <p className="mt-1 text-xs text-quiet">另有 {numberField(track, "additional_qualified_count")} 条合格结论</p>
+                    )}
+                    <div className="mt-3 flex flex-wrap gap-2">
+                      {arrayField(track, "citation_group_ids").map((citationId, citationIndex) => {
+                        const citation = citationsById.get(citationId);
+                        return citation ? citationButton(citation, citationIndex) : null;
+                      })}
+                    </div>
+                  </div>
+                ) : directional ? (
+                  <div className="mt-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-3 text-xs text-quiet">
+                    <p className="font-medium text-ink">待验证方向</p>
+                    <p className="mt-2 font-medium leading-6 text-ink">{stringField(track, "statement")}</p>
+                    <p className="mt-2">当前 {numberField(track, "supporting_note_count")} 篇 / {numberField(track, "independent_author_count")} 位作者</p>
+                    <p className="mt-1">还缺 {numberField(track, "note_gap")} 篇独立笔记、{numberField(track, "author_gap")} 位独立作者</p>
+                    <p className="mt-2 font-medium text-amber-900">该方向不可作为功效或投放定论</p>
+                    <div className="mt-3 flex flex-wrap gap-2">
+                      {arrayField(track, "citation_group_ids").map((citationId, citationIndex) => {
+                        const citation = citationsById.get(citationId);
+                        return citation ? citationButton(citation, citationIndex) : null;
+                      })}
+                    </div>
+                  </div>
+                ) : (
+                  <div className="mt-3 rounded-xl bg-slate-50 px-3 py-3 text-xs text-quiet">
+                    <p className="font-medium text-ink">暂无可验证结论</p>
+                    {arrayField(track, "reason_codes").map((reason) => (
+                      <p key={reason} className="mt-1">{marketingConclusionReasonLabel(reason)}</p>
+                    ))}
+                    <p className="mt-2">验证方向：{stringField(track, "verification_direction")}</p>
+                  </div>
+                )}
+              </section>
+            );
+          })}
+
+          {hasMarketingTracks && priorityAction && (
+            <section aria-label="优先行动建议" className="border-t border-line pt-4">
+              <h4 className="font-semibold">优先行动建议</h4>
+              <div className="mt-3 rounded-xl border border-[#c7d5cc] bg-[#f4f8f5] px-3 py-3">
+                <p className="text-xs font-semibold text-[#4f6f5f]">{stringField(priorityAction, "label", "建议")}</p>
+                <p className="mt-1 leading-6">{stringField(priorityAction, "statement")}</p>
+              </div>
+            </section>
+          )}
+
+          {findings.length > 0 && (
+            <section aria-label="核心发现" className="border-t border-line pt-4">
+              <h4 className="font-semibold">核心发现</h4>
+              <div className="mt-3 space-y-2">{findings.map((item, index) => card(item, index, false))}</div>
+            </section>
+          )}
+
+          {observations.length > 0 && (
+            <section aria-label="样本观察" className="border-t border-line pt-4">
+              <h4 className="font-semibold">样本观察</h4>
+              <div className="mt-3 space-y-2">{observations.map((item, index) => card(item, index, true))}</div>
+            </section>
+          )}
+
+          {leads.length > 0 && (
+            <section aria-label="线索" className="border-t border-line pt-4">
+              <h4 className="font-semibold">线索</h4>
+              {leads.map((item, index) => (
+                <details
+                  key={`lead-${index}`}
+                  className="mt-2 border-l-4 border-slate-300 bg-slate-50 px-3 py-2 text-xs leading-5 text-quiet"
+                >
+                  <summary className="cursor-pointer">{stringField(item, "statement", "证据尚不足以构成发现。")}</summary>
+                  {stringField(item, "direction") && <p className="mt-2">方向：{stringField(item, "direction")}</p>}
+                  {stringField(item, "sample_summary") && <p className="mt-1">样本范围：{stringField(item, "sample_summary")}</p>}
+                  <p className="mt-1">{stringField(item, "qualification_reason", "证据范围或样本门槛尚不足。")}</p>
+                  <p className="mt-1 font-medium text-ink">仅供参考，不构成结论。</p>
+                  <div className="mt-2 flex flex-wrap gap-2">
+                    {arrayField(item, "citation_group_ids").map((id, citationIndex) => {
+                      const citation = citationsById.get(id);
+                      return citation ? citationButton(citation, citationIndex) : null;
+                    })}
+                  </div>
+                </details>
+              ))}
+            </section>
+          )}
+
+          {directionStates.length > 0 && (
+            <section aria-label="方向状态" className="border-t border-line pt-4">
+              <h4 className="font-semibold">方向状态</h4>
+              <div className="mt-2 space-y-2">
+                {directionStates.map((item, index) => (
+                  <div key={`${stringField(item, "direction")}-${index}`} className="rounded-lg bg-slate-50 px-3 py-2 text-xs text-quiet">
+                    <p className="font-medium text-ink">{liteDirectionLabel(stringField(item, "direction", "未知方向"))} · {stringField(item, "state", "unavailable")}</p>
+                    {stringField(item, "reason_code") && <p className="mt-1">{stringField(item, "reason_code")}</p>}
+                    {stringField(item, "recovery_action") && <p className="mt-1">{stringField(item, "recovery_action")}</p>}
+                  </div>
+                ))}
+              </div>
+            </section>
+          )}
+
+          {!evidenceOnly && (
+            <section aria-label="范围与限制" className="border-t border-line pt-4">
+              <h4 className="font-semibold">范围与限制</h4>
+              <div className="mt-2 space-y-2 text-xs text-quiet">
+                {limitations.length
+                  ? limitations.map((item, index) => <p key={`limitation-${index}`}>{firstString(item, ["message", "reason", "summary"])}</p>)
+                  : <p>请在本次冻结样本与引用范围内理解结果。</p>}
+              </div>
+            </section>
+          )}
+
+          <section aria-label="证据与来源" className="border-t border-line pt-4">
+            <h4 className="font-semibold">{evidenceOnly ? "已保存依据" : "证据与来源"}</h4>
+            <div className="mt-2 flex flex-wrap gap-2">
+              {citations.map(citationButton)}
+              {citations.length === 0 && <span className="text-xs text-quiet">没有可展示的冻结引用。</span>}
+            </div>
+          </section>
+        </div>
+
+        {selectedCitation && (
+          <aside className="border-t border-line bg-slate-50 px-5 py-4" aria-label="Content Research citation evidence">
+            <div className="flex justify-between gap-3">
+              <p className="font-semibold">引用 [{String(selectedCitation.display_index ?? "—")}]</p>
+              <button type="button" onClick={() => setSelectedCitation(null)} aria-label="关闭引用依据">关闭</button>
+            </div>
+            {refs.length > 0 ? (
+              <div className="mt-3 space-y-2 border-t border-line pt-3">
+                <p className="text-xs font-semibold text-quiet">同组证据</p>
+                {refs.map((ref, index) => {
+                  const navigationState = stringField(ref, "navigation_state", "missing_source_url");
+                  const sourceUrl = stringField(ref, "source_url");
+                  return (
+                    <div key={`${stringField(ref, "source_text_hash")}-${index}`} className="rounded-lg bg-white px-3 py-2 text-xs text-quiet">
+                      <p>{stringField(ref, "quote", "已冻结证据")}</p>
+                      <div className="mt-1 flex flex-wrap gap-x-2">
+                        <span>{stringField(ref, "field_path", "字段未公开")}</span>
+                        <span>{stringField(ref, "source_collected_at", "采集时间未公开")}</span>
+                      </div>
+                      {sourceUrl && navigationState === "available" && (
+                        <a className="mt-1 inline-flex underline" href={sourceUrl} target="_blank" rel="noopener noreferrer">打开原笔记</a>
+                      )}
+                      {navigationState === "missing_source_url" && (
+                        <p className="mt-1">未保存来源链接；可查看原文片段与采集时间</p>
+                      )}
+                      {navigationState === "navigation_unavailable" && (
+                        <p className="mt-1">来源链接当前不可打开；可查看原文片段与采集时间</p>
+                      )}
+                      {stringField(ref, "navigation_reason") && <p className="mt-1">{stringField(ref, "navigation_reason")}</p>}
+                    </div>
+                  );
+                })}
+              </div>
+            ) : (
+              <p className="mt-3 text-xs text-quiet">该冻结引用未提供可展示的证据明细。</p>
+            )}
+          </aside>
+        )}
+      </article>
+    </div>
+  );
+}
+
+interface ContentResearchContextStage {
+  id: string;
+  title: string;
+  detail: string;
+  tone: "complete" | "warning" | "pending";
+}
+
+interface TraceTimelineStep {
+  id: string;
+  number: number;
+  stage: string;
+  title: string;
+  durationText: string;
+  status: string;
+  output: string;
+}
+
+type TraceProviderOperation = ContentResearchTrace["provider_operations"][number];
+
+interface ContentResearchRecoveryState {
+  providerFailure: TraceProviderOperation | null;
+  childFailure: Record<string, unknown> | null;
+  authRequired: boolean;
+  recoverable: boolean;
+}
+
+function traceStepTitle(stepName: string) {
+  if (stepName === "presearch") return "识别调研主体与候选方向";
+  if (stepName === "brief_confirm") return "确认调研 Brief";
+  if (stepName === "plan_build") return "拆解调研计划";
+  if (stepName === "formal_research") return "并行执行专家调研";
+  return stepName.replaceAll("_", " ");
+}
+
+function traceStepGroup(stepName: string) {
+  if (["presearch", "brief_confirm", "plan_build"].includes(stepName)) return "研究范围与计划";
+  if (stepName === "formal_research") return "来源收集与字段提取";
+  return "安全执行阶段";
+}
+
+function contentResearchTraceTimeline(trace: ContentResearchTrace | null): TraceTimelineStep[] {
+  const workflowEvents = recordList(trace?.workflow_events);
+  return recordList(trace?.runtime_steps).map((step, index) => {
+    const stepName = stringField(step, "step_name", "执行阶段");
+    const status = stringField(step, "status", "pending");
+    return {
+      id: stringField(step, "step_id", `${stepName}-${index}`),
+      number: index + 1,
+      stage: traceStepGroup(stepName),
+      title: traceStepTitle(stepName),
+      durationText: traceExecutionDurationText(step, workflowEvents),
+      status: workflowStatusLabel(status),
+      output: `状态：${workflowStatusLabel(status)}\n尝试：${numberField(step, "attempt_count")} / ${numberField(step, "max_attempts")}`,
+    };
+  });
+}
+
+function contentResearchRecoveryState(run: ContentResearchRunState): ContentResearchRecoveryState {
+  const published = run.report ? litePublicationState(run.report) !== null : false;
+  const providerFailures = [...(run.trace?.provider_operations ?? [])]
+    .reverse()
+    .filter((operation) => !["completed", "running", "pending"].includes(operation.status));
+  const providerFailure = (
+    !published && run.trace?.run_status !== "succeeded"
+      ? providerFailures[0] ?? null
+      : null
+  );
+  const childFailures = [...recordList(run.trace?.runtime_child_tasks)]
+    .reverse()
+    .filter((task) => stringField(task, "status") === "failed");
+  const childFailure = childFailures[0] ?? null;
+  const reportRecoveryReason = run.report?.recovery_projection
+    ? stringField(run.report.recovery_projection, "reason_code")
+    : "";
+  const authCodes = new Set(["auth_expired", "auth_required"]);
+  const childFailureCode = stringField(childFailure, "error_code");
+  const authChildFailure = childFailures.find((task) => authCodes.has(stringField(task, "error_code"))) ?? null;
+  const authProviderFailure = providerFailures.find((operation) => authCodes.has(operation.failure_code ?? "")) ?? null;
+  const authRequired = !published && Boolean(
+    authProviderFailure || authChildFailure || authCodes.has(reportRecoveryReason)
+  );
+  const selectedProviderFailure = authProviderFailure ?? providerFailure;
+  const recoverableCodes = new Set(["auth_expired", "auth_required", "timeout", "transient_error", "rate_limited", "unavailable"]);
+  const providerRecoverable = Boolean(selectedProviderFailure?.retryable && recoverableCodes.has(selectedProviderFailure.failure_code ?? ""));
+  const childRecoverable = childFailures.some((task) => recoverableCodes.has(stringField(task, "error_code")));
+  const reportRecoverable = recoverableCodes.has(reportRecoveryReason);
+  return {
+    providerFailure: selectedProviderFailure,
+    childFailure,
+    authRequired,
+    recoverable: !published && (providerRecoverable || childRecoverable || reportRecoverable),
+  };
+}
+
+function contentResearchContextStatus(run: ContentResearchRunState): string {
+  if (run.report) {
+    const state = litePublicationState(run.report);
+    if (state) return reportStateLabel(state);
+  }
+  const recovery = contentResearchRecoveryState(run);
+  if (recovery.authRequired) return "需要登录小红书网页端";
+  if (recovery.recoverable) return "部分专家任务可继续";
+  if (run.formalResearchStatus === "invalid") return "所属对话已不存在";
+  if (run.formalResearchStatus === "failed") return "专家调研启动失败";
+  if (run.trace?.run_status === "succeeded") return "专家调研已完成，等待正式报告";
+  if (run.trace?.run_status === "paused") return "专家调研已暂停";
+  if (run.trace?.run_status === "waiting_user") return "专家调研等待恢复";
+  if (run.formalResearchStatus === "collecting" || run.trace?.run_status === "running") return "专家调研进行中";
+  if (run.formalResearchStatus === "completed") return "专家调研已完成，等待正式报告";
+  return "等待启动";
+}
+
+function contentResearchChildTaskTitle(task: Record<string, unknown>) {
+  const taskType = stringField(task, "task_type", "专家任务");
+  if (taskType.includes("product_marketing")) return "产品营销专家";
+  if (taskType.includes("competitor_discovery")) return "竞品发现专家";
+  if (taskType.includes("content_performance")) return "内容表现专家";
+  return taskType.replaceAll("_", " ");
+}
+
+function contentResearchChildTaskStatus(task: Record<string, unknown>) {
+  if (["auth_expired", "auth_required"].includes(stringField(task, "error_code"))) return "需要登录";
+  return workflowStatusLabel(stringField(task, "status", "pending"));
+}
+
+function ContentResearchTraceInspector({
+  run,
+  expanded,
+  onExpandedChange,
+  onRefresh,
+  onRetry,
+}: {
+  run: ContentResearchRunState;
+  expanded: boolean;
+  onExpandedChange: (expanded: boolean) => void;
+  onRefresh: () => Promise<void>;
+  onRetry: () => Promise<void>;
+}) {
+  const [qrLogin, setQrLogin] = useState<{ status: string; image?: string | null } | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
+  const [resuming, setResuming] = useState(false);
+  const timeline = contentResearchTraceTimeline(run.trace);
+  const displayTimeline = [...timeline].reverse();
+  const recovery = contentResearchRecoveryState(run);
+  const childTasks = recordList(run.trace?.runtime_child_tasks);
+  const logicalCheckpoints = recordList(run.trace?.logical_checkpoints);
+  const marketingModelRecoveryRequired = marketingConclusionRecoveryRequired(run.trace);
+  const terminalPublished = run.report ? litePublicationState(run.report) !== null : false;
+  const [expandedStepId, setExpandedStepId] = useState<string | null>(null);
+  const refreshTraceRef = useRef(onRefresh);
+  const selectedStep = timeline.find((step) => step.id === expandedStepId) ?? timeline[timeline.length - 1] ?? null;
+
+  useEffect(() => {
+    refreshTraceRef.current = onRefresh;
+  }, [onRefresh]);
+
+  useEffect(() => {
+    setQrLogin(null);
+  }, [run.workflowRunId]);
+
+  useEffect(() => {
+    if (!recovery.authRequired || qrLogin !== null) return;
+    void getCurrentXHSQRLogin()
+      .then((value) => setQrLogin({ status: value.status, image: value.qr_image_data_url }))
+      .catch(() => undefined);
+  }, [recovery.authRequired, qrLogin]);
+
+  useEffect(() => {
+    if (qrLogin?.status !== "pending") return;
+    const refreshLoginStatus = () => void getCurrentXHSQRLogin()
+      .then((value) => setQrLogin({ status: value.status, image: value.qr_image_data_url }))
+      .catch(() => undefined);
+    refreshLoginStatus();
+    const timer = window.setInterval(refreshLoginStatus, 1500);
+    return () => window.clearInterval(timer);
+  }, [qrLogin?.status]);
+
+  useEffect(() => {
+    if (!expanded) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onExpandedChange(false);
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [expanded, onExpandedChange]);
+
+  useEffect(() => {
+    if (!expanded || terminalPublished) return;
+    const refresh = () => void refreshTraceRef.current().catch(() => undefined);
+    refresh();
+    const timer = window.setInterval(refresh, 3000);
+    return () => window.clearInterval(timer);
+  }, [expanded, run.workflowRunId, terminalPublished]);
+
+  if (!expanded) return null;
+
+  const startLogin = async () => {
+    const value = await startXHSQRLogin();
+    setQrLogin({ status: value.status, image: value.qr_image_data_url });
+  };
+  const refreshTrace = async () => {
+    if (refreshing) return;
+    setRefreshing(true);
+    try {
+      await onRefresh();
+    } finally {
+      setRefreshing(false);
+    }
+  };
+  const resumeRun = async () => {
+    if (resuming || terminalPublished) return;
+    if (recovery.authRequired && qrLogin?.status !== "authenticated") return;
+    setResuming(true);
+    try {
+      await onRetry();
+    } finally {
+      setResuming(false);
+    }
+  };
+  const authenticationControls = recovery.authRequired && !terminalPublished ? (
+    <div className="mt-3">
+      {qrLogin?.status !== "authenticated" && (
+        <button
+          type="button"
+          onClick={() => void startLogin()}
+          className="rounded-lg bg-[#486b5b] px-3 py-1.5 text-xs font-medium text-white"
+        >
+          扫码登录小红书
+        </button>
+      )}
+      {qrLogin?.image && qrLogin.status === "pending" && <>
+        <img src={qrLogin.image} alt="小红书登录二维码" className="mt-3 h-40 w-40 rounded bg-white p-2" />
+        <p className="mt-2 text-xs text-quiet">请在小红书 App 扫码并确认。</p>
+      </>}
+      {qrLogin?.status === "authenticated" && (
+        <button
+          type="button"
+          onClick={() => void resumeRun()}
+          disabled={resuming}
+          className="mt-3 block rounded-lg border border-[#486b5b] px-3 py-1.5 text-xs font-medium text-[#486b5b] disabled:opacity-40"
+        >
+          {resuming ? "继续中" : "登录成功，继续本轮调研"}
+        </button>
+      )}
+    </div>
+  ) : null;
+
+  return (
+    <section
+      className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/30 p-6"
+      aria-label="Content Research Trace"
+      onClick={(event) => {
+        if (event.target === event.currentTarget) onExpandedChange(false);
+      }}
+    >
+      <div
+        className="flex max-h-[min(760px,calc(100vh-48px))] w-full max-w-xl flex-col overflow-hidden rounded-2xl border border-line bg-white text-ink shadow-[0_24px_72px_rgba(15,23,42,0.20)]"
+        role="dialog"
+        aria-modal="true"
+        aria-label="Agent 决策日志 · Trace"
+        onClick={(event) => event.stopPropagation()}
+      >
+        <div className="flex items-center justify-between gap-3 bg-[#486b5b] px-4 py-3 text-white">
+          <div className="min-w-0 flex items-center gap-2">
+            <span className="text-lg leading-none">⌁</span>
+            <div className="min-w-0">
+              <p className="truncate text-base font-semibold">查看调研过程</p>
+              <p className="mt-0.5 truncate text-[11px] text-white/70">「{contentResearchSubject(run)}」</p>
+              <p className="mt-0.5 truncate text-[11px] text-white/70">workflow_run · {run.workflowRunId}</p>
+            </div>
+          </div>
+          <div className="flex shrink-0 items-center gap-2">
+            <button
+              type="button"
+              onClick={() => void refreshTrace()}
+              disabled={refreshing}
+              className="rounded-full bg-white/12 px-2.5 py-1 text-xs font-medium text-white hover:bg-white/20 disabled:opacity-40"
+            >
+              {refreshing ? "刷新中" : "刷新"}
+            </button>
+            <button
+              type="button"
+              onClick={() => onExpandedChange(false)}
+              className="flex h-7 w-7 items-center justify-center rounded-lg bg-white/12 text-lg leading-none text-white hover:bg-white/20"
+              aria-label="关闭 Trace 对话框"
+            >
+              ×
+            </button>
+          </div>
+        </div>
+
+        <div className="border-b border-line px-4 py-3 text-xs text-quiet">
+          <span className="truncate">当前进度：{contentResearchContextStatus(run)}</span>
+        </div>
+
+        <div className="min-h-0 flex-1 overflow-y-auto px-3 py-3">
+          {recovery.providerFailure && (
+            <article className="mb-3 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-ink" aria-label="采集异常诊断">
+              <p className="font-semibold">采集异常诊断</p>
+              <p className="mt-1 text-xs text-quiet">
+                {recovery.providerFailure.provider_operation ?? recovery.providerFailure.operation ?? "provider"} · {recovery.providerFailure.failure_code ?? recovery.providerFailure.failure_reason ?? recovery.providerFailure.status}
+              </p>
+              <p className="mt-2 text-xs leading-5 text-ink">
+                {recovery.authRequired ? "更新小红书登录态后继续。" : "该外部调用未产生可安全继续的结果，请先确认外部状态。"}
+              </p>
+              {authenticationControls}
+            </article>
+          )}
+          {!recovery.providerFailure && recovery.authRequired && (
+            <article className="mb-3 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-ink" aria-label="认证恢复">
+              <p className="font-semibold">需要登录小红书网页端</p>
+              <p className="mt-2 text-xs leading-5 text-ink">完成扫码认证后可继续同一轮调研。</p>
+              {authenticationControls}
+            </article>
+          )}
+
+          {logicalCheckpoints.length > 0 && (
+            <section className="mb-4" aria-label="结构化调研决策">
+              <p className="mb-2 text-xs font-semibold text-quiet">结构与覆盖决策</p>
+              <div className="space-y-2">
+                {logicalCheckpoints.map((checkpoint, index) => {
+                  const stage = stringField(checkpoint, "stage");
+                  const counts = checkpoint.counts && typeof checkpoint.counts === "object" && !Array.isArray(checkpoint.counts)
+                    ? checkpoint.counts as Record<string, unknown>
+                    : {};
+                  const title = stage === "subject_structure"
+                    ? "主题结构已确认"
+                    : stage === "query_plan"
+                      ? "检索计划已冻结"
+                      : stage === "coverage_decision"
+                        ? "证据覆盖判定"
+                        : stage === "fallback_decision"
+                          ? "补位检索判定"
+                          : stage === "marketing_conclusion"
+                            ? "营销结论判定"
+                            : "历史相关性修订";
+                  const marketingTracks = stage === "marketing_conclusion"
+                    ? Object.entries(checkpoint.tracks && typeof checkpoint.tracks === "object" && !Array.isArray(checkpoint.tracks)
+                      ? checkpoint.tracks as Record<string, unknown>
+                      : {}).flatMap(([track, value]) => {
+                        if (!value || typeof value !== "object" || Array.isArray(value)) return [];
+                        const outcome = value as Record<string, unknown>;
+                        const support = typeof outcome.supporting_note_count === "number" && typeof outcome.independent_author_count === "number"
+                          ? ` · ${outcome.supporting_note_count} 篇 / ${outcome.independent_author_count} 位作者`
+                          : "";
+                        return [`${marketingConclusionTrackLabel(track)}：${marketingConclusionStateLabel(stringField(outcome, "state"))}${support}`];
+                      })
+                    : [];
+                  const detail = stage === "query_plan"
+                    ? `主检索 ${numberField(checkpoint, "primary_group_count")} 组 · 补位 ${numberField(checkpoint, "fallback_group_count")} 组 · 合并 ${numberField(checkpoint, "merged_group_count")} 组`
+                    : stage === "coverage_decision"
+                      ? `发现 ${numberField(counts, "discovered")} · 去重 ${numberField(counts, "deduplicated")} · 相关 ${numberField(counts, "relevant")} · 准入 ${numberField(counts, "admitted")}`
+                      : stage === "fallback_decision"
+                        ? `Q3：${stringField(checkpoint, "state", "未启用")}`
+                        : stage === "marketing_conclusion"
+                          ? marketingTracks.length > 0
+                            ? marketingTracks.join("；")
+                            : `状态：${marketingConclusionStateLabel(stringField(checkpoint, "status"))}`
+                          : `状态：${stringField(checkpoint, "state", stringField(checkpoint, "status"))}`;
+                  const trackReasons = stage === "marketing_conclusion"
+                    ? Object.values(checkpoint.tracks && typeof checkpoint.tracks === "object" && !Array.isArray(checkpoint.tracks)
+                      ? checkpoint.tracks as Record<string, unknown>
+                      : {}).flatMap((value) => value && typeof value === "object" && !Array.isArray(value)
+                      ? arrayField(value as Record<string, unknown>, "reason_codes")
+                      : [])
+                    : [];
+                  const reasonCodes = [...arrayField(checkpoint, "reason_codes"), ...trackReasons];
+                  const reasons = reasonCodes.map(stage === "marketing_conclusion" ? marketingConclusionReasonLabel : coverageReasonLabel);
+                  return (
+                    <article key={`${stage}-${index}`} className="rounded-xl border border-line bg-white px-3 py-2.5 text-xs">
+                      <div className="flex items-center justify-between gap-3"><p className="font-medium text-ink">{title}</p><span className="text-quiet">{stringField(checkpoint, "status")}</span></div>
+                      <p className="mt-1 leading-5 text-quiet">{detail}</p>
+                      {reasons.length > 0 && <p className="mt-1 leading-5 text-amber-700">{reasons.join("·")}</p>}
+                    </article>
+                  );
+                })}
+              </div>
+            </section>
+          )}
+
+          <section aria-label="Content Research Trace timeline">
+            <p className="mb-2 text-xs font-semibold text-quiet">执行时间线</p>
+            {displayTimeline.length ? (
+              <div className="space-y-3">
+                {displayTimeline.map((step) => {
+                  const isExpanded = selectedStep?.id === step.id;
+                  return (
+                    <article
+                      key={step.id}
+                      className={[
+                        "rounded-2xl border bg-white px-3 py-3 text-sm shadow-sm transition",
+                        isExpanded ? "border-[#9fb8aa] ring-2 ring-[#e4eee8]" : "border-line hover:border-[#c7d5cc]",
+                      ].join(" ")}
+                    >
+                      <button type="button" onClick={() => setExpandedStepId(isExpanded ? null : step.id)} className="w-full text-left">
+                        <div className="flex items-start justify-between gap-3">
+                          <div className="flex min-w-0 gap-2.5">
+                            <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-[#e8f1ea] text-xs font-semibold text-[#4f6f5f]">{step.number}</span>
+                            <div className="min-w-0"><span className="block text-xs text-quiet">{step.stage}</span><span className="mt-0.5 block font-semibold leading-5 text-ink">{step.title}</span><span className="mt-2 block text-xs text-quiet">内容调研 · {step.status}</span></div>
+                          </div>
+                          <div className="flex shrink-0 flex-col items-end gap-1 text-sm text-quiet"><span>{step.durationText}</span><span className="text-lg leading-none">{isExpanded ? "⌃" : "⌄"}</span></div>
+                        </div>
+                      </button>
+                      {isExpanded && <div className="mt-4 border-t border-line pt-4"><p className="text-xs font-semibold tracking-wide text-quiet">安全执行状态</p><pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap rounded-xl bg-slate-50 px-3 py-3 text-xs leading-5 text-ink">{step.output}</pre></div>}
+                    </article>
+                  );
+                })}
+              </div>
+            ) : (
+              <div className="rounded-2xl border border-line bg-slate-50 px-4 py-5 text-sm text-quiet">暂无 trace 记录。确认 brief 后会自动写入执行轨迹。</div>
+            )}
+          </section>
+
+          {childTasks.length > 0 && (
+            <section className="mt-4" aria-label="内容调研子任务状态">
+              <p className="mb-2 text-xs font-semibold text-quiet">专家子任务</p>
+              <div className="space-y-2">
+                {childTasks.map((task, index) => (
+                  <article key={stringField(task, "child_task_id", String(index))} className="rounded-xl border border-line bg-white px-3 py-3 text-xs" aria-label="内容调研子任务">
+                    <div className="flex items-center justify-between gap-3"><p className="font-medium text-ink">{contentResearchChildTaskTitle(task)}</p><span className="text-quiet">{contentResearchChildTaskStatus(task)}</span></div>
+                    <p className="mt-1 text-quiet">尝试 {numberField(task, "attempt_count")} / {numberField(task, "max_attempts")}</p>
+                  </article>
+                ))}
+              </div>
+            </section>
+          )}
+
+          {recovery.recoverable && !recovery.authRequired && !marketingModelRecoveryRequired && !terminalPublished && (
+            <div className="mt-4 flex justify-end">
+              <button type="button" onClick={() => void resumeRun()} disabled={resuming} className="rounded-lg bg-ink px-3 py-1.5 text-xs font-medium text-white disabled:opacity-40">
+                {resuming ? "继续中" : "继续本轮调研"}
+              </button>
+            </div>
+          )}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function contentResearchContextStages(report: ContentResearchLiteReportResponse): ContentResearchContextStage[] {
+  const state = litePublicationState(report);
+  if (!state) return [];
+  return [
+    {
+      id: "scope",
+      title: "范围与检索冻结",
+      detail: `${report.citations.length} 条冻结引用可追溯。`,
+      tone: "complete",
+    },
+    {
+      id: "governance",
+      title: "证据准入与归纳",
+      detail: `${numberField(report.status_strip, "admitted_finding_count")} 条已准入发现已进入报告。`,
+      tone: "complete",
+    },
+    {
+      id: "publication",
+      title: "报告发布与范围",
+      detail: `${reportStateLabel(state)}；请结合报告中的范围与限制使用。`,
+      tone: state !== "complete_verified_report" ? "warning" : "complete",
+    },
+  ];
+}
+
+function ContentResearchContextSidebar({
+  run,
+  onExpandedChange,
+  onModifyDirections,
+  recoveryPending = false,
+  recoveryRequiredSince = null,
+  onContinuePresearch = async () => {},
+}: {
+  run: ContentResearchRunState;
+  onExpandedChange: (expanded: boolean) => void;
+  onModifyDirections: () => void;
+  recoveryPending?: boolean;
+  recoveryRequiredSince?: string | null;
+  onContinuePresearch?: () => void | Promise<void>;
+}) {
+  const report = run.report;
+  const published = report ? litePublicationState(report) !== null : false;
+  const evidenceOnly = report ? litePublicationState(report) === "evidence_only_report" : false;
+  const stages = report && !evidenceOnly ? contentResearchContextStages(report) : [];
+  const requestedDirectionCount = report ? selectRequestedDirectionStates(report).length : 0;
+
+  return (
+    <aside className="hidden w-[300px] shrink-0 overflow-y-auto border-l border-line bg-slate-50 p-4 lg:block" aria-label="内容调研上下文">
+      <h2 className="mb-3 text-sm font-semibold text-ink">研究运行 / Trace</h2>
+      <section className="mb-4 rounded-xl border border-line bg-white p-4" aria-label="内容调研运行摘要">
+        <p className="text-sm font-semibold text-ink">{contentResearchContextStatus(run)}</p>
+        <p className="mt-1 text-xs leading-5 text-quiet">主体：{contentResearchSubject(run)}</p>
+        {stages.length > 0 && <div className="mt-3 border-t border-line pt-2">
+          {stages.map((stage) => <div key={stage.id} className="grid grid-cols-[12px_1fr] gap-2 py-2 text-xs">
+            <span className={[
+              "mt-1.5 h-2 w-2 rounded-full",
+              stage.tone === "complete" ? "bg-[#4f6f5f]" : stage.tone === "warning" ? "bg-amber-500" : "bg-slate-300",
+            ].join(" ")} aria-hidden="true" />
+            <div><p className="font-medium text-ink">{stage.title}</p><p className="mt-0.5 leading-5 text-quiet">{stage.detail}</p></div>
+          </div>)}
+        </div>}
+        {!published && <p className="mt-3 border-t border-line pt-3 text-xs leading-5 text-quiet">研究摘要将在正式报告发布后显示。</p>}
+        {run.formalResearchStatus === "invalid" ? <p className="mt-3 text-xs leading-5 text-quiet">该历史任务不能继续。请新建或选择有效对话后重新发起调研。</p> : null}
+        {run.formalResearchStatus === "failed" && <button type="button" onClick={onModifyDirections} className="mt-3 rounded-lg border border-line px-3 py-1.5 text-xs">返回 checklist</button>}
+        {run.reportStatus === "failed" && run.reportError && (
+          <p className="mt-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs leading-5 text-red-700">
+            正式报告暂不可读取：{run.reportError}
+          </p>
+        )}
+        <button type="button" onClick={() => onExpandedChange(true)} className="mt-3 w-full border-t border-line pt-3 text-left text-xs font-semibold text-blue-600 hover:text-blue-700" aria-label="查看完整 workflow trace">查看完整 workflow trace →</button>
+      </section>
+
+      <section className="mb-4 rounded-xl border border-line bg-white p-4 text-ink" aria-label="Content Research Trace inspector">
+        <div className="flex items-start justify-between gap-3">
+          <button type="button" onClick={() => onExpandedChange(true)} className="min-w-0 flex-1 text-left" aria-label="展开 Content Research Trace">
+            <p className="text-sm font-semibold">证据与 Trace</p>
+            <p className="mt-1 text-xs text-quiet">{contentResearchTraceTimeline(run.trace).length} 条执行记录 · {contentResearchContextStatus(run)}</p>
+          </button>
+          <button type="button" onClick={() => onExpandedChange(true)} className="rounded-lg border border-line px-2 py-1 text-xs hover:bg-slate-50" aria-label="查看 Trace">查看 Trace</button>
+        </div>
+      </section>
+
+      <h2 className="mb-3 text-sm font-semibold text-ink">本次研究摘要</h2>
+      <section className="mb-4 rounded-xl border border-line bg-white p-4" aria-label="内容调研研究摘要">
+        {report && published ? <ul className="space-y-2 text-xs leading-5 text-quiet">
+          <li>{evidenceOnly ? numberField(report.status_strip, "saved_evidence_count") : report.citations.length} 条冻结引用</li>
+          {!evidenceOnly && <li>{numberField(report.status_strip, "admitted_finding_count")} 条已准入发现</li>}
+          {!evidenceOnly && <li>{requestedDirectionCount} 个请求方向状态</li>}
+          {!evidenceOnly && <li>{numberField(report.status_strip, "lead_count")} 条初步信号</li>}
+        </ul> : <p className="text-xs leading-5 text-quiet">暂无已发布报告；此处不会显示未冻结的来源、结论或指标。</p>}
+      </section>
+      <ModelServiceCard recoveryPending={recoveryPending} recoveryRequiredSince={recoveryRequiredSince} onContinue={onContinuePresearch} onConfigurationChanged={() => undefined} />
+      <XiaohongshuLoginCard />
+    </aside>
+  );
+}
+
 export default function CreatorPage() {
   const { selectedBrandId } = useBrandContext();
   const [threads, setThreads] = useState<CreatorThreadSummary[]>([]);
   const [activeThreadId, setActiveThreadId] = useState<string | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([WELCOME_MESSAGE]);
   const [input, setInput] = useState("");
+  const [contentResearchMode, setContentResearchMode] = useState(false);
+  const [contentResearchIntent, setContentResearchIntent] = useState<ContentResearchIntentState | null>(null);
+  const [contentResearchRun, setContentResearchRun] = useState<ContentResearchRunState | null>(null);
+  const [traceExpanded, setTraceExpanded] = useState(false);
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
   const [editingText, setEditingText] = useState("");
   const [activeMenuId, setActiveMenuId] = useState<string | null>(null);
@@ -440,6 +1983,25 @@ export default function CreatorPage() {
   const isTaskRunning = task?.status === "running" || task?.status === "paused";
   const showTaskCard = task?.status === "running" || task?.status === "paused" || task?.status === "failed";
   const allArtifactRefs = collectArtifactRefs(messages);
+  const modelRecovery = resolveContentResearchModelRecovery({
+    transientPresearch: contentResearchIntent
+      ? {
+          workflowRunId: contentResearchIntent.presearch.workflow_run_id,
+          status: contentResearchIntent.presearch.status,
+        }
+      : null,
+    durableRun: contentResearchRun
+      ? {
+          workflowRunId: contentResearchRun.workflowRunId,
+          llmRecovery: marketingConclusionRecoveryRequired(contentResearchRun.trace)
+            ? {
+                required: true,
+                required_since: contentResearchRun.trace?.llm_recovery?.required_since ?? null,
+              }
+            : contentResearchRun.trace?.llm_recovery,
+        }
+      : null,
+  });
 
   useEffect(() => { taskRef.current = task; }, [task]);
   useEffect(() => { activeThreadIdRef.current = activeThreadId; }, [activeThreadId]);
@@ -450,14 +2012,68 @@ export default function CreatorPage() {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, generatedResult]);
 
-  // Load thread list on mount; auto-select most recent
   useEffect(() => {
-    listThreads(selectedBrandId)
-      .then((items) => {
+    let cancelled = false;
+
+    async function loadInitialThread() {
+      const workflowRunId = new URLSearchParams(window.location.search).get("contentResearchRunId")?.trim() || null;
+      let restoredThreadId: string | null = null;
+      let workflowRestoreError: string | null = null;
+      if (workflowRunId) {
+        try {
+          const workflow = await getContentResearchWorkflow(workflowRunId);
+          if (cancelled) return;
+          restoredThreadId = workflow.brief.thread_id;
+          saveContentResearchRunForThread(restoredThreadId, workflowRunId);
+        } catch (error) {
+          if (isExpectedLiteReportAbsence(error)) {
+            // A broken direct link must not reuse an unrelated thread's run.
+            restoredThreadId = "__content_research_run_not_found__";
+          } else {
+            workflowRestoreError = error instanceof Error ? error.message : "运行读取失败";
+            restoredThreadId = contentResearchThreadForRun(workflowRunId)
+              ?? "__content_research_run_restore_failed__";
+          }
+        }
+      }
+
+      try {
+        // A direct run link is authoritative: its thread may predate brand
+        // scoping and therefore have no brand_id. The normal Creator landing
+        // page keeps the selected-brand filter for its history list.
+        const items = await listThreads(workflowRunId ? null : selectedBrandId);
+        if (cancelled) return;
         setThreads(items);
-        if (items.length > 0) void selectThread(items[0].thread_id);
-      })
-      .catch(() => {});
+        // A user can create/send while the initial list is still in flight.
+        // Never let late hydration reset that live presearch interaction.
+        if (activeThreadIdRef.current) return;
+        if (restoredThreadId) {
+          const restoredThread = items.find((item) => item.thread_id === restoredThreadId);
+          if (restoredThread) {
+            await selectThread(restoredThread.thread_id);
+          } else {
+            // Do not silently replace a requested report with the first thread.
+            resetConversation();
+            setActiveThreadId(null);
+            setMessages([
+              WELCOME_MESSAGE,
+              workflowRestoreError
+                ? { id: "content-research-run-restore-failed", role: "system", text: `内容调研运行暂不可读取：${workflowRestoreError}` }
+                : { id: "content-research-run-thread-unavailable", role: "system", text: "该内容调研所属对话不可访问，未切换到其他对话。" },
+            ]);
+          }
+          return;
+        }
+        if (items.length > 0) await selectThread(items[0].thread_id);
+      } catch {
+        // Keep the initial welcome state if the thread list cannot be read.
+      }
+    }
+
+    void loadInitialThread();
+    return () => {
+      cancelled = true;
+    };
   }, [selectedBrandId]);
 
   // SSE subscription — active only while task is running
@@ -519,7 +2135,7 @@ export default function CreatorPage() {
             });
           })
           .catch(() => {
-            appendMessage({ role: "assistant", text: "任务完成，但读取结果失败，请刷新页面重试。" });
+            appendMessage({ role: "assistant", text: "任务完成，但读取结果失败，请刷新页面后继续查看。" });
           });
       },
       onFailed: () => {
@@ -549,6 +2165,17 @@ export default function CreatorPage() {
     setMessages((current) => [...current, { ...message, id: createId("msg") }]);
   }
 
+  function appendLiteReportMessage(report: ContentResearchLiteReportResponse) {
+    const reportId = report.workflow_run_id;
+    setMessages((current) => {
+      const existing = current.findIndex((message) => message.report?.workflow_run_id === reportId);
+      if (existing < 0) {
+        return [...current, { id: `report-${reportId}`, role: "assistant", text: "", messageType: "artifact_result", report }];
+      }
+      return current.map((message, index) => index === existing ? { ...message, report } : message);
+    });
+  }
+
   function applySnapshot(snapshot: WorkflowRunSnapshot | null | undefined, threadId: string) {
     if (!snapshot) return;
     const nextTask = taskFromSnapshot(snapshot);
@@ -566,11 +2193,287 @@ export default function CreatorPage() {
   }
 
   function resetConversation() {
+    // Switching conversations must not erase another thread's resumable research run.
     setMessages([WELCOME_MESSAGE]);
+    setContentResearchIntent(null);
+    setContentResearchRun(null);
+    setTraceExpanded(false);
     setTask(null);
     setStatusLog([]);
     setGeneratedResult(null);
     setIsAccepted(false);
+  }
+
+  async function refreshContentResearchTrace(workflowRunId: string) {
+    const trace = await getContentResearchTrace(workflowRunId);
+    setContentResearchRun((current) =>
+      current && current.workflowRunId === workflowRunId
+        ? { ...current, trace }
+        : current
+    );
+    return trace;
+  }
+
+  async function refreshContentResearchReport(workflowRunId: string): Promise<ContentResearchLiteReportResponse | null> {
+    setContentResearchRun((current) =>
+      current && current.workflowRunId === workflowRunId
+        ? { ...current, reportStatus: "loading", reportError: null }
+        : current
+    );
+    try {
+      const report = await getContentResearchLiteReportWithRetry(workflowRunId);
+      appendLiteReportMessage(report);
+      setContentResearchRun((current) =>
+        current && current.workflowRunId === workflowRunId
+          ? {
+              ...current,
+              report,
+              reportStatus: "ready",
+              reportError: null,
+            }
+          : current
+      );
+      return report;
+    } catch (error) {
+      const unavailable = isExpectedLiteReportAbsence(error);
+      setContentResearchRun((current) =>
+        current && current.workflowRunId === workflowRunId
+          ? {
+              ...current,
+              reportStatus: unavailable ? "unavailable" : "failed",
+              reportError: unavailable ? null : error instanceof Error ? error.message : "报告读取失败",
+            }
+          : current
+      );
+      if (unavailable) return null;
+      throw error;
+    }
+  }
+
+  async function pollContentResearchReport(
+    workflowRunId: string,
+    { requirePublication = false }: { requirePublication?: boolean } = {}
+  ): Promise<ContentResearchLiteReportResponse | null> {
+    for (let attempt = 0; attempt < 120; attempt += 1) {
+      const report = await refreshContentResearchReport(workflowRunId);
+      if (
+        report
+        && (
+          litePublicationState(report)
+          || (!requirePublication && report.publication.state === null && report.recovery_projection)
+        )
+      ) {
+        return report;
+      }
+      await new Promise<void>((resolve) => window.setTimeout(resolve, 1000));
+    }
+    return null;
+  }
+
+  async function startContentResearchForRun(workflowRunId: string) {
+    setContentResearchRun((current) =>
+      current && current.workflowRunId === workflowRunId ? { ...current, formalResearchStatus: "collecting" } : current
+    );
+    let formalResearch: ContentResearchFormalResearchResponse | null = null;
+    try {
+      formalResearch = await startContentResearchFormalResearch(workflowRunId, {
+        source_kind: "search_result",
+        sort: "likes",
+        provider: "xiaohongshu",
+      });
+    } catch (error) {
+      const detail = error instanceof Error && error.message.trim() ? error.message.trim() : "未知运行时错误";
+      if (isUncertainContentResearchDispatchFailure(detail)) {
+        appendMessage({
+          role: "system",
+          text: "调研已入队，正在读取运行状态；无需重复发起调研。",
+        });
+      } else {
+        const failure = contentResearchStartFailure(detail);
+        setContentResearchRun((current) =>
+          current && current.workflowRunId === workflowRunId ? { ...current, formalResearchStatus: failure.status } : current
+        );
+        appendMessage({ role: "system", text: failure.message });
+        return;
+      }
+    }
+    if (formalResearch) {
+      setContentResearchRun((current) =>
+        current && current.workflowRunId === workflowRunId
+          ? {
+              ...current,
+              formalResearch,
+              formalResearchStatus: formalResearchStatus(formalResearch),
+            }
+          : current
+      );
+    }
+    try {
+      await refreshContentResearchTrace(workflowRunId);
+    } catch {
+      // Dispatch succeeded; Trace remains available through manual refresh.
+    }
+    try {
+      const projection = await pollContentResearchReport(workflowRunId);
+      if (projection && litePublicationState(projection)) {
+        setContentResearchRun((current) =>
+          current && current.workflowRunId === workflowRunId
+            ? { ...current, formalResearchStatus: "completed" }
+            : current
+        );
+      }
+      if (formalResearch?.status === "failed") {
+        setStatusLog((log) => [...log, `${formalResearch.failed_tasks.length} 个专家任务未完成。`].slice(-6));
+      } else if (formalResearch) {
+        setStatusLog((log) => [...log, `已提交 ${formalResearch.task_count} 个专家的独立采集与分析。`].slice(-6));
+      }
+    } catch (error) {
+      appendMessage({
+        role: "system",
+        text: `调研已启动，但正式报告读取失败：${error instanceof Error ? error.message : "未知错误"}`,
+      });
+    }
+  }
+
+  async function resumeContentResearchForRun(workflowRunId: string) {
+    setContentResearchRun((current) =>
+      current && current.workflowRunId === workflowRunId
+        ? { ...current, formalResearchStatus: "collecting", reportError: null }
+        : current
+    );
+    try {
+      if (contentResearchRun?.trace?.run_status === "waiting_user") {
+        const source = contentResearchRun.summary.plan?.payload ?? {};
+        await retryContentResearchFormalResearch(workflowRunId, {
+          provider: stringField(source, "provider", "xiaohongshu"),
+          source_kind: stringField(source, "source_kind", "search_result"),
+          limit: numberField(source, "limit") || 20,
+        });
+      } else {
+        await resumeContentResearchFormalResearch(workflowRunId);
+      }
+      try {
+        await refreshContentResearchTrace(workflowRunId);
+      } catch {
+        // Resume succeeded; a transient read must not trigger another action.
+      }
+      const report = await pollContentResearchReport(workflowRunId, { requirePublication: true });
+      if (report && litePublicationState(report)) {
+        setContentResearchRun((current) =>
+          current && current.workflowRunId === workflowRunId
+            ? { ...current, formalResearchStatus: "completed" }
+            : current
+        );
+      }
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : "未知错误";
+      appendMessage({ role: "system", text: `继续调研失败：${detail}` });
+    }
+  }
+
+  async function repairContentResearchForRun(workflowRunId: string) {
+    try {
+      await repairContentResearchFromPersistedPackets(workflowRunId);
+      const report = await pollContentResearchReport(workflowRunId, { requirePublication: true });
+      if (report) appendLiteReportMessage(report);
+      await refreshContentResearchTrace(workflowRunId);
+    } catch (error) {
+      appendMessage({ role: "system", text: `已有笔记重新处理失败：${error instanceof Error ? error.message : "未知错误"}` });
+    }
+  }
+
+  async function modifyContentResearchDirections() {
+    const run = contentResearchRun;
+    if (!run || !activeThreadId) return;
+    const payload = run.summary.brief.payload;
+    const subject = stringField(payload, "seed_text") ||
+      stringField(payload, "confirmed_subject") ||
+      stringField(payload, "subject_confirmation") ||
+      run.summary.brief.id;
+    const competitors = [
+      ...arrayField(payload, "selected_competitors"),
+      ...arrayField(payload, "custom_competitors"),
+      ...arrayField(payload, "competitor_tags"),
+    ];
+    const directions = arrayField(payload, "selected_directions").length
+      ? arrayField(payload, "selected_directions")
+      : arrayField(payload, "research_directions");
+    try {
+      await endContentResearchWorkflow(run.workflowRunId);
+      removeContentResearchRunForThread(run.summary.brief.thread_id);
+      const presearch = await createContentResearchPresearch({ seed_text: subject, user_note: null, thread_id: activeThreadId });
+      setContentResearchIntent({ seed: subject, presearch: { ...presearch, competitor_tags: [...new Set([...presearch.competitor_tags, ...competitors])], research_directions: directions.length ? directions : presearch.research_directions } });
+      setContentResearchRun(null);
+      setTraceExpanded(false);
+      appendMessage({ role: "assistant", text: "已新建一轮调研 checklist，可以修改主体、竞品或调研方向后重新确认。" });
+    } catch {
+      appendMessage({ role: "system", text: "回到 checklist 失败，请稍后重试。" });
+    }
+  }
+
+  async function endActiveContentResearch() {
+    const run = contentResearchRun;
+    if (!run) return;
+    try {
+      await endContentResearchWorkflow(run.workflowRunId);
+      removeContentResearchRunForThread(run.summary.brief.thread_id);
+      setContentResearchRun(null);
+      setContentResearchIntent(null);
+      setTraceExpanded(false);
+      appendMessage({ role: "assistant", text: "已结束本次内容调研，并清除当前线程的调研恢复入口。" });
+    } catch (error) {
+      appendMessage({
+        role: "system",
+        text: `结束本次调研失败：${error instanceof Error ? error.message : "请稍后重试。"}`,
+      });
+    }
+  }
+
+  async function handleContentResearchConfirmed(summary: ContentResearchWorkflowSummary) {
+    setContentResearchIntent(null);
+    saveContentResearchRunForThread(summary.brief.thread_id, summary.workflow_run_id);
+    setContentResearchRun({
+      workflowRunId: summary.workflow_run_id,
+      summary,
+      trace: null,
+      formalResearch: null,
+      formalResearchStatus: "idle",
+      report: null,
+      reportStatus: "idle",
+      reportError: null,
+    });
+    setTraceExpanded(false);
+    appendMessage({
+      role: "assistant",
+      text: "已确认调研范围，正在开始内容调研。",
+    });
+    try {
+      await refreshContentResearchTrace(summary.workflow_run_id);
+    } catch {
+      appendMessage({ role: "system", text: "调研过程暂时不可用，稍后可在 Trace 中刷新。" });
+    }
+    void startContentResearchForRun(summary.workflow_run_id);
+  }
+
+  async function continueModelRecovery() {
+    const workflowRunId = modelRecovery.workflowRunId;
+    if (!workflowRunId) return;
+    if (
+      contentResearchRun?.workflowRunId === workflowRunId
+      && marketingConclusionRecoveryRequired(contentResearchRun.trace)
+    ) {
+      await resumeContentResearchForRun(workflowRunId);
+      return;
+    }
+    const presearch = await retryContentResearchPresearch(workflowRunId);
+    const durablePayload = contentResearchRun?.summary.brief.payload ?? {};
+    const seed = contentResearchIntent?.seed
+      || stringField(durablePayload, "seed_text")
+      || stringField(durablePayload, "subject_confirmation")
+      || "本轮调研";
+    setContentResearchIntent({ seed, presearch });
+    setContentResearchRun(null);
+    setTraceExpanded(false);
   }
 
   async function selectThread(threadId: string) {
@@ -582,8 +2485,100 @@ export default function CreatorPage() {
       const { thread, messages: history } = await getThreadTimeline(threadId);
       // Discard stale response if user already switched to another thread
       if (loadingThreadRef.current !== threadId) return;
+      let restoredRunId: string | null = null;
+      let latestReport: ContentResearchLiteReportResponse | null = null;
+      let latestFailure: { messageId: string; workflowRunId: string; error: string } | undefined;
       if (history.length > 0) {
-        setMessages(history.map(chatMessageFromRecord));
+        const timelineMessages = history.map(chatMessageFromRecord);
+        const artifactRunIds = history
+          .filter((message) => message.message_type === "artifact_result" && message.run_id)
+          .map((message) => message.run_id as string);
+        const reports = await Promise.all(history.map(async (message) => {
+          if (message.message_type !== "artifact_result" || !message.run_id) return null;
+          try {
+            return { messageId: message.message_id, report: await getContentResearchLiteReportWithRetry(message.run_id) };
+          } catch (error) {
+            return { messageId: message.message_id, workflowRunId: message.run_id, error: error instanceof Error ? error.message : "报告读取失败" };
+          }
+        }));
+        if (loadingThreadRef.current !== threadId) return;
+        const reportResults = reports.filter((value): value is { messageId: string; report: ContentResearchLiteReportResponse } => value !== null && "report" in value);
+        const reportByMessageId = new Map(reportResults.map((value) => [value.messageId, value.report]));
+        const reportFailures = reports.filter((value): value is { messageId: string; workflowRunId: string; error: string } => value !== null && "error" in value);
+        const visibleFailures = reportFailures.filter(
+          (failure) => !isContentResearchReportPending(new Error(failure.error))
+        );
+        setMessages([
+          ...timelineMessages.map((message) => ({ ...message, report: reportByMessageId.get(message.id) })),
+          ...visibleFailures.map((failure) => ({ id: `report-error-${failure.messageId}`, role: "system" as const, text: `正式报告暂不可读取：${failure.error}` })),
+        ]);
+        latestReport = reportResults[reportResults.length - 1]?.report ?? null;
+        latestFailure = visibleFailures[visibleFailures.length - 1];
+        restoredRunId = latestReport?.workflow_run_id ?? artifactRunIds[artifactRunIds.length - 1] ?? null;
+      }
+      // The workflow API is the authority for classifying this durable run.
+      // A legacy Creator run simply returns the documented Content Research
+      // 404 and is hydrated by the legacy snapshot path below.
+      const durableContentResearchRunId = thread.active_run_id ?? null;
+      const runIdForThread =
+        restoredRunId
+        ?? contentResearchRunForThread(threadId)
+        ?? durableContentResearchRunId;
+      if (runIdForThread) {
+        try {
+          const workflow = await getContentResearchWorkflow(runIdForThread);
+          if (loadingThreadRef.current !== threadId || workflow.brief.thread_id !== threadId) return;
+          saveContentResearchRunForThread(threadId, runIdForThread);
+          let trace: ContentResearchTrace | null = null;
+          try {
+            trace = await getContentResearchTrace(runIdForThread);
+          } catch {
+            // Workflow/report restoration remains usable when Trace is temporarily unavailable.
+          }
+          if (!latestReport && !latestFailure) {
+            try {
+              const projection = await getContentResearchLiteReportWithRetry(runIdForThread);
+              if (
+                litePublicationState(projection)
+                || (projection.publication.state === null && projection.recovery_projection)
+              ) {
+                latestReport = projection;
+                appendLiteReportMessage(projection);
+              }
+            } catch (error) {
+              if (!isExpectedLiteReportAbsence(error)) {
+                const detail = error instanceof Error ? error.message : "报告读取失败";
+                latestFailure = {
+                  messageId: `active-${runIdForThread}`,
+                  workflowRunId: runIdForThread,
+                  error: detail,
+                };
+                appendMessage({ role: "system", text: `正式报告暂不可读取：${detail}` });
+              }
+            }
+          }
+          const restoredRun = contentResearchRunWithReport(runIdForThread, workflow, trace, null, latestReport);
+          // A historical artifact can outlive its readable publication. Keep
+          // the restored workflow visible and expose the report failure; do
+          // not silently substitute a legacy result or clear the Timeline.
+          if (latestFailure) {
+            setContentResearchRun({
+              ...restoredRun,
+              reportStatus: "failed",
+              reportError: latestFailure.error,
+            });
+          } else {
+            setContentResearchRun(restoredRun);
+          }
+        } catch (error) {
+          if (isExpectedLiteReportAbsence(error)) {
+            removeContentResearchRunForThread(threadId);
+          } else {
+            const detail = error instanceof Error ? error.message : "运行读取失败";
+            appendMessage({ role: "system", text: `内容调研运行暂不可读取：${detail}` });
+          }
+          // The Timeline report remains visible even if an old workflow summary is unavailable.
+        }
       }
       if (thread.status === "accepted") {
         setIsAccepted(true);
@@ -598,7 +2593,9 @@ export default function CreatorPage() {
           .catch(() => {});
       }
 
-      if (thread.active_run_id && thread.status !== "accepted") {
+      // Content Research also records its own run id on the thread. Only the
+      // legacy workflow has a session and may hydrate the legacy task card.
+      if (thread.active_workflow_session_id && thread.active_run_id && thread.status !== "accepted") {
         const snapshot = await getWorkflowRunSnapshot(thread.active_run_id, threadId);
         if (loadingThreadRef.current !== threadId) return;
         applySnapshot(snapshot, threadId);
@@ -612,6 +2609,7 @@ export default function CreatorPage() {
     try {
       const created = await createThread(undefined, selectedBrandId);
       addThreadToState(created.thread_id, created.title);
+      activeThreadIdRef.current = created.thread_id;
       setActiveThreadId(created.thread_id);
       resetConversation();
     } catch {
@@ -642,6 +2640,7 @@ export default function CreatorPage() {
         : firstMessage;
       const created = await createThread(title, selectedBrandId);
       addThreadToState(created.thread_id, created.title);
+      activeThreadIdRef.current = created.thread_id;
       setActiveThreadId(created.thread_id);
       return created.thread_id;
     } catch {
@@ -665,6 +2664,28 @@ export default function CreatorPage() {
     const threadId = await ensureThread(text);
     if (!threadId) {
       setIsLoading(false);
+      return;
+    }
+
+    if (contentResearchMode) {
+      try {
+        appendMessage({
+          role: "assistant",
+          text: "我会先做一次轻量预检索，确认你要研究的主体、竞品范围和调研方向。这个阶段不会生成正式结论。",
+        });
+        const result = await createContentResearchPresearch({
+          seed_text: text,
+          user_note: null,
+          thread_id: threadId,
+        });
+        setContentResearchIntent({ seed: text, presearch: result });
+        setContentResearchMode(false);
+      } catch {
+        appendMessage({ role: "system", text: "内容调研预检索失败，请检查 runtime 或小红书登录态。" });
+      } finally {
+        setIsLoading(false);
+        inputRef.current?.focus();
+      }
       return;
     }
 
@@ -904,7 +2925,6 @@ export default function CreatorPage() {
         {/* Chat message feed */}
         <div className="flex-1 overflow-y-auto px-4 py-6 md:px-6">
           <div className="mx-auto flex max-w-3xl flex-col gap-5">
-
             {messages.map((message) => {
               const isUser = message.role === "user";
               const isSystem = message.role === "system";
@@ -915,6 +2935,14 @@ export default function CreatorPage() {
                   key={message.id}
                   className={["group flex", isUser ? "justify-end" : "justify-start"].join(" ")}
                 >
+                  {message.report ? (
+                    <ContentResearchReportMessage
+                      report={message.report}
+                      onRecover={() => void resumeContentResearchForRun(message.report!.workflow_run_id)}
+                      onRepair={() => void repairContentResearchForRun(message.report!.workflow_run_id)}
+                      onOpenTrace={() => setTraceExpanded(true)}
+                    />
+                  ) : (
                   <div
                     className={[
                       "relative max-w-[80%] rounded-2xl px-4 py-3 text-sm leading-6",
@@ -945,7 +2973,7 @@ export default function CreatorPage() {
                       </div>
                     ) : (
                       <>
-                        <div className="whitespace-pre-wrap">{message.text}</div>
+                        <div className="whitespace-pre-wrap">{displayChatText(message.text)}</div>
                         {message.actionUrl && message.actionLabel ? (
                           <a
                             className="mt-2 inline-flex rounded-lg border border-line bg-white px-3 py-1.5 text-xs font-medium text-ink transition hover:bg-slate-50"
@@ -969,9 +2997,19 @@ export default function CreatorPage() {
                       </>
                     )}
                   </div>
+                  )}
                 </div>
               );
             })}
+
+            {contentResearchIntent && (
+              <ContentResearchIntentCard
+                intent={contentResearchIntent}
+                onConfirmed={(summary) => void handleContentResearchConfirmed(summary)}
+                onPresearchUpdated={(presearch) => setContentResearchIntent((current) => current ? { ...current, presearch } : current)}
+                onError={(message) => appendMessage({ role: "system", text: message })}
+              />
+            )}
 
             {/* Live WorkflowRun progress card */}
             {showTaskCard && task && (
@@ -1133,13 +3171,17 @@ export default function CreatorPage() {
 
         {/* ── Input area ── */}
         <div className="border-t border-line bg-white px-4 py-4 md:px-6">
-          <div className="mx-auto flex max-w-3xl items-end gap-3">
+          <div
+            className={[
+              "mx-auto max-w-3xl rounded-[28px] border bg-white px-5 py-4 shadow-[0_16px_48px_rgba(15,23,42,0.08)] transition",
+              contentResearchMode ? "border-blue-300 ring-4 ring-blue-50" : "border-line",
+            ].join(" ")}
+          >
             <textarea
               ref={inputRef}
               value={input}
               onChange={(e) => {
                 setInput(e.target.value);
-                // Auto-grow: reset then expand to scrollHeight
                 e.target.style.height = "auto";
                 e.target.style.height = `${e.target.scrollHeight}px`;
               }}
@@ -1151,34 +3193,49 @@ export default function CreatorPage() {
               }}
               disabled={isLoading}
               rows={1}
-              className="max-h-36 min-h-[44px] flex-1 resize-none overflow-y-auto rounded-2xl border border-line bg-slate-50 px-4 py-3 text-sm leading-6 text-ink outline-none transition focus:border-slate-400 focus:bg-white disabled:opacity-50"
+              className="max-h-32 min-h-[42px] w-full resize-none overflow-y-auto bg-transparent text-base leading-7 text-ink outline-none placeholder:text-slate-400 disabled:opacity-50"
               placeholder={
-                isTaskRunning
-                  ? "任务进行中，可继续补充要求..."
-                  : "描述你想生成的内容，Enter 发送 · Shift+Enter 换行"
+                contentResearchMode
+                  ? "输入品类、品牌或 SKU，发送后开始内容调研"
+                  : isTaskRunning
+                    ? "任务进行中，可继续补充要求..."
+                    : "发消息..."
               }
             />
-            <button
-              type="button"
-              onClick={() => void sendMessage()}
-              disabled={isLoading || !input.trim()}
-              className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-ink text-white transition hover:bg-slate-800 disabled:opacity-30"
-              aria-label="发送"
-            >
-              <svg
-                width="16"
-                height="16"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2.5"
-                strokeLinecap="round"
-                strokeLinejoin="round"
+            <div className="mt-3 flex items-center justify-between gap-3">
+              <div className="flex min-w-0 items-center gap-2 overflow-x-auto">
+                <button
+                  type="button"
+                  className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-2xl leading-none text-ink hover:bg-slate-100"
+                  aria-label="添加"
+                >
+                  +
+                </button>
+                <span className="h-6 w-px shrink-0 bg-line" />
+                <button
+                  type="button"
+                  onClick={() => setContentResearchMode((current) => !current)}
+                  className={[
+                    "inline-flex h-9 shrink-0 items-center gap-2 rounded-full border px-3 text-sm font-medium transition",
+                    contentResearchMode
+                      ? "border-ink bg-slate-100 text-ink"
+                      : "border-transparent text-ink hover:bg-slate-100",
+                  ].join(" ")}
+                >
+                  <span className="text-base">⌕</span>
+                  内容调研
+                </button>
+              </div>
+              <button
+                type="button"
+                onClick={() => void sendMessage()}
+                disabled={isLoading || !input.trim()}
+                className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-ink text-white transition hover:bg-slate-800 disabled:opacity-30"
+                aria-label="发送"
               >
-                <line x1="22" y1="2" x2="11" y2="13" />
-                <polygon points="22 2 15 22 11 13 2 9 22 2" />
-              </svg>
-            </button>
+                ↑
+              </button>
+            </div>
             {task?.status === "running" && (
               <button
                 type="button"
@@ -1194,6 +3251,43 @@ export default function CreatorPage() {
           </div>
         </div>
       </section>
+      {contentResearchRun && <button
+        type="button"
+        onClick={() => setTraceExpanded(true)}
+        className="fixed bottom-20 right-4 z-30 rounded-full border border-line bg-white px-3 py-2 text-xs font-semibold text-blue-600 shadow-lg lg:hidden"
+        aria-label="查看完整 workflow trace"
+      >
+        查看完整 Trace
+      </button>}
+      {contentResearchRun && <ContentResearchContextSidebar
+        run={contentResearchRun}
+        onExpandedChange={setTraceExpanded}
+        onModifyDirections={() => void modifyContentResearchDirections()}
+        recoveryPending={modelRecovery.recoveryPending}
+        recoveryRequiredSince={modelRecovery.requiredSince}
+        onContinuePresearch={continueModelRecovery}
+      />}
+      {!contentResearchRun && contentResearchMode && <aside className="hidden w-[300px] shrink-0 overflow-y-auto border-l border-line bg-slate-50 p-4 lg:block" aria-label="内容调研上下文">
+        <h2 className="mb-3 text-sm font-semibold text-ink">本次研究摘要</h2>
+        <section className="mb-4 rounded-xl border border-line bg-white p-4" aria-label="内容调研研究摘要">
+          <p className="text-xs leading-5 text-quiet">
+            {contentResearchIntent
+              ? "调研范围尚未确认；正式报告发布后将在此显示冻结摘要。"
+              : "暂无进行中的内容调研。发起调研后，此处会显示冻结范围与研究摘要。"}
+          </p>
+        </section>
+        <ModelServiceCard recoveryPending={modelRecovery.recoveryPending} recoveryRequiredSince={modelRecovery.requiredSince} onContinue={continueModelRecovery} onConfigurationChanged={() => undefined} />
+        <XiaohongshuLoginCard />
+      </aside>}
+      {contentResearchRun && <ContentResearchTraceInspector
+        run={contentResearchRun}
+        expanded={traceExpanded}
+        onExpandedChange={setTraceExpanded}
+        onRefresh={async () => { await refreshContentResearchTrace(contentResearchRun.workflowRunId); }}
+        onRetry={() => resumeContentResearchForRun(contentResearchRun.workflowRunId)}
+      />}
     </div>
   );
 }
+
+CreatorPage.ContentResearchIntentCard = ContentResearchIntentCard;

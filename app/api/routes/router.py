@@ -6,106 +6,158 @@ import asyncio
 import base64
 import json
 import uuid
+from collections.abc import AsyncIterator
 from datetime import datetime
 from time import monotonic
-from typing import Any, AsyncIterator, Optional
+from typing import Any
 
 from fastapi import FastAPI, Header, Query, Request, status
+from fastapi.encoders import jsonable_encoder
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.config import settings
+from app.content_research.api_schemas import (
+    ContentResearchBriefConfirmRequest,
+    ContentResearchDirectionEvidenceResponse,
+    ContentResearchGovernanceResponse,
+    ContentResearchLiteReportResponse,
+    ContentResearchLLMConfigurationRequest,
+    ContentResearchLLMConfigurationResponse,
+    ContentResearchPresearchRequest,
+    ContentResearchPresearchResponse,
+    ContentResearchSourceCollectionRequest,
+    ContentResearchSourceCollectionResponse,
+    ContentResearchTraceResponse,
+    ContentResearchWorkflowActionRequest,
+    ContentResearchWorkflowActionResponse,
+    ContentResearchWorkflowEventsResponse,
+    ContentResearchWorkflowSummaryResponse,
+    HumanDecisionRequest,
+    HumanDecisionResponse,
+    HumanDecisionsResponse,
+    XHSQRLoginResponse,
+    XHSLoginStatusResponse,
+    XHSManualCookieRequest,
+)
+from app.content_research.presearch.service import PresearchService
+from app.content_research.service import (
+    ContentResearchNotFoundError,
+    ContentResearchService,
+    ContentResearchStateConflictError,
+    ContentResearchValidationError,
+    WorkflowRunManagerRuntime,
+)
+from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
 from app.logging_config import get_logger, log_event
 from app.memory.job_store import JobStore, SessionEventRecord
 from app.memory.session_state import SessionManager
 from app.memory.thread_store import ThreadStore
 from app.memory.workflow_store import WorkflowStore
-from app.models.workflow import WorkflowArtifactType
-from app.services.creator_intent_router import ACTIVE_JOB_STATUSES, IntentContext, classify_intent
-from app.services.conversation_orchestrator import ConversationOrchestrator
-from app.services.workflow_artifact_policy import WorkflowArtifactVersionPolicy
 from app.models.schemas import (
+    CompleteThreadResponse,
     CreateSessionResponse,
+    CreatorMessageCreateRequest,
+    CreatorMessageRecord,
+    CreatorMessageResponse,
+    CreatorThreadCreateRequest,
+    CreatorThreadDeleteResponse,
+    CreatorThreadDetail,
+    CreatorThreadDetailResponse,
+    CreatorThreadListResponse,
+    CreatorThreadResponse,
+    CreatorThreadSummary,
+    CreatorThreadTimelineResponse,
+    CreatorThreadUpdateRequest,
+    CreatorWorkflowRequest,
+    CreatorWorkflowResponse,
     EnqueueResponse,
     ErrorResponse,
+    GeneratedNoteItem,
     InitSessionRequest,
+    JobControlResponse,
     JobStatusResponse,
+    LLMUsageEventResponse,
+    LLMUsageEventsResponse,
+    LLMUsageStepsResponse,
+    LLMUsageStepSummaryResponse,
+    LLMUsageSummaryResponse,
+    PublishCandidate,
+    PublishCandidatesResponse,
     ResumeSessionResponse,
     SessionEvent,
     SessionEventPayload,
     SessionStatusResponse,
+    ThreadResultResponse,
     V2BrandChannelCreateRequest,
     V2BrandChannelListResponse,
     V2BrandChannelResponse,
     V2BrandChannelUpdateRequest,
     V2BrandCreateRequest,
-    V2DataImportPreviewRequest,
-    V2DataImportPreviewResponse,
+    V2BrandDataImportRequest,
     V2BrandListResponse,
     V2BrandPolicyConfigResponse,
     V2BrandPolicyConfigUpsertRequest,
     V2BrandResponse,
-    V2BrandUpdateRequest,
-    V2BrandDataImportRequest,
     V2BrandSourceSyncRequest,
-    V2BrandWorkspaceResponse,
-    V2ExtensionCaptureSessionCreateRequest,
-    V2ExtensionCaptureSessionResponse,
-    V2ExtensionCaptureSubmitRequest,
     V2BrandStateSnapshotCreateRequest,
     V2BrandStateSnapshotListResponse,
     V2BrandStateSnapshotResponse,
-    V2DiscoveryCustomQueryRequest,
-    V2DiscoveryTaskCreateRequest,
-    V2DiscoveryTaskResponse,
-    V2IngestionAcceptedResponse,
-    V2IngestionRunResponse,
-    V2TopicPoolBrandSummary,
-    V2TopicPoolItemResponse,
-    V2TopicPoolListResponse,
-    V2TopicPoolRefreshRequest,
-    V2TopicPoolRefreshResponse,
-    V2TopicPoolStatsResponse,
-    V2DefaultWorkspaceResponse,
-    V2DecisionBatchItemResponse,
+    V2BrandUpdateRequest,
+    V2BrandWorkspaceResponse,
+    V2DataImportPreviewRequest,
+    V2DataImportPreviewResponse,
     V2DecisionBatchDetailResponse,
+    V2DecisionBatchItemResponse,
     V2DecisionBatchItemReviewRequest,
     V2DecisionBatchItemReviewResponse,
     V2DecisionRunRequest,
     V2DecisionRunResponse,
+    V2DefaultWorkspaceResponse,
+    V2DiscoveryCustomQueryRequest,
+    V2DiscoveryTaskCreateRequest,
+    V2DiscoveryTaskResponse,
     V2EvaluationRunRequest,
     V2EvaluationRunResponse,
     V2EvaluationRunSliceResponse,
-    V2WorkspaceCreateRequest,
-    V2WorkspaceResponse,
+    V2ExtensionCaptureSessionCreateRequest,
+    V2ExtensionCaptureSessionResponse,
+    V2ExtensionCaptureSubmitRequest,
+    V2IngestionAcceptedResponse,
+    V2IngestionRunResponse,
     V2PerformanceImportRequest,
     V2PerformanceSnapshotListResponse,
     V2PerformanceSnapshotResponse,
     V2PublishRecordCreateRequest,
     V2PublishRecordListResponse,
     V2PublishRecordResponse,
-    CreatorThreadCreateRequest,
-    CreatorThreadUpdateRequest,
-    CreatorThreadSummary,
-    CreatorThreadDetail,
-    CreatorMessageRecord,
-    CreatorThreadResponse,
-    CreatorThreadListResponse,
-    CreatorThreadDetailResponse,
-    CreatorThreadTimelineResponse,
-    CreatorThreadDeleteResponse,
-    CreatorMessageCreateRequest,
-    CreatorMessageResponse,
-    CreatorWorkflowRequest,
-    CreatorWorkflowResponse,
-    JobControlResponse,
-    PublishCandidate,
-    CompleteThreadResponse,
-    PublishCandidatesResponse,
-    GeneratedNoteItem,
-    ThreadResultResponse,
+    V2TopicPoolBrandSummary,
+    V2TopicPoolItemResponse,
+    V2TopicPoolListResponse,
+    V2TopicPoolRefreshRequest,
+    V2TopicPoolRefreshResponse,
+    V2TopicPoolStatsResponse,
+    V2WorkspaceCreateRequest,
+    V2WorkspaceResponse,
 )
 from app.models.session import Session, SessionLifecycleState, SessionStage
+from app.models.workflow import WorkflowArtifactType
+from app.services.conversation_orchestrator import ConversationOrchestrator
+from app.services.creator_intent_router import ACTIVE_JOB_STATUSES, IntentContext, classify_intent
+from app.services.llm.tracked_client import build_default_llm_service
+from app.services.llm.configuration import LLMConfigurationCandidate
+from app.services.llm.configuration_service import LiteLLMConfigurationService
+from app.services.llm.configuration_store import SQLiteLLMConfigurationStore
+from app.services.llm.providers.openai_compatible import OpenAICompatibleAdapter
+from app.services.llm.usage_tracker import (
+    LLMUsageEvent,
+    LLMUsageStepSummary,
+    LLMUsageSummary,
+    LLMUsageTracker,
+)
+from app.services.workflow_artifact_policy import WorkflowArtifactVersionPolicy
 from app.v2.auth import WorkspaceAuthError, resolve_workspace_principal
 from app.v2.decision import (
     DecisionError,
@@ -121,7 +173,6 @@ from app.v2.discovery import (
     DiscoveryService,
     DiscoveryValidationError,
 )
-from app.v2.foundation.bootstrap import DEFAULT_USER_ID, DEFAULT_WORKSPACE_ID
 from app.v2.feedback import (
     FeedbackError,
     FeedbackNotFoundError,
@@ -129,9 +180,10 @@ from app.v2.feedback import (
     FeedbackValidationError,
 )
 from app.v2.foundation import MasterDataService
+from app.v2.foundation.bootstrap import DEFAULT_USER_ID, DEFAULT_WORKSPACE_ID
 from app.v2.foundation.service import (
-    MasterDataError,
     MasterDataConflictError,
+    MasterDataError,
     MasterDataInvariantError,
     MasterDataNotFoundError,
     MasterDataScopeError,
@@ -148,9 +200,9 @@ class APIError(Exception):
         status_code: int,
         error_code: str,
         error_message: str,
-        error_details: Optional[dict[str, Any]] = None,
+        error_details: dict[str, Any] | None = None,
         retryable: bool = False,
-        suggested_action: Optional[str] = None,
+        suggested_action: str | None = None,
     ) -> None:
         super().__init__(error_message)
         self.status_code = status_code
@@ -172,7 +224,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_allowed_origins,
     allow_credentials=False,
-    allow_methods=["GET", "POST", "PATCH", "DELETE", "HEAD", "OPTIONS"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"],
     allow_headers=[
         "Authorization",
         "Content-Type",
@@ -183,7 +235,7 @@ app.add_middleware(
     allow_private_network=True,
 )
 _logger = get_logger(__name__, component="api")
-_embedding_prewarm_task: Optional[asyncio.Task] = None
+_embedding_prewarm_task: asyncio.Task | None = None
 _embedding_prewarm_status: dict[str, Any] = {
     "status": "idle",
     "message": "Embedding model has not been prewarmed.",
@@ -229,7 +281,24 @@ async def handle_api_error(_request: Request, exc: APIError) -> JSONResponse:
     return JSONResponse(status_code=exc.status_code, content=exc.payload.model_dump(mode="json"))
 
 
-def _iso(value: Optional[datetime]) -> Optional[str]:
+@app.exception_handler(RequestValidationError)
+async def handle_request_validation_error(request: Request, exc: RequestValidationError):
+    if request.url.path in {
+        "/content-research/llm-config",
+        "/content-research/llm-config/validate",
+    }:
+        errors = [
+            {key: value for key, value in error.items() if key != "input"}
+            for error in exc.errors()
+        ]
+        return JSONResponse(
+            status_code=422,
+            content={"detail": jsonable_encoder(errors)},
+        )
+    return await request_validation_exception_handler(request, exc)
+
+
+def _iso(value: datetime | None) -> str | None:
     return value.isoformat() if value else None
 
 
@@ -246,6 +315,64 @@ def _session_to_create_response(session: Session) -> CreateSessionResponse:
         purge_after=_iso(session.purge_after),
         created_at=session.created_at.isoformat(),
         updated_at=session.updated_at.isoformat(),
+    )
+
+
+def _usage_summary_to_response(
+    usage: LLMUsageSummary,
+    *,
+    session_id: str | None = None,
+    job_id: str | None = None,
+) -> LLMUsageSummaryResponse:
+    return LLMUsageSummaryResponse(
+        session_id=session_id,
+        job_id=job_id,
+        total_calls=usage.total_calls,
+        prompt_tokens=usage.prompt_tokens,
+        completion_tokens=usage.completion_tokens,
+        total_tokens=usage.total_tokens,
+        total_cost=usage.total_cost,
+        currency=usage.currency,
+        latency_ms=usage.latency_ms,
+    )
+
+
+def _usage_step_to_response(step: LLMUsageStepSummary) -> LLMUsageStepSummaryResponse:
+    return LLMUsageStepSummaryResponse(
+        step_id=step.step_id,
+        step_name=step.step_name,
+        agent_name=step.agent_name,
+        total_calls=step.total_calls,
+        failed_calls=step.failed_calls,
+        prompt_tokens=step.prompt_tokens,
+        completion_tokens=step.completion_tokens,
+        total_tokens=step.total_tokens,
+        total_cost=step.total_cost,
+        currency=step.currency,
+        latency_ms=step.latency_ms,
+    )
+
+
+def _usage_event_to_response(event: LLMUsageEvent) -> LLMUsageEventResponse:
+    return LLMUsageEventResponse(
+        id=event.id,
+        session_id=event.session_id,
+        job_id=event.job_id,
+        step_id=event.step_id,
+        step_name=event.step_name,
+        agent_name=event.agent_name,
+        provider=event.provider,
+        model=event.model,
+        model_policy=event.model_policy,
+        prompt_tokens=event.prompt_tokens,
+        completion_tokens=event.completion_tokens,
+        total_tokens=event.total_tokens,
+        total_cost=event.total_cost,
+        currency=event.currency,
+        latency_ms=event.latency_ms,
+        status=event.status,
+        error_message=event.error_message,
+        created_at=event.created_at,
     )
 
 
@@ -706,6 +833,74 @@ def _get_job_store(request: Request) -> JobStore:
     return store
 
 
+def _get_content_research_service(request: Request) -> ContentResearchService:
+    service = getattr(request.app.state, "content_research_service", None)
+    if service is not None:
+        return service
+    llm_service = getattr(request.app.state, "content_research_llm_service", None)
+    if llm_service is None:
+        llm_service = build_default_llm_service()
+        request.app.state.content_research_llm_service = llm_service
+    return ContentResearchService(
+        store=SQLiteContentResearchStore(settings.SQLITE_DB_PATH),
+        presearch=PresearchService(llm_service),
+        workflow_runtime=WorkflowRunManagerRuntime(settings.SQLITE_DB_PATH),
+        analysis_llm=llm_service,
+    )
+
+
+def _get_llm_configuration_service(request: Request) -> LiteLLMConfigurationService:
+    service = getattr(request.app.state, "llm_configuration_service", None)
+    if service is None:
+        service = LiteLLMConfigurationService(
+            store=SQLiteLLMConfigurationStore(settings.SQLITE_DB_PATH),
+            probe_adapter=OpenAICompatibleAdapter(provider="openai_compatible"),
+        )
+        request.app.state.llm_configuration_service = service
+    return service
+
+
+def _require_f003_lite_preview() -> None:
+    if settings.F003_LITE_PREVIEW_ENABLED:
+        return
+    raise APIError(
+        status_code=403,
+        error_code="F003_LITE_PREVIEW_DISABLED",
+        error_message="F003 Lite internal preview is disabled",
+    )
+
+
+def _content_research_error(exc: Exception) -> APIError:
+    if isinstance(exc, ContentResearchNotFoundError):
+        return APIError(
+            status_code=404,
+            error_code="CONTENT_RESEARCH_PRESEARCH_NOT_FOUND",
+            error_message=str(exc),
+        )
+    if isinstance(exc, ContentResearchStateConflictError):
+        return APIError(
+            status_code=409,
+            error_code=exc.error_code,
+            error_message=str(exc),
+            retryable=True,
+            suggested_action=exc.suggested_action,
+        )
+    if isinstance(exc, (ContentResearchValidationError, ValueError)):
+        error_code = "INVALID_CONTENT_RESEARCH_PAYLOAD"
+        if "Unsupported Content Research workflow action" in str(exc):
+            error_code = "INVALID_CONTENT_RESEARCH_ACTION"
+        return APIError(
+            status_code=422,
+            error_code=error_code,
+            error_message=str(exc),
+        )
+    return APIError(
+        status_code=500,
+        error_code="CONTENT_RESEARCH_ERROR",
+        error_message=str(exc),
+    )
+
+
 async def _generate_thread_title(user_message: str) -> str:
     """Use Haiku to summarise the user's first message into a short thread title.
     Falls back to a 10-char hard truncation on any error."""
@@ -731,6 +926,398 @@ async def _generate_thread_title(user_message: str) -> str:
     except Exception:
         raw = user_message.strip().replace("\n", " ")
         return raw[:10] + "…" if len(raw) > 10 else raw
+
+
+@app.post(
+    "/content-research/presearch",
+    response_model=ContentResearchPresearchResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_content_research_presearch(
+    payload: ContentResearchPresearchRequest,
+    request: Request,
+) -> ContentResearchPresearchResponse:
+    _require_f003_lite_preview()
+    principal = _resolve_workspace_principal_or_error(request)
+    assert principal.user_id is not None
+    service = _get_content_research_service(request)
+    try:
+        return await service.submit_presearch(
+            seed_text=payload.seed_text,
+            user_note=payload.user_note,
+            thread_id=payload.thread_id,
+            workspace_id=principal.workspace_id,
+            user_id=principal.user_id,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise _content_research_error(exc) from exc
+
+
+@app.get("/content-research/llm-config", response_model=ContentResearchLLMConfigurationResponse)
+async def get_content_research_llm_configuration(request: Request) -> ContentResearchLLMConfigurationResponse:
+    principal = _resolve_workspace_principal_or_error(request)
+    assert principal.user_id is not None
+    return ContentResearchLLMConfigurationResponse(**_get_llm_configuration_service(request).get_summary(
+        principal.workspace_id, principal.user_id
+    ).__dict__)
+
+
+@app.post("/content-research/llm-config/validate", response_model=ContentResearchLLMConfigurationResponse)
+async def validate_content_research_llm_configuration(
+    payload: ContentResearchLLMConfigurationRequest, request: Request
+) -> ContentResearchLLMConfigurationResponse:
+    principal = _resolve_workspace_principal_or_error(request)
+    assert principal.user_id is not None
+    summary = await _get_llm_configuration_service(request).validate(
+        workspace_id=principal.workspace_id, user_id=principal.user_id,
+        candidate=LLMConfigurationCandidate(payload.base_url, payload.model, payload.api_key),
+    )
+    return ContentResearchLLMConfigurationResponse(**summary.__dict__)
+
+
+@app.put("/content-research/llm-config", response_model=ContentResearchLLMConfigurationResponse)
+async def save_content_research_llm_configuration(
+    payload: ContentResearchLLMConfigurationRequest, request: Request
+) -> ContentResearchLLMConfigurationResponse:
+    principal = _resolve_workspace_principal_or_error(request)
+    assert principal.user_id is not None
+    summary = await _get_llm_configuration_service(request).save(
+        workspace_id=principal.workspace_id, user_id=principal.user_id,
+        candidate=LLMConfigurationCandidate(payload.base_url, payload.model, payload.api_key),
+    )
+    if summary.status != "validated":
+        raise APIError(status_code=422, error_code=summary.error_code or "llm_protocol_incompatible", error_message="模型配置验证失败")
+    return ContentResearchLLMConfigurationResponse(**summary.__dict__)
+
+
+@app.delete("/content-research/llm-config", response_model=ContentResearchLLMConfigurationResponse)
+async def delete_content_research_llm_configuration(request: Request) -> ContentResearchLLMConfigurationResponse:
+    principal = _resolve_workspace_principal_or_error(request)
+    assert principal.user_id is not None
+    return ContentResearchLLMConfigurationResponse(**_get_llm_configuration_service(request).delete(
+        principal.workspace_id, principal.user_id
+    ).__dict__)
+
+
+@app.post("/content-research/providers/xiaohongshu/login/qr", response_model=XHSQRLoginResponse)
+async def start_xhs_qr_login(request: Request) -> XHSQRLoginResponse:
+    session = getattr(request.app.state, "xhs_qr_login_session", None)
+    if session is None:
+        raise APIError(status_code=503, error_code="XHS_LOGIN_UNAVAILABLE", error_message="XHS login session is unavailable")
+    return XHSQRLoginResponse(**(await asyncio.to_thread(session.start)))
+
+
+@app.get("/content-research/providers/xiaohongshu/login", response_model=XHSLoginStatusResponse)
+async def get_xhs_login_status(request: Request) -> XHSLoginStatusResponse:
+    store = getattr(request.app.state, "xhs_credential_store", None)
+    if store is None:
+        from app.services.xhs_credentials import XHSCredentialStore
+        store = XHSCredentialStore(settings.SQLITE_DB_PATH)
+        request.app.state.xhs_credential_store = store
+    return XHSLoginStatusResponse(**store.get_status().__dict__)
+
+
+@app.put("/content-research/providers/xiaohongshu/login", response_model=XHSLoginStatusResponse)
+async def save_xhs_manual_cookie(payload: XHSManualCookieRequest, request: Request) -> XHSLoginStatusResponse:
+    session = getattr(request.app.state, "xhs_qr_login_session", None)
+    if session is None:
+        raise APIError(status_code=503, error_code="XHS_LOGIN_UNAVAILABLE", error_message="XHS login session is unavailable")
+    try:
+        await asyncio.to_thread(session.set_manual_cookie, payload.cookie)
+    except ValueError:
+        raise APIError(status_code=422, error_code="INVALID_XHS_COOKIE", error_message="Cookie 格式无效") from None
+    store = getattr(request.app.state, "xhs_credential_store", None)
+    return XHSLoginStatusResponse(**store.get_status().__dict__)
+
+
+@app.delete("/content-research/providers/xiaohongshu/login", response_model=XHSLoginStatusResponse)
+async def clear_xhs_login(request: Request) -> XHSLoginStatusResponse:
+    session = getattr(request.app.state, "xhs_qr_login_session", None)
+    if session is not None:
+        await asyncio.to_thread(session.clear_auth)
+    store = getattr(request.app.state, "xhs_credential_store", None)
+    if store is None:
+        from app.services.xhs_credentials import XHSCredentialStore
+        store = XHSCredentialStore(settings.SQLITE_DB_PATH)
+    return XHSLoginStatusResponse(**store.get_status().__dict__)
+
+
+@app.get("/content-research/providers/xiaohongshu/login/qr", response_model=XHSQRLoginResponse)
+async def get_current_xhs_qr_login(request: Request) -> XHSQRLoginResponse:
+    session = getattr(request.app.state, "xhs_qr_login_session", None)
+    projection = session.current_status() if session is not None else None
+    if projection is None:
+        raise APIError(status_code=404, error_code="XHS_LOGIN_ATTEMPT_NOT_FOUND", error_message="XHS login attempt not found")
+    return XHSQRLoginResponse(**projection)
+
+
+@app.get("/content-research/providers/xiaohongshu/login/qr/{attempt_id}", response_model=XHSQRLoginResponse)
+async def get_xhs_qr_login(attempt_id: str, request: Request) -> XHSQRLoginResponse:
+    session = getattr(request.app.state, "xhs_qr_login_session", None)
+    projection = session.status(attempt_id) if session is not None else None
+    if projection is None:
+        raise APIError(status_code=404, error_code="XHS_LOGIN_ATTEMPT_NOT_FOUND", error_message="XHS login attempt not found")
+    return XHSQRLoginResponse(**projection)
+
+
+@app.get(
+    "/content-research/presearch/{attempt_id}",
+    response_model=ContentResearchPresearchResponse,
+)
+async def get_content_research_presearch(
+    attempt_id: str,
+    request: Request,
+) -> ContentResearchPresearchResponse:
+    service = _get_content_research_service(request)
+    try:
+        return service.get_presearch(attempt_id)
+    except Exception as exc:  # noqa: BLE001
+        raise _content_research_error(exc) from exc
+
+
+@app.post(
+    "/content-research/briefs/{brief_id}/confirm",
+    response_model=ContentResearchWorkflowSummaryResponse,
+)
+async def confirm_content_research_brief(
+    brief_id: str,
+    payload: ContentResearchBriefConfirmRequest,
+    request: Request,
+) -> ContentResearchWorkflowSummaryResponse:
+    _require_f003_lite_preview()
+    service = _get_content_research_service(request)
+    try:
+        return await service.confirm_brief(brief_id=brief_id, confirmation_request=payload)
+    except Exception as exc:  # noqa: BLE001
+        raise _content_research_error(exc) from exc
+
+
+@app.post(
+    "/content-research/workflows",
+    response_model=ContentResearchWorkflowSummaryResponse,
+)
+async def create_content_research_workflow_from_brief(
+    payload: ContentResearchBriefConfirmRequest,
+    request: Request,
+    brief_id: str = Query(...),
+) -> ContentResearchWorkflowSummaryResponse:
+    _require_f003_lite_preview()
+    service = _get_content_research_service(request)
+    try:
+        return await service.confirm_brief(brief_id=brief_id, confirmation_request=payload)
+    except Exception as exc:  # noqa: BLE001
+        raise _content_research_error(exc) from exc
+
+
+@app.get(
+    "/content-research/workflows/{workflow_run_id}",
+    response_model=ContentResearchWorkflowSummaryResponse,
+)
+async def get_content_research_workflow(
+    workflow_run_id: str,
+    request: Request,
+) -> ContentResearchWorkflowSummaryResponse:
+    service = _get_content_research_service(request)
+    try:
+        return await service.get_workflow_summary(workflow_run_id)
+    except Exception as exc:  # noqa: BLE001
+        raise _content_research_error(exc) from exc
+
+
+@app.get("/content-research/workflows/{workflow_run_id}/policy-snapshot")
+async def get_content_research_policy_snapshot(workflow_run_id: str, request: Request) -> dict[str, Any]:
+    service = _get_content_research_service(request)
+    try:
+        return service.get_policy_snapshot(workflow_run_id)
+    except Exception as exc:  # noqa: BLE001
+        raise _content_research_error(exc) from exc
+
+
+@app.get(
+    "/content-research/workflows/{workflow_run_id}/events",
+    response_model=ContentResearchWorkflowEventsResponse,
+)
+async def get_content_research_workflow_events(
+    workflow_run_id: str,
+    request: Request,
+) -> ContentResearchWorkflowEventsResponse:
+    service = _get_content_research_service(request)
+    try:
+        return await service.list_workflow_events(workflow_run_id)
+    except Exception as exc:  # noqa: BLE001
+        raise _content_research_error(exc) from exc
+
+
+@app.get(
+    "/content-research/workflows/{workflow_run_id}/trace",
+    response_model=ContentResearchTraceResponse,
+)
+async def get_content_research_workflow_trace(
+    workflow_run_id: str,
+    request: Request,
+) -> ContentResearchTraceResponse:
+    service = _get_content_research_service(request)
+    try:
+        return await service.get_workflow_trace(workflow_run_id)
+    except Exception as exc:  # noqa: BLE001
+        raise _content_research_error(exc) from exc
+
+
+@app.post(
+    "/content-research/workflows/{workflow_run_id}/brand-decisions",
+    response_model=HumanDecisionResponse,
+)
+async def submit_content_research_brand_decision(
+    workflow_run_id: str,
+    payload: HumanDecisionRequest,
+    request: Request,
+    x_user_id: str = Header(default=DEFAULT_USER_ID, alias="X-User-Id"),
+) -> HumanDecisionResponse:
+    service = _get_content_research_service(request)
+    try:
+        return await service.submit_brand_decision(
+            workflow_run_id=workflow_run_id,
+            request=payload,
+            user_id=x_user_id,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise _content_research_error(exc) from exc
+
+
+@app.post(
+    "/content-research/workflows/{workflow_run_id}/content-decisions",
+    response_model=HumanDecisionResponse,
+)
+async def submit_content_research_content_decision(
+    workflow_run_id: str,
+    payload: HumanDecisionRequest,
+    request: Request,
+    x_user_id: str = Header(default=DEFAULT_USER_ID, alias="X-User-Id"),
+) -> HumanDecisionResponse:
+    service = _get_content_research_service(request)
+    try:
+        return await service.submit_content_decision(
+            workflow_run_id=workflow_run_id,
+            request=payload,
+            user_id=x_user_id,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise _content_research_error(exc) from exc
+
+
+@app.get(
+    "/content-research/workflows/{workflow_run_id}/decisions",
+    response_model=HumanDecisionsResponse,
+)
+async def list_content_research_human_decisions(
+    workflow_run_id: str,
+    request: Request,
+) -> HumanDecisionsResponse:
+    service = _get_content_research_service(request)
+    try:
+        return service.list_human_decisions(workflow_run_id)
+    except Exception as exc:  # noqa: BLE001
+        raise _content_research_error(exc) from exc
+
+
+@app.get(
+    "/content-research/workflows/{workflow_run_id}/lite-report",
+    response_model=ContentResearchLiteReportResponse,
+)
+async def get_content_research_lite_report(
+    workflow_run_id: str,
+    request: Request,
+    research_plan_id: str | None = Query(default=None),
+    publication_id: str | None = Query(default=None),
+    citation_group_ids: list[str] | None = Query(default=None),
+) -> ContentResearchLiteReportResponse:
+    """Read the Lite projection from frozen, materialized publication facts."""
+    service = _get_content_research_service(request)
+    try:
+        return await service.get_lite_report(
+            workflow_run_id=workflow_run_id,
+            research_plan_id=research_plan_id,
+            publication_id=publication_id,
+            citation_group_ids=citation_group_ids,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise _content_research_error(exc) from exc
+
+@app.post(
+    "/content-research/workflows/{workflow_run_id}/actions",
+    response_model=ContentResearchWorkflowActionResponse,
+)
+async def run_content_research_workflow_action(
+    workflow_run_id: str,
+    payload: ContentResearchWorkflowActionRequest,
+    request: Request,
+) -> ContentResearchWorkflowActionResponse:
+    if payload.action.strip() == "confirm_brief":
+        _require_f003_lite_preview()
+    service = _get_content_research_service(request)
+    try:
+        return await service.run_workflow_action(workflow_run_id=workflow_run_id, request=payload)
+    except Exception as exc:  # noqa: BLE001
+        raise _content_research_error(exc) from exc
+
+
+@app.post(
+    "/content-research/workflows/{workflow_run_id}/source-collections",
+    response_model=ContentResearchSourceCollectionResponse,
+)
+async def collect_content_research_sources(
+    workflow_run_id: str,
+    payload: ContentResearchSourceCollectionRequest,
+    request: Request,
+) -> ContentResearchSourceCollectionResponse:
+    service = _get_content_research_service(request)
+    try:
+        return await service.collect_sources(workflow_run_id=workflow_run_id, request=payload)
+    except Exception as exc:  # noqa: BLE001
+        raise _content_research_error(exc) from exc
+
+
+@app.get(
+    "/content-research/workflows/{workflow_run_id}/directions/{direction_id}/evidence",
+    response_model=ContentResearchDirectionEvidenceResponse,
+)
+async def get_content_research_direction_evidence(
+    workflow_run_id: str,
+    direction_id: str,
+    request: Request,
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=50, ge=1, le=50),
+) -> ContentResearchDirectionEvidenceResponse:
+    service = _get_content_research_service(request)
+    try:
+        return service.get_direction_evidence(
+            workflow_run_id=workflow_run_id, direction_id=direction_id, offset=offset, limit=limit,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise _content_research_error(exc) from exc
+
+
+@app.get(
+    "/content-research/workflows/{workflow_run_id}/governance",
+    response_model=ContentResearchGovernanceResponse,
+)
+async def get_content_research_governance(
+    workflow_run_id: str,
+    request: Request,
+    research_plan_id: str | None = Query(default=None),
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=50, ge=1, le=50),
+) -> ContentResearchGovernanceResponse:
+    service = _get_content_research_service(request)
+    try:
+        return service.get_governance_read_model(
+            workflow_run_id=workflow_run_id,
+            research_plan_id=research_plan_id,
+            offset=offset,
+            limit=limit,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise _content_research_error(exc) from exc
 
 
 def _resolve_workspace_principal_or_error(request: Request):
@@ -943,7 +1530,7 @@ def _resolve_budget_snapshot(session: Session) -> dict[str, Any]:
     }
 
 
-def _parse_last_event_id(raw_value: Optional[str]) -> Optional[int]:
+def _parse_last_event_id(raw_value: str | None) -> int | None:
     if raw_value is None:
         return None
     try:
@@ -1002,7 +1589,7 @@ def _format_workflow_sse_event(event) -> str:
     ) + "\n\n"
 
 
-async def _get_active_workflow_job(store: WorkflowStore, active_job_id: Optional[str]) -> Optional[dict[str, Any]]:
+async def _get_active_workflow_job(store: WorkflowStore, active_job_id: str | None) -> dict[str, Any] | None:
     if not active_job_id:
         return None
     assert store._conn is not None
@@ -1019,7 +1606,7 @@ async def _get_active_workflow_job(store: WorkflowStore, active_job_id: Optional
 async def _load_workflow_snapshot(
     run_id: str,
     *,
-    expected_thread_id: Optional[str] = None,
+    expected_thread_id: str | None = None,
 ) -> dict[str, Any]:
     async with WorkflowStore(settings.SQLITE_DB_PATH) as store:
         run = await store.get_run(run_id)
@@ -1053,7 +1640,7 @@ async def _load_workflow_snapshot(
     }
 
 
-def _message_record_from_row(row: dict[str, Any], artifact_refs: Optional[list[dict[str, Any]]] = None) -> CreatorMessageRecord:
+def _message_record_from_row(row: dict[str, Any], artifact_refs: list[dict[str, Any]] | None = None) -> CreatorMessageRecord:
     refs = artifact_refs
     if refs is None:
         try:
@@ -1114,11 +1701,11 @@ async def _hydrate_timeline_artifact_refs(messages: list[dict[str, Any]]) -> lis
     return records
 
 
-def _note_from_payload(payload: dict[str, Any], *, fallback_id: str) -> Optional[dict[str, Any]]:
+def _note_from_payload(payload: dict[str, Any], *, fallback_id: str) -> dict[str, Any] | None:
     return WorkflowArtifactVersionPolicy.note_from_payload(payload, fallback_id=fallback_id)
 
 
-def _notes_from_final_result(payload: Optional[dict[str, Any]]) -> list[dict[str, Any]]:
+def _notes_from_final_result(payload: dict[str, Any] | None) -> list[dict[str, Any]]:
     if not isinstance(payload, dict):
         return []
     candidates = payload.get("notes") or payload.get("generated_notes") or []
@@ -1137,8 +1724,8 @@ async def _ensure_publish_candidate_artifacts(
     *,
     thread_id: str,
     run_id: str,
-    workspace_id: Optional[str],
-    brand_id: Optional[str],
+    workspace_id: str | None,
+    brand_id: str | None,
     notes: list[dict[str, Any]],
 ) -> int:
     async with WorkflowStore(settings.SQLITE_DB_PATH) as store:
@@ -1182,10 +1769,10 @@ async def _ensure_publish_candidate_artifacts(
 
 async def _list_publish_candidate_artifacts(
     *,
-    workspace_id: Optional[str] = None,
-    brand_id: Optional[str] = None,
-    thread_id: Optional[str] = None,
-    run_id: Optional[str] = None,
+    workspace_id: str | None = None,
+    brand_id: str | None = None,
+    thread_id: str | None = None,
+    run_id: str | None = None,
 ) -> list[dict[str, Any]]:
     async with WorkflowStore(settings.SQLITE_DB_PATH) as store:
         artifacts = await store.list_artifacts_by_type(WorkflowArtifactType.PUBLISH_CANDIDATE)
@@ -1226,7 +1813,7 @@ async def _load_workflow_result(
     thread: dict[str, Any],
     *,
     publishable_only: bool = False,
-) -> tuple[Optional[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]], list[dict[str, Any]]]:
     run_id = thread.get("active_run_id")
     if not run_id:
         return None, [], []
@@ -1265,9 +1852,9 @@ async def _load_workflow_result(
 
 def _resolve_workflow_event_cursor(
     *,
-    after_event_id: Optional[int],
-    last_event_id: Optional[str],
-) -> Optional[int]:
+    after_event_id: int | None,
+    last_event_id: str | None,
+) -> int | None:
     if after_event_id is not None:
         if after_event_id < 0:
             raise APIError(
@@ -1285,7 +1872,7 @@ async def _workflow_event_stream(
     request: Request,
     *,
     run_id: str,
-    after_event_id: Optional[int],
+    after_event_id: int | None,
 ) -> AsyncIterator[str]:
     async with WorkflowStore(settings.SQLITE_DB_PATH) as store:
         last_sent_event_id = after_event_id or 0
@@ -1400,8 +1987,8 @@ async def _enqueue_with_stage(
     session_id: str,
     job_type: str,
     next_stage: SessionStage,
-    payload: Optional[dict[str, Any]],
-    idempotency_key: Optional[str],
+    payload: dict[str, Any] | None,
+    idempotency_key: str | None,
     previous_stage: SessionStage,
 ) -> EnqueueResponse:
     async with SessionManager(settings.SQLITE_DB_PATH) as session_manager:
@@ -1452,8 +2039,8 @@ async def _try_replay_idempotent_enqueue(
     session: Session,
     job_type: str,
     next_stage: SessionStage,
-    idempotency_key: Optional[str],
-) -> Optional[EnqueueResponse]:
+    idempotency_key: str | None,
+) -> EnqueueResponse | None:
     del next_stage
     if not idempotency_key:
         return None
@@ -2542,8 +3129,8 @@ async def create_session(payload: InitSessionRequest) -> CreateSessionResponse:
 )
 async def enqueue_strategy(
     session_id: str,
-    payload: Optional[dict[str, Any]] = None,
-    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
+    payload: dict[str, Any] | None = None,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> EnqueueResponse:
     session = await _load_session_or_error(session_id, allow_frozen=False)
     _assert_not_in_cooldown(session)
@@ -2573,8 +3160,8 @@ async def enqueue_strategy(
 )
 async def enqueue_generate(
     session_id: str,
-    payload: Optional[dict[str, Any]] = None,
-    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
+    payload: dict[str, Any] | None = None,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> EnqueueResponse:
     session = await _load_session_or_error(session_id, allow_frozen=False)
     _assert_not_in_cooldown(session)
@@ -2689,6 +3276,60 @@ async def get_job_status(job_id: str) -> JobStatusResponse:
     )
 
 
+@app.get("/sessions/{session_id}/usage", response_model=LLMUsageSummaryResponse)
+async def get_session_usage(session_id: str) -> LLMUsageSummaryResponse:
+    async with LLMUsageTracker() as tracker:
+        usage = await tracker.summarize_session(session_id)
+    return _usage_summary_to_response(usage, session_id=session_id)
+
+
+@app.get("/jobs/{job_id}/usage", response_model=LLMUsageSummaryResponse)
+async def get_job_usage(job_id: str) -> LLMUsageSummaryResponse:
+    async with LLMUsageTracker() as tracker:
+        usage = await tracker.summarize_job(job_id)
+    return _usage_summary_to_response(usage, job_id=job_id)
+
+
+@app.get("/sessions/{session_id}/usage/steps", response_model=LLMUsageStepsResponse)
+async def get_session_usage_steps(session_id: str) -> LLMUsageStepsResponse:
+    async with LLMUsageTracker() as tracker:
+        steps = await tracker.summarize_session_steps(session_id)
+    return LLMUsageStepsResponse(
+        session_id=session_id,
+        steps=[_usage_step_to_response(step) for step in steps],
+    )
+
+
+@app.get("/jobs/{job_id}/usage/steps", response_model=LLMUsageStepsResponse)
+async def get_job_usage_steps(job_id: str) -> LLMUsageStepsResponse:
+    async with LLMUsageTracker() as tracker:
+        steps = await tracker.summarize_job_steps(job_id)
+    return LLMUsageStepsResponse(
+        job_id=job_id,
+        steps=[_usage_step_to_response(step) for step in steps],
+    )
+
+
+@app.get("/sessions/{session_id}/usage/events", response_model=LLMUsageEventsResponse)
+async def get_session_usage_events(session_id: str) -> LLMUsageEventsResponse:
+    async with LLMUsageTracker() as tracker:
+        events = await tracker.list_session_events(session_id)
+    return LLMUsageEventsResponse(
+        session_id=session_id,
+        events=[_usage_event_to_response(event) for event in events],
+    )
+
+
+@app.get("/jobs/{job_id}/usage/events", response_model=LLMUsageEventsResponse)
+async def get_job_usage_events(job_id: str) -> LLMUsageEventsResponse:
+    async with LLMUsageTracker() as tracker:
+        events = await tracker.list_job_events(job_id)
+    return LLMUsageEventsResponse(
+        job_id=job_id,
+        events=[_usage_event_to_response(event) for event in events],
+    )
+
+
 _SESSION_TO_THREAD_EVENT: dict[str, str] = {
     "task_progress":   "workflow_task_progress",
     "task_completed":  "workflow_task_completed",
@@ -2730,7 +3371,7 @@ async def _thread_event_stream(
     thread_id: str,
     session_id: str,
     job_store: JobStore,
-    last_event_id: Optional[int],
+    last_event_id: int | None,
 ) -> AsyncIterator[str]:
     replay_events = await job_store.list_session_events(
         session_id,
@@ -2772,7 +3413,7 @@ async def _event_stream(
     request: Request,
     *,
     session_id: str,
-    last_event_id: Optional[int],
+    last_event_id: int | None,
 ) -> AsyncIterator[str]:
     async with JobStore(settings.SQLITE_DB_PATH) as store:
         replay_events = await store.list_session_events(
@@ -2837,7 +3478,7 @@ async def _event_stream(
 async def stream_session_events(
     session_id: str,
     request: Request,
-    last_event_id: Optional[str] = Header(default=None, alias="Last-Event-ID"),
+    last_event_id: str | None = Header(default=None, alias="Last-Event-ID"),
 ) -> StreamingResponse:
     session = await _load_session_or_error(session_id, allow_frozen=True)
     if session.lifecycle_state == SessionLifecycleState.PURGED:
@@ -2862,7 +3503,7 @@ async def stream_session_events(
 @app.get("/workflow-runs/{run_id}/snapshot")
 async def get_workflow_run_snapshot(
     run_id: str,
-    thread_id: Optional[str] = None,
+    thread_id: str | None = None,
 ) -> dict[str, Any]:
     return await _load_workflow_snapshot(run_id, expected_thread_id=thread_id)
 
@@ -2871,8 +3512,8 @@ async def get_workflow_run_snapshot(
 async def stream_workflow_events(
     run_id: str,
     request: Request,
-    after_event_id: Optional[int] = Query(default=None),
-    last_event_id: Optional[str] = Header(default=None, alias="Last-Event-ID"),
+    after_event_id: int | None = Query(default=None),
+    last_event_id: str | None = Header(default=None, alias="Last-Event-ID"),
 ) -> StreamingResponse:
     async with WorkflowStore(settings.SQLITE_DB_PATH) as store:
         if await store.get_run(run_id) is None:
@@ -3032,7 +3673,7 @@ async def delete_thread(thread_id: str, request: Request) -> CreatorThreadDelete
             error_message=f"Thread {thread_id} not found",
             suggested_action="请检查 thread_id 是否正确",
         )
-    active_session_id: Optional[str] = row["active_workflow_session_id"]
+    active_session_id: str | None = row["active_workflow_session_id"]
     if active_session_id:
         await job_store.cancel_session_jobs(active_session_id, reason="thread_deleted")
     deleted = await thread_store.delete_thread(thread_id)
@@ -3076,8 +3717,8 @@ async def append_thread_message(
             assistant_reply=result["assistant_reply"],
         )
 
-    active_session_id: Optional[str] = thread["active_workflow_session_id"]
-    active_job_id: Optional[str] = thread["active_job_id"]
+    active_session_id: str | None = thread["active_workflow_session_id"]
+    active_job_id: str | None = thread["active_job_id"]
     job_store = _get_job_store(request)
     active_job = None
     if active_job_id:
@@ -3093,7 +3734,7 @@ async def append_thread_message(
         ),
     )
 
-    job_action_result: Optional[dict] = None
+    job_action_result: dict | None = None
     if intent == "pause_job" and active_session_id:
         count = await job_store.pause_session_jobs(active_session_id)
         job_action_result = {
@@ -3121,7 +3762,7 @@ async def append_thread_message(
         }
 
     # Auto-rename thread on first user message (placeholder titles start with "对话 ")
-    updated_title: Optional[str] = None
+    updated_title: str | None = None
     current_title: str = thread["title"]
     is_placeholder = current_title.startswith("对话 ")
     if is_placeholder:
@@ -3146,7 +3787,7 @@ async def append_thread_message(
         "running": "进行中", "paused": "已暂停",
         "cancelled": "已中断", "succeeded": "已完成",
     }
-    assistant_reply: Optional[str] = None
+    assistant_reply: str | None = None
     if intent == "pause_job":
         assistant_reply = "已暂停当前任务。"
     elif intent == "resume_job":
@@ -3236,7 +3877,7 @@ async def start_thread_workflow(
 async def stream_thread_events(
     thread_id: str,
     request: Request,
-    last_event_id: Optional[str] = Header(default=None, alias="Last-Event-ID"),
+    last_event_id: str | None = Header(default=None, alias="Last-Event-ID"),
 ) -> StreamingResponse:
     thread_store = _get_thread_store(request)
     job_store = _get_job_store(request)
@@ -3251,7 +3892,7 @@ async def stream_thread_events(
         )
 
     parsed_last_event_id = _parse_last_event_id(last_event_id)
-    session_id: Optional[str] = thread["active_workflow_session_id"]
+    session_id: str | None = thread["active_workflow_session_id"]
 
     if session_id is None:
         async def _empty_stream() -> AsyncIterator[str]:
@@ -3401,11 +4042,12 @@ async def complete_thread_endpoint(thread_id: str, request: Request) -> Complete
             count = 0
         return CompleteThreadResponse(thread_id=thread_id, status="accepted", publish_candidate_count=count)
 
-    session_id: Optional[str] = thread.get("active_workflow_session_id")
+    session_id: str | None = thread.get("active_workflow_session_id")
     candidates: list[dict] = []
     if session_id:
         try:
             import aiosqlite as _aiosqlite
+
             from app.memory.session_data_store import SessionDataStore as _SessionDataStore
 
             async with _aiosqlite.connect(settings.SQLITE_DB_PATH) as _conn:
@@ -3436,9 +4078,9 @@ async def complete_thread_endpoint(thread_id: str, request: Request) -> Complete
 @app.get("/publish-candidates")
 async def list_publish_candidates_endpoint(
     request: Request,
-    brand_id: Optional[str] = Query(default=None),
-    thread_id: Optional[str] = Query(default=None),
-    run_id: Optional[str] = Query(default=None),
+    brand_id: str | None = Query(default=None),
+    thread_id: str | None = Query(default=None),
+    run_id: str | None = Query(default=None),
 ) -> PublishCandidatesResponse:
     thread_store = _get_thread_store(request)
     principal = None
@@ -3504,14 +4146,15 @@ async def get_thread_result_endpoint(thread_id: str, request: Request) -> Thread
             notes=[GeneratedNoteItem(**note) for note in notes],
         )
 
-    session_id: Optional[str] = thread.get("active_workflow_session_id")
+    session_id: str | None = thread.get("active_workflow_session_id")
     if not session_id:
         return ThreadResultResponse(thread_id=thread_id, session_id=None, strategy=None, notes=[])
 
-    strategy_dict: Optional[dict] = None
+    strategy_dict: dict | None = None
     notes_list: list[GeneratedNoteItem] = []
     try:
         import aiosqlite as _aiosqlite
+
         from app.memory.session_data_store import SessionDataStore as _SessionDataStore
 
         async with _aiosqlite.connect(settings.SQLITE_DB_PATH) as _conn:

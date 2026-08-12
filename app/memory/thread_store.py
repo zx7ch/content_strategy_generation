@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-import os
-import uuid
 import json
+import uuid
 from datetime import datetime
 from typing import Any, Optional
 
 import aiosqlite
 
+from app.config import settings
 from app.logging_config import get_logger
 from app.memory.workflow_store import ensure_column
 
@@ -25,8 +25,11 @@ def _new_id() -> str:
 class ThreadStore:
     """Persistent store for Creator conversation threads and messages."""
 
-    def __init__(self, db_path: str = os.environ.get("CREATOR_THREADS_DB_PATH", "./data/creator_threads.db")):
-        self.db_path = db_path
+    def __init__(self, db_path: str | None = None):
+        # Content Research runs, their timeline messages, and Creator threads
+        # must share one runtime database.  An explicit path is still useful
+        # for isolated tests and migrations.
+        self.db_path = db_path or settings.SQLITE_DB_PATH
         self._conn: Optional[aiosqlite.Connection] = None
         self._logger = get_logger(__name__, component="thread_store")
 
@@ -40,11 +43,15 @@ class ThreadStore:
     async def connect(self) -> None:
         if self._conn is not None:
             return
-        self._conn = await aiosqlite.connect(self.db_path)
+        # Content Research may hold a short SQLite write transaction while a
+        # Creator timeline message is appended; wait for that transaction
+        # instead of turning a valid run into a spurious startup failure.
+        self._conn = await aiosqlite.connect(self.db_path, timeout=30)
         self._conn.row_factory = aiosqlite.Row
-        await self._conn.execute("PRAGMA journal_mode=WAL")
+        # WAL is configured once during database bootstrap. Re-applying it on
+        # ordinary Creator connections can block behind an active checkpoint.
+        await self._conn.execute("PRAGMA busy_timeout=30000")
         await self._conn.execute("PRAGMA synchronous=NORMAL")
-        await self._conn.execute("PRAGMA busy_timeout=5000")
         await self._init_tables()
 
     async def close(self) -> None:
@@ -242,7 +249,9 @@ class ThreadStore:
                 linked_session_id,
                 linked_job_id,
                 run_id,
-                json.dumps(artifact_refs, ensure_ascii=False) if artifact_refs is not None else None,
+                json.dumps(artifact_refs, ensure_ascii=False)
+                if artifact_refs is not None
+                else None,
                 now,
             ),
         )

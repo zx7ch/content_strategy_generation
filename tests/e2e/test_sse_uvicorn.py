@@ -62,7 +62,8 @@ def _run_uvicorn() -> str:
         thread.join(timeout=5)
 
 
-async def _fake_strategy_execute(self, session_id: str) -> StrategyResult:
+async def _fake_strategy_execute(self, session_id: str, *, progress_callback=None) -> StrategyResult:
+    del progress_callback
     async with SessionManager(settings.SQLITE_DB_PATH) as manager:
         strategy = ContentStrategy(
             positioning="轻运动",

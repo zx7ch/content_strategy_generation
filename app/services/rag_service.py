@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -14,6 +15,8 @@ from chromadb.config import Settings as ChromaSettings
 from app.config import settings
 from app.models.schemas import RAGDocument
 from app.services.xhs_spider import XHSPost
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -69,19 +72,48 @@ class RAGService:
         return self._client
 
     def _get_collection(self):
+        """Get or create the Chroma collection, enforcing embedding model consistency.
+
+        The collection metadata stores which embedding model built the index.
+        If the configured model differs from what's recorded, a warning is logged
+        so the operator knows a re-index is required rather than getting silently
+        wrong query results.
+        """
         client = self._get_client()
-        if hasattr(client, "get_or_create_collection"):
-            return client.get_or_create_collection(
-                name=self.COLLECTION_NAME,
-                metadata={"hnsw:space": "cosine"},
-            )
+        base_metadata = {"hnsw:space": "cosine", "embedding_model": self.embedding_model}
+
         try:
-            return client.get_collection(self.COLLECTION_NAME)
+            collection = client.get_collection(name=self.COLLECTION_NAME)
         except Exception:
+            # Collection does not exist yet — create with fingerprint.
             return client.create_collection(
                 name=self.COLLECTION_NAME,
-                metadata={"hnsw:space": "cosine"},
+                metadata=base_metadata,
             )
+
+        # Collection exists: check model fingerprint.
+        stored_model = (collection.metadata or {}).get("embedding_model")
+
+        if stored_model and stored_model != self.embedding_model:
+            logger.warning(
+                "Embedding model mismatch: collection '%s' was built with '%s' "
+                "but current config is '%s'. "
+                "Query results will be incorrect until you re-index. "
+                "To re-index: delete %s and restart the runtime.",
+                self.COLLECTION_NAME,
+                stored_model,
+                self.embedding_model,
+                settings.CHROMA_PERSIST_DIR,
+            )
+
+        if not stored_model:
+            # Backfill fingerprint for collections created before this feature.
+            try:
+                collection.modify(metadata={**(collection.metadata or {}), **base_metadata})
+            except Exception:
+                pass  # older chromadb versions may not support modify()
+
+        return collection
 
     def _make_doc_id(self, session_id: str, note_id: str) -> str:
         return f"{session_id}:{note_id}"

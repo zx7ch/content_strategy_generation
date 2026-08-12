@@ -69,8 +69,8 @@ PROVIDER_CONFIGS: dict[LLMProvider, dict] = {
         "default_model": "abab6.5s-chat",
     },
     LLMProvider.KIMI: {
-        "base_url": "https://api.moonshot.cn/v1",
-        "default_model": "moonshot-v1-8k",
+        "base_url": "https://api.kimi.com/coding/v1",
+        "default_model": "kimi-for-coding",
     },
 }
 

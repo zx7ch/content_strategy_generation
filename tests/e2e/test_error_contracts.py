@@ -63,7 +63,8 @@ async def _set_session_state(db_path: str, session_id: str, **fields) -> None:
         await manager.update_session(session_id, **fields)
 
 
-async def _fake_budget_exceeded(self, session_id: str) -> GenerationExecutionResult:
+async def _fake_budget_exceeded(self, session_id: str, *, progress_callback=None) -> GenerationExecutionResult:
+    del progress_callback
     return GenerationExecutionResult(
         success=False,
         status="failed",
@@ -74,7 +75,8 @@ async def _fake_budget_exceeded(self, session_id: str) -> GenerationExecutionRes
     )
 
 
-async def _fake_retryable_strategy_failure(self, session_id: str) -> StrategyResult:
+async def _fake_retryable_strategy_failure(self, session_id: str, *, progress_callback=None) -> StrategyResult:
+    del progress_callback
     return StrategyResult(
         success=False,
         message=f"spider unavailable for {session_id}",
