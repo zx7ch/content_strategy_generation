@@ -19,6 +19,8 @@ def test_p0_workflow_action_contract_lists_supported_actions():
         "end_content_research",
         "retry_presearch",
         "clarify_subject",
+        "confirm_subject_structure",
+        "repair_from_persisted_packets",
     )
 
     request = ContentResearchWorkflowActionRequest(action="confirm_brief")

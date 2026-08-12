@@ -6,12 +6,12 @@ import pytest
 
 from app.content_research.admission.candidates import ExtractedFact
 from app.content_research.admission.evaluator import ClaimAdmissionEvaluator
-from app.content_research.admission.relevance import query_relevance_reason
 from app.content_research.admission.product_marketing import (
     PRODUCT_MARKETING_CLAIM_INTENTS,
     build_product_marketing_candidate,
     product_marketing_boundary_reason,
 )
+from app.content_research.admission.relevance import query_relevance_reason
 from app.content_research.contracts import build_default_snapshot
 from app.content_research.persistence_models import (
     ClaimCandidateRecord,

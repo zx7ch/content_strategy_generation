@@ -13,10 +13,10 @@ from app.content_research.api_schemas import ContentResearchTraceResponse
 from app.content_research.models import ObservationEventRecord, ResearchBriefRecord, TraceRecord
 from app.content_research.persistence_models import (
     MARKETING_CONCLUSION_DECISION_STATES,
-    MARKETING_CONCLUSION_TRACE_REASON_CODES,
-    MARKETING_CONCLUSION_TRACE_RECOVERY_ACTIONS,
     MARKETING_CONCLUSION_TRACE_FAILURE_CODES,
     MARKETING_CONCLUSION_TRACE_PROTOCOL_DETAILS,
+    MARKETING_CONCLUSION_TRACE_REASON_CODES,
+    MARKETING_CONCLUSION_TRACE_RECOVERY_ACTIONS,
     MARKETING_CONCLUSION_TRACKS,
     StageCheckpointRecord,
 )

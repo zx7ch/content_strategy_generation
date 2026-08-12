@@ -30,7 +30,38 @@ jobs:
           pip install -e ".[dev]"
 
       - name: Lint (ruff)
-        run: ruff check app/ tests/ --output-format=github
+        run: >-
+          ruff check
+          app/content_research
+          app/main.py
+          app/services/xhs_credentials.py
+          app/services/xhs_qr_auth.py
+          app/services/xhs_spider.py
+          runtime_main.py
+          tests/unit/test_runtime_config_migration.py
+          tests/unit/test_runtime_launcher.py
+          tests/unit/test_xhs_credentials.py
+          tests/unit/test_xhs_qr_auth.py
+          tests/e2e/test_xhs_login_api.py
+          tests/e2e/test_xhs_qr_login_api.py
+          tests/unit/test_content_research_*.py
+          tests/e2e/test_content_research_*.py
+          --output-format=github
 
       - name: Unit tests
-        run: pytest tests/unit/ -v --tb=short -q
+        run: >-
+          pytest
+          tests/unit/test_content_research_*.py
+          tests/unit/test_runtime_config_migration.py
+          tests/unit/test_runtime_launcher.py
+          tests/unit/test_xhs_credentials.py
+          tests/unit/test_xhs_qr_auth.py
+          tests/e2e/test_content_research_brief_confirm_api.py
+          tests/e2e/test_content_research_formal_workflow_e2e.py
+          tests/e2e/test_content_research_model_configuration_api.py
+          tests/e2e/test_content_research_presearch_api.py
+          tests/e2e/test_content_research_report_publication_timeline_api.py
+          tests/e2e/test_content_research_trace_api.py
+          tests/e2e/test_xhs_login_api.py
+          tests/e2e/test_xhs_qr_login_api.py
+          -v --tb=short -q

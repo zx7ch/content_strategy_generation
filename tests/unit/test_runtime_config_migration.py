@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import importlib.util
 import os
 import sys
-import importlib.util
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -91,7 +91,8 @@ def test_frozen_runtime_restart_and_upgrade_keep_credentials_outside_bundle(tmp_
     home = tmp_path / "clean-home"
     install_a = tmp_path / "runtime-a"
     install_b = tmp_path / "runtime-b"
-    install_a.mkdir(); install_b.mkdir()
+    install_a.mkdir()
+    install_b.mkdir()
     for install in (install_a, install_b):
         (install / "config.env").write_text("SQLITE_DB_PATH=./data/leak.db\n", encoding="utf-8")
 

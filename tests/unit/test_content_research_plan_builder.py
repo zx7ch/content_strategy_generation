@@ -25,6 +25,7 @@ def test_plan_builder_outputs_required_research_plan_contract():
         custom_competitors=["凯乐石"],
         selected_directions=["product_marketing", "comment_insight"],
         custom_research_question="关注夏季轻量户外",
+        primary_marketing_goal="content_seeding",
     )
     registry = ResearchDirectionRegistry()
     directions = registry.require_many(confirmation.selected_directions)

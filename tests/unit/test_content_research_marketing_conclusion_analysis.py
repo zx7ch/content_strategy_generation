@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import json
 import asyncio
+import json
 from dataclasses import replace
 
 import pytest
@@ -15,8 +15,8 @@ from app.content_research.persistence_models import (
     ClaimAdmissionDecisionRecord,
     ClaimCandidateRecord,
 )
-from app.services.llm.types import LLMResponse, TokenUsage
 from app.services.llm.failures import LLMProviderFailure
+from app.services.llm.types import LLMResponse, TokenUsage
 
 
 def marketing_policy() -> dict:

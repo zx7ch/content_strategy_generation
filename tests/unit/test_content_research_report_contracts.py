@@ -112,7 +112,7 @@ def test_publication_state_matrix_requires_core_sections_and_excludes_evidence_o
 
     with pytest.raises(ValueError, match="core audited"):
         _publication(draft, decision, verified_section_kinds=("core_conclusions", "main_findings"))
-    with pytest.raises(ValueError, match="partial report requires omitted"):
+    with pytest.raises(ValueError, match="partial or directional report requires omitted"):
         _publication(
             draft,
             decision,

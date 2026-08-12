@@ -8,19 +8,19 @@ from app.api.routes.router import app, schedule_embedding_prewarm
 from app.config import settings
 from app.content_research.presearch.service import PresearchService
 from app.content_research.service import ContentResearchService, WorkflowRunManagerRuntime
-from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
 from app.content_research.sources import SourceAdapterRegistry
 from app.content_research.sources.xiaohongshu.adapter import XiaohongshuSourceAdapter
+from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
 from app.content_research.worker import ContentResearchDispatchWorker
 from app.memory.job_store import JobStore
 from app.memory.thread_store import ThreadStore
-from app.services.llm.tracked_client import build_default_llm_service
 from app.services.llm.configuration_service import LiteLLMConfigurationService
 from app.services.llm.configuration_store import SQLiteLLMConfigurationStore
 from app.services.llm.providers.openai_compatible import OpenAICompatibleAdapter
+from app.services.llm.tracked_client import build_default_llm_service
 from app.services.step_executors import build_agent_step_executor_registry
-from app.services.xhs_qr_auth import XHSQRLoginSession
 from app.services.xhs_credentials import XHSCredentialStore
+from app.services.xhs_qr_auth import XHSQRLoginSession
 from app.services.xhs_spider import XHSSpiderClient
 from app.v2.decision.bootstrap import build_decision_runtime
 from app.v2.discovery.bootstrap import build_discovery_runtime

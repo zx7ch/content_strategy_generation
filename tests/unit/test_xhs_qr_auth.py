@@ -3,9 +3,9 @@ from __future__ import annotations
 import threading
 import time
 
+from app.services.xhs_credentials import XHSCredentialStore
 from app.services.xhs_qr_auth import XHSQRLoginAttempt, XHSQRLoginSession, _prepare_upstream_runtime
 from app.services.xhs_spider import XHSSpiderClient
-from app.services.xhs_credentials import XHSCredentialStore
 
 
 def test_start_returns_redacted_qr_projection_and_reuses_pending_attempt() -> None:

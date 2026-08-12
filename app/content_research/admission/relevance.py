@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from app.content_research.contracts import (
-    QUERY_SUBJECT_NOT_SUPPORTED,
     DirectionContract,
     RunPolicySnapshot,
     frozen_query_relevance,

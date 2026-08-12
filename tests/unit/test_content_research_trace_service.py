@@ -397,6 +397,12 @@ async def _confirmed_workflow(service):
             selected_directions=["product_marketing", "content_performance"],
             custom_research_question="关注轻量速干",
             primary_marketing_goal="content_seeding",
+            subject_structure_hash=str(presearch.subject_structure_hash),
+            subject_structure_confirmation={
+                "core_object": "徒步短裤",
+                "research_intent": "产品营销",
+                "context_modifiers": ["夏季"],
+            },
         ),
     )
     return presearch
@@ -646,6 +652,12 @@ async def test_plan_build_failure_aborts_plan_without_overlapping_brief(
                 subject_type="category",
                 selected_directions=["product_marketing"],
                 primary_marketing_goal="content_seeding",
+                subject_structure_hash=str(presearch.subject_structure_hash),
+                subject_structure_confirmation={
+                    "core_object": "徒步短裤",
+                    "research_intent": "产品营销",
+                    "context_modifiers": ["夏季"],
+                },
             ),
         )
 
@@ -675,6 +687,12 @@ async def test_confirmation_persistence_failure_aborts_plan_execution_span(
                 subject_type="category",
                 selected_directions=["product_marketing"],
                 primary_marketing_goal="content_seeding",
+                subject_structure_hash=str(presearch.subject_structure_hash),
+                subject_structure_confirmation={
+                    "core_object": "徒步短裤",
+                    "research_intent": "产品营销",
+                    "context_modifiers": ["夏季"],
+                },
             ),
         )
 
