@@ -11,9 +11,13 @@ Coverage:
 """
 
 import asyncio
+import inspect
+import sys
+from types import ModuleType
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch, Mock
+from unittest.mock import AsyncMock, MagicMock, patch
 
+from app.config import settings
 from app.services.xhs_spider import (
     SEARCH_SORT_OPTIONS,
     SpiderSearchSortOption,
@@ -49,6 +53,48 @@ class TestXHSSpiderClientInitialization:
             client = XHSSpiderClient(cookies="custom_cookie")
             assert client.cookies == "custom_cookie"
 
+    def test_current_upstream_auth_is_constructed_and_bootstrapped_once(self, monkeypatch):
+        created = []
+
+        class FakeAuth:
+            @classmethod
+            def from_cookie(cls, cookie):
+                created.append(cookie)
+                return object()
+
+        class FakeApi:
+            instances = []
+
+            def __init__(self, auth):
+                self.auth = auth
+                self.bootstrap_calls = 0
+                self.__class__.instances.append(self)
+
+            def bootstrap(self):
+                self.bootstrap_calls += 1
+                return self
+
+        api_module = ModuleType("apis.xhs_pc_apis")
+        api_module.XHS_Apis = FakeApi
+        auth_module = ModuleType("xhs_utils.xhs_pc")
+        auth_module.XHSPcAuth = FakeAuth
+        monkeypatch.setitem(sys.modules, "apis.xhs_pc_apis", api_module)
+        monkeypatch.setitem(sys.modules, "xhs_utils.xhs_pc", auth_module)
+
+        client = XHSSpiderClient(cookies="complete-cookie")
+
+        assert client._get_api() is client._get_api()
+        assert created == ["complete-cookie"]
+        assert len(FakeApi.instances) == 1
+        assert FakeApi.instances[0].bootstrap_calls == 1
+
+    def test_missing_cookie_is_an_auth_failure_without_echoing_input(self, monkeypatch):
+        monkeypatch.setattr(settings, "XHS_SPIDER_COOKIES", "")
+        client = XHSSpiderClient(cookies="")
+
+        with pytest.raises(SpiderPermanentError, match="Auth error"):
+            client._get_api()
+
 
 class TestErrorClassification:
     """Test error classification logic."""
@@ -81,10 +127,28 @@ class TestErrorClassification:
         assert isinstance(error, SpiderPermanentError)
         assert "Auth error" in str(error)
 
+    def test_classify_permanent_error_expired_chinese_login(self, client):
+        """Provider's localized expired-login response is an auth failure."""
+        error = client._classify_error("登录已过期")
+        assert isinstance(error, SpiderPermanentError)
+        assert "Auth error" in str(error)
+
+    def test_classify_permanent_error_missing_login_information(self, client):
+        """A partial Cookie header must use the same credential recovery path."""
+        error = client._classify_error("无登录信息，或登录信息为空")
+        assert isinstance(error, SpiderPermanentError)
+        assert "Auth error" in str(error)
+
     def test_classify_permanent_error_unknown(self, client):
         """Test unknown errors default to permanent."""
         error = client._classify_error("Some random error")
         assert isinstance(error, SpiderPermanentError)
+
+    def test_facade_has_no_cdp_transport_fallback(self):
+        source = inspect.getsource(XHSSpiderClient)
+
+        assert "xhs_browser_session" not in source
+        assert "XHS_BROWSER_CDP" not in source
 
 
 class TestSearchWithRetry:
@@ -124,6 +188,7 @@ class TestSearchWithRetry:
                 result = await client.search_with_retry("query")
                 
                 # Should retry 3 times total
+                assert len(result) == 1
                 assert call_count == 3
                 # Should sleep twice (not on last attempt)
                 assert mock_sleep.call_count == 2
@@ -141,18 +206,30 @@ class TestSearchWithRetry:
             assert "auth failed" in str(exc_info.value)
 
     @pytest.mark.asyncio
+    async def test_no_retry_when_provider_returns_expired_login_response(self, client):
+        """An expired Cookie must enter recovery without consuming retry budget."""
+        with patch.object(client, "search", return_value=(False, "登录已过期", [])) as mock_search:
+            with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+                with pytest.raises(SpiderPermanentError, match="Auth error: 登录已过期"):
+                    await client.search_with_retry("query")
+
+        assert mock_search.call_count == 1
+        mock_sleep.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_max_retries_exceeded(self, client):
-        """Test error raised when max retries exceeded."""
+        """Exhausted automatic retries remain recoverable by the workflow."""
         with patch.object(client, 'search', side_effect=SpiderTransientError("always fails")):
             with patch('asyncio.sleep', new_callable=AsyncMock):
-                with pytest.raises(SpiderPermanentError) as exc_info:
+                with pytest.raises(SpiderTransientError) as exc_info:
                     await client.search_with_retry("query")
                 
                 assert "failed after 3 retries" in str(exc_info.value)
+                assert exc_info.value.retry_count == 3
 
     @pytest.mark.asyncio
-    async def test_retry_backoff_sequence_matches_3_plus_2_spec(self):
-        """Spec requires 3 auto + 2 user retries -> 5 retries with 2/4/8/16/32 backoff."""
+    async def test_provider_call_uses_only_automatic_retry_budget(self):
+        """User recoveries must not be consumed inside one provider call."""
         with patch("app.services.xhs_spider.settings") as mock_settings:
             mock_settings.XHS_SPIDER_COOKIES = "cookie"
             mock_settings.XHS_SPIDER_MAX_AUTO_RETRIES = 3
@@ -163,13 +240,31 @@ class TestSearchWithRetry:
 
         with patch.object(client, "search", side_effect=SpiderTransientError("timeout")):
             with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
-                with pytest.raises(SpiderPermanentError) as exc_info:
+                with pytest.raises(SpiderTransientError) as exc_info:
                     await client.search_with_retry("query")
 
-                assert "after 5 retries" in str(exc_info.value)
-                assert client.search.call_count == 6  # initial + 5 retries
+                assert "after 3 retries" in str(exc_info.value)
+                assert client.search.call_count == 4  # initial + 3 automatic retries
                 waits = [call.args[0] for call in mock_sleep.call_args_list]
-                assert waits == [2, 4, 8, 16, 32]
+                assert waits == [2, 4, 8]
+
+    @pytest.mark.asyncio
+    async def test_search_result_reports_actual_automatic_retry_count(self, client):
+        attempts = 0
+
+        async def search(*_args, **_kwargs):
+            nonlocal attempts
+            attempts += 1
+            if attempts < 3:
+                raise SpiderTransientError("timeout")
+            return True, "", [MagicMock()]
+
+        with patch.object(client, "search", side_effect=search):
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                posts, retry_count = await client.search_with_retry_result("query")
+
+        assert len(posts) == 1
+        assert retry_count == 2
 
     @pytest.mark.asyncio
     async def test_search_with_retry_passes_sort_parameter(self, client):
@@ -177,7 +272,7 @@ class TestSearchWithRetry:
         with patch.object(client, "search", return_value=(True, "", [MagicMock()])) as mock_search:
             await client.search_with_retry("query", num=12, sort=4)
 
-        mock_search.assert_awaited_once_with("query", 12, 4)
+        mock_search.assert_awaited_once_with("query", 12, 4, on_page=None)
 
 
 class TestDataNormalization:
@@ -349,7 +444,11 @@ class TestDataNormalization:
         }]
         with patch.object(client, "_get_api") as mock_get_api:
             mock_api = MagicMock()
-            mock_api.search_some_note.return_value = (True, "", raw)
+            mock_api.search_note.return_value = (
+                True,
+                "",
+                {"data": {"items": raw, "has_more": False}},
+            )
             mock_get_api.return_value = mock_api
             success, msg, posts = client._sync_search("q", 1, 2)
 
@@ -373,29 +472,27 @@ class TestSortParameter:
 
     @pytest.mark.asyncio
     async def test_sort_parameter_passed_to_api(self, client):
-        """Test that sort parameter is correctly passed to search_some_note."""
+        """Test that sort parameter is correctly passed to the page API."""
         with patch.object(client, '_get_api') as mock_get_api:
             mock_api = MagicMock()
-            mock_api.search_some_note.return_value = (True, "", [])
+            mock_api.search_note.return_value = (True, "", {"data": {"items": [], "has_more": False}})
             mock_get_api.return_value = mock_api
-            
-            # Test default sort (2=最多点赞)
-            # Signature: search_some_note(query, require_num, cookies_str, sort_type_choice=0, ...)
+
+            # First page uses the selected default sort (2=最多点赞).
             await client.search("query", num=10)
-            mock_api.search_some_note.assert_called_once_with("query", 10, "test_cookie", 2)
+            mock_api.search_note.assert_called_once_with("query", page=1, sort_type_choice=2)
 
     @pytest.mark.asyncio
     async def test_sort_parameter_custom_value(self, client):
         """Test custom sort value is passed correctly."""
         with patch.object(client, '_get_api') as mock_get_api:
             mock_api = MagicMock()
-            mock_api.search_some_note.return_value = (True, "", [])
+            mock_api.search_note.return_value = (True, "", {"data": {"items": [], "has_more": False}})
             mock_get_api.return_value = mock_api
-            
-            # Test sort=1 (最新)
-            # Signature: search_some_note(query, require_num, cookies_str, sort_type_choice=0, ...)
+
+            # Test sort=1 (最新).
             await client.search("query", num=20, sort=1)
-            mock_api.search_some_note.assert_called_once_with("query", 20, "test_cookie", 1)
+            mock_api.search_note.assert_called_once_with("query", page=1, sort_type_choice=1)
 
     def test_hotspot_sort_options_come_from_spider_sort_registry(self, client):
         options = client.get_hotspot_sort_options()
@@ -419,9 +516,9 @@ class TestEdgeCases:
         """Test handling of empty query string."""
         with patch.object(client, '_get_api') as mock_get_api:
             mock_api = MagicMock()
-            mock_api.search_some_note.return_value = (True, "", [])
+            mock_api.search_note.return_value = (True, "", {"data": {"items": [], "has_more": False}})
             mock_get_api.return_value = mock_api
-            
+
             success, msg, posts = await client.search("")
             assert success is True
             assert posts == []
@@ -431,9 +528,9 @@ class TestEdgeCases:
         """Test handling when API returns failure status."""
         with patch.object(client, '_get_api') as mock_get_api:
             mock_api = MagicMock()
-            mock_api.search_some_note.return_value = (False, "API Error", [])
+            mock_api.search_note.return_value = (False, "API Error", {})
             mock_get_api.return_value = mock_api
-            
+
             success, msg, posts = await client.search("query")
             assert success is False
             assert msg == "API Error"

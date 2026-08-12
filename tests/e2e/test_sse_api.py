@@ -34,7 +34,8 @@ def _wait_for_job(client: TestClient, job_id: str, timeout: float = 3.0) -> None
     raise AssertionError(f"job {job_id} did not finish in time")
 
 
-async def _fake_strategy_execute(self, session_id: str) -> StrategyResult:
+async def _fake_strategy_execute(self, session_id: str, *, progress_callback=None) -> StrategyResult:
+    del progress_callback
     async with SessionManager(settings.SQLITE_DB_PATH) as manager:
         strategy = ContentStrategy(
             positioning="轻运动",

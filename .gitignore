@@ -11,8 +11,9 @@ downloads/
 eggs/
 .eggs/
 lib/
-lib64/
 !frontend/src/lib/
+!frontend/src/lib/**
+lib64/
 parts/
 sdist/
 var/
@@ -80,14 +81,17 @@ coverage.xml
 .mypy_cache/
 .dmypy.json
 dmypy.json
+*.tsbuildinfo
 
 # Ruff
 .ruff_cache/
 
 # Local development
 local/
+.worktrees/
 notes/
 tmp/
+config.env
 instructions/
 
 # Claude Code session data
@@ -96,3 +100,6 @@ instructions/
 
 # ML models (large binaries)
 models/
+
+# Local browser-network captures may contain session credentials and request signatures.
+*.har

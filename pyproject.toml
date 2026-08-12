@@ -36,7 +36,15 @@ dependencies = [
     "pydantic>=2.5.0",
     "pydantic-settings>=2.1.0",
     "httpx>=0.25.0",
+    "websocket-client>=1.8.0",
+    "curl_cffi==0.15.0",
+    "qrcode>=8.0",
+    "Pillow>=10.0",
     "python-dotenv>=1.0.0",
+    "openai>=1.0.0",
+    "anthropic>=0.39.0",
+    "numpy>=1.24.0",
+    "structlog>=24.0.0",
 ]
 
 [project.optional-dependencies]
@@ -44,10 +52,14 @@ dev = [
     "pytest>=7.4.0",
     "pytest-asyncio>=0.21.0",
     "pytest-cov>=4.1.0",
+    "playwright>=1.62.0",
     "black>=23.0.0",
     "ruff>=0.1.0",
     "mypy>=1.6.0",
 ]
+
+[tool.setuptools.packages.find]
+include = ["app*", "experiments*"]
 
 [tool.black]
 line-length = 100
@@ -55,7 +67,9 @@ target-version = ['py310']
 
 [tool.ruff]
 line-length = 100
-select = ["E", "F", "I", "N", "W", "UP"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N"]
 ignore = ["E501"]
 
 [tool.mypy]

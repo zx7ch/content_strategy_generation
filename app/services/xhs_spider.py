@@ -3,11 +3,15 @@ XHS Spider Service - Wrapper for third-party Spider_XHS
 """
 
 import asyncio
-from dataclasses import dataclass
 import os
-from pathlib import Path
+import sys
 import threading
-from typing import Callable, List, Optional, Tuple, Dict, Any
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Tuple
+from urllib.parse import parse_qs, urlparse
+
 from pydantic import BaseModel
 
 from app.config import settings
@@ -30,6 +34,9 @@ class XHSPost(BaseModel):
     share_count: int
     note_url: str
     images: List[str]
+    note_type: str = ""
+    source_published_at: str | None = None
+    provider_item_type: str = "note"
 
 
 class SpiderError(Exception):
@@ -39,7 +46,10 @@ class SpiderError(Exception):
 
 class SpiderTransientError(SpiderError):
     """临时错误（可重试）"""
-    pass
+
+    def __init__(self, message: str, *, retry_count: int = 0) -> None:
+        super().__init__(message)
+        self.retry_count = retry_count
 
 
 class SpiderPermanentError(SpiderError):
@@ -72,13 +82,22 @@ class XHSSpiderClient:
         posts = await client.search_with_retry("巴黎时装周穿搭")
     """
     
-    _cwd_lock = threading.Lock()
+    _upstream_lock = threading.RLock()
 
-    def __init__(self, cookies: Optional[str] = None):
+    def __init__(
+        self,
+        cookies: Optional[str] = None,
+        *,
+        auth_provider: Callable[[], Any | None] | None = None,
+        on_auth_failure: Callable[[], None] | None = None,
+    ):
         self.cookies = cookies or settings.XHS_SPIDER_COOKIES
         self.max_retries = self._resolve_retry_budget()
         self.backoff_base = self._safe_int(settings.XHS_SPIDER_BACKOFF_BASE, default=2)
         self._api = None
+        self._api_auth = None
+        self._auth_provider = auth_provider
+        self._on_auth_failure = on_auth_failure
         self._submodule_path = Path(__file__).parent.parent / "ingest" / "xhs_spider"
 
     @classmethod
@@ -99,16 +118,6 @@ class XHSSpiderClient:
             return
         os.environ["NODE_PATH"] = target if not current else f"{target}{os.pathsep}{current}"
 
-    def _run_in_submodule_cwd(self, fn, *args, **kwargs):
-        """Run call in spider submodule cwd for execjs relative imports."""
-        original_dir = os.getcwd()
-        with self._cwd_lock:
-            os.chdir(str(self._submodule_path))
-            try:
-                return fn(*args, **kwargs)
-            finally:
-                os.chdir(original_dir)
-
     @staticmethod
     def _safe_int(value: Any, default: int) -> int:
         if isinstance(value, bool):
@@ -123,60 +132,84 @@ class XHSSpiderClient:
         return default
 
     def _resolve_retry_budget(self) -> int:
-        # Spec: 3 auto retries + 2 user retries.
+        # This client owns one provider operation, so it may consume only the
+        # automatic retry budget. User-triggered recovery is accounted for by
+        # the workflow and must never be folded into this loop.
         auto = self._safe_int(getattr(settings, "XHS_SPIDER_MAX_AUTO_RETRIES", None), default=-1)
-        user = self._safe_int(getattr(settings, "XHS_SPIDER_MAX_USER_RETRIES", None), default=-1)
-        if auto >= 0 and user >= 0:
-            return auto + user
-        # Backward-compatible fallback
+        if auto >= 0:
+            return auto
+        # Backward-compatible fallback for configurations created before the
+        # separate automatic retry setting existed.
         return self._safe_int(getattr(settings, "XHS_SPIDER_MAX_RETRIES", 5), default=5)
+
+    def authentication_ready(self) -> bool:
+        """Return whether this process has credentials available for a retry."""
+        if self._auth_provider is not None:
+            return self._auth_provider() is not None
+        return bool(str(self.cookies or "").strip())
     
     def _get_api(self):
-        """Lazy load XHS_Apis from submodule"""
-        if self._api is None:
+        """Create one bootstrapped current-upstream API lifecycle per client.
+
+        The upstream client owns mutable signing and HTTP session state.  It is
+        initialized once and never rebuilt for an individual endpoint call.
+        """
+        upstream_auth = self._auth_provider() if self._auth_provider is not None else None
+        if self._api is None or (
+            self._auth_provider is not None and self._api_auth is not upstream_auth
+        ):
             try:
-                # Import from git submodule: app/ingest/xhs_spider
-                # Need to set correct working directory for relative paths in submodule
-                import sys
-                import os
-                from pathlib import Path
-                
                 if str(self._submodule_path) not in sys.path:
                     sys.path.insert(0, str(self._submodule_path))
                 self._configure_node_path()
+                from apis.xhs_pc_apis import XHS_Apis
+                from xhs_utils.xhs_pc import XHSPcAuth
 
-                # Change to submodule directory for relative path resolution
-                original_dir = os.getcwd()
-                os.chdir(str(self._submodule_path))
-                try:
-                    from apis.xhs_pc_apis import XHS_Apis
-                    self._api = XHS_Apis()
-                finally:
-                    os.chdir(original_dir)
-                    
-            except ImportError as e:
+                if upstream_auth is None:
+                    if not self.cookies or not self.cookies.strip():
+                        raise ValueError("XHS login Cookie is not configured")
+                    upstream_auth = XHSPcAuth.from_cookie(self.cookies)
+                self._api = XHS_Apis(upstream_auth).bootstrap()
+                self._api_auth = upstream_auth
+            except (ImportError, ValueError) as e:
                 _logger.error("spider submodule import failed", error=str(e), submodule_path=str(self._submodule_path))
                 raise SpiderPermanentError(
-                    f"XHS Spider submodule not available. "
-                    f"Please run: git submodule update --init\n"
-                    f"Error: {e}"
-                )
+                    "Auth error: XHS Spider login is unavailable or expired"
+                ) from e
+            except Exception as e:
+                _logger.warning("spider bootstrap failed", error_type=type(e).__name__)
+                raise self._classify_error(str(e)) from e
         return self._api
+
+    def _call_api(self, method_name: str, *args, **kwargs):
+        """Serialize mutable upstream signer/session use on the worker thread."""
+        with self._upstream_lock:
+            return getattr(self._get_api(), method_name)(*args, **kwargs)
     
     def _classify_error(self, error_msg: str) -> SpiderError:
         """分类错误类型"""
         error_lower = error_msg.lower()
-        
+
         transient_keywords = [
-            "timeout", "connection", "network", "temporarily", 
+            "timeout", "connection", "network", "temporarily",
             "retry", "rate limit", "too many requests"
         ]
-        auth_keywords = ["cookie", "auth", "unauthorized", "forbidden", "login"]
-        
+        auth_keywords = [
+            "cookie", "auth", "unauthorized", "forbidden", "login",
+            "登录已过期", "未登录", "请先登录", "身份验证", "无登录信息", "登录信息为空",
+        ]
+
+        # A credential failure cannot be repaired by retrying the same request.
+        # Check it before generic transport wording so it reaches recovery intact.
+        if any(kw in error_lower for kw in auth_keywords):
+            if self._on_auth_failure is not None:
+                try:
+                    self._on_auth_failure()
+                except Exception:
+                    _logger.exception("failed to persist Xiaohongshu authentication failure")
+            return SpiderPermanentError(f"Auth error: {error_msg}")
         if any(kw in error_lower for kw in transient_keywords):
             return SpiderTransientError(error_msg)
-        elif any(kw in error_lower for kw in auth_keywords):
-            return SpiderPermanentError(f"Auth error: {error_msg}")
         else:
             return SpiderPermanentError(error_msg)
     
@@ -199,7 +232,7 @@ class XHSSpiderClient:
         Returns:
             (success, message, posts)
         """
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             None, self._sync_search, query, num, sort, on_page
         )
@@ -212,18 +245,16 @@ class XHSSpiderClient:
         on_page: Optional[Callable[[List["XHSPost"]], None]] = None,
     ) -> Tuple[bool, str, List["XHSPost"]]:
         """同步分页搜索，每页完成后触发 on_page 回调（在线程池中运行）。"""
-        api = self._get_api()
         all_posts: List[XHSPost] = []
         page = 1
 
         try:
             while True:
-                success, msg, res_json = self._run_in_submodule_cwd(
-                    api.search_note,
+                success, msg, res_json = self._call_api(
+                    "search_note",
                     query,
-                    self.cookies,
-                    page,
-                    sort,
+                    page=page,
+                    sort_type_choice=sort,
                 )
                 if not success:
                     if not all_posts:
@@ -259,7 +290,7 @@ class XHSSpiderClient:
             if all_posts:
                 return True, "", all_posts[:num]
             raise self._classify_error(str(exc))
-    
+
     async def search_with_retry(
         self,
         query: str,
@@ -267,8 +298,23 @@ class XHSSpiderClient:
         sort: int = 2,
         on_page: Optional[Callable[[List["XHSPost"]], None]] = None,
     ) -> List[XHSPost]:
+        posts, _retry_count = await self.search_with_retry_result(
+            query,
+            num=num,
+            sort=sort,
+            on_page=on_page,
+        )
+        return posts
+
+    async def search_with_retry_result(
+        self,
+        query: str,
+        num: int = 50,
+        sort: int = 2,
+        on_page: Optional[Callable[[List["XHSPost"]], None]] = None,
+    ) -> tuple[List[XHSPost], int]:
         """
-        带重试的搜索
+        带重试的搜索，并返回本次 provider operation 实际消耗的自动重试次数。
         
         Args:
             query: 搜索关键词
@@ -288,10 +334,12 @@ class XHSSpiderClient:
                 success, msg, posts = await self.search(query, num, sort, on_page=on_page)
                 
                 if success:
-                    return posts
+                    return posts, retry_count
                 else:
-                    # API returned failure - treat as transient
-                    last_error = SpiderTransientError(msg)
+                    # API-level failures still carry their typed provider reason.
+                    # In particular, an expired Cookie must reach the workflow
+                    # as a non-retryable credential recovery state immediately.
+                    raise self._classify_error(msg)
                     
             except SpiderTransientError as e:
                 _logger.warning("spider transient error, will retry", attempt=retry_count, error=str(e))
@@ -300,6 +348,7 @@ class XHSSpiderClient:
                 
             except SpiderPermanentError as e:
                 _logger.error("spider permanent error, aborting retries", attempt=retry_count, error=str(e))
+                e.retry_count = retry_count
                 raise
             
             # Calculate backoff: 2^attempt seconds (2, 4, 8, 16, 32)
@@ -308,9 +357,71 @@ class XHSSpiderClient:
                 await asyncio.sleep(wait_time)
         
         # Max retries exceeded
-        raise SpiderPermanentError(
-            f"Spider failed after {self.max_retries} retries. Last error: {last_error}"
+        raise SpiderTransientError(
+            f"Spider failed after {self.max_retries} retries. Last error: {last_error}",
+            retry_count=self.max_retries,
         )
+
+    async def collect_comment_page(
+        self,
+        *,
+        note_id: str,
+        note_url: str,
+        cursor: str | None = None,
+    ) -> tuple[list[dict[str, Any]], str | None, bool]:
+        """Fetch one top-level comment page through the bundled spider facade."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None, self._sync_collect_comment_page, note_id, note_url, cursor or ""
+        )
+
+    def _sync_collect_comment_page(
+        self, note_id: str, note_url: str, cursor: str
+    ) -> tuple[list[dict[str, Any]], str | None, bool]:
+        parsed = urlparse(note_url)
+        token = (parse_qs(parsed.query).get("xsec_token") or [""])[0]
+        if not token:
+            raise SpiderPermanentError("comment collection requires xsec_token in note URL")
+        try:
+            success, message, payload = self._call_api("get_note_out_comment", note_id, cursor, token)
+        except Exception as exc:
+            raise self._classify_error(str(exc)) from exc
+        if not success:
+            raise self._classify_error(str(message))
+        data = (payload or {}).get("data") or {}
+        comments = data.get("comments") or []
+        return list(comments), str(data.get("cursor") or "") or None, bool(data.get("has_more", False))
+
+    async def collect_note_detail(self, *, note_id: str, note_url: str) -> XHSPost:
+        """Fetch a single note through the spider's detail endpoint.
+
+        The endpoint needs the security parameters embedded in the source URL;
+        callers must therefore pass the discovered URL rather than a search card
+        payload as an ersatz detail response.
+        """
+        if not note_url:
+            raise SpiderPermanentError("note detail collection requires a note URL")
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None, self._sync_collect_note_detail, note_id, note_url
+        )
+
+    def _sync_collect_note_detail(self, note_id: str, note_url: str) -> XHSPost:
+        try:
+            success, message, payload = self._call_api("get_note_info", note_url)
+        except Exception as exc:
+            raise self._classify_error(str(exc)) from exc
+        if not success:
+            raise self._classify_error(str(message))
+
+        items = ((payload or {}).get("data") or {}).get("items") or []
+        if not items or not isinstance(items[0], dict):
+            raise SpiderPermanentError("note detail response did not include an item")
+        raw_post = {**items[0], "url": note_url}
+        post = self._normalize_post(raw_post)
+        if not post.note_id:
+            post = post.model_copy(update={"note_id": note_id})
+        return post
 
     @staticmethod
     def _safe_str(value: Any, default: str = "") -> str:
@@ -403,6 +514,9 @@ class XHSSpiderClient:
             note_id,
             raw_post,
         )
+        raw_note_type = self._safe_str(note_card.get("type") or raw_post.get("note_type")).strip().lower()
+        note_type = "video" if raw_note_type == "video" else "image_text" if raw_note_type else ""
+        published_at = self._timestamp_to_iso(note_card.get("time") or raw_post.get("time"))
 
         return XHSPost(
             note_id=note_id,
@@ -417,7 +531,22 @@ class XHSSpiderClient:
             share_count=parse_int(raw_post.get("share_count", interact_info.get("share_count"))),
             note_url=note_url,
             images=self._extract_images(raw_post, note_card),
+            note_type=note_type,
+            source_published_at=published_at,
+            provider_item_type=self._safe_str(raw_post.get("model_type") or "note"),
         )
+
+    @staticmethod
+    def _timestamp_to_iso(value: Any) -> str | None:
+        try:
+            timestamp = float(value)
+        except (TypeError, ValueError):
+            return None
+        if timestamp <= 0:
+            return None
+        if timestamp > 10_000_000_000:
+            timestamp /= 1000
+        return datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat()
 
     @classmethod
     def _derive_title(cls, *candidates: Any, fallback: str = "无标题") -> tuple[str, bool]:

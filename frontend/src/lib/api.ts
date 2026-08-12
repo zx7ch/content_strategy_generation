@@ -487,6 +487,13 @@ export function getWorkspaceContext(): { workspaceId: string; userId: string } {
   };
 }
 
+export function getRuntimeAuthorizationHeader(): string | undefined {
+  const token =
+    process.env.NEXT_PUBLIC_XHS_AUTH_TOKEN?.trim() ||
+    process.env.XHS_AUTH_TOKEN?.trim();
+  return token ? `Bearer ${token}` : undefined;
+}
+
 export async function getDefaultWorkspace(): Promise<{ workspace_id: string; user_id: string }> {
   const response = await fetch(`${RUNTIME_BASE_URL}/workspaces/default`, { cache: "no-store" });
   if (!response.ok) {
@@ -516,7 +523,7 @@ export async function initializeWorkspaceContext(): Promise<{ workspace_id: stri
       `Agent Runtime API 契约不匹配：当前 ${health.api_contract}，需要 ${REQUIRED_API_CONTRACT}。请升级本地 runtime。`
     );
   }
-  if (compareSemver(health.version, MIN_BACKEND_VERSION) < 0) {
+  if (!isLocalRuntimeVersion(health.version) && compareSemver(health.version, MIN_BACKEND_VERSION) < 0) {
     throw new Error(
       `Agent Runtime 版本过低：当前 ${health.version}，需要 ${MIN_BACKEND_VERSION} 或更高。请升级本地 runtime。`
     );
@@ -531,6 +538,10 @@ export async function initializeWorkspaceContext(): Promise<{ workspace_id: stri
   const workspace = await getDefaultWorkspace();
   setWorkspaceContext(workspace.workspace_id, workspace.user_id);
   return workspace;
+}
+
+function isLocalRuntimeVersion(version: string): boolean {
+  return ["dev", "development", "local"].includes(version.trim().toLowerCase());
 }
 
 function compareSemver(current: string, minimum: string): number {
@@ -569,9 +580,7 @@ function getApiConfig() {
     baseUrl: RUNTIME_BASE_URL,
     workspaceId: _workspaceId,
     userId: _userId,
-    authToken:
-      process.env.NEXT_PUBLIC_XHS_AUTH_TOKEN?.trim() ||
-      process.env.XHS_AUTH_TOKEN?.trim()
+    authorization: getRuntimeAuthorizationHeader()
   };
 }
 
@@ -658,8 +667,8 @@ async function requestJson<T>(
     "X-Workspace-Id": config.workspaceId,
     "X-User-Id": config.userId
   });
-  if (config.authToken) {
-    headers.set("Authorization", `Bearer ${config.authToken}`);
+  if (config.authorization) {
+    headers.set("Authorization", config.authorization);
   }
 
   const response = await fetch(`${config.baseUrl}${path}`, {
@@ -679,7 +688,11 @@ async function requestJson<T>(
         throw error;
       }
     } catch (error) {
-      if (error instanceof Error && error.message !== `request failed: ${response.status}`) {
+      if (
+        error instanceof Error &&
+        error.message !== `request failed: ${response.status}` &&
+        error.name !== "SyntaxError"
+      ) {
         throw error;
       }
     }
@@ -1542,8 +1555,8 @@ async function creatorFetch<T>(
   if (options?.body !== undefined) {
     headers.set("Content-Type", "application/json");
   }
-  if (config.authToken) {
-    headers.set("Authorization", `Bearer ${config.authToken}`);
+  if (config.authorization) {
+    headers.set("Authorization", config.authorization);
   }
   const res = await fetch(`${RUNTIME_BASE_URL}${path}`, {
     method: options?.method ?? "GET",

@@ -93,8 +93,9 @@ async def migrate_workflow_compat_columns(conn: aiosqlite.Connection) -> None:
 class WorkflowStore:
     """Persistence boundary for workflow tables introduced by restructure T1."""
 
-    def __init__(self, db_path: Optional[str] = None):
+    def __init__(self, db_path: Optional[str] = None, *, read_only: bool = False):
         self.db_path = db_path or settings.SQLITE_DB_PATH
+        self.read_only = read_only
         self._conn: Optional[aiosqlite.Connection] = None
         self._logger = get_logger(__name__, component="workflow_store")
 
@@ -108,12 +109,17 @@ class WorkflowStore:
     async def connect(self) -> None:
         if self._conn is not None:
             return
-        self._conn = await aiosqlite.connect(self.db_path)
+        if self.read_only:
+            self._conn = await aiosqlite.connect(f"file:{self.db_path}?mode=ro", uri=True)
+        else:
+            self._conn = await aiosqlite.connect(self.db_path)
         self._conn.row_factory = aiosqlite.Row
-        await self._conn.execute("PRAGMA journal_mode=WAL")
         await self._conn.execute("PRAGMA synchronous=NORMAL")
         await self._conn.execute("PRAGMA busy_timeout=5000")
-        await self.initialize_schema()
+        if self.read_only:
+            await self._conn.execute("PRAGMA query_only=ON")
+        else:
+            await self.initialize_schema()
 
     async def close(self) -> None:
         if self._conn is None:
@@ -124,6 +130,12 @@ class WorkflowStore:
     async def initialize_schema(self) -> None:
         assert self._conn is not None
         await self._create_workflow_tables()
+        await self._conn.commit()
+
+    async def delete_run(self, run_id: str) -> None:
+        assert self._conn is not None
+        for table in ("workflow_constraints", "workflow_artifacts", "workflow_events", "workflow_child_tasks", "workflow_steps", "workflow_runs"):
+            await self._conn.execute(f"DELETE FROM {table} WHERE run_id = ?", (run_id,))
         await self._conn.commit()
 
     async def _create_workflow_tables(self) -> None:
@@ -171,6 +183,7 @@ class WorkflowStore:
                 checkpoint_json TEXT,
                 output_artifact_refs_json TEXT,
                 active_job_id TEXT,
+                timing_json TEXT,
                 started_at TIMESTAMP,
                 completed_at TIMESTAMP,
                 next_retry_at TIMESTAMP,
@@ -200,6 +213,7 @@ class WorkflowStore:
                 checkpoint_json TEXT,
                 output_artifact_refs_json TEXT,
                 note_id TEXT,
+                timing_json TEXT,
                 started_at TIMESTAMP,
                 completed_at TIMESTAMP,
                 error_code TEXT,
@@ -211,6 +225,18 @@ class WorkflowStore:
         )
         await self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_workflow_child_tasks_step ON workflow_child_tasks(step_id, slot_index)"
+        )
+        await ensure_column(
+            self._conn,
+            table_name="workflow_steps",
+            column_name="timing_json",
+            column_sql="timing_json TEXT",
+        )
+        await ensure_column(
+            self._conn,
+            table_name="workflow_child_tasks",
+            column_name="timing_json",
+            column_sql="timing_json TEXT",
         )
         await self._conn.execute(
             """
@@ -326,6 +352,7 @@ class WorkflowStore:
             checkpoint_json=_json_load(row["checkpoint_json"], None),
             output_artifact_refs_json=_json_load(row["output_artifact_refs_json"], None),
             active_job_id=row["active_job_id"],
+            timing_json=_json_load(row["timing_json"], None),
             started_at=_parse_dt(row["started_at"]),
             completed_at=_parse_dt(row["completed_at"]),
             next_retry_at=_parse_dt(row["next_retry_at"]),
@@ -351,6 +378,7 @@ class WorkflowStore:
             checkpoint_json=_json_load(row["checkpoint_json"], None),
             output_artifact_refs_json=_json_load(row["output_artifact_refs_json"], None),
             note_id=row["note_id"],
+            timing_json=_json_load(row["timing_json"], None),
             started_at=_parse_dt(row["started_at"]),
             completed_at=_parse_dt(row["completed_at"]),
             error_code=row["error_code"],

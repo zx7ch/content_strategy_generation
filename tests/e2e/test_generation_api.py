@@ -61,7 +61,8 @@ async def _seed_strategy_session(db_path: str, session_id: str) -> None:
         )
 
 
-async def _fake_generation_execute(self, session_id: str) -> GenerationExecutionResult:
+async def _fake_generation_execute(self, session_id: str, *, progress_callback=None) -> GenerationExecutionResult:
+    del progress_callback
     note = GeneratedNote(
         note_id="g1",
         title="修护精华怎么选",

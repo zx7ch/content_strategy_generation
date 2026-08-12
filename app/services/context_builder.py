@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import asdict, dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 from app.config import settings
 from app.memory.thread_store import ThreadStore
@@ -38,7 +38,7 @@ class StepContext:
     run: dict[str, Any]
     step: dict[str, Any]
     definition: dict[str, Any]
-    user_request: Optional[str]
+    user_request: str | None
     brand_context: dict[str, Any]
     constraints: list[dict[str, Any]]
     pending_constraints: list[dict[str, Any]]
@@ -65,7 +65,7 @@ def _definition(
     constraint_types: tuple[WorkflowConstraintType, ...] = (),
     artifact_types: tuple[WorkflowArtifactType, ...] = (),
     interrupt_policy: str = "step_boundary",
-    output_requirements: Optional[dict[str, Any]] = None,
+    output_requirements: dict[str, Any] | None = None,
 ) -> StepDefinition:
     return StepDefinition(
         step_name=step_name,
@@ -261,7 +261,7 @@ STEP_DEFINITIONS: dict[str, StepDefinition] = {
 
 
 class ContextBuilder:
-    def __init__(self, db_path: Optional[str] = None) -> None:
+    def __init__(self, db_path: str | None = None) -> None:
         self.db_path = db_path or settings.SQLITE_DB_PATH
 
     async def build_context(self, run_id: str, step_name: str) -> StepContext:
@@ -305,9 +305,8 @@ class ContextBuilder:
                 return step
         raise ValueError(f"Workflow step not found: {step_name}")
 
-    @staticmethod
-    async def _load_messages(thread_id: str) -> list[dict[str, Any]]:
-        async with ThreadStore() as ts:
+    async def _load_messages(self, thread_id: str) -> list[dict[str, Any]]:
+        async with ThreadStore(self.db_path) as ts:
             return await ts.get_thread_messages(thread_id)
 
     @staticmethod
@@ -402,7 +401,7 @@ class ContextBuilder:
         return StepContext(**payload)
 
     @staticmethod
-    def _resolve_user_request(run: WorkflowRun, messages: list[dict[str, Any]]) -> Optional[str]:
+    def _resolve_user_request(run: WorkflowRun, messages: list[dict[str, Any]]) -> str | None:
         for message in messages:
             if message["id"] == run.source_message_id:
                 return message["text"]

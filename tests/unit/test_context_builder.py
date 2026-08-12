@@ -6,8 +6,12 @@ import pytest
 
 from app.memory.thread_store import ThreadStore
 from app.memory.workflow_store import WorkflowStore
-from app.models.workflow import WorkflowArtifactType, WorkflowConstraintType, WorkflowPhase
-from app.services.context_builder import ContextBuilder, STEP_DEFINITIONS
+from app.models.workflow import (
+    WorkflowArtifactType,
+    WorkflowConstraintType,
+    WorkflowPhase,
+)
+from app.services.context_builder import STEP_DEFINITIONS, ContextBuilder
 from app.services.workflow_run_manager import WorkflowRunManager
 
 
@@ -40,42 +44,40 @@ async def seeded(tmp_path):
                     },
                 ],
             )
-    async with WorkflowStore(db_path) as store:
-        await store.create_constraint(
+    async with WorkflowRunManager(db_path) as manager:
+        await manager.add_constraint(
             run_id=run.run_id,
-            thread_id=run.thread_id,
             message_id="msg-style",
             raw_text="语气更生活化",
             constraint_type=WorkflowConstraintType.STYLE,
             scope="run",
-            normalized={"tone": "lifestyle"},
+            normalized_constraint={"tone": "lifestyle"},
         )
-        await store.create_constraint(
+        await manager.add_constraint(
             run_id=run.run_id,
-            thread_id=run.thread_id,
             message_id="msg-topic",
             raw_text="主题改成露营",
             constraint_type=WorkflowConstraintType.TOPIC_CHANGE,
             scope="run",
-            normalized={"topic": "camping"},
+            normalized_constraint={"topic": "camping"},
         )
-        await store.create_artifact(
+        await manager.attach_artifact(
             run_id=run.run_id,
-            thread_id=run.thread_id,
             artifact_type=WorkflowArtifactType.STRATEGY,
             payload={"positioning": "防晒衣"},
+            created_by_step_id=steps[1].step_id,
         )
-        await store.create_artifact(
+        await manager.attach_artifact(
             run_id=run.run_id,
-            thread_id=run.thread_id,
             artifact_type=WorkflowArtifactType.PROPOSAL,
             payload={"proposal_id": "p1"},
+            created_by_step_id=steps[2].step_id,
         )
-        await store.create_artifact(
+        await manager.attach_artifact(
             run_id=run.run_id,
-            thread_id=run.thread_id,
             artifact_type=WorkflowArtifactType.SOURCE_SNAPSHOT,
             payload={"source": "xhs"},
+            created_by_step_id=steps[0].step_id,
         )
     return db_path, run, steps
 
@@ -174,15 +176,14 @@ async def test_input_hash_changes_when_relevant_input_changes(seeded):
     builder = ContextBuilder(db_path)
     first = await builder.build_context(run.run_id, "generation.generate_notes_parallel")
 
-    async with WorkflowStore(db_path) as store:
-        await store.create_constraint(
+    async with WorkflowRunManager(db_path) as manager:
+        await manager.add_constraint(
             run_id=run.run_id,
-            thread_id=run.thread_id,
             message_id="msg-forbidden",
             raw_text="不要太硬广",
             constraint_type=WorkflowConstraintType.FORBIDDEN_WORDS,
             scope="run",
-            normalized={"avoid": "hard_sell"},
+            normalized_constraint={"avoid": "hard_sell"},
         )
 
     second = await builder.build_context(run.run_id, "generation.generate_notes_parallel")
