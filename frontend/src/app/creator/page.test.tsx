@@ -53,6 +53,68 @@ test("Xiaohongshu login card exposes both setup paths and only redacted status m
   globalThis.fetch = previousFetch;
 });
 
+test("model setup explains the action a Creator can take when a Key is rejected", async () => {
+  const dom = new JSDOM("<!doctype html><html><body></body></html>", { url: "http://localhost" });
+  Object.assign(globalThis, {
+    window: dom.window,
+    document: dom.window.document,
+    HTMLElement: dom.window.HTMLElement,
+    HTMLButtonElement: dom.window.HTMLButtonElement,
+    HTMLInputElement: dom.window.HTMLInputElement,
+    Event: dom.window.Event,
+    IS_REACT_ACT_ENVIRONMENT: true,
+  });
+  Object.defineProperty(globalThis, "navigator", { configurable: true, value: dom.window.navigator });
+  const previousFetch = globalThis.fetch;
+  let requestCount = 0;
+  globalThis.fetch = async () => {
+    requestCount += 1;
+    const payload = requestCount === 1
+      ? { source: "system_default", status: "not_configured", base_url: "", model: "", api_key_configured: false }
+      : { source: "candidate", status: "invalid", base_url: "https://api.openai.com/v1", model: "gpt-4o-mini", api_key_configured: true, error_code: "llm_auth_invalid" };
+    return new Response(JSON.stringify(payload), { status: 200, headers: { "Content-Type": "application/json" } });
+  };
+  const React = await import("react");
+  Object.assign(globalThis, { React });
+  const { act } = React;
+  const { createRoot } = await import("react-dom/client");
+  const { setWorkspaceContext } = await import("@/lib/api.ts");
+  const { ModelServiceCard } = await import("@/components/content-research/ModelServiceCard.tsx");
+  setWorkspaceContext("workspace_test", "user_test");
+  const container = document.createElement("div");
+  document.body.append(container);
+  const root = createRoot(container);
+  await act(async () => {
+    root.render(React.createElement(ModelServiceCard, {
+      recoveryPending: false,
+      onContinue: () => undefined,
+      onConfigurationChanged: () => undefined,
+    }));
+  });
+  await act(async () => { await Promise.resolve(); });
+
+  const buttonNamed = (name: string) =>
+    [...container.querySelectorAll("button")].find((button) => button.textContent === name);
+  await act(async () => { buttonNamed("配置模型")?.click(); });
+  for (const [label, value] of Object.entries({
+    "Base URL": "https://api.openai.com/v1",
+    "模型": "gpt-4o-mini",
+    "API Key": "never-render-this-key",
+  })) {
+    const input = container.querySelector(`input[aria-label="${label}"]`) as HTMLInputElement;
+    input.value = value;
+    input.dispatchEvent(new dom.window.Event("input", { bubbles: true }));
+  }
+  await act(async () => { buttonNamed("测试连接")?.click(); await Promise.resolve(); });
+
+  assert.match(container.textContent ?? "", /API Key 无效、已撤销，或无权调用该模型服务/);
+  assert.doesNotMatch(container.textContent ?? "", /never-render-this-key/);
+
+  await act(async () => { root.unmount(); });
+  container.remove();
+  globalThis.fetch = previousFetch;
+});
+
 test("Brief confirmation requires an explicit marketing goal before enabling confirmation", async () => {
   const dom = new JSDOM("<!doctype html><html><body></body></html>", {
     url: "http://localhost",
