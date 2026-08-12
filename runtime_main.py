@@ -128,12 +128,13 @@ if getattr(sys, "frozen", False):
     _load_env_file(_dot_env)
 
     # ── Resolve data paths ────────────────────────────────────────────────────
-    os.environ.setdefault("SQLITE_DB_PATH", os.path.join(_data_home, "xhs_agent.db"))
-    os.environ.setdefault("CHROMA_PERSIST_DIR", os.path.join(_data_home, "chroma"))
-    os.environ.setdefault("CREATOR_THREADS_DB_PATH", os.path.join(_data_home, "creator_threads.db"))
-    os.environ.setdefault(
-        "V2_DISCOVERY_SQLITE_PATH", os.path.join(_data_home, "xhs_discovery.db")
-    )
+    # Bundle templates are never allowed to redirect durable user state back
+    # into the extracted application folder.  These paths are an installation
+    # boundary, not user-configurable Runtime settings.
+    os.environ["SQLITE_DB_PATH"] = os.path.join(_data_home, "xhs_agent.db")
+    os.environ["CHROMA_PERSIST_DIR"] = os.path.join(_data_home, "chroma")
+    os.environ["CREATOR_THREADS_DB_PATH"] = os.path.join(_data_home, "creator_threads.db")
+    os.environ["V2_DISCOVERY_SQLITE_PATH"] = os.path.join(_data_home, "xhs_discovery.db")
 
     # ── Model cache ───────────────────────────────────────────────────────────
     # Redirect ALL HuggingFace downloads (sentence-transformers, transformers,
@@ -142,7 +143,7 @@ if getattr(sys, "frozen", False):
     #   • are shared across runtime versions (no re-download after update)
     #   • are removed cleanly when the user uninstalls the app
     # Adding a new model in config is enough — HF handles download on first use.
-    os.environ.setdefault("HF_HOME", os.path.join(_data_home, "hf_cache"))
+    os.environ["HF_HOME"] = os.path.join(_data_home, "hf_cache")
 
 import uvicorn
 

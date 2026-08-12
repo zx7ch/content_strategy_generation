@@ -448,6 +448,31 @@ def _apply_0016(conn: sqlite3.Connection) -> None:
     conn.executescript(_V16_MARKETING_CONCLUSION_SQL)
 
 
+_V17_XHS_CREDENTIAL_SQL = """
+CREATE TABLE xhs_local_credentials (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    cookie TEXT NOT NULL,
+    source TEXT NOT NULL CHECK (source IN ('qr', 'manual_cookie')),
+    status TEXT NOT NULL DEFAULT 'authenticated',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+"""
+
+
+def _apply_0017(conn: sqlite3.Connection) -> None:
+    conn.executescript(_V17_XHS_CREDENTIAL_SQL)
+
+
+_V18_XHS_CREDENTIAL_STATUS_SQL = """
+ALTER TABLE xhs_local_credentials ADD COLUMN failure_code TEXT;
+"""
+
+
+def _apply_0018(conn: sqlite3.Connection) -> None:
+    conn.executescript(_V18_XHS_CREDENTIAL_STATUS_SQL)
+
+
 def _apply_0015(conn: sqlite3.Connection) -> None:
     conn.execute(_V15_LLM_CONFIGURATION_SQL)
 
@@ -499,6 +524,8 @@ def _expected_checksums(migration_0002_sql: str, legacy_checksum: str) -> dict[s
         "0014": _checksum(_V14_REPORT_TABLES),
         "0015": hashlib.sha256(_V15_LLM_CONFIGURATION_SQL.encode("utf-8")).hexdigest(),
         "0016": _checksum((_V16_SUPERSEDED_LITE_REPORT_TABLES, _V16_MARKETING_CONCLUSION_SQL)),
+        "0017": hashlib.sha256(_V17_XHS_CREDENTIAL_SQL.encode("utf-8")).hexdigest(),
+        "0018": hashlib.sha256(_V18_XHS_CREDENTIAL_STATUS_SQL.encode("utf-8")).hexdigest(),
     }
 
 
@@ -690,6 +717,20 @@ def apply_content_research_migrations(
                 name="govern_lite_marketing_conclusions",
                 checksum=expected_checksums["0016"],
                 apply=lambda: _apply_0016(conn),
+            )
+            _apply_migration(
+                conn,
+                version="0017",
+                name="local_xhs_credentials",
+                checksum=expected_checksums["0017"],
+                apply=lambda: _apply_0017(conn),
+            )
+            _apply_migration(
+                conn,
+                version="0018",
+                name="local_xhs_credential_status",
+                checksum=expected_checksums["0018"],
+                apply=lambda: _apply_0018(conn),
             )
         except Exception:
             conn.rollback()

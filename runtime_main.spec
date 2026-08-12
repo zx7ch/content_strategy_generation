@@ -127,11 +127,11 @@ import sys as _sys
 
 _dist = _os.path.join("dist", "xhs-runtime")
 
-# config.env template — always included on all platforms.
-# Use the tracked example file, not a developer's local config.env, so release
-# archives never accidentally include local API keys or cookies.
-if _os.path.exists(".env.example"):
-    _shutil.copy2(".env.example", _os.path.join(_dist, "config.env"))
+# config.env template — always included on all platforms.  This dedicated,
+# tracked release template deliberately contains no developer .env values,
+# credential fields, or data paths.
+if _os.path.exists("runtime.config.env"):
+    _shutil.copy2("runtime.config.env", _os.path.join(_dist, "config.env"))
 
 # macOS launcher
 if _sys.platform == "darwin":

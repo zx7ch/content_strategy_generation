@@ -39,6 +39,8 @@ from app.content_research.api_schemas import (
     HumanDecisionResponse,
     HumanDecisionsResponse,
     XHSQRLoginResponse,
+    XHSLoginStatusResponse,
+    XHSManualCookieRequest,
 )
 from app.content_research.presearch.service import PresearchService
 from app.content_research.service import (
@@ -1003,6 +1005,41 @@ async def start_xhs_qr_login(request: Request) -> XHSQRLoginResponse:
     if session is None:
         raise APIError(status_code=503, error_code="XHS_LOGIN_UNAVAILABLE", error_message="XHS login session is unavailable")
     return XHSQRLoginResponse(**(await asyncio.to_thread(session.start)))
+
+
+@app.get("/content-research/providers/xiaohongshu/login", response_model=XHSLoginStatusResponse)
+async def get_xhs_login_status(request: Request) -> XHSLoginStatusResponse:
+    store = getattr(request.app.state, "xhs_credential_store", None)
+    if store is None:
+        from app.services.xhs_credentials import XHSCredentialStore
+        store = XHSCredentialStore(settings.SQLITE_DB_PATH)
+        request.app.state.xhs_credential_store = store
+    return XHSLoginStatusResponse(**store.get_status().__dict__)
+
+
+@app.put("/content-research/providers/xiaohongshu/login", response_model=XHSLoginStatusResponse)
+async def save_xhs_manual_cookie(payload: XHSManualCookieRequest, request: Request) -> XHSLoginStatusResponse:
+    session = getattr(request.app.state, "xhs_qr_login_session", None)
+    if session is None:
+        raise APIError(status_code=503, error_code="XHS_LOGIN_UNAVAILABLE", error_message="XHS login session is unavailable")
+    try:
+        await asyncio.to_thread(session.set_manual_cookie, payload.cookie)
+    except ValueError:
+        raise APIError(status_code=422, error_code="INVALID_XHS_COOKIE", error_message="Cookie 格式无效") from None
+    store = getattr(request.app.state, "xhs_credential_store", None)
+    return XHSLoginStatusResponse(**store.get_status().__dict__)
+
+
+@app.delete("/content-research/providers/xiaohongshu/login", response_model=XHSLoginStatusResponse)
+async def clear_xhs_login(request: Request) -> XHSLoginStatusResponse:
+    session = getattr(request.app.state, "xhs_qr_login_session", None)
+    if session is not None:
+        await asyncio.to_thread(session.clear_auth)
+    store = getattr(request.app.state, "xhs_credential_store", None)
+    if store is None:
+        from app.services.xhs_credentials import XHSCredentialStore
+        store = XHSCredentialStore(settings.SQLITE_DB_PATH)
+    return XHSLoginStatusResponse(**store.get_status().__dict__)
 
 
 @app.get("/content-research/providers/xiaohongshu/login/qr", response_model=XHSQRLoginResponse)

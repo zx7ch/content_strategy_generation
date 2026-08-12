@@ -232,6 +232,25 @@ export interface XHSQRLoginResponse {
   failure_code?: string | null;
 }
 
+export interface XHSLoginStatus {
+  authenticated: boolean;
+  source?: "qr" | "manual_cookie" | null;
+  updated_at?: string | null;
+  failure_code?: string | null;
+}
+
+export async function getXHSLoginStatus(): Promise<XHSLoginStatus> {
+  return contentResearchFetch("/content-research/providers/xiaohongshu/login");
+}
+
+export async function saveXHSManualCookie(cookie: string): Promise<XHSLoginStatus> {
+  return contentResearchFetch("/content-research/providers/xiaohongshu/login", { method: "PUT", body: { cookie } });
+}
+
+export async function clearXHSLogin(): Promise<XHSLoginStatus> {
+  return contentResearchFetch("/content-research/providers/xiaohongshu/login", { method: "DELETE" });
+}
+
 export async function startXHSQRLogin(): Promise<XHSQRLoginResponse> {
   return contentResearchFetch("/content-research/providers/xiaohongshu/login/qr", { method: "POST" });
 }

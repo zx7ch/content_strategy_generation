@@ -26,8 +26,7 @@
 xhs-runtime        ← 必须在同级
 start.command
 ```
-`config.env` 模板通常也会在同级目录，但真实配置文件会在首次启动后生成到：
-`~/Library/Application Support/xhs-growth-agent/config.env`
+`config.env` 只是 Runtime 模板；LLM 和小红书登录请在 Creator 的右侧栏设置。
 
 ---
 
@@ -45,12 +44,12 @@ start.command
 
 ### ❌ 任务执行失败，日志显示"API key 无效"或"authentication error"
 
-**原因**：真实配置文件里的 `ANTHROPIC_API_KEY` 填错了。
+**原因**：Creator 右栏“模型服务”中的 API Key 填错了。
 
 **解决**：
-1. 用文本编辑器打开 `~/Library/Application Support/xhs-growth-agent/config.env`
-2. 确认 Key 以 `sk-ant-` 开头，中间没有多余空格
-3. 保存后重启 Runtime（关闭终端窗口 → 重新双击 `start.command`）
+1. 点击输入框下方的“内容调研”
+2. 在右栏“模型服务”中重新填写并验证 Key
+3. 保存后直接重新发起任务；无需编辑文件或重启 Runtime
 
 ---
 
@@ -59,10 +58,9 @@ start.command
 **原因 1**：Cookie 已过期（有效期约 7 天）。
 
 **解决**：
-1. 重新登录 [小红书网页版](https://www.xiaohongshu.com)
-2. 按 `F12` → Network → 刷新页面 → 点任意请求 → 复制 Cookie 字段
-3. 粘贴到 `~/Library/Application Support/xhs-growth-agent/config.env` 的 `XHS_SPIDER_COOKIES=` 后，保存
-4. 重启 Runtime
+1. 点击输入框下方的“内容调研”
+2. 在右栏“小红书登录”重新扫码，或粘贴新的完整 Cookie
+3. 保存后重试任务；无需编辑文件或重启 Runtime
 
 **原因 2**：Cookie 格式不完整。
 
@@ -141,7 +139,7 @@ start.command
 
 在。数据和真实配置都存储在 `~/Library/Application Support/xhs-growth-agent/`，与 exe 安装目录完全独立，重新打包不会影响数据，也不需要重新填写已有 API Key 或 Cookie。
 
-如果新版 Runtime 的配置模板增加了字段，启动时会自动把缺失字段追加到真实 `config.env`，并生成一个 `config.env.bak-*` 备份文件。终端会提示新增了哪些配置项，请按提示检查。
+LLM API Key 与小红书登录信息会持续保存在本机用户数据目录，升级 Runtime 不会要求重新填写或扫码；只有用户主动清除，或上游登录失效时才需要更新。
 
 ---
 

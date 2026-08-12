@@ -224,6 +224,17 @@ class XHSQRLoginResponse(BaseModel):
     failure_code: str | None = None
 
 
+class XHSLoginStatusResponse(BaseModel):
+    authenticated: bool
+    source: str | None = None
+    updated_at: str | None = None
+    failure_code: str | None = None
+
+
+class XHSManualCookieRequest(BaseModel):
+    cookie: str = Field(min_length=1, max_length=16384)
+
+
 class ContentResearchDirectionEvidenceResponse(BaseModel):
     schema_version: str = CONTENT_RESEARCH_API_SCHEMA_VERSION
     workflow_run_id: str

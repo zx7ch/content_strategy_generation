@@ -8,6 +8,7 @@ import {
   validateLLMConfiguration,
   type LLMConfiguration,
 } from "@/lib/content-research-api";
+import { llmConfigurationFeedback } from "@/lib/llm-configuration-feedback";
 
 function statusLabel(status: string): string {
   return status === "validated" ? "连接已验证" : status === "invalid" ? "配置需要修正" : "使用系统默认配置";
@@ -55,8 +56,8 @@ export function ModelServiceCard({
     try {
       const value = await validateLLMConfiguration({ base_url: baseUrl, model, api_key: apiKey || null });
       if (value.status === "validated") setMessage("连接验证成功");
-      else setMessage("连接验证失败，请检查模型服务配置");
-    } catch { setMessage("连接验证失败，请检查模型服务配置"); }
+      else setMessage(llmConfigurationFeedback(value.error_code));
+    } catch { setMessage(llmConfigurationFeedback(null)); }
     finally { busyRef.current = false; setBusy(false); }
   };
 

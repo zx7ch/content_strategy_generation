@@ -9,8 +9,8 @@
 
 | 准备项 | 说明 |
 |---|---|
-| Anthropic API Key | 用于驱动 AI 模型，在 [console.anthropic.com](https://console.anthropic.com) 申请 |
-| 小红书账号 | 用于采集竞品内容，需要登录后获取 Cookie |
+| LLM API Key | 用于驱动 AI 模型，在所选模型服务商处申请 |
+| 小红书账号 | 用于采集竞品内容，可扫码登录或粘贴 Cookie |
 | Mac 电脑 | 当前版本仅支持 macOS |
 
 ---
@@ -30,29 +30,14 @@ xhs-runtime/
 
 > 数据和真实配置存储在 `~/Library/Application Support/xhs-growth-agent/`，升级 exe 不会影响这里的数据。
 
-### 2. 填写配置文件
+### 2. 在网页右栏完成连接设置
 
-第一次启动 Runtime 后，用任意文本编辑器打开真实配置文件：
+启动 Runtime 并打开创作台后，点击输入框下方的 **内容调研**。右侧栏会立即显示两个卡片：
 
-```
-~/Library/Application Support/xhs-growth-agent/config.env
-```
+1. **模型服务**：填写并验证 LLM API Key、Base URL 和模型名称。
+2. **小红书登录**：可直接扫码登录，也可粘贴完整 Cookie。
 
-填入以下内容：
-
-```
-LLM_PROVIDER=anthropic
-ANTHROPIC_API_KEY=sk-ant-xxxxxxxxxxxxxxxx   ← 填你的 Key
-XHS_SPIDER_COOKIES=                          ← 填小红书 Cookie（见下方获取步骤）
-```
-
-**如何获取小红书 Cookie：**
-
-1. 用 Chrome 打开 [小红书网页版](https://www.xiaohongshu.com) 并登录
-2. 按 `F12` 打开开发者工具 → 切换到 **Network** 标签页
-3. 刷新页面，点击任意一个请求
-4. 在右侧找到 **Request Headers** → 复制 **Cookie** 字段的完整内容
-5. 粘贴到 `config.env` 的 `XHS_SPIDER_COOKIES=` 后面
+两种信息都只保存在本机用户数据目录；关闭或重启 Runtime、替换升级包后会自动恢复。不要编辑压缩包内的 `config.env` 来填写 Key 或 Cookie。
 
 ### 3. 允许程序运行（首次需要）
 
@@ -125,9 +110,9 @@ Agent 会依次执行以下步骤（每步完成后会告知进度）：
 ## 六、注意事项
 
 - **保持 Runtime 窗口开启**：关闭终端窗口会停止所有服务
-- **小红书 Cookie 有效期约 7 天**：过期后需重新获取并更新 `~/Library/Application Support/xhs-growth-agent/config.env`
+- **小红书登录失效**：在 Creator 右栏重新扫码或替换 Cookie
 - **数据本地存储**：所有生成内容和真实配置存储在 `~/Library/Application Support/xhs-growth-agent/`，不会上传到服务器；升级 Runtime 不影响历史数据或已填写配置
-- **配置模板更新**：升级后如果新版模板增加了配置项，Runtime 会自动追加缺失项到真实 `config.env`，并生成备份文件；请按终端提示检查新增配置
+- **凭据本机保存**：LLM API Key 与小红书登录信息保存在本机 Runtime 数据库中，不会写入安装包或网页云端
 - **API 费用**：每次完整任务约消耗 $0.5-2 的 Anthropic API 费用（取决于内容量）
 
 ---

@@ -89,6 +89,7 @@ class XHSSpiderClient:
         cookies: Optional[str] = None,
         *,
         auth_provider: Callable[[], Any | None] | None = None,
+        on_auth_failure: Callable[[], None] | None = None,
     ):
         self.cookies = cookies or settings.XHS_SPIDER_COOKIES
         self.max_retries = self._resolve_retry_budget()
@@ -96,6 +97,7 @@ class XHSSpiderClient:
         self._api = None
         self._api_auth = None
         self._auth_provider = auth_provider
+        self._on_auth_failure = on_auth_failure
         self._submodule_path = Path(__file__).parent.parent / "ingest" / "xhs_spider"
 
     @classmethod
@@ -200,6 +202,11 @@ class XHSSpiderClient:
         # A credential failure cannot be repaired by retrying the same request.
         # Check it before generic transport wording so it reaches recovery intact.
         if any(kw in error_lower for kw in auth_keywords):
+            if self._on_auth_failure is not None:
+                try:
+                    self._on_auth_failure()
+                except Exception:
+                    _logger.exception("failed to persist Xiaohongshu authentication failure")
             return SpiderPermanentError(f"Auth error: {error_msg}")
         if any(kw in error_lower for kw in transient_keywords):
             return SpiderTransientError(error_msg)

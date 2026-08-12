@@ -20,6 +20,7 @@ from app.services.llm.configuration_store import SQLiteLLMConfigurationStore
 from app.services.llm.providers.openai_compatible import OpenAICompatibleAdapter
 from app.services.step_executors import build_agent_step_executor_registry
 from app.services.xhs_qr_auth import XHSQRLoginSession
+from app.services.xhs_credentials import XHSCredentialStore
 from app.services.xhs_spider import XHSSpiderClient
 from app.v2.decision.bootstrap import build_decision_runtime
 from app.v2.discovery.bootstrap import build_discovery_runtime
@@ -49,14 +50,18 @@ async def _worker_lifespan(application):
         probe_adapter=OpenAICompatibleAdapter(provider="openai_compatible"),
     )
     content_research_dispatch_event = asyncio.Event()
-    xhs_qr_login_session = XHSQRLoginSession()
+    xhs_credential_store = XHSCredentialStore(settings.SQLITE_DB_PATH)
+    xhs_qr_login_session = XHSQRLoginSession(credential_store=xhs_credential_store)
     content_research_service = ContentResearchService(
         store=SQLiteContentResearchStore(settings.SQLITE_DB_PATH),
         presearch=PresearchService(content_research_llm_service),
         workflow_runtime=WorkflowRunManagerRuntime(settings.SQLITE_DB_PATH),
         analysis_llm=content_research_llm_service,
         source_registry=SourceAdapterRegistry({"xiaohongshu": XiaohongshuSourceAdapter(
-            spider_client=XHSSpiderClient(auth_provider=xhs_qr_login_session.get_auth),
+            spider_client=XHSSpiderClient(
+                auth_provider=xhs_qr_login_session.get_auth,
+                on_auth_failure=xhs_qr_login_session.mark_auth_stale,
+            ),
         )}),
         dispatch_wake_event=content_research_dispatch_event,
     )
@@ -111,6 +116,7 @@ async def _worker_lifespan(application):
     application.state.llm_configuration_service = llm_configuration_service
     application.state.content_research_service = content_research_service
     application.state.xhs_qr_login_session = xhs_qr_login_session
+    application.state.xhs_credential_store = xhs_credential_store
     application.state.content_research_dispatch_worker = content_research_worker
     application.state.content_research_dispatch_worker_task = content_research_worker_task
     application.state.worker_started = True

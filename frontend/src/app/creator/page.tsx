@@ -45,6 +45,7 @@ import {
   type ContentResearchWorkflowSummary,
 } from "@/lib/content-research-api";
 import { ModelServiceCard } from "@/components/content-research/ModelServiceCard";
+import { XiaohongshuLoginCard } from "@/components/content-research/XiaohongshuLoginCard";
 import { traceExecutionDurationText } from "@/lib/content-research-trace";
 import { resolveContentResearchModelRecovery } from "@/lib/content-research-recovery";
 
@@ -90,9 +91,6 @@ interface ContentResearchRunState {
 }
 
 type LitePublicationState = "complete_verified_report" | "partial_verified_report" | "directional_report" | "evidence_only_report";
-
-const F003_LITE_PREVIEW_ENABLED =
-  process.env.F003_LITE_PREVIEW_ENABLED === "true";
 
 function litePublicationState(report: ContentResearchLiteReportResponse): LitePublicationState | null {
   const state = stringField(report.publication, "state");
@@ -1941,6 +1939,7 @@ function ContentResearchContextSidebar({
         </ul> : <p className="text-xs leading-5 text-quiet">暂无已发布报告；此处不会显示未冻结的来源、结论或指标。</p>}
       </section>
       <ModelServiceCard recoveryPending={recoveryPending} recoveryRequiredSince={recoveryRequiredSince} onContinue={onContinuePresearch} onConfigurationChanged={() => undefined} />
+      <XiaohongshuLoginCard />
     </aside>
   );
 }
@@ -3213,21 +3212,19 @@ export default function CreatorPage() {
                   +
                 </button>
                 <span className="h-6 w-px shrink-0 bg-line" />
-                {F003_LITE_PREVIEW_ENABLED && (
-                  <button
-                    type="button"
-                    onClick={() => setContentResearchMode((current) => !current)}
-                    className={[
-                      "inline-flex h-9 shrink-0 items-center gap-2 rounded-full border px-3 text-sm font-medium transition",
-                      contentResearchMode
-                        ? "border-ink bg-slate-100 text-ink"
-                        : "border-transparent text-ink hover:bg-slate-100",
-                    ].join(" ")}
-                  >
-                    <span className="text-base">⌕</span>
-                    内容调研
-                  </button>
-                )}
+                <button
+                  type="button"
+                  onClick={() => setContentResearchMode((current) => !current)}
+                  className={[
+                    "inline-flex h-9 shrink-0 items-center gap-2 rounded-full border px-3 text-sm font-medium transition",
+                    contentResearchMode
+                      ? "border-ink bg-slate-100 text-ink"
+                      : "border-transparent text-ink hover:bg-slate-100",
+                  ].join(" ")}
+                >
+                  <span className="text-base">⌕</span>
+                  内容调研
+                </button>
               </div>
               <button
                 type="button"
@@ -3270,7 +3267,7 @@ export default function CreatorPage() {
         recoveryRequiredSince={modelRecovery.requiredSince}
         onContinuePresearch={continueModelRecovery}
       />}
-      {!contentResearchRun && <aside className="hidden w-[300px] shrink-0 overflow-y-auto border-l border-line bg-slate-50 p-4 lg:block" aria-label="内容调研上下文">
+      {!contentResearchRun && contentResearchMode && <aside className="hidden w-[300px] shrink-0 overflow-y-auto border-l border-line bg-slate-50 p-4 lg:block" aria-label="内容调研上下文">
         <h2 className="mb-3 text-sm font-semibold text-ink">本次研究摘要</h2>
         <section className="mb-4 rounded-xl border border-line bg-white p-4" aria-label="内容调研研究摘要">
           <p className="text-xs leading-5 text-quiet">
@@ -3280,6 +3277,7 @@ export default function CreatorPage() {
           </p>
         </section>
         <ModelServiceCard recoveryPending={modelRecovery.recoveryPending} recoveryRequiredSince={modelRecovery.requiredSince} onContinue={continueModelRecovery} onConfigurationChanged={() => undefined} />
+        <XiaohongshuLoginCard />
       </aside>}
       {contentResearchRun && <ContentResearchTraceInspector
         run={contentResearchRun}
