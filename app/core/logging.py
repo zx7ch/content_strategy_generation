@@ -119,6 +119,7 @@ def configure_logging(
     log_level: Optional[str] = None,
     json_format: bool = True,
     force: bool = False,
+    log_file: Optional[str] = None,
 ) -> None:
     """Configure structured logging for the application.
 
@@ -153,6 +154,12 @@ def configure_logging(
     handler.setLevel(getattr(logging, level))
     handler.setFormatter(logging.Formatter("%(message)s"))
     root_logger.addHandler(handler)
+    if log_file:
+        os.makedirs(os.path.dirname(log_file), exist_ok=True)
+        file_handler = logging.FileHandler(log_file, encoding="utf-8")
+        file_handler.setLevel(getattr(logging, level))
+        file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+        root_logger.addHandler(file_handler)
 
     # Configure structlog
     processors = get_processors() if json_format else get_processors()[:-1]
