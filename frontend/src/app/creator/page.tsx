@@ -205,6 +205,28 @@ function contentResearchRunWithReport(
   };
 }
 
+function interruptedPresearchSummary(
+  workflowRunId: string,
+  threadId: string,
+): ContentResearchWorkflowSummary {
+  return {
+    workflow_run_id: workflowRunId,
+    brief: {
+      id: `pending-${workflowRunId}`,
+      workflow_run_id: workflowRunId,
+      thread_id: threadId,
+      status: "presearch_interrupted",
+      payload: {},
+    },
+    plan: null,
+    directions: [],
+    subagent_tasks: [],
+    runtime_run: null,
+    runtime_steps: [],
+    runtime_child_tasks: [],
+  };
+}
+
 function sourceFailureReasonText(reason: string | null | undefined) {
   if (reason === "auth_required") return "需要登录小红书网页端";
   if (reason === "rate_limited") return "当前访问过于频繁，请稍后再继续";
@@ -2214,6 +2236,27 @@ export default function CreatorPage() {
     return trace;
   }
 
+  async function restoreInterruptedContentResearchRun(threadId: string): Promise<boolean> {
+    try {
+      const { thread } = await getThreadTimeline(threadId);
+      const workflowRunId = thread.active_run_id ?? contentResearchRunForThread(threadId);
+      if (!workflowRunId) return false;
+      const trace = await getContentResearchTrace(workflowRunId);
+      setContentResearchIntent(null);
+      setContentResearchRun(contentResearchRunWithReport(
+        workflowRunId,
+        interruptedPresearchSummary(workflowRunId, threadId),
+        trace,
+        null,
+        null,
+      ));
+      saveContentResearchRunForThread(threadId, workflowRunId);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   async function refreshContentResearchReport(workflowRunId: string): Promise<ContentResearchLiteReportResponse | null> {
     setContentResearchRun((current) =>
       current && current.workflowRunId === workflowRunId
@@ -2681,7 +2724,13 @@ export default function CreatorPage() {
         setContentResearchIntent({ seed: text, presearch: result });
         setContentResearchMode(false);
       } catch {
-        appendMessage({ role: "system", text: "内容调研预检索失败，请检查 runtime 或小红书登录态。" });
+        const restored = await restoreInterruptedContentResearchRun(threadId);
+        appendMessage({
+          role: "system",
+          text: restored
+            ? "预检索连接中断，已恢复本次运行的 Trace；请打开 Trace 查看当前步骤与日志。"
+            : "内容调研预检索失败，请检查 runtime 或小红书登录态。",
+        });
       } finally {
         setIsLoading(false);
         inputRef.current?.focus();

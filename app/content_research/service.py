@@ -1579,7 +1579,8 @@ class ContentResearchService:
 
     async def get_workflow_trace(self, workflow_run_id: str) -> ContentResearchTraceResponse:
         brief = self._store.get_brief_by_workflow(workflow_run_id)
-        if brief is None:
+        traces = self._store.list_traces_for_workflow(workflow_run_id)
+        if brief is None and not traces:
             raise ContentResearchNotFoundError(
                 f"Content research workflow not found: {workflow_run_id}"
             )

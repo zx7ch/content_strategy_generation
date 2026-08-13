@@ -97,6 +97,47 @@ async def _record_usage(db_path: str, workflow_run_id: str) -> None:
         )
 
 
+@pytest.mark.asyncio
+async def test_trace_is_readable_after_presearch_started_before_a_brief_exists(
+    client_with_db,
+):
+    client, db_path = client_with_db
+    async with WorkflowRunManager(db_path) as manager:
+        run = await manager.start_run(
+            thread_id="thread-interrupted", user_id="user-interrupted", initial_request="夏季短裤"
+        )
+        await manager.initialize_steps(
+            run.run_id,
+            [{"step_name": "presearch", "phase": "intake", "max_attempts": 3}],
+        )
+        await manager.start_step(run.run_id, "presearch")
+
+    store = SQLiteContentResearchStore(db_path)
+    trace = store.save_trace(TraceRecord(
+        id="trace-interrupted", workflow_run_id=run.run_id,
+        thread_id="thread-interrupted", schema_version="content_research_trace_v1",
+        status="running", started_at=utcnow(), payload={
+            "schema_version": "content_research_trace_v1", "stage": "presearch"
+        },
+    ))
+    store.append_observation_event(ObservationEventRecord(
+        id="event-interrupted", trace_id=trace.id, workflow_run_id=run.run_id,
+        thread_id="thread-interrupted", schema_version="content_research_observation_event_v1",
+        status="recorded", sequence_no=1, event_type="task_started",
+        event_name="presearch_started", timestamp=utcnow(), payload={
+            "schema_version": "content_research_observation_event_v1"
+        },
+    ))
+
+    response = await client.get(f"/content-research/workflows/{run.run_id}/trace")
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["thread_id"] == "thread-interrupted"
+    assert payload["current_stage"] == "presearch"
+    assert [event["event_name"] for event in payload["observation_events"]] == ["presearch_started"]
+
+
 def _subject_structure_confirmation(presearch: dict) -> dict:
     return {
         "subject_structure_hash": presearch["subject_structure_hash"],

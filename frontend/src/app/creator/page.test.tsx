@@ -11,6 +11,14 @@ test("Creator always renders the content research entry instead of preview-gatin
   assert.match(source, /内容调研/);
 });
 
+test("Creator restores the durable presearch Trace when the request disconnects after acceptance", () => {
+  const source = readFileSync(new URL("./page.tsx", import.meta.url), "utf8");
+
+  assert.match(source, /restoreInterruptedContentResearchRun/);
+  assert.match(source, /getThreadTimeline\(threadId\)/);
+  assert.match(source, /预检索连接中断，已恢复本次运行的 Trace/);
+});
+
 test("Xiaohongshu login card exposes both setup paths and only redacted status metadata", async () => {
   const dom = new JSDOM("<!doctype html><html><body></body></html>", { url: "http://localhost" });
   Object.assign(globalThis, {
