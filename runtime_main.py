@@ -148,6 +148,20 @@ if getattr(sys, "frozen", False):
 import uvicorn
 
 if __name__ == "__main__":
+    if getattr(sys, "frozen", False):
+        from app.core.logging import configure_logging
+
+        _runtime_log = os.path.join(_data_home, "runtime.log")
+        configure_logging(log_file=_runtime_log, force=True)
+
+        def _log_unhandled_exception(exc_type, exc_value, exc_traceback) -> None:
+            import logging
+
+            logging.getLogger("xhs_runtime").critical(
+                "Unhandled Runtime exception", exc_info=(exc_type, exc_value, exc_traceback)
+            )
+
+        sys.excepthook = _log_unhandled_exception
     uvicorn.run(
         "app.main:create_app",
         factory=True,
