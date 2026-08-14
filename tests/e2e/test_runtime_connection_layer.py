@@ -9,6 +9,7 @@ import pytest
 
 import app.api.routes.router as router_module
 from app.api.routes.router import app
+from app.config import settings
 
 
 @pytest.mark.asyncio
@@ -24,6 +25,7 @@ async def test_health_exposes_runtime_contract_and_features():
     assert body["api_contract"] == "local-runtime-v1"
     assert body["features"]["publish_candidate_artifacts"] is True
     assert body["features"]["embedding_prewarm"] is True
+    assert body["features"]["content_research"] is settings.F003_LITE_PREVIEW_ENABLED
 
 
 @pytest.mark.asyncio

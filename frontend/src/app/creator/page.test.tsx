@@ -61,6 +61,15 @@ test("Xiaohongshu login card exposes both setup paths and only redacted status m
   globalThis.fetch = previousFetch;
 });
 
+test("Xiaohongshu login prevents duplicate submit while a request is pending", () => {
+  const source = readFileSync(new URL("../../components/content-research/XiaohongshuLoginCard.tsx", import.meta.url), "utf8");
+
+  assert.match(source, /savingCookie/);
+  assert.match(source, /startingQr/);
+  assert.match(source, /disabled=\{startingQr \|\| qrPending\}/);
+  assert.match(source, /contentResearchErrorFeedback/);
+});
+
 test("model setup explains the action a Creator can take when a Key is rejected", async () => {
   const dom = new JSDOM("<!doctype html><html><body></body></html>", { url: "http://localhost" });
   Object.assign(globalThis, {

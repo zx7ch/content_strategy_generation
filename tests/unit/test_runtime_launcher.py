@@ -9,3 +9,10 @@ def test_runtime_launcher_directs_users_to_the_creator_sidebar_for_credentials()
     assert "Creator" in launcher
     assert "内容调研" in launcher
     assert "右侧栏" in launcher
+
+
+def test_runtime_bundle_includes_lazy_xhs_login_dependencies() -> None:
+    spec = Path("runtime_main.spec").read_text(encoding="utf-8")
+
+    assert '"qrcode"' in spec
+    assert '"curl_cffi"' in spec
