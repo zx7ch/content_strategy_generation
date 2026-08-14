@@ -127,6 +127,11 @@ if getattr(sys, "frozen", False):
     # Backward-compat: also load exe-dir .env (dev / legacy installs)
     _load_env_file(_dot_env)
 
+    # Content Research is a released Runtime feature. Older installations may
+    # retain the former internal-preview value in their durable config; do not
+    # let that stale switch expose an unusable Creator entry after an upgrade.
+    os.environ["F003_LITE_PREVIEW_ENABLED"] = "true"
+
     # ── Resolve data paths ────────────────────────────────────────────────────
     # Bundle templates are never allowed to redirect durable user state back
     # into the extracted application folder.  These paths are an installation

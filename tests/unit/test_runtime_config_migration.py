@@ -112,3 +112,14 @@ def test_frozen_runtime_restart_and_upgrade_keep_credentials_outside_bundle(tmp_
     assert XHSCredentialStore(os.environ["SQLITE_DB_PATH"]).get_status().authenticated is True
     assert not list(install_a.glob("data/*.db"))
     assert not list(install_b.glob("data/*.db"))
+
+
+def test_frozen_runtime_enables_released_content_research_despite_legacy_config(tmp_path, monkeypatch):
+    home = tmp_path / "clean-home"
+    install = tmp_path / "runtime"
+    install.mkdir()
+    (install / "config.env").write_text("F003_LITE_PREVIEW_ENABLED=false\n", encoding="utf-8")
+
+    _run_frozen_runtime(monkeypatch, install, home)
+
+    assert os.environ["F003_LITE_PREVIEW_ENABLED"] == "true"

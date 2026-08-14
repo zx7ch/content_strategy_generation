@@ -4201,6 +4201,7 @@ async def health_check() -> dict[str, Any]:
             "sse_progress": True,
             "runtime_commands": True,
             "embedding_prewarm": True,
+            "content_research": settings.F003_LITE_PREVIEW_ENABLED,
         },
         "timestamp": datetime.utcnow().isoformat(),
         "queue": "active",

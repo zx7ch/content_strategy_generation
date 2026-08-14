@@ -4,11 +4,13 @@ type JsonObject = Record<string, unknown>;
 
 export class ContentResearchApiError extends Error {
   readonly status: number;
+  readonly code?: string;
 
-  constructor(message: string, status: number) {
+  constructor(message: string, status: number, code?: string) {
     super(message);
     this.name = "ContentResearchApiError";
     this.status = status;
+    this.code = code;
   }
 }
 
@@ -605,27 +607,32 @@ async function contentResearchFetch<T>(
     cache: "no-store",
   });
   if (!response.ok) {
-    throw new ContentResearchApiError(
-      await contentResearchErrorText(response, `${options?.method ?? "GET"} ${path} failed`),
-      response.status
-    );
+    const error = await contentResearchError(response, `${options?.method ?? "GET"} ${path} failed`);
+    throw new ContentResearchApiError(error.message, response.status, error.code);
   }
   return response.json() as Promise<T>;
 }
 
-async function contentResearchErrorText(response: Response, fallbackPrefix: string): Promise<string> {
+async function contentResearchError(
+  response: Response,
+  fallbackPrefix: string,
+): Promise<{ message: string; code?: string }> {
   try {
     const payload = (await response.json()) as {
+      error_code?: string;
       error_message?: string;
       suggested_action?: string;
     };
     if (payload.error_message) {
-      return payload.suggested_action
-        ? `${payload.error_message}。${payload.suggested_action}`
-        : payload.error_message;
+      return {
+        message: payload.suggested_action
+          ? `${payload.error_message}。${payload.suggested_action}`
+          : payload.error_message,
+        code: payload.error_code,
+      };
     }
   } catch {
     // Keep the status fallback readable.
   }
-  return `${fallbackPrefix}: ${response.status}`;
+  return { message: `${fallbackPrefix}: ${response.status}` };
 }
