@@ -28,6 +28,7 @@ import {
   confirmContentResearchBrief,
   createContentResearchPresearch,
   endContentResearchWorkflow,
+  getContentResearchDirectionEvidence,
   getContentResearchTrace,
   getCurrentXHSQRLogin,
   isContentResearchReportPending,
@@ -39,6 +40,7 @@ import {
   resumeContentResearchFormalResearch,
   startXHSQRLogin,
   type ContentResearchFormalResearchResponse,
+  type ContentResearchDirectionEvidence,
   type ContentResearchLiteReportResponse,
   type ContentResearchPresearchResponse,
   type ContentResearchTrace,
@@ -48,6 +50,7 @@ import { ModelServiceCard } from "@/components/content-research/ModelServiceCard
 import { XiaohongshuLoginCard } from "@/components/content-research/XiaohongshuLoginCard";
 import { traceExecutionDurationText } from "@/lib/content-research-trace";
 import { resolveContentResearchModelRecovery } from "@/lib/content-research-recovery";
+import { contentResearchErrorFeedback } from "@/lib/content-research-error-feedback";
 
 type TaskStatus = "running" | "paused" | "failed" | "cancelled" | "completed";
 type MessageRole = "assistant" | "user" | "system";
@@ -1090,6 +1093,8 @@ function ContentResearchReportMessage({
   onOpenTrace?: () => void;
 }) {
   const [selectedCitation, setSelectedCitation] = useState<Record<string, unknown> | null>(null);
+  const [candidateAudit, setCandidateAudit] = useState<ContentResearchDirectionEvidence | null>(null);
+  const [candidateAuditError, setCandidateAuditError] = useState<string | null>(null);
   const publicationState = litePublicationState(report);
   const recovery = report.recovery_projection && typeof report.recovery_projection === "object"
     ? report.recovery_projection
@@ -1161,6 +1166,33 @@ function ContentResearchReportMessage({
   const statusText = evidenceOnly
     ? `${numberField(statusStrip, "saved_evidence_count")} 条已保存依据`
     : `${numberField(statusStrip, "completed_direction_count")} 个方向完成 · ${numberField(statusStrip, "admitted_finding_count")} 条已验证发现 · ${numberField(statusStrip, "observation_count")} 条样本观察 · ${numberField(statusStrip, "lead_count")} 条线索`;
+  const auditDirection = stringField(recordList(report.run_direction_states)[0], "direction", "product_marketing");
+  const auditDecisions = new Map<string, Record<string, unknown>>(
+    (candidateAudit ? [...candidateAudit.selections, ...candidateAudit.exclusions] : [])
+      .flatMap((item) => {
+        const id = stringField(item, "canonical_source_id");
+        return id ? [[id, item] as [string, Record<string, unknown>]] : [];
+      }),
+  );
+
+  async function openCandidateAudit() {
+    setCandidateAuditError(null);
+    try {
+      setCandidateAudit(await getContentResearchDirectionEvidence(report.workflow_run_id, auditDirection));
+    } catch (error) {
+      setCandidateAuditError(error instanceof Error ? error.message : "候选笔记暂不可读取");
+    }
+  }
+
+  function downloadCandidateAudit() {
+    if (!candidateAudit) return;
+    const url = URL.createObjectURL(new Blob([JSON.stringify(candidateAudit, null, 2)], { type: "application/json" }));
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `${report.workflow_run_id}-${candidateAudit.direction_id}-candidates.json`;
+    link.click();
+    URL.revokeObjectURL(url);
+  }
 
   const citationButton = (citation: Record<string, unknown>, index: number) => {
     const displayIndex = String(citation.display_index ?? index + 1);
@@ -1250,6 +1282,13 @@ function ContentResearchReportMessage({
             <section className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-3" aria-label="已有笔记重新处理">
               <p className="text-xs text-amber-900">可复用已保存的笔记重新评估相关性，不会新增采集。</p>
               <button type="button" onClick={onRepair} className="mt-2 rounded-lg bg-ink px-3 py-2 text-xs font-medium text-white">使用已有笔记重新处理</button>
+            </section>
+          )}
+          {evidenceOnly && (
+            <section className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-3" aria-label="候选笔记与筛选">
+              <p className="text-xs text-amber-900">报告未准入结论时，可查看候选笔记和每篇的筛选原因。</p>
+              <button type="button" onClick={() => void openCandidateAudit()} className="mt-2 rounded-lg border border-amber-300 bg-white px-3 py-2 text-xs font-medium text-ink">查看候选与筛选</button>
+              {candidateAuditError && <p className="mt-2 text-xs text-red-700">{candidateAuditError}</p>}
             </section>
           )}
 
@@ -1422,6 +1461,33 @@ function ContentResearchReportMessage({
             ) : (
               <p className="mt-3 text-xs text-quiet">该冻结引用未提供可展示的证据明细。</p>
             )}
+          </aside>
+        )}
+        {candidateAudit && (
+          <aside className="border-t border-line bg-slate-50 px-5 py-4" aria-label="候选笔记与筛选">
+            <div className="flex items-center justify-between gap-3">
+              <p className="font-semibold">候选笔记与筛选</p>
+              <div className="flex gap-2">
+                <button type="button" onClick={downloadCandidateAudit} className="text-xs underline">导出 JSON</button>
+                <button type="button" onClick={() => setCandidateAudit(null)} aria-label="关闭候选笔记与筛选">关闭</button>
+              </div>
+            </div>
+            <div className="mt-3 space-y-2 border-t border-line pt-3">
+              <p className="text-xs text-quiet">检索来源（命中查询组）表示该笔记由本轮哪组检索发现，不要求正文逐字包含完整检索词。</p>
+              {candidateAudit.candidates.map((candidate, index) => {
+                const candidateId = stringField(candidate, "canonical_source_id") || stringField(candidate, "canonical_id");
+                const decision = auditDecisions.get(candidateId);
+                const sourceUrl = stringField(candidate, "source_url");
+                return <div key={candidateId || index} className="rounded-lg bg-white px-3 py-2 text-xs text-quiet">
+                  <p className="font-medium text-ink">{stringField(candidate, "title", "未提供标题")}</p>
+                  <p className="mt-1">作者：{stringField(candidate, "author", stringField(candidate, "author_id", "未提供"))} · 详情：{candidate.detail_attempted ? "已抓取" : "未抓取"}</p>
+                  {stringField(candidate, "retrieval_query") && <p className="mt-1">检索来源（命中查询组）：{stringField(candidate, "retrieval_query")}</p>}
+                  {decision && <p className="mt-1">{decision.selected ? "已入选" : "未入选"}：{arrayField(decision, "reasons").join(" · ") || "未提供原因"}</p>}
+                  {sourceUrl && <a className="mt-1 inline-flex underline" href={sourceUrl} target="_blank" rel="noopener noreferrer">打开原笔记</a>}
+                </div>;
+              })}
+              {candidateAudit.candidates.length === 0 && <p className="text-xs text-quiet">本方向未保存可展示的候选笔记。</p>}
+            </div>
           </aside>
         )}
       </article>
@@ -2723,13 +2789,13 @@ export default function CreatorPage() {
         });
         setContentResearchIntent({ seed: text, presearch: result });
         setContentResearchMode(false);
-      } catch {
+      } catch (error) {
         const restored = await restoreInterruptedContentResearchRun(threadId);
         appendMessage({
           role: "system",
           text: restored
             ? "预检索连接中断，已恢复本次运行的 Trace；请打开 Trace 查看当前步骤与日志。"
-            : "内容调研预检索失败，请检查 runtime 或小红书登录态。",
+            : contentResearchErrorFeedback(error, "内容调研预检索失败"),
         });
       } finally {
         setIsLoading(false);

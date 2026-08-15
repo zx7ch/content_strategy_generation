@@ -9,6 +9,7 @@ import {
   createContentResearchPresearch,
   endContentResearchWorkflow,
   getContentResearchDecisions,
+  getContentResearchDirectionEvidence,
   getContentResearchLiteReport,
   getContentResearchLiteReportWithRetry,
   getContentResearchWorkflow,
@@ -466,6 +467,27 @@ test("endContentResearchWorkflow sends end workflow action", async () => {
   assert.match(requestBody, /"action":"end_content_research"/);
   assert.equal(result.action, "end_content_research");
   assert.equal(result.result.ended, true);
+});
+
+test("getContentResearchDirectionEvidence reads the safe direction evidence projection", async () => {
+  let requestUrl = "";
+  globalThis.fetch = (async (input) => {
+    requestUrl = String(input);
+    return jsonResponse({
+      workflow_run_id: "run_1",
+      direction_id: "product_marketing",
+      candidates: [{ title: "防晒长袖实测", source_url: "https://example.test/note" }],
+      selections: [],
+      exclusions: [{ canonical_source_id: "note_1", reasons: ["core_entity_not_supported"] }],
+      packets: [],
+    });
+  }) as typeof fetch;
+
+  const evidence = await getContentResearchDirectionEvidence("run_1", "product_marketing");
+
+  assert.ok(requestUrl.endsWith("/content-research/workflows/run_1/directions/product_marketing/evidence?limit=50"));
+  assert.equal(evidence.candidates[0].title, "防晒长袖实测");
+  assert.equal(evidence.exclusions[0].reasons?.[0], "core_entity_not_supported");
 });
 
 test("content research helpers throw readable non-ok errors", async () => {
