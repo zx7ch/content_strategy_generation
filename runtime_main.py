@@ -1,6 +1,7 @@
 """Entry point for the packaged local runtime executable."""
 from __future__ import annotations
 
+import json
 import os
 import sys
 import time
@@ -95,6 +96,39 @@ if getattr(sys, "frozen", False):
         print(f"Please review: {user_config}", file=sys.stderr)
         return missing_keys
 
+    def _migrate_runtime_config(user_config: str, template_config: str) -> bool:
+        """Replace legacy active config with the minimal supported template."""
+        try:
+            with open(template_config, encoding="utf-8") as template:
+                template_text = template.read()
+            with open(user_config, encoding="utf-8") as current:
+                current_text = current.read()
+        except OSError:
+            return False
+
+        if current_text == template_text:
+            return False
+
+        backup_path = f"{user_config}.bak-{time.strftime('%Y%m%d-%H%M%S')}"
+        try:
+            import shutil as _shutil
+
+            _shutil.copy2(user_config, backup_path)
+            with open(user_config, "w", encoding="utf-8") as current:
+                current.write(template_text)
+        except OSError as exc:
+            print(
+                f"WARNING: Could not migrate legacy runtime config at {user_config}: {exc}",
+                file=sys.stderr,
+            )
+            return False
+
+        print(
+            f"Migrated legacy runtime config to the minimal template. Backup created at: {backup_path}",
+            file=sys.stderr,
+        )
+        return True
+
     # ── User data lives outside the exe so it survives upgrades ──────────────
     # macOS/Linux: ~/Library/Application Support/xhs-growth-agent/
     _data_home = os.path.join(
@@ -120,7 +154,7 @@ if getattr(sys, "frozen", False):
         else:
             open(_config_in_data, "w").close()
     else:
-        _append_missing_template_keys(_config_in_data, _config_in_exe)
+        _migrate_runtime_config(_config_in_data, _config_in_exe)
 
     # Always load from the stable data-home location
     _load_env_file(_config_in_data)
@@ -141,6 +175,31 @@ if getattr(sys, "frozen", False):
     os.environ["CREATOR_THREADS_DB_PATH"] = os.path.join(_data_home, "creator_threads.db")
     os.environ["V2_DISCOVERY_SQLITE_PATH"] = os.path.join(_data_home, "xhs_discovery.db")
 
+    _sqlite_db_path = os.path.abspath(os.environ["SQLITE_DB_PATH"])
+    try:
+        _sqlite_stat = os.stat(_sqlite_db_path)
+        _db_exists = True
+        _db_size_bytes = _sqlite_stat.st_size
+        _db_modified_at = time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", time.gmtime(_sqlite_stat.st_mtime)
+        )
+    except OSError:
+        _db_exists = False
+        _db_size_bytes = 0
+        _db_modified_at = None
+    os.environ["RUNTIME_STORAGE_DIAGNOSTICS_JSON"] = json.dumps(
+        {
+            "build_id": os.environ.get("RUNTIME_BUILD_ID")
+            or os.environ.get("RUNTIME_VERSION")
+            or "local-runtime",
+            "sqlite_db_path": _sqlite_db_path,
+            "db_exists": _db_exists,
+            "db_size_bytes": _db_size_bytes,
+            "db_modified_at": _db_modified_at,
+        },
+        sort_keys=True,
+    )
+
     # ── Model cache ───────────────────────────────────────────────────────────
     # Redirect ALL HuggingFace downloads (sentence-transformers, transformers,
     # future models) to the user data directory so they:
@@ -158,6 +217,12 @@ if __name__ == "__main__":
 
         _runtime_log = os.path.join(_data_home, "runtime.log")
         configure_logging(log_file=_runtime_log, force=True)
+        import logging
+
+        logging.getLogger("xhs_runtime").info(
+            "Runtime storage diagnostics: %s",
+            os.environ["RUNTIME_STORAGE_DIAGNOSTICS_JSON"],
+        )
 
         def _log_unhandled_exception(exc_type, exc_value, exc_traceback) -> None:
             import logging
@@ -167,10 +232,14 @@ if __name__ == "__main__":
             )
 
         sys.excepthook = _log_unhandled_exception
+    try:
+        _runtime_port = int(os.environ.get("RUNTIME_PORT", "8000"))
+    except ValueError:
+        _runtime_port = 8000
     uvicorn.run(
         "app.main:create_app",
         factory=True,
         host="127.0.0.1",
-        port=8000,
+        port=_runtime_port,
         log_level="info",
     )

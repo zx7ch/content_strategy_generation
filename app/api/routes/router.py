@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
 import uuid
 from collections.abc import AsyncIterator
 from datetime import datetime
+from pathlib import Path
 from time import monotonic
 from typing import Any
 
@@ -4190,6 +4192,7 @@ async def get_thread_result_endpoint(thread_id: str, request: Request) -> Thread
 @app.get("/health")
 @app.head("/health")
 async def health_check() -> dict[str, Any]:
+    runtime_diagnostics = _runtime_storage_diagnostics()
     return {
         "service": settings.RUNTIME_SERVICE_NAME,
         "status": "healthy",
@@ -4205,7 +4208,45 @@ async def health_check() -> dict[str, Any]:
         },
         "timestamp": datetime.utcnow().isoformat(),
         "queue": "active",
+        "runtime_diagnostics": runtime_diagnostics,
     }
+
+
+def _runtime_storage_diagnostics() -> dict[str, Any]:
+    """Return a safe, support-facing storage identity without config values."""
+    configured = os.environ.get("RUNTIME_STORAGE_DIAGNOSTICS_JSON", "")
+    if configured:
+        try:
+            parsed = json.loads(configured)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, dict):
+            return {
+                "build_id": str(parsed.get("build_id") or settings.RUNTIME_VERSION),
+                "sqlite_db_path": str(parsed.get("sqlite_db_path") or ""),
+                "db_exists": bool(parsed.get("db_exists")),
+                "db_size_bytes": int(parsed.get("db_size_bytes") or 0),
+                "db_modified_at": parsed.get("db_modified_at"),
+            }
+
+    db_path = Path(settings.SQLITE_DB_PATH).expanduser().resolve()
+    try:
+        stat = db_path.stat()
+        return {
+            "build_id": settings.RUNTIME_VERSION,
+            "sqlite_db_path": str(db_path),
+            "db_exists": True,
+            "db_size_bytes": stat.st_size,
+            "db_modified_at": datetime.fromtimestamp(stat.st_mtime).isoformat(),
+        }
+    except OSError:
+        return {
+            "build_id": settings.RUNTIME_VERSION,
+            "sqlite_db_path": str(db_path),
+            "db_exists": False,
+            "db_size_bytes": 0,
+            "db_modified_at": None,
+        }
 
 
 def schedule_embedding_prewarm() -> None:

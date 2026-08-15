@@ -543,26 +543,23 @@ class WorkflowRunManagerRuntime:
         await self.append_event(
             workflow_run_id=workflow_run_id,
             thread_id=thread_id,
-            event_type="content_research_ended",
+            event_type="content_research_archived",
             payload={
                 "schema_version": "content_research_workflow_event_v1",
-                "reason": "user_ended_content_research",
+                "reason": "user_archived_content_research",
                 "active_run_cleared": True,
                 "cancel_status": cancel_status,
             },
         )
-        async with WorkflowStore(self._db_path) as workflow_store:
-            await workflow_store.delete_run(workflow_run_id)
-        SQLiteContentResearchStore(self._db_path).delete_workflow(workflow_run_id)
         return {
             "schema_version": CONTENT_RESEARCH_API_SCHEMA_VERSION,
             "ended": True,
+            "archived": True,
             "workflow_run_id": workflow_run_id,
             "thread_id": thread_id,
             "active_run_cleared": True,
-            # Ending a research run must never delete the Creator conversation:
-            # users can revise the checklist and launch a subsequent run in the
-            # same chronological chat history.
+            # Archiving keeps every research record available for audit and
+            # recovery while allowing a new run in the same Creator thread.
             "resources_destroyed": False,
             "cancel_status": cancel_status,
         }

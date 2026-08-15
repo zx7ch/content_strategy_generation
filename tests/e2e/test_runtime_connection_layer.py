@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 
 import httpx
 import pytest
@@ -13,7 +14,8 @@ from app.config import settings
 
 
 @pytest.mark.asyncio
-async def test_health_exposes_runtime_contract_and_features():
+async def test_health_exposes_runtime_contract_and_features(monkeypatch):
+    monkeypatch.delenv("RUNTIME_STORAGE_DIAGNOSTICS_JSON", raising=False)
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
         response = await client.get("/health")
@@ -26,6 +28,11 @@ async def test_health_exposes_runtime_contract_and_features():
     assert body["features"]["publish_candidate_artifacts"] is True
     assert body["features"]["embedding_prewarm"] is True
     assert body["features"]["content_research"] is settings.F003_LITE_PREVIEW_ENABLED
+    diagnostics = body["runtime_diagnostics"]
+    assert diagnostics["build_id"]
+    assert diagnostics["sqlite_db_path"] == str(Path(settings.SQLITE_DB_PATH).expanduser().resolve())
+    assert isinstance(diagnostics["db_exists"], bool)
+    assert "api_key" not in str(diagnostics).lower()
 
 
 @pytest.mark.asyncio

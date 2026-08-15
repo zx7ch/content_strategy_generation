@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import sys
 from datetime import datetime, timezone
@@ -55,7 +56,8 @@ def test_append_missing_template_keys_noops_when_config_is_current(tmp_path):
 def test_runtime_template_does_not_define_user_storage_or_credentials():
     template = Path("runtime.config.env").read_text(encoding="utf-8")
 
-    assert "APP_ENV=development" in template
+    assert "LOG_LEVEL=INFO" in template
+    assert "APP_ENV=" not in template
     assert "SQLITE_DB_PATH=" not in template
     assert "CHROMA_PERSIST_DIR=" not in template
     assert "XHS_SPIDER_COOKIES=" not in template
@@ -68,7 +70,7 @@ def _run_frozen_runtime(monkeypatch, runtime_folder: Path, home: Path) -> Path:
     executable = runtime_folder / "xhs-runtime"
     executable.touch()
     monkeypatch.setenv("HOME", str(home))
-    for key in ("SQLITE_DB_PATH", "CHROMA_PERSIST_DIR", "CREATOR_THREADS_DB_PATH", "V2_DISCOVERY_SQLITE_PATH", "HF_HOME"):
+    for key in ("SQLITE_DB_PATH", "CHROMA_PERSIST_DIR", "CREATOR_THREADS_DB_PATH", "V2_DISCOVERY_SQLITE_PATH", "HF_HOME", "RUNTIME_STORAGE_DIAGNOSTICS_JSON"):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setattr(sys, "frozen", True, raising=False)
     monkeypatch.setattr(sys, "executable", str(executable))
@@ -123,3 +125,46 @@ def test_frozen_runtime_enables_released_content_research_despite_legacy_config(
     _run_frozen_runtime(monkeypatch, install, home)
 
     assert os.environ["F003_LITE_PREVIEW_ENABLED"] == "true"
+
+
+def test_frozen_runtime_publishes_safe_resolved_storage_diagnostics(tmp_path, monkeypatch):
+    home = tmp_path / "clean-home"
+    install = tmp_path / "runtime"
+    install.mkdir()
+    (install / "config.env").write_text("SQLITE_DB_PATH=./data/leak.db\n", encoding="utf-8")
+
+    data_home = _run_frozen_runtime(monkeypatch, install, home)
+
+    diagnostics = json.loads(os.environ["RUNTIME_STORAGE_DIAGNOSTICS_JSON"])
+    assert diagnostics["sqlite_db_path"] == str(data_home / "xhs_agent.db")
+    assert diagnostics["sqlite_db_path"].startswith(str(data_home))
+    assert diagnostics["build_id"]
+    assert "leak.db" not in json.dumps(diagnostics)
+
+
+def test_frozen_runtime_migrates_legacy_config_to_minimum_runtime_config(tmp_path, monkeypatch):
+    home = tmp_path / "clean-home"
+    install = tmp_path / "runtime"
+    install.mkdir()
+    (install / "config.env").write_text(
+        Path("runtime.config.env").read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    data_home = home / "Library" / "Application Support" / "xhs-growth-agent"
+    data_home.mkdir(parents=True)
+    user_config = data_home / "config.env"
+    user_config.write_text(
+        "OPENAI_API_KEY=legacy-secret\n"
+        "XHS_SPIDER_COOKIES=legacy-cookie\n"
+        "SQLITE_DB_PATH=./data/leak.db\n"
+        "GENERATION_MAX_RETRIES=9\n",
+        encoding="utf-8",
+    )
+
+    _run_frozen_runtime(monkeypatch, install, home)
+
+    assert user_config.read_text(encoding="utf-8") == Path("runtime.config.env").read_text(encoding="utf-8")
+    backups = list(data_home.glob("config.env.bak-*"))
+    assert len(backups) == 1
+    backup = backups[0].read_text(encoding="utf-8")
+    assert "OPENAI_API_KEY=legacy-secret" in backup
+    assert "XHS_SPIDER_COOKIES=legacy-cookie" in backup
