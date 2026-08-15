@@ -4,11 +4,13 @@ type JsonObject = Record<string, unknown>;
 
 export class ContentResearchApiError extends Error {
   readonly status: number;
+  readonly code?: string;
 
-  constructor(message: string, status: number) {
+  constructor(message: string, status: number, code?: string) {
     super(message);
     this.name = "ContentResearchApiError";
     this.status = status;
+    this.code = code;
   }
 }
 
@@ -320,6 +322,16 @@ export interface ContentResearchLiteReportResponse {
   recovery_projection?: JsonObject | null;
 }
 
+export interface ContentResearchDirectionEvidence {
+  workflow_run_id: string;
+  direction_id: string;
+  status?: string;
+  candidates: Array<JsonObject & { title?: string; source_url?: string; author?: string; author_id?: string; retrieval_query?: string; detail_attempted?: boolean }>;
+  selections: Array<JsonObject & { canonical_source_id?: string; selected?: boolean; reasons?: string[] }>;
+  exclusions: Array<JsonObject & { canonical_source_id?: string; reasons?: string[] }>;
+  packets: JsonObject[];
+}
+
 export interface ContentResearchHumanDecisionRequest {
   target_id: string;
   decision_request_id: string;
@@ -439,6 +451,15 @@ export async function getContentResearchLiteReport(
   }
   const suffix = query.size ? `?${query.toString()}` : "";
   return contentResearchFetch(`/content-research/workflows/${encodeURIComponent(workflowRunId)}/lite-report${suffix}`);
+}
+
+export async function getContentResearchDirectionEvidence(
+  workflowRunId: string,
+  directionId: string,
+): Promise<ContentResearchDirectionEvidence> {
+  return contentResearchFetch(
+    `/content-research/workflows/${encodeURIComponent(workflowRunId)}/directions/${encodeURIComponent(directionId)}/evidence?limit=50`,
+  );
 }
 
 export async function getContentResearchLiteReportWithRetry(
@@ -605,27 +626,32 @@ async function contentResearchFetch<T>(
     cache: "no-store",
   });
   if (!response.ok) {
-    throw new ContentResearchApiError(
-      await contentResearchErrorText(response, `${options?.method ?? "GET"} ${path} failed`),
-      response.status
-    );
+    const error = await contentResearchError(response, `${options?.method ?? "GET"} ${path} failed`);
+    throw new ContentResearchApiError(error.message, response.status, error.code);
   }
   return response.json() as Promise<T>;
 }
 
-async function contentResearchErrorText(response: Response, fallbackPrefix: string): Promise<string> {
+async function contentResearchError(
+  response: Response,
+  fallbackPrefix: string,
+): Promise<{ message: string; code?: string }> {
   try {
     const payload = (await response.json()) as {
+      error_code?: string;
       error_message?: string;
       suggested_action?: string;
     };
     if (payload.error_message) {
-      return payload.suggested_action
-        ? `${payload.error_message}。${payload.suggested_action}`
-        : payload.error_message;
+      return {
+        message: payload.suggested_action
+          ? `${payload.error_message}。${payload.suggested_action}`
+          : payload.error_message,
+        code: payload.error_code,
+      };
     }
   } catch {
     // Keep the status fallback readable.
   }
-  return `${fallbackPrefix}: ${response.status}`;
+  return { message: `${fallbackPrefix}: ${response.status}` };
 }

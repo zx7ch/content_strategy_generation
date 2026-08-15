@@ -11,6 +11,25 @@ test("Creator always renders the content research entry instead of preview-gatin
   assert.match(source, /内容调研/);
 });
 
+test("Creator restores the durable presearch Trace when the request disconnects after acceptance", () => {
+  const source = readFileSync(new URL("./page.tsx", import.meta.url), "utf8");
+
+  assert.match(source, /restoreInterruptedContentResearchRun/);
+  assert.match(source, /getThreadTimeline\(threadId\)/);
+  assert.match(source, /预检索连接中断，已恢复本次运行的 Trace/);
+});
+
+test("evidence-only reports expose a candidate audit instead of only an insufficient summary", () => {
+  const source = readFileSync(new URL("./page.tsx", import.meta.url), "utf8");
+
+  assert.match(source, /查看候选与筛选/);
+  assert.match(source, /候选笔记与筛选/);
+  assert.match(source, /检索来源（命中查询组）/);
+  assert.match(source, /表示该笔记由本轮哪组检索发现，不要求正文逐字包含完整检索词/);
+  assert.match(source, /导出 JSON/);
+  assert.match(source, /getContentResearchDirectionEvidence/);
+});
+
 test("Xiaohongshu login card exposes both setup paths and only redacted status metadata", async () => {
   const dom = new JSDOM("<!doctype html><html><body></body></html>", { url: "http://localhost" });
   Object.assign(globalThis, {
@@ -47,6 +66,73 @@ test("Xiaohongshu login card exposes both setup paths and only redacted status m
   assert.match(container.textContent ?? "", /登录状态已失效/);
   assert.match(container.textContent ?? "", /更新于/);
   assert.doesNotMatch(container.textContent ?? "", /very-secret/);
+
+  await act(async () => { root.unmount(); });
+  container.remove();
+  globalThis.fetch = previousFetch;
+});
+
+test("Xiaohongshu login keeps a rejected Cookie editable and blocks a duplicate save", async () => {
+  const dom = new JSDOM("<!doctype html><html><body></body></html>", { url: "http://localhost" });
+  Object.assign(globalThis, {
+    window: dom.window,
+    document: dom.window.document,
+    HTMLElement: dom.window.HTMLElement,
+    HTMLButtonElement: dom.window.HTMLButtonElement,
+    HTMLInputElement: dom.window.HTMLInputElement,
+    Event: dom.window.Event,
+    IS_REACT_ACT_ENVIRONMENT: true,
+  });
+  Object.defineProperty(globalThis, "navigator", { configurable: true, value: dom.window.navigator });
+  const previousFetch = globalThis.fetch;
+  let resolveSave: ((response: Response) => void) | undefined;
+  let requestCount = 0;
+  globalThis.fetch = ((_: RequestInfo | URL, init?: RequestInit) => {
+    requestCount += 1;
+    if ((init?.method ?? "GET") === "PUT") {
+      return new Promise<Response>((resolve) => { resolveSave = resolve; });
+    }
+    return Promise.resolve(new Response(JSON.stringify({ authenticated: false }), {
+      status: 200, headers: { "Content-Type": "application/json" },
+    }));
+  }) as typeof fetch;
+  const React = await import("react");
+  Object.assign(globalThis, { React });
+  const { act } = React;
+  const { createRoot } = await import("react-dom/client");
+  const { setWorkspaceContext } = await import("@/lib/api.ts");
+  const { XiaohongshuLoginCard } = await import("@/components/content-research/XiaohongshuLoginCard.tsx");
+  setWorkspaceContext("workspace_test", "user_test");
+  const container = document.createElement("div");
+  document.body.append(container);
+  const root = createRoot(container);
+  await act(async () => { root.render(React.createElement(XiaohongshuLoginCard)); });
+  await act(async () => { await Promise.resolve(); });
+
+  const input = container.querySelector("#xhs-cookie") as HTMLInputElement;
+  await act(async () => {
+    const valueSetter = Object.getOwnPropertyDescriptor(
+      dom.window.HTMLInputElement.prototype,
+      "value",
+    )?.set;
+    valueSetter?.call(input, "a1=incomplete");
+    input.dispatchEvent(new dom.window.Event("input", { bubbles: true }));
+  });
+  const save = [...container.querySelectorAll("button")].find((button) => button.textContent === "保存 Cookie") as HTMLButtonElement;
+  assert.equal(save.disabled, false);
+  await act(async () => { save.click(); await Promise.resolve(); });
+  assert.equal(requestCount, 2);
+  assert.equal(save.disabled, true);
+  assert.equal(save.textContent, "保存中…");
+
+  await act(async () => {
+    resolveSave?.(new Response(JSON.stringify({
+      error_code: "invalid_cookie", error_message: "Cookie 格式无效",
+    }), { status: 422, headers: { "Content-Type": "application/json" } }));
+    await Promise.resolve();
+  });
+  assert.equal(input.value, "a1=incomplete");
+  assert.match(container.textContent ?? "", /Cookie 格式无效/);
 
   await act(async () => { root.unmount(); });
   container.remove();
