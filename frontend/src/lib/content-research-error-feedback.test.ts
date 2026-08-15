@@ -1,18 +1,24 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { ContentResearchApiError } from "./content-research-api";
-import { contentResearchErrorFeedback } from "./content-research-error-feedback";
+import { ContentResearchApiError } from "./content-research-api.ts";
+import { contentResearchErrorFeedback } from "./content-research-error-feedback.ts";
 
-test("maps Runtime login error codes to a safe corrective action", () => {
-  const error = new ContentResearchApiError("upstream unavailable", 503, "runtime_unavailable");
-
-  assert.equal(
-    contentResearchErrorFeedback(error, "二维码登录失败"),
-    "二维码登录失败：Runtime 未启动或暂不可用。请启动 Runtime 后重试。",
+test("released-content feature errors tell the Creator to restart the upgraded Runtime", () => {
+  const feedback = contentResearchErrorFeedback(
+    new ContentResearchApiError("legacy feature disabled", 403, "F003_LITE_PREVIEW_DISABLED"),
+    "内容调研预检索失败",
   );
+
+  assert.match(feedback, /升级并重启 Runtime/);
+  assert.doesNotMatch(feedback, /小红书登录态/);
 });
 
-test("keeps a non-API login failure readable", () => {
-  assert.equal(contentResearchErrorFeedback(new Error("network down"), "Cookie 保存失败"), "Cookie 保存失败：network down");
+test("unknown API errors preserve a safe actionable server message", () => {
+  const feedback = contentResearchErrorFeedback(
+    new ContentResearchApiError("服务暂时不可用。请稍后重试", 503, "provider_unavailable"),
+    "内容调研预检索失败",
+  );
+
+  assert.equal(feedback, "内容调研预检索失败：服务暂时不可用。请稍后重试");
 });

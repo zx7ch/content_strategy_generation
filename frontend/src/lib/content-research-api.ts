@@ -322,6 +322,16 @@ export interface ContentResearchLiteReportResponse {
   recovery_projection?: JsonObject | null;
 }
 
+export interface ContentResearchDirectionEvidence {
+  workflow_run_id: string;
+  direction_id: string;
+  status?: string;
+  candidates: Array<JsonObject & { title?: string; source_url?: string; author?: string; author_id?: string; retrieval_query?: string; detail_attempted?: boolean }>;
+  selections: Array<JsonObject & { canonical_source_id?: string; selected?: boolean; reasons?: string[] }>;
+  exclusions: Array<JsonObject & { canonical_source_id?: string; reasons?: string[] }>;
+  packets: JsonObject[];
+}
+
 export interface ContentResearchHumanDecisionRequest {
   target_id: string;
   decision_request_id: string;
@@ -441,6 +451,15 @@ export async function getContentResearchLiteReport(
   }
   const suffix = query.size ? `?${query.toString()}` : "";
   return contentResearchFetch(`/content-research/workflows/${encodeURIComponent(workflowRunId)}/lite-report${suffix}`);
+}
+
+export async function getContentResearchDirectionEvidence(
+  workflowRunId: string,
+  directionId: string,
+): Promise<ContentResearchDirectionEvidence> {
+  return contentResearchFetch(
+    `/content-research/workflows/${encodeURIComponent(workflowRunId)}/directions/${encodeURIComponent(directionId)}/evidence?limit=50`,
+  );
 }
 
 export async function getContentResearchLiteReportWithRetry(

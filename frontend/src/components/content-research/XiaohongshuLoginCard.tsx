@@ -44,18 +44,27 @@ export function XiaohongshuLoginCard() {
       const result = await startXHSQRLogin();
       setQrImage(result.qr_image_data_url ?? null);
       setQrPending(result.status === "pending");
-      if (result.status === "failed") setError("二维码登录失败：二维码暂不可用，请稍后重试或改用粘贴 Cookie。");
+      if (result.status === "failed") {
+        setError("二维码登录失败：二维码暂不可用，请稍后重试或改用粘贴 Cookie。");
+      }
     } catch (reason) {
       setError(contentResearchErrorFeedback(reason, "二维码登录失败"));
-    } finally { setStartingQr(false); }
+    } finally {
+      setStartingQr(false);
+    }
   };
   const saveCookie = async () => {
     if (!cookie.trim() || savingCookie) return;
     setError(null);
     setSavingCookie(true);
-    try { setStatus(await saveXHSManualCookie(cookie)); setCookie(""); }
-    catch (reason) { setError(contentResearchErrorFeedback(reason, "Cookie 保存失败")); }
-    finally { setSavingCookie(false); }
+    try {
+      setStatus(await saveXHSManualCookie(cookie));
+      setCookie("");
+    } catch (reason) {
+      setError(contentResearchErrorFeedback(reason, "Cookie 保存失败"));
+    } finally {
+      setSavingCookie(false);
+    }
   };
   const clear = async () => { setError(null); try { setStatus(await clearXHSLogin()); } catch { setError("清除登录信息失败"); } };
   const source = status?.source === "qr" ? "扫码登录" : status?.source === "manual_cookie" ? "Cookie" : null;
