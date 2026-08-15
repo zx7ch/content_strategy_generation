@@ -72,6 +72,10 @@ a = Analysis(
             "retry",
             "execjs",
             "requests",
+            # QR login and the Chrome-impersonating Cookie transport are
+            # imported only after a user starts one of the login flows.
+            "qrcode",
+            "curl_cffi",
         ]
     ),
     hookspath=[],

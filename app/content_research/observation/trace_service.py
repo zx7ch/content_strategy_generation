@@ -36,7 +36,7 @@ class ContentResearchTraceService:
         self,
         *,
         workflow_run_id: str,
-        brief: ResearchBriefRecord,
+        brief: ResearchBriefRecord | None,
     ) -> ContentResearchTraceResponse:
         traces = self._store.list_traces_for_workflow(workflow_run_id)
         observation_events = [
@@ -63,8 +63,10 @@ class ContentResearchTraceService:
         run_status = (
             str(run.status.value if run and hasattr(run.status, "value") else run.status)
             if run
-            else brief.status
+            else (brief.status if brief else (traces[-1].status if traces else "unknown"))
         )
+        thread_id = brief.thread_id if brief else (traces[-1].thread_id if traces else None)
+        brief_status = brief.status if brief else "presearch_started"
         duration_ms = _duration_ms(
             traces=traces,
             observation_events=observation_events,
@@ -88,10 +90,10 @@ class ContentResearchTraceService:
 
         return ContentResearchTraceResponse(
             workflow_run_id=workflow_run_id,
-            thread_id=brief.thread_id,
+            thread_id=thread_id,
             current_stage=current_stage,
             run_status=run_status,
-            recoverable=_is_recoverable(run_status, brief.status),
+            recoverable=_is_recoverable(run_status, brief_status),
             duration_ms=duration_ms,
             error_count=_error_count(
                 observation_events=observation_event_dicts,
@@ -263,7 +265,7 @@ def _llm_recovery_projection(
     current_stage: str | None,
     runtime_steps: list[dict],
     workflow_events: list[dict],
-    brief: ResearchBriefRecord,
+    brief: ResearchBriefRecord | None,
 ) -> dict:
     presearch_step = next(
         (step for step in runtime_steps if step.get("step_name") == "presearch"), {}
@@ -272,7 +274,7 @@ def _llm_recovery_projection(
     error_code = presearch_step.get("error_code")
     if not isinstance(error_code, str) or not error_code.startswith("llm_"):
         error_code = None
-    payload = brief.payload
+    payload = brief.payload if brief else {}
     recovery_event = next(
         (
             event

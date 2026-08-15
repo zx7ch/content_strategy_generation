@@ -1,0 +1,70 @@
+<div id="content-research-data-lifecycle-fix" style="font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#172033;max-width:1000px;margin:0 auto;line-height:1.45">
+  <style>
+    #content-research-data-lifecycle-fix *{box-sizing:border-box}
+    #content-research-data-lifecycle-fix .hero{padding:20px 22px 18px;border:1px solid #d9e0ea;border-radius:16px;background:#f7fafc}
+    #content-research-data-lifecycle-fix h1{font-size:23px;margin:0 0 7px;letter-spacing:-.02em}
+    #content-research-data-lifecycle-fix h2{font-size:16px;margin:26px 0 10px}
+    #content-research-data-lifecycle-fix .sub{color:#5c697d;margin:0;font-size:14px}
+    #content-research-data-lifecycle-fix .flow{display:grid;grid-template-columns:repeat(5,minmax(150px,1fr));gap:10px;margin:16px 0 4px}
+    #content-research-data-lifecycle-fix .stage{border:1px solid #d9e0ea;border-radius:12px;background:white;padding:12px;min-height:118px;position:relative}
+    #content-research-data-lifecycle-fix .stage:not(:last-child):after{content:'→';position:absolute;right:-8px;top:45px;color:#7990a8;background:#f7fafc;padding:0 1px;font-weight:700}
+    #content-research-data-lifecycle-fix .n{font-size:11px;font-weight:700;color:#3d6f5b;letter-spacing:.05em}
+    #content-research-data-lifecycle-fix .stage b{display:block;font-size:14px;margin:5px 0 3px}
+    #content-research-data-lifecycle-fix .stage span{font-size:12px;color:#617086;display:block}
+    #content-research-data-lifecycle-fix table{width:100%;border-collapse:separate;border-spacing:0;border:1px solid #d9e0ea;border-radius:13px;overflow:hidden;font-size:13px}
+    #content-research-data-lifecycle-fix th{background:#eef4f1;text-align:left;font-size:12px;color:#3b5148;padding:10px;vertical-align:bottom}
+    #content-research-data-lifecycle-fix td{padding:11px 10px;vertical-align:top;border-top:1px solid #e5eaf0}
+    #content-research-data-lifecycle-fix tr:first-child td{border-top:0}
+    #content-research-data-lifecycle-fix code{font-size:11px;color:#3c526b;word-break:break-word}
+    #content-research-data-lifecycle-fix .bad{color:#a6452d;font-weight:650}
+    #content-research-data-lifecycle-fix .fix{color:#216b50;font-weight:650}
+    #content-research-data-lifecycle-fix .grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+    #content-research-data-lifecycle-fix .box{border:1px solid #d9e0ea;border-radius:13px;background:#fff;padding:15px}
+    #content-research-data-lifecycle-fix .box h3{font-size:14px;margin:0 0 8px}
+    #content-research-data-lifecycle-fix ul{margin:8px 0 0;padding-left:18px;font-size:13px}
+    #content-research-data-lifecycle-fix li{margin:6px 0}
+    #content-research-data-lifecycle-fix .config{white-space:pre-wrap;background:#172033;color:#e8f0fa;border-radius:12px;padding:14px;font:12px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace;margin:8px 0}
+    #content-research-data-lifecycle-fix .gate{border-left:4px solid #d27836;padding:10px 13px;background:#fff8f1;border-radius:4px;font-size:13px}
+    @media(max-width:760px){#content-research-data-lifecycle-fix .flow{grid-template-columns:1fr 1fr}#content-research-data-lifecycle-fix .stage:not(:last-child):after{display:none}#content-research-data-lifecycle-fix .grid{grid-template-columns:1fr}#content-research-data-lifecycle-fix table{display:block;overflow-x:auto}}
+  </style>
+  <section class="hero">
+    <h1>内容调研：数据生命周期 P0 Bugfix</h1>
+    <p class="sub">目标：每次抓取、筛选、报告和 Trace 都可追溯；停止 Runtime、返回 checklist 或升级版本都不丢失用户证据。</p>
+  </section>
+
+  <h2>数据阶段与修复落点</h2>
+  <div class="flow" aria-label="内容调研数据流">
+    <div class="stage"><div class="n">01 / DISCOVER</div><b>检索候选</b><span>查询词、分页、36 个候选</span></div>
+    <div class="stage"><div class="n">02 / DETAIL</div><b>详情抓取</b><span>28 篇笔记、作者、链接、正文、指标</span></div>
+    <div class="stage"><div class="n">03 / SELECT</div><b>筛选与准入</b><span>关联性、独立作者、核心对象直接证据</span></div>
+    <div class="stage"><div class="n">04 / REPORT</div><b>报告与 Trace</b><span>结论、限制、执行时间线</span></div>
+    <div class="stage"><div class="n">05 / ARCHIVE</div><b>归档与重启恢复</b><span>同一 run 可继续查看、导出与复核</span></div>
+  </div>
+
+  <table aria-label="数据阶段修复方案">
+    <thead><tr><th>数据阶段</th><th>已有持久化规格</th><th>当前缺口 / 用户影响</th><th>本次修改</th><th>验收信号</th></tr></thead>
+    <tbody>
+      <tr><td><b>检索候选</b><br>discover</td><td><code>stage_checkpoints: collect_page</code><br>保存 query、排序、分页候选。</td><td><span class="bad">候选只能藏在检查点 JSON 中；用户无法判断“搜到了什么”。</span></td><td><span class="fix">将候选投影为审计读模型</span>：查询词、标题、作者、链接、排名、后续状态。</td><td>一次运行后可读取全部候选；不暴露 Cookie、token、原始会话。</td></tr>
+      <tr><td><b>详情抓取</b><br>detail</td><td><code>stage_checkpoints: detail / selection_revision</code><br>每次外部调用前后 flush；保留 28 篇详情。</td><td><span class="bad">Runtime 重启后无法证明读回同一 SQLite；用户看不到 28 篇详情。</span></td><td><span class="fix">增加 Runtime build ID + 实际 DB 绝对路径诊断</span>；为用户提供候选笔记明细与 JSON 导出。</td><td>停止并重启冻结 Runtime 后，相同 run 仍读到 28 篇详情。</td></tr>
+      <tr><td><b>筛选 / 准入</b></td><td><code>direction_source_projections</code>、<code>directional_evidence_packets</code><br>保存 selected、原因、query hits 和安全字段。</td><td><span class="bad">“相关 0 / 准入 0”只有汇总，无法判断筛选是否合理。</span></td><td><span class="fix">用户侧证据审计页</span>：入选/排除原因、详情状态、检索词；证据不足报告中直接引导打开。</td><td>用户可独立复核每篇笔记为何被排除或未准入。</td></tr>
+      <tr><td><b>报告 / Trace</b></td><td><code>result_snapshots</code>、publication、<code>observation_events</code><br>Trace API 有意脱敏 payload。</td><td><span class="bad">Trace 缺少可理解的筛选过程；开发者无法确认实际运行哪个包、使用哪个 DB。</span></td><td><span class="fix">双层观测</span>：用户看脱敏筛选过程；开发者看 build、DB 路径、数据库更新时间和操作摘要。</td><td><code>/health</code> 与启动日志均能标识同一 Runtime 与同一 DB。</td></tr>
+      <tr><td><b>返回 checklist / 结束</b></td><td>当前 <code>end_content_research</code> 会删 workflow、brief、Trace 与基础证据；部分新表反而遗留为孤儿。</td><td><span class="bad">修改方向会不可逆地丢失可见证据；又留下无法通过产品访问的残余数据。</span></td><td><span class="fix">改为永久归档</span>：清除活动入口，不删除 run 数据。另设二次确认的“永久删除”，事务覆盖全部关联表。</td><td>归档后历史仍可查看/导出；永久删除后所有关联表均无该 run。</td></tr>
+    </tbody>
+  </table>
+
+  <h2>两个视角，各自解决的问题</h2>
+  <div class="grid">
+    <section class="box"><h3>用户功能：证据审计</h3><ul><li>入口：报告和侧栏的“查看候选与筛选”。</li><li>展示：标题、作者、链接、检索词、详情状态、入选/排除原因。</li><li>价值：用户能判断“系统筛掉得是否合理”，而不是只能接受“证据不足”。</li><li>导出：JSON 是辅助能力，不替代页面审计。</li></ul></section>
+    <section class="box"><h3>开发者 Observation：运行诊断</h3><ul><li>启动与健康检查：build ID、Runtime 版本、最终 SQLite 绝对路径、DB 修改时间。</li><li>执行：每个 provider 操作的次数、耗时、错误代码与持久化检查点。</li><li>边界：不向 UI 泄露 Cookie、API Key、token、原始登录会话。</li><li>价值：能定位“旧包 / 错误 DB / Worker 与 API 不一致”。</li></ul></section>
+  </div>
+
+  <h2>最小化活动配置</h2>
+  <div class="grid">
+    <section class="box"><h3>新的 <code>config.env</code></h3><div class="config"># LLM 与小红书登录由 Creator 右栏保存到本机 SQLite。
+LOG_LEVEL=INFO</div><p class="sub">文件可为空；该行仅保留运行日志可读性。</p></section>
+    <section class="box"><h3>升级迁移规则</h3><ul><li>先创建带时间戳的旧配置备份。</li><li>生成最小活动配置；不再加载 API Key、Cookie、模型、DB 路径、RAG/V2/告警/生成参数。</li><li>Runtime 强制拥有内部存储路径；UI 保存的模型与登录态仍在 SQLite。</li><li>启动后以 health 诊断确认迁移后的实际库。</li></ul></section>
+  </div>
+
+  <h2>发布门禁：必须同时通过</h2>
+  <div class="gate"><b>冻结包真实重启测试</b>：携带旧配置启动 → 创建一轮包含详情候选的调研 fixture → 停止 Runtime → 重启同一包 → 读取相同 run 的候选、Trace、报告 → 归档后仍可读 → 显式永久删除后所有关联表与 API 均不可读。</div>
+</div>
