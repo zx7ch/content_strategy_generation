@@ -473,6 +473,59 @@ def _apply_0018(conn: sqlite3.Connection) -> None:
     conn.executescript(_V18_XHS_CREDENTIAL_STATUS_SQL)
 
 
+_V19_SCOPE_CONTRACT_SQL = """
+CREATE TABLE content_research_scope_contracts (
+    id TEXT PRIMARY KEY,
+    workflow_run_id TEXT NOT NULL,
+    research_plan_id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    schema_version TEXT NOT NULL,
+    constraints_json TEXT NOT NULL,
+    query_groups_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(workflow_run_id, version)
+);
+CREATE INDEX idx_cr_scope_contract_workflow_version
+    ON content_research_scope_contracts(workflow_run_id, version);
+CREATE TABLE content_research_scope_audit_events (
+    id TEXT PRIMARY KEY,
+    workflow_run_id TEXT NOT NULL,
+    scope_contract_id TEXT NOT NULL,
+    scope_contract_version INTEGER NOT NULL,
+    event_name TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX idx_cr_scope_audit_workflow_version
+    ON content_research_scope_audit_events(workflow_run_id, scope_contract_version, created_at);
+"""
+
+
+def _apply_0019(conn: sqlite3.Connection) -> None:
+    conn.executescript(_V19_SCOPE_CONTRACT_SQL)
+
+
+_V20_SCOPE_COVERAGE_SQL = """
+CREATE TABLE content_research_scope_coverage_snapshots (
+    id TEXT PRIMARY KEY,
+    workflow_run_id TEXT NOT NULL,
+    scope_contract_id TEXT NOT NULL UNIQUE,
+    scope_contract_version INTEGER NOT NULL,
+    state TEXT NOT NULL,
+    constraint_counts_json TEXT NOT NULL,
+    unmet_constraint_ids_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX idx_cr_scope_coverage_workflow_version
+    ON content_research_scope_coverage_snapshots(workflow_run_id, scope_contract_version);
+"""
+
+
+def _apply_0020(conn: sqlite3.Connection) -> None:
+    conn.executescript(_V20_SCOPE_COVERAGE_SQL)
+
+
 def _apply_0015(conn: sqlite3.Connection) -> None:
     conn.execute(_V15_LLM_CONFIGURATION_SQL)
 
@@ -526,6 +579,8 @@ def _expected_checksums(migration_0002_sql: str, legacy_checksum: str) -> dict[s
         "0016": _checksum((_V16_SUPERSEDED_LITE_REPORT_TABLES, _V16_MARKETING_CONCLUSION_SQL)),
         "0017": hashlib.sha256(_V17_XHS_CREDENTIAL_SQL.encode("utf-8")).hexdigest(),
         "0018": hashlib.sha256(_V18_XHS_CREDENTIAL_STATUS_SQL.encode("utf-8")).hexdigest(),
+        "0019": hashlib.sha256(_V19_SCOPE_CONTRACT_SQL.encode("utf-8")).hexdigest(),
+        "0020": hashlib.sha256(_V20_SCOPE_COVERAGE_SQL.encode("utf-8")).hexdigest(),
     }
 
 
@@ -731,6 +786,20 @@ def apply_content_research_migrations(
                 name="local_xhs_credential_status",
                 checksum=expected_checksums["0018"],
                 apply=lambda: _apply_0018(conn),
+            )
+            _apply_migration(
+                conn,
+                version="0019",
+                name="lite_scope_contract_audit",
+                checksum=expected_checksums["0019"],
+                apply=lambda: _apply_0019(conn),
+            )
+            _apply_migration(
+                conn,
+                version="0020",
+                name="lite_scope_coverage_snapshots",
+                checksum=expected_checksums["0020"],
+                apply=lambda: _apply_0020(conn),
             )
         except Exception:
             conn.rollback()

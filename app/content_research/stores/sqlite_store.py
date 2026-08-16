@@ -42,6 +42,13 @@ from app.content_research.persistence_models import (
     TypedPersistenceRecord,
     WeakSignalRecord,
 )
+from app.content_research.scope_contract import (
+    CoverageSnapshot,
+    ResearchScopeContract,
+    ScopeAuditEvent,
+    ScopeConstraint,
+    ScopeQueryGroup,
+)
 
 
 def _fmt_dt(value: datetime) -> str:
@@ -434,6 +441,140 @@ class SQLiteContentResearchStore:
                 (trace_id,),
             ).fetchall()
         return [self._row_to_observation_event(row) for row in rows]
+
+    def save_scope_contract(self, contract: ResearchScopeContract) -> ResearchScopeContract:
+        constraints = [
+            {
+                "id": item.id,
+                "label": item.label,
+                "value": item.value,
+                "retrieval_priority": item.retrieval_priority,
+                "evidence_gate": item.evidence_gate,
+                "allowed_aliases": list(item.allowed_aliases),
+            }
+            for item in contract.constraints
+        ]
+        groups = [
+            {
+                "id": item.id,
+                "suggested_query": item.suggested_query,
+                "final_query": item.final_query,
+                "origin": item.origin,
+                "execution_role": item.execution_role,
+            }
+            for item in contract.query_groups
+        ]
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    """INSERT INTO content_research_scope_contracts
+                       (id, workflow_run_id, research_plan_id, version, schema_version,
+                        constraints_json, query_groups_json, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        contract.id,
+                        contract.workflow_run_id,
+                        contract.research_plan_id,
+                        contract.version,
+                        contract.schema_version,
+                        _dumps_any_list(constraints),
+                        _dumps_any_list(groups),
+                        _fmt_dt(contract.created_at),
+                    ),
+                )
+        except sqlite3.IntegrityError as exc:
+            raise ValueError(f"Scope contract is append-only and already exists: {contract.id}") from exc
+        return contract
+
+    def get_scope_contract(
+        self, workflow_run_id: str, *, version: int
+    ) -> ResearchScopeContract | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """SELECT * FROM content_research_scope_contracts
+                   WHERE workflow_run_id = ? AND version = ?""",
+                (workflow_run_id, version),
+            ).fetchone()
+        return self._row_to_scope_contract(row) if row else None
+
+    def list_scope_contracts(self, workflow_run_id: str) -> list[ResearchScopeContract]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """SELECT * FROM content_research_scope_contracts
+                   WHERE workflow_run_id = ? ORDER BY version ASC""",
+                (workflow_run_id,),
+            ).fetchall()
+        return [self._row_to_scope_contract(row) for row in rows]
+
+    def save_coverage_snapshot(self, snapshot: CoverageSnapshot) -> CoverageSnapshot:
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    """INSERT INTO content_research_scope_coverage_snapshots
+                       (id, workflow_run_id, scope_contract_id, scope_contract_version, state,
+                        constraint_counts_json, unmet_constraint_ids_json, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        snapshot.id,
+                        snapshot.workflow_run_id,
+                        snapshot.scope_contract_id,
+                        snapshot.scope_contract_version,
+                        snapshot.state,
+                        _dumps(snapshot.constraint_counts),
+                        _dumps_any_list(list(snapshot.unmet_constraint_ids)),
+                        _fmt_dt(snapshot.created_at),
+                    ),
+                )
+        except sqlite3.IntegrityError as exc:
+            raise ValueError(f"Coverage snapshot is append-only and already exists: {snapshot.id}") from exc
+        return snapshot
+
+    def get_coverage_snapshot(
+        self, workflow_run_id: str, *, version: int
+    ) -> CoverageSnapshot | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """SELECT * FROM content_research_scope_coverage_snapshots
+                   WHERE workflow_run_id = ? AND scope_contract_version = ?""",
+                (workflow_run_id, version),
+            ).fetchone()
+        return self._row_to_coverage_snapshot(row) if row else None
+
+    def append_scope_audit_event(self, event: ScopeAuditEvent) -> ScopeAuditEvent:
+        _validate_payload("ScopeAuditEvent", event.payload)
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    """INSERT INTO content_research_scope_audit_events
+                       (id, workflow_run_id, scope_contract_id, scope_contract_version,
+                        event_name, payload_json, metadata_json, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        event.id,
+                        event.workflow_run_id,
+                        event.scope_contract_id,
+                        event.scope_contract_version,
+                        event.event_name,
+                        _dumps(event.payload),
+                        _dumps(event.metadata or {}),
+                        _fmt_dt(event.created_at),
+                    ),
+                )
+        except sqlite3.IntegrityError as exc:
+            raise ValueError(f"Scope audit event is append-only and already exists: {event.id}") from exc
+        return event
+
+    def list_scope_audit_events(
+        self, workflow_run_id: str, *, version: int
+    ) -> list[ScopeAuditEvent]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """SELECT * FROM content_research_scope_audit_events
+                   WHERE workflow_run_id = ? AND scope_contract_version = ?
+                   ORDER BY created_at ASC, id ASC""",
+                (workflow_run_id, version),
+            ).fetchall()
+        return [self._row_to_scope_audit_event(row) for row in rows]
 
     def save_evidence_record(self, record: EvidenceRecord) -> EvidenceRecord:
         _validate_payload("EvidenceRecord", record.normalized_payload)
@@ -1157,6 +1298,68 @@ class SQLiteContentResearchStore:
             metadata=_loads(row["metadata_json"]),
             created_at=_parse_dt(row["created_at"]),
             updated_at=_parse_dt(row["updated_at"]),
+        )
+
+    @staticmethod
+    def _row_to_scope_contract(row: sqlite3.Row) -> ResearchScopeContract:
+        constraints = tuple(
+            ScopeConstraint(
+                id=str(item["id"]),
+                label=str(item["label"]),
+                value=str(item["value"]),
+                retrieval_priority=str(item["retrieval_priority"]),
+                evidence_gate=str(item["evidence_gate"]),
+                allowed_aliases=tuple(str(alias) for alias in item.get("allowed_aliases") or ()),
+            )
+            for item in _loads_any_list(row["constraints_json"])
+        )
+        groups = tuple(
+            ScopeQueryGroup(
+                id=str(item["id"]),
+                suggested_query=str(item["suggested_query"]),
+                final_query=str(item["final_query"]),
+                origin=str(item["origin"]),
+                execution_role=str(item["execution_role"]),
+            )
+            for item in _loads_any_list(row["query_groups_json"])
+        )
+        return ResearchScopeContract(
+            id=row["id"],
+            workflow_run_id=row["workflow_run_id"],
+            research_plan_id=row["research_plan_id"],
+            version=row["version"],
+            schema_version=row["schema_version"],
+            constraints=constraints,
+            query_groups=groups,
+            created_at=_parse_dt(row["created_at"]),
+        )
+
+    @staticmethod
+    def _row_to_scope_audit_event(row: sqlite3.Row) -> ScopeAuditEvent:
+        return ScopeAuditEvent(
+            id=row["id"],
+            workflow_run_id=row["workflow_run_id"],
+            scope_contract_id=row["scope_contract_id"],
+            scope_contract_version=row["scope_contract_version"],
+            event_name=row["event_name"],
+            payload=_loads(row["payload_json"]),
+            metadata=_loads(row["metadata_json"]),
+            created_at=_parse_dt(row["created_at"]),
+        )
+
+    @staticmethod
+    def _row_to_coverage_snapshot(row: sqlite3.Row) -> CoverageSnapshot:
+        return CoverageSnapshot(
+            id=row["id"],
+            workflow_run_id=row["workflow_run_id"],
+            scope_contract_id=row["scope_contract_id"],
+            scope_contract_version=row["scope_contract_version"],
+            state=row["state"],
+            constraint_counts=_loads(row["constraint_counts_json"]),
+            unmet_constraint_ids=tuple(
+                str(item) for item in _loads_any_list(row["unmet_constraint_ids_json"])
+            ),
+            created_at=_parse_dt(row["created_at"]),
         )
 
     @staticmethod
