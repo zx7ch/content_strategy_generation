@@ -134,3 +134,22 @@ def test_constraint_has_one_user_controlled_mode() -> None:
     constraint = ScopeConstraint("season", "季节", "夏季", "preferred")
 
     assert constraint.mode == "preferred"
+
+
+def test_query_group_id_is_unique_to_its_scope_contract() -> None:
+    first = build_scope_contract(
+        workflow_run_id="run_1",
+        research_plan_id="rp_1",
+        version=1,
+        constraints=_required_constraints(),
+        query_groups=(ScopeQueryGroupInput("夏季 长袖衬衫 通勤", "夏季 长袖衬衫 通勤"),),
+    )
+    second = build_scope_contract(
+        workflow_run_id="run_2",
+        research_plan_id="rp_2",
+        version=1,
+        constraints=_required_constraints(),
+        query_groups=(ScopeQueryGroupInput("夏季 长袖衬衫 通勤", "夏季 长袖衬衫 通勤"),),
+    )
+
+    assert first.query_groups[0].id != second.query_groups[0].id
