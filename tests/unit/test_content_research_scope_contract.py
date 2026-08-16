@@ -6,6 +6,7 @@ from app.content_research.scope_contract import (
     ScopeConstraint,
     ScopeQueryGroupInput,
     build_scope_contract,
+    classify_query_group,
 )
 
 
@@ -15,22 +16,19 @@ def _required_constraints() -> tuple[ScopeConstraint, ...]:
             id="core_object",
             label="核心对象",
             value="长袖衬衫",
-            retrieval_priority="must_cover",
-            evidence_gate="required",
+            mode="required",
         ),
         ScopeConstraint(
             id="season",
             label="季节",
             value="夏季",
-            retrieval_priority="must_cover",
-            evidence_gate="required",
+            mode="required",
         ),
         ScopeConstraint(
             id="scenario",
             label="使用场景",
             value="通勤",
-            retrieval_priority="must_cover",
-            evidence_gate="required",
+            mode="required",
         ),
     )
 
@@ -86,7 +84,6 @@ def test_scope_contract_rejects_more_than_three_or_blank_queries() -> None:
                 for index in range(4)
             ),
         )
-
     with pytest.raises(ValueError, match="final_query"):
         build_scope_contract(
             workflow_run_id="run_1",
@@ -95,3 +92,45 @@ def test_scope_contract_rejects_more_than_three_or_blank_queries() -> None:
             constraints=_required_constraints(),
             query_groups=(ScopeQueryGroupInput("夏季 长袖衬衫 通勤", "  "),),
         )
+
+
+@pytest.mark.parametrize(
+    "constraints",
+    (
+        (
+            ScopeConstraint("season", "季节", "夏季", "required"),
+        ),
+        (
+            ScopeConstraint("core_object", "核心对象", "衬衫", "required"),
+            ScopeConstraint("core_object", "核心对象", "长袖衬衫", "required"),
+        ),
+    ),
+)
+def test_scope_contract_requires_exactly_one_core_object(
+    constraints: tuple[ScopeConstraint, ...],
+) -> None:
+    with pytest.raises(ValueError, match="exactly one core_object"):
+        build_scope_contract(
+            workflow_run_id="run_1",
+            research_plan_id="rp_1",
+            version=1,
+            constraints=constraints,
+            query_groups=(ScopeQueryGroupInput("夏季 长袖衬衫", "夏季 长袖衬衫"),),
+        )
+
+
+def test_classify_query_group_marks_targeted_missing_required_term_as_supplementary() -> None:
+    assert (
+        classify_query_group(
+            "夏季 长袖衬衫",
+            required_terms=("夏季", "长袖衬衫", "通勤"),
+            targeted_required_terms=("夏季",),
+        )
+        == "supplementary"
+    )
+
+
+def test_constraint_has_one_user_controlled_mode() -> None:
+    constraint = ScopeConstraint("season", "季节", "夏季", "preferred")
+
+    assert constraint.mode == "preferred"

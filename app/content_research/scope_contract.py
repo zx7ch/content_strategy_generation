@@ -12,12 +12,10 @@ from typing import Literal
 
 from app.content_research.models import utcnow
 
-
 SCOPE_CONTRACT_SCHEMA_VERSION = "content_research_scope_contract_v1"
 MAX_LITE_QUERY_GROUPS = 3
 
-RetrievalPriority = Literal["must_cover", "prefer_cover"]
-EvidenceGate = Literal["required", "optional"]
+ConstraintMode = Literal["required", "preferred"]
 QueryOrigin = Literal["system_suggested", "user_edited"]
 QueryExecutionRole = Literal["coverage", "supplementary", "exploratory"]
 
@@ -27,23 +25,23 @@ class ScopeConstraint:
     id: str
     label: str
     value: str
-    retrieval_priority: RetrievalPriority
-    evidence_gate: EvidenceGate
+    mode: ConstraintMode
     allowed_aliases: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.id.strip() or not self.label.strip() or not self.value.strip():
             raise ValueError("scope constraint id, label, and value are required")
-        if self.retrieval_priority not in {"must_cover", "prefer_cover"}:
-            raise ValueError("invalid retrieval_priority")
-        if self.evidence_gate not in {"required", "optional"}:
-            raise ValueError("invalid evidence_gate")
+        if self.mode not in {"required", "preferred"}:
+            raise ValueError("invalid scope constraint mode")
+        if any(not alias.strip() for alias in self.allowed_aliases):
+            raise ValueError("scope constraint aliases must be non-empty")
 
 
 @dataclass(frozen=True)
 class ScopeQueryGroupInput:
     suggested_query: str
     final_query: str
+    targeted_required_terms: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -135,6 +133,9 @@ def build_scope_contract(
         raise ValueError("scope contract version must be positive")
     if not constraints:
         raise ValueError("scope contract requires constraints")
+    core_object_count = sum(constraint.id == "core_object" for constraint in constraints)
+    if core_object_count != 1:
+        raise ValueError("scope contract requires exactly one core_object constraint")
     if len({constraint.id for constraint in constraints}) != len(constraints):
         raise ValueError("scope constraint ids must be unique")
     if len(query_groups) > MAX_LITE_QUERY_GROUPS:
@@ -142,15 +143,7 @@ def build_scope_contract(
     if not query_groups:
         raise ValueError("scope contract requires query groups")
 
-    required_terms = tuple(
-        constraint.value
-        for constraint in constraints
-        if constraint.retrieval_priority == "must_cover"
-    )
-    frozen_groups = tuple(
-        _build_query_group(item, index=index, required_terms=required_terms)
-        for index, item in enumerate(query_groups, start=1)
-    )
+    required_terms = tuple(constraint.value for constraint in constraints if constraint.mode == "required")
     contract_id = "rsc_" + _fingerprint(
         {
             "workflow_run_id": workflow_run_id,
@@ -158,6 +151,15 @@ def build_scope_contract(
             "version": version,
         }
     )[:24]
+    frozen_groups = tuple(
+        _build_query_group(
+            item,
+            scope_contract_id=contract_id,
+            index=index,
+            required_terms=required_terms,
+        )
+        for index, item in enumerate(query_groups, start=1)
+    )
     return ResearchScopeContract(
         id=contract_id,
         workflow_run_id=workflow_run_id,
@@ -173,6 +175,7 @@ def build_scope_contract(
 def _build_query_group(
     value: ScopeQueryGroupInput,
     *,
+    scope_contract_id: str,
     index: int,
     required_terms: tuple[str, ...],
 ) -> ScopeQueryGroup:
@@ -181,18 +184,42 @@ def _build_query_group(
     origin: QueryOrigin = (
         "system_suggested" if _normalized(suggested_query) == _normalized(final_query) else "user_edited"
     )
-    role: QueryExecutionRole = (
-        "coverage"
-        if all(_normalized(term) in _normalized(final_query) for term in required_terms)
-        else "exploratory"
+    role = classify_query_group(
+        final_query,
+        required_terms=required_terms,
+        targeted_required_terms=value.targeted_required_terms,
     )
     return ScopeQueryGroup(
-        id="qg_" + _fingerprint({"index": index, "final_query": final_query})[:16],
+        id="qg_"
+        + _fingerprint(
+            {
+                "scope_contract_id": scope_contract_id,
+                "index": index,
+                "final_query": final_query,
+            }
+        )[:16],
         suggested_query=suggested_query,
         final_query=final_query,
         origin=origin,
         execution_role=role,
     )
+
+
+def classify_query_group(
+    final_query: str,
+    *,
+    required_terms: tuple[str, ...],
+    targeted_required_terms: tuple[str, ...] = (),
+) -> QueryExecutionRole:
+    """Classify query intent without rejecting arbitrary user-authored text."""
+    normalized_query = _normalized(_clean_query(final_query, field_name="final_query"))
+    normalized_required = tuple(_normalized(term) for term in required_terms)
+    if all(term in normalized_query for term in normalized_required):
+        return "coverage"
+    normalized_targets = tuple(_normalized(term) for term in targeted_required_terms)
+    if normalized_targets and all(term in normalized_query for term in normalized_targets):
+        return "supplementary"
+    return "exploratory"
 
 
 def _clean_query(value: str, *, field_name: str) -> str:

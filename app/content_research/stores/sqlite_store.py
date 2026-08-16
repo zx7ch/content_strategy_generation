@@ -443,13 +443,45 @@ class SQLiteContentResearchStore:
         return [self._row_to_observation_event(row) for row in rows]
 
     def save_scope_contract(self, contract: ResearchScopeContract) -> ResearchScopeContract:
+        try:
+            with self._connect() as conn:
+                self._insert_scope_contract(conn, contract)
+        except sqlite3.IntegrityError as exc:
+            raise ValueError(f"Scope contract is append-only and already exists: {contract.id}") from exc
+        return contract
+
+    def save_scope_contract_with_audit_event(
+        self, contract: ResearchScopeContract, event: ScopeAuditEvent
+    ) -> ResearchScopeContract:
+        _validate_payload("ScopeAuditEvent", event.payload)
+        if (
+            event.workflow_run_id != contract.workflow_run_id
+            or event.scope_contract_id != contract.id
+            or event.scope_contract_version != contract.version
+        ):
+            raise ValueError("scope audit event must reference the contract being saved")
+        try:
+            with self._connect() as conn:
+                self._insert_scope_contract(conn, contract)
+                self._assert_scope_contract_reference(
+                    conn,
+                    workflow_run_id=event.workflow_run_id,
+                    scope_contract_id=event.scope_contract_id,
+                    scope_contract_version=event.scope_contract_version,
+                )
+                self._insert_scope_audit_event(conn, event)
+        except sqlite3.IntegrityError as exc:
+            raise ValueError(f"Scope contract or audit event is append-only and already exists: {contract.id}") from exc
+        return contract
+
+    @staticmethod
+    def _scope_contract_payload(contract: ResearchScopeContract) -> tuple[str, str]:
         constraints = [
             {
                 "id": item.id,
                 "label": item.label,
                 "value": item.value,
-                "retrieval_priority": item.retrieval_priority,
-                "evidence_gate": item.evidence_gate,
+                "mode": item.mode,
                 "allowed_aliases": list(item.allowed_aliases),
             }
             for item in contract.constraints
@@ -464,27 +496,26 @@ class SQLiteContentResearchStore:
             }
             for item in contract.query_groups
         ]
-        try:
-            with self._connect() as conn:
-                conn.execute(
-                    """INSERT INTO content_research_scope_contracts
-                       (id, workflow_run_id, research_plan_id, version, schema_version,
-                        constraints_json, query_groups_json, created_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        contract.id,
-                        contract.workflow_run_id,
-                        contract.research_plan_id,
-                        contract.version,
-                        contract.schema_version,
-                        _dumps_any_list(constraints),
-                        _dumps_any_list(groups),
-                        _fmt_dt(contract.created_at),
-                    ),
-                )
-        except sqlite3.IntegrityError as exc:
-            raise ValueError(f"Scope contract is append-only and already exists: {contract.id}") from exc
-        return contract
+        return _dumps_any_list(constraints), _dumps_any_list(groups)
+
+    def _insert_scope_contract(self, conn: sqlite3.Connection, contract: ResearchScopeContract) -> None:
+        constraints_json, query_groups_json = self._scope_contract_payload(contract)
+        conn.execute(
+            """INSERT INTO content_research_scope_contracts
+               (id, workflow_run_id, research_plan_id, version, schema_version,
+                constraints_json, query_groups_json, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                contract.id,
+                contract.workflow_run_id,
+                contract.research_plan_id,
+                contract.version,
+                contract.schema_version,
+                constraints_json,
+                query_groups_json,
+                _fmt_dt(contract.created_at),
+            ),
+        )
 
     def get_scope_contract(
         self, workflow_run_id: str, *, version: int
@@ -509,6 +540,12 @@ class SQLiteContentResearchStore:
     def save_coverage_snapshot(self, snapshot: CoverageSnapshot) -> CoverageSnapshot:
         try:
             with self._connect() as conn:
+                self._assert_scope_contract_reference(
+                    conn,
+                    workflow_run_id=snapshot.workflow_run_id,
+                    scope_contract_id=snapshot.scope_contract_id,
+                    scope_contract_version=snapshot.scope_contract_version,
+                )
                 conn.execute(
                     """INSERT INTO content_research_scope_coverage_snapshots
                        (id, workflow_run_id, scope_contract_id, scope_contract_version, state,
@@ -544,25 +581,51 @@ class SQLiteContentResearchStore:
         _validate_payload("ScopeAuditEvent", event.payload)
         try:
             with self._connect() as conn:
-                conn.execute(
-                    """INSERT INTO content_research_scope_audit_events
-                       (id, workflow_run_id, scope_contract_id, scope_contract_version,
-                        event_name, payload_json, metadata_json, created_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        event.id,
-                        event.workflow_run_id,
-                        event.scope_contract_id,
-                        event.scope_contract_version,
-                        event.event_name,
-                        _dumps(event.payload),
-                        _dumps(event.metadata or {}),
-                        _fmt_dt(event.created_at),
-                    ),
+                self._assert_scope_contract_reference(
+                    conn,
+                    workflow_run_id=event.workflow_run_id,
+                    scope_contract_id=event.scope_contract_id,
+                    scope_contract_version=event.scope_contract_version,
                 )
+                self._insert_scope_audit_event(conn, event)
         except sqlite3.IntegrityError as exc:
             raise ValueError(f"Scope audit event is append-only and already exists: {event.id}") from exc
         return event
+
+    @staticmethod
+    def _assert_scope_contract_reference(
+        conn: sqlite3.Connection,
+        *,
+        workflow_run_id: str,
+        scope_contract_id: str,
+        scope_contract_version: int,
+    ) -> None:
+        contract = conn.execute(
+            """SELECT 1 FROM content_research_scope_contracts
+               WHERE id = ? AND workflow_run_id = ? AND version = ?""",
+            (scope_contract_id, workflow_run_id, scope_contract_version),
+        ).fetchone()
+        if contract is None:
+            raise ValueError("scope record does not match a persisted scope contract")
+
+    @staticmethod
+    def _insert_scope_audit_event(conn: sqlite3.Connection, event: ScopeAuditEvent) -> None:
+        conn.execute(
+            """INSERT INTO content_research_scope_audit_events
+               (id, workflow_run_id, scope_contract_id, scope_contract_version,
+                event_name, payload_json, metadata_json, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                event.id,
+                event.workflow_run_id,
+                event.scope_contract_id,
+                event.scope_contract_version,
+                event.event_name,
+                _dumps(event.payload),
+                _dumps(event.metadata or {}),
+                _fmt_dt(event.created_at),
+            ),
+        )
 
     def list_scope_audit_events(
         self, workflow_run_id: str, *, version: int
@@ -1307,8 +1370,7 @@ class SQLiteContentResearchStore:
                 id=str(item["id"]),
                 label=str(item["label"]),
                 value=str(item["value"]),
-                retrieval_priority=str(item["retrieval_priority"]),
-                evidence_gate=str(item["evidence_gate"]),
+                mode=str(item["mode"]),
                 allowed_aliases=tuple(str(alias) for alias in item.get("allowed_aliases") or ()),
             )
             for item in _loads_any_list(row["constraints_json"])
