@@ -40,13 +40,19 @@ from app.content_research.persistence_models import (
 from app.content_research.scope_contract import (
     CoverageSnapshot,
     ResearchScopeContract,
+    ResearchScopeDraft,
     ScopeAuditEvent,
+    ScopeDraftAuditEvent,
 )
 
 TypedRecordT = TypeVar("TypedRecordT", bound=CanonicalSourceRecord | DirectionSourceProjectionRecord | DirectionalEvidencePacketRecord | ClaimCandidateRecord | ClaimAdmissionDecisionRecord | DirectionResultDecisionRecord | WeakSignalRecord | CrossDirectionRecord | AggregateClaimRecord | MarketingConclusionCandidateRecord | MarketingConclusionDecisionRecord | StageCheckpointRecord | BudgetLedgerEntryRecord | ReportDraftRecord | ReportFaithfulnessDecisionRecord | ReportPublicationRecord)
 
 
 class ContentResearchStore(Protocol):
+    def save_scope_draft_with_audit_event(
+        self, draft: ResearchScopeDraft, event: ScopeDraftAuditEvent
+    ) -> ResearchScopeDraft: ...
+    def get_scope_draft(self, scope_draft_id: str) -> ResearchScopeDraft | None: ...
     def save_scope_contract(self, contract: ResearchScopeContract) -> ResearchScopeContract: ...
     def save_scope_contract_with_audit_event(
         self, contract: ResearchScopeContract, event: ScopeAuditEvent

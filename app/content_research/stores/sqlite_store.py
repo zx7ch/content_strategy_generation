@@ -45,9 +45,12 @@ from app.content_research.persistence_models import (
 from app.content_research.scope_contract import (
     CoverageSnapshot,
     ResearchScopeContract,
+    ResearchScopeDraft,
     ScopeAuditEvent,
     ScopeConstraint,
+    ScopeDraftAuditEvent,
     ScopeQueryGroup,
+    ScopeQueryGroupInput,
 )
 
 
@@ -441,6 +444,49 @@ class SQLiteContentResearchStore:
                 (trace_id,),
             ).fetchall()
         return [self._row_to_observation_event(row) for row in rows]
+
+    def save_scope_draft_with_audit_event(
+        self, draft: ResearchScopeDraft, event: ScopeDraftAuditEvent
+    ) -> ResearchScopeDraft:
+        _validate_payload("ScopeDraftAuditEvent", event.payload)
+        if event.workflow_run_id != draft.workflow_run_id or event.scope_draft_id != draft.id:
+            raise ValueError("scope draft audit event must reference the draft being saved")
+        constraints = [
+            {"id": item.id, "label": item.label, "value": item.value, "mode": item.mode,
+             "allowed_aliases": list(item.allowed_aliases)}
+            for item in draft.constraints
+        ]
+        groups = [
+            {"suggested_query": item.suggested_query, "final_query": item.final_query,
+             "targeted_required_terms": list(item.targeted_required_terms)}
+            for item in draft.query_groups
+        ]
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    """INSERT INTO content_research_scope_drafts
+                       (id, workflow_run_id, research_plan_id, structure_hash, constraints_json,
+                        query_groups_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (draft.id, draft.workflow_run_id, draft.research_plan_id, draft.structure_hash,
+                     _dumps_any_list(constraints), _dumps_any_list(groups), _fmt_dt(draft.created_at)),
+                )
+                conn.execute(
+                    """INSERT INTO content_research_scope_draft_audit_events
+                       (id, workflow_run_id, scope_draft_id, event_name, payload_json, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (event.id, event.workflow_run_id, event.scope_draft_id, event.event_name,
+                     _dumps(event.payload), _fmt_dt(event.created_at)),
+                )
+        except sqlite3.IntegrityError as exc:
+            raise ValueError(f"Scope draft or audit event is append-only and already exists: {draft.id}") from exc
+        return draft
+
+    def get_scope_draft(self, scope_draft_id: str) -> ResearchScopeDraft | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM content_research_scope_drafts WHERE id = ?", (scope_draft_id,)
+            ).fetchone()
+        return self._row_to_scope_draft(row) if row else None
 
     def save_scope_contract(self, contract: ResearchScopeContract) -> ResearchScopeContract:
         try:
@@ -1361,6 +1407,29 @@ class SQLiteContentResearchStore:
             metadata=_loads(row["metadata_json"]),
             created_at=_parse_dt(row["created_at"]),
             updated_at=_parse_dt(row["updated_at"]),
+        )
+
+    @staticmethod
+    def _row_to_scope_draft(row: sqlite3.Row) -> ResearchScopeDraft:
+        constraints = tuple(
+            ScopeConstraint(
+                id=str(item["id"]), label=str(item["label"]), value=str(item["value"]),
+                mode=str(item["mode"]),
+                allowed_aliases=tuple(str(alias) for alias in item.get("allowed_aliases") or ()),
+            )
+            for item in _loads_any_list(row["constraints_json"])
+        )
+        groups = tuple(
+            ScopeQueryGroupInput(
+                suggested_query=str(item["suggested_query"]), final_query=str(item["final_query"]),
+                targeted_required_terms=tuple(str(term) for term in item.get("targeted_required_terms") or ()),
+            )
+            for item in _loads_any_list(row["query_groups_json"])
+        )
+        return ResearchScopeDraft(
+            id=row["id"], workflow_run_id=row["workflow_run_id"],
+            research_plan_id=row["research_plan_id"], structure_hash=row["structure_hash"],
+            constraints=constraints, query_groups=groups, created_at=_parse_dt(row["created_at"]),
         )
 
     @staticmethod

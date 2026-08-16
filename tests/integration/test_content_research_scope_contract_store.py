@@ -7,8 +7,10 @@ from app.content_research.scope_contract import (
     ResearchScopeContract,
     ScopeAuditEvent,
     ScopeConstraint,
+    ScopeDraftAuditEvent,
     ScopeQueryGroupInput,
     build_scope_contract,
+    build_scope_draft,
 )
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
 
@@ -62,6 +64,30 @@ def test_scope_contract_versions_and_scope_audit_events_are_append_only(tmp_path
     assert store.get_coverage_snapshot(v1.workflow_run_id, version=1) == snapshot
     with pytest.raises(ValueError, match="append-only"):
         store.append_scope_audit_event(event)
+
+
+def test_scope_draft_and_suggestion_audit_event_commit_atomically(tmp_path) -> None:
+    store = SQLiteContentResearchStore(str(tmp_path / "scope-draft.db"))
+    draft = build_scope_draft(
+        workflow_run_id="run_scope_1",
+        research_plan_id="rp_scope_1",
+        structure_hash="structure_hash_1",
+        constraints=_contract(version=1).constraints,
+        query_groups=(ScopeQueryGroupInput("夏季 长袖衬衫 通勤", "夏季 长袖衬衫 通勤"),),
+    )
+    event = ScopeDraftAuditEvent(
+        id="sda_1",
+        workflow_run_id=draft.workflow_run_id,
+        scope_draft_id=draft.id,
+        event_name="scope_suggested",
+        payload={"schema_version": "content_research_scope_audit_event_v1"},
+    )
+
+    store.save_scope_draft_with_audit_event(draft, event)
+
+    assert store.get_scope_draft(draft.id) == draft
+    with pytest.raises(ValueError, match="append-only"):
+        store.save_scope_draft_with_audit_event(draft, event)
 
 
 def test_scope_records_reject_a_reference_to_another_or_missing_contract(tmp_path) -> None:

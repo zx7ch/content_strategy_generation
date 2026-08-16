@@ -20,6 +20,8 @@ P0_WORKFLOW_ACTIONS = (
     "clarify_subject",
     "confirm_subject_structure",
     "repair_from_persisted_packets",
+    "prepare_scope",
+    "confirm_scope",
 )
 
 
@@ -294,6 +296,31 @@ class ContentResearchWorkflowActionRequest(BaseModel):
     schema_version: str = WORKFLOW_ACTION_REQUEST_SCHEMA_VERSION
     action: str = Field(min_length=1)
     payload: dict = Field(default_factory=dict)
+
+
+class PrepareScopeRequest(BaseModel):
+    direction_id: str = Field(min_length=1)
+
+
+class ScopeConstraintInput(BaseModel):
+    id: str = Field(min_length=1)
+    label: str = Field(min_length=1)
+    value: str = Field(min_length=1)
+    mode: str = Field(pattern="^(required|preferred)$")
+    allowed_aliases: list[str] = Field(default_factory=list)
+
+
+class ScopeQueryGroupInput(BaseModel):
+    suggested_query: str = Field(min_length=1)
+    final_query: str = Field(min_length=1)
+    targeted_required_terms: list[str] = Field(default_factory=list)
+
+
+class ConfirmScopeRequest(BaseModel):
+    scope_draft_id: str = Field(min_length=1)
+    research_plan_id: str = Field(min_length=1)
+    constraints: list[ScopeConstraintInput] = Field(min_length=1)
+    query_groups: list[ScopeQueryGroupInput] = Field(min_length=1, max_length=3)
 
 
 class ContentResearchSubjectClarificationRequest(BaseModel):

@@ -54,6 +54,35 @@ class ScopeQueryGroup:
 
 
 @dataclass(frozen=True)
+class ResearchScopeDraft:
+    id: str
+    workflow_run_id: str
+    research_plan_id: str
+    structure_hash: str
+    constraints: tuple[ScopeConstraint, ...]
+    query_groups: tuple[ScopeQueryGroupInput, ...]
+    created_at: datetime
+
+
+@dataclass(frozen=True)
+class ScopeDraftAuditEvent:
+    id: str
+    workflow_run_id: str
+    scope_draft_id: str
+    event_name: str
+    payload: dict[str, object]
+    created_at: datetime = field(default_factory=utcnow)
+
+    def __post_init__(self) -> None:
+        if not all((self.id.strip(), self.workflow_run_id.strip(), self.scope_draft_id.strip())):
+            raise ValueError("scope draft audit event identity is required")
+        if self.event_name != "scope_suggested":
+            raise ValueError("invalid scope draft audit event")
+        if self.payload.get("schema_version") != "content_research_scope_audit_event_v1":
+            raise ValueError("scope draft audit event payload schema version is required")
+
+
+@dataclass(frozen=True)
 class ResearchScopeContract:
     id: str
     workflow_run_id: str
@@ -170,6 +199,20 @@ def build_scope_contract(
         query_groups=frozen_groups,
         created_at=utcnow(),
     )
+
+
+def build_scope_draft(
+    *, workflow_run_id: str, research_plan_id: str, structure_hash: str,
+    constraints: tuple[ScopeConstraint, ...], query_groups: tuple[ScopeQueryGroupInput, ...],
+) -> ResearchScopeDraft:
+    if not workflow_run_id.strip() or not research_plan_id.strip() or not structure_hash.strip():
+        raise ValueError("scope draft identity is required")
+    build_scope_contract(
+        workflow_run_id=workflow_run_id, research_plan_id=research_plan_id, version=1,
+        constraints=constraints, query_groups=query_groups,
+    )
+    draft_id = "rsd_" + _fingerprint({"workflow_run_id": workflow_run_id, "research_plan_id": research_plan_id, "structure_hash": structure_hash, "constraints": [item.__dict__ for item in constraints], "query_groups": [item.__dict__ for item in query_groups]})[:24]
+    return ResearchScopeDraft(draft_id, workflow_run_id, research_plan_id, structure_hash, constraints, query_groups, utcnow())
 
 
 def _build_query_group(

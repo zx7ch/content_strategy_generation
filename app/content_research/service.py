@@ -20,6 +20,7 @@ from app.content_research.analysis import DirectionalAnalysisLLM
 from app.content_research.api_schemas import (
     CONTENT_RESEARCH_API_SCHEMA_VERSION,
     P0_WORKFLOW_ACTIONS,
+    ConfirmScopeRequest,
     ContentResearchBriefConfirmRequest,
     ContentResearchBriefResponse,
     ContentResearchDirectionEvidenceResponse,
@@ -42,6 +43,7 @@ from app.content_research.api_schemas import (
     HumanDecisionRequest,
     HumanDecisionResponse,
     HumanDecisionsResponse,
+    PrepareScopeRequest,
     SnapshotResponse,
 )
 from app.content_research.async_dispatch import AsyncFormalResearchDispatchRepository
@@ -106,6 +108,15 @@ from app.content_research.reporting.lite_read_model import LiteReportReader
 from app.content_research.reporting.publication_materializer import ReportPublicationMaterializer
 from app.content_research.reporting.read_model import PublishedReportNotFoundError
 from app.content_research.runtime import canonical_fingerprint
+from app.content_research.scope_contract import (
+    ResearchScopeDraft,
+    ScopeAuditEvent,
+    ScopeConstraint,
+    ScopeDraftAuditEvent,
+    ScopeQueryGroupInput,
+    build_scope_contract,
+    build_scope_draft,
+)
 from app.content_research.sources import (
     SourceAdapterRegistry,
 )
@@ -2560,6 +2571,103 @@ class ContentResearchService:
             limit=limit,
         )
 
+    def _prepare_scope(self, *, brief: ResearchBriefRecord, direction_id: str) -> dict[str, Any]:
+        plans = self._store.list_plans_for_brief(brief.id)
+        if not plans:
+            raise ContentResearchValidationError("Cannot prepare scope before confirming the research brief")
+        plan = plans[-1]
+        direction_ids = {
+            str(item.payload.get("direction_id") or "")
+            for item in self._store.list_directions_for_plan(plan.id)
+        }
+        if direction_id not in direction_ids:
+            raise ContentResearchValidationError("Scope direction is not part of the confirmed research plan")
+        structure_payload = dict(brief.payload.get("subject_structure") or {})
+        normalized_input = " ".join(
+            str(item).strip()
+            for item in (
+                *(entry.get("canonical_name") for entry in structure_payload.get("core_entities") or () if isinstance(entry, dict)),
+                *(structure_payload.get("research_intents") or ()),
+                *(structure_payload.get("context_modifiers") or ()),
+            )
+            if str(item).strip()
+        )
+        decision = parse_subject_structure(structure_payload, normalized_input=normalized_input)
+        if decision.state != "confirmed" or decision.structure is None:
+            raise ContentResearchValidationError("Cannot prepare scope from an unconfirmed subject structure")
+        structure = decision.structure
+        core = structure.core_entities[0]
+        constraints = [
+            ScopeConstraint("core_object", "核心对象", core.canonical_name, "required", tuple(
+                value for value in core.raw_mentions if value != core.canonical_name
+            ))
+        ]
+        required_terms = [core.canonical_name]
+        for index, context in enumerate(structure.context_modifiers, start=1):
+            constraint_id = "season" if _is_season_context(context) else f"context_{index}"
+            constraints.append(ScopeConstraint(
+                constraint_id, "季节" if constraint_id == "season" else "上下文", context, "required"
+            ))
+            required_terms.append(context)
+        if structure.research_intents:
+            constraints.append(ScopeConstraint("scenario", "研究场景", structure.research_intents[0], "required"))
+            required_terms.append(structure.research_intents[0])
+        full_query = " ".join(required_terms)
+        intent_query = " ".join((core.canonical_name, *structure.research_intents[:1]))
+        draft = build_scope_draft(
+            workflow_run_id=brief.workflow_run_id, research_plan_id=plan.id,
+            structure_hash=str(brief.payload.get("subject_structure_hash") or ""),
+            constraints=tuple(constraints),
+            query_groups=(
+                ScopeQueryGroupInput(full_query, full_query, tuple(required_terms)),
+                ScopeQueryGroupInput(core.canonical_name, core.canonical_name, (core.canonical_name,)),
+                ScopeQueryGroupInput(intent_query, intent_query, (core.canonical_name, *structure.research_intents[:1])),
+            ),
+        )
+        event = ScopeDraftAuditEvent(
+            id=_new_id("sae"), workflow_run_id=brief.workflow_run_id, scope_draft_id=draft.id,
+            event_name="scope_suggested",
+            payload={
+                "schema_version": "content_research_scope_audit_event_v1", "scope_draft_id": draft.id,
+                "structure_hash": draft.structure_hash,
+                "constraints": [_scope_constraint_payload(item) for item in draft.constraints],
+                "query_groups": [_scope_query_input_payload(item) for item in draft.query_groups],
+            },
+        )
+        self._store.save_scope_draft_with_audit_event(draft, event)
+        return {**_scope_draft_payload(draft), "audit_event": _scope_draft_audit_payload(event)}
+
+    def _confirm_scope(self, *, workflow_run_id: str, request: ConfirmScopeRequest) -> dict[str, Any]:
+        draft = self._store.get_scope_draft(request.scope_draft_id)
+        if draft is None or draft.workflow_run_id != workflow_run_id:
+            raise ContentResearchValidationError("Scope draft was not found for this workflow")
+        if request.research_plan_id != draft.research_plan_id:
+            raise ContentResearchValidationError("Scope draft research plan does not match confirmation")
+        constraints = tuple(ScopeConstraint(
+            item.id, item.label, item.value, item.mode, tuple(item.allowed_aliases)
+        ) for item in request.constraints)
+        query_groups = tuple(ScopeQueryGroupInput(
+            item.suggested_query, item.final_query, tuple(item.targeted_required_terms)
+        ) for item in request.query_groups)
+        contract = build_scope_contract(
+            workflow_run_id=workflow_run_id, research_plan_id=request.research_plan_id,
+            version=len(self._store.list_scope_contracts(workflow_run_id)) + 1,
+            constraints=constraints, query_groups=query_groups,
+        )
+        event = ScopeAuditEvent(
+            id=_new_id("sae"), workflow_run_id=workflow_run_id,
+            scope_contract_id=contract.id, scope_contract_version=contract.version,
+            event_name="scope_confirmed",
+            payload={
+                "schema_version": "content_research_scope_audit_event_v1", "scope_draft_id": draft.id,
+                "scope_contract_id": contract.id, "scope_contract_version": contract.version,
+                "constraints": [_scope_constraint_payload(item) for item in contract.constraints],
+                "query_groups": [_scope_query_group_payload(item) for item in contract.query_groups],
+            },
+        )
+        self._store.save_scope_contract_with_audit_event(contract, event)
+        return {"scope_contract": _scope_contract_payload(contract), "audit_event": _scope_audit_payload(event)}
+
     async def run_workflow_action(
         self,
         *,
@@ -2627,6 +2735,32 @@ class ContentResearchService:
                 status=response.status,
                 result=response.model_dump(mode="json"),
                 local_cache_id=response.brief_id,
+            )
+
+        if action == "prepare_scope":
+            prepared = self._prepare_scope(
+                brief=brief,
+                direction_id=PrepareScopeRequest(**request.payload).direction_id,
+            )
+            return self._action_response(
+                workflow_run_id=workflow_run_id,
+                action=action,
+                status="completed",
+                result={"scope": prepared},
+                local_cache_id=brief.id,
+            )
+
+        if action == "confirm_scope":
+            confirmed = self._confirm_scope(
+                workflow_run_id=workflow_run_id,
+                request=ConfirmScopeRequest(**request.payload),
+            )
+            return self._action_response(
+                workflow_run_id=workflow_run_id,
+                action=action,
+                status="completed",
+                result=confirmed,
+                local_cache_id=brief.id,
             )
 
         if action == "repair_from_persisted_packets":
@@ -4629,6 +4763,70 @@ def _governed_input_fingerprint(governed: dict[str, Any]) -> str:
             "aggregate_ids": [item["aggregate_claim_id"] for item in governed["aggregate_claims"]],
         }
     )
+
+
+def _is_season_context(value: str) -> bool:
+    return any(marker in value for marker in ("春", "夏", "秋", "冬", "季"))
+
+
+def _scope_constraint_payload(item: ScopeConstraint) -> dict[str, Any]:
+    return {
+        "id": item.id, "label": item.label, "value": item.value, "mode": item.mode,
+        "allowed_aliases": list(item.allowed_aliases),
+    }
+
+
+def _scope_query_input_payload(item: ScopeQueryGroupInput) -> dict[str, Any]:
+    return {
+        "suggested_query": item.suggested_query, "final_query": item.final_query,
+        "targeted_required_terms": list(item.targeted_required_terms),
+    }
+
+
+def _scope_query_group_payload(item: Any) -> dict[str, Any]:
+    return {
+        "id": item.id, "suggested_query": item.suggested_query, "final_query": item.final_query,
+        "origin": item.origin, "execution_role": item.execution_role,
+    }
+
+
+def _scope_draft_payload(draft: ResearchScopeDraft) -> dict[str, Any]:
+    return {
+        "id": draft.id, "workflow_run_id": draft.workflow_run_id,
+        "research_plan_id": draft.research_plan_id, "structure_hash": draft.structure_hash,
+        "constraints": [_scope_constraint_payload(item) for item in draft.constraints],
+        "query_groups": [_scope_query_input_payload(item) for item in draft.query_groups],
+        "created_at": draft.created_at.isoformat(),
+    }
+
+
+def _scope_draft_audit_payload(event: ScopeDraftAuditEvent) -> dict[str, Any]:
+    return {
+        "id": event.id, "workflow_run_id": event.workflow_run_id,
+        "scope_draft_id": event.scope_draft_id, "event_name": event.event_name,
+        "payload": event.payload, "created_at": event.created_at.isoformat(),
+    }
+
+
+def _scope_contract_payload(contract: Any) -> dict[str, Any]:
+    return {
+        "id": contract.id, "workflow_run_id": contract.workflow_run_id,
+        "research_plan_id": contract.research_plan_id, "version": contract.version,
+        "schema_version": contract.schema_version,
+        "constraints": [_scope_constraint_payload(item) for item in contract.constraints],
+        "query_groups": [_scope_query_group_payload(item) for item in contract.query_groups],
+        "created_at": contract.created_at.isoformat(),
+    }
+
+
+def _scope_audit_payload(event: ScopeAuditEvent) -> dict[str, Any]:
+    return {
+        "id": event.id, "workflow_run_id": event.workflow_run_id,
+        "scope_contract_id": event.scope_contract_id,
+        "scope_contract_version": event.scope_contract_version,
+        "event_name": event.event_name, "payload": event.payload,
+        "created_at": event.created_at.isoformat(),
+    }
 
 
 def _publication_lineage_is_materializable(

@@ -522,8 +522,35 @@ CREATE INDEX idx_cr_scope_coverage_workflow_version
 """
 
 
+_V21_SCOPE_DRAFT_SQL = """
+CREATE TABLE content_research_scope_drafts (
+    id TEXT PRIMARY KEY,
+    workflow_run_id TEXT NOT NULL,
+    research_plan_id TEXT NOT NULL,
+    structure_hash TEXT NOT NULL,
+    constraints_json TEXT NOT NULL,
+    query_groups_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX idx_cr_scope_draft_workflow_created
+    ON content_research_scope_drafts(workflow_run_id, created_at);
+CREATE TABLE content_research_scope_draft_audit_events (
+    id TEXT PRIMARY KEY,
+    workflow_run_id TEXT NOT NULL,
+    scope_draft_id TEXT NOT NULL UNIQUE,
+    event_name TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+"""
+
+
 def _apply_0020(conn: sqlite3.Connection) -> None:
     conn.executescript(_V20_SCOPE_COVERAGE_SQL)
+
+
+def _apply_0021(conn: sqlite3.Connection) -> None:
+    conn.executescript(_V21_SCOPE_DRAFT_SQL)
 
 
 def _apply_0015(conn: sqlite3.Connection) -> None:
@@ -581,6 +608,7 @@ def _expected_checksums(migration_0002_sql: str, legacy_checksum: str) -> dict[s
         "0018": hashlib.sha256(_V18_XHS_CREDENTIAL_STATUS_SQL.encode("utf-8")).hexdigest(),
         "0019": hashlib.sha256(_V19_SCOPE_CONTRACT_SQL.encode("utf-8")).hexdigest(),
         "0020": hashlib.sha256(_V20_SCOPE_COVERAGE_SQL.encode("utf-8")).hexdigest(),
+        "0021": hashlib.sha256(_V21_SCOPE_DRAFT_SQL.encode("utf-8")).hexdigest(),
     }
 
 
@@ -800,6 +828,13 @@ def apply_content_research_migrations(
                 name="lite_scope_coverage_snapshots",
                 checksum=expected_checksums["0020"],
                 apply=lambda: _apply_0020(conn),
+            )
+            _apply_migration(
+                conn,
+                version="0021",
+                name="lite_scope_drafts",
+                checksum=expected_checksums["0021"],
+                apply=lambda: _apply_0021(conn),
             )
         except Exception:
             conn.rollback()
