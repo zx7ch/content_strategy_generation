@@ -18,7 +18,11 @@ from app.content_research.admission.evaluator import (
     ClaimAdmissionEvaluator,
 )
 from app.content_research.admission.registry import DEFAULT_ADMISSION_STRATEGIES
-from app.content_research.admission.relevance import query_relevance_reason
+from app.content_research.admission.relevance import (
+    evaluate_scope_match,
+    query_relevance_reason,
+    scope_match_payload,
+)
 from app.content_research.admission.results import (
     DIRECTION_RESULT_ALGORITHM_VERSION,
     build_direction_result,
@@ -38,6 +42,11 @@ from app.content_research.persistence_models import (
     StageCheckpointRecord,
 )
 from app.content_research.runtime import canonical_fingerprint
+from app.content_research.scope_contract import (
+    CoverageSnapshot,
+    ResearchScopeContract,
+    ScopeAuditEvent,
+)
 from app.content_research.sources.base import SourceOperationResult
 from app.content_research.sources.canonical_registry import CanonicalSourceRegistry
 from app.content_research.stores.base import ContentResearchStore
@@ -130,6 +139,223 @@ class DirectionCoverageDecision:
     satisfied: bool
     reason_codes: tuple[str, ...]
     counts: DirectionCoverageCounts
+
+
+def persist_scope_coverage_evaluation(
+    *,
+    store: Any,
+    contract: ResearchScopeContract,
+    candidates: tuple[Mapping[str, Any], ...],
+    query_group_outcomes: Mapping[str, Mapping[str, Any]],
+    minimum_samples: int,
+    minimum_independent_authors: int,
+) -> CoverageSnapshot:
+    """Persist candidate Scope projections and their decision-ready aggregate."""
+    existing = store.get_coverage_snapshot(
+        contract.workflow_run_id, version=contract.version
+    )
+    if existing is not None:
+        existing_events = store.list_scope_audit_events(
+            contract.workflow_run_id, version=contract.version
+        )
+        if not any(
+            event.event_name == "coverage_evaluated"
+            and event.payload.get("coverage_snapshot_id") == existing.id
+            for event in existing_events
+        ):
+            store.append_scope_audit_event(
+                ScopeAuditEvent(
+                    id=_scope_event_id(contract, "coverage_evaluated", existing.id),
+                    workflow_run_id=contract.workflow_run_id,
+                    scope_contract_id=contract.id,
+                    scope_contract_version=contract.version,
+                    event_name="coverage_evaluated",
+                    payload={
+                        "schema_version": "content_research_scope_audit_event_v1",
+                        "coverage_snapshot_id": existing.id,
+                        "state": existing.state,
+                        "constraint_counts": existing.constraint_counts,
+                        "unmet_constraint_ids": list(existing.unmet_constraint_ids),
+                        "reason_codes": list(
+                            existing.constraint_counts.get("_summary", {}).get(
+                                "reason_codes", ()
+                            )
+                        ),
+                    },
+                )
+            )
+        return existing
+
+    schema_version = "content_research_scope_audit_event_v1"
+    contract_group_ids = {group.id for group in contract.query_groups}
+    existing_event_ids = {
+        event.id
+        for event in store.list_scope_audit_events(
+            contract.workflow_run_id, version=contract.version
+        )
+    }
+    for group in contract.query_groups:
+        outcome = dict(query_group_outcomes.get(group.id) or {})
+        event = ScopeAuditEvent(
+            id=_scope_event_id(contract, "query_group_collected", group.id),
+            workflow_run_id=contract.workflow_run_id,
+            scope_contract_id=contract.id,
+            scope_contract_version=contract.version,
+            event_name="query_group_collected",
+            payload={
+                "schema_version": schema_version,
+                "query_group_id": group.id,
+                "final_query": group.final_query,
+                "execution_role": group.execution_role,
+                "request_outcome": str(outcome.get("status") or "unknown"),
+                "discovered_count": int(outcome.get("discovered_count") or 0),
+                "failure_code": outcome.get("failure_code"),
+            },
+        )
+        if event.id not in existing_event_ids:
+            store.append_scope_audit_event(event)
+            existing_event_ids.add(event.id)
+
+    matches: list[tuple[str, str | None, Any]] = []
+    for candidate in candidates:
+        candidate_id = str(
+            candidate.get("canonical_source_id") or candidate.get("canonical_id") or ""
+        ).strip()
+        if not candidate_id:
+            continue
+        match = evaluate_scope_match(source=candidate, contract=contract)
+        author_id = admission_author_identity(candidate)
+        matches.append((candidate_id, author_id, match))
+        event = ScopeAuditEvent(
+            id=_scope_event_id(contract, "candidate_scope_evaluated", candidate_id),
+            workflow_run_id=contract.workflow_run_id,
+            scope_contract_id=contract.id,
+            scope_contract_version=contract.version,
+            event_name="candidate_scope_evaluated",
+            payload={
+                "schema_version": schema_version,
+                "candidate_id": candidate_id,
+                "scope_contract_version": match.scope_contract_version,
+                "query_group_hits": list(match.query_group_hits),
+                "constraint_matches": {
+                    constraint_id: {
+                        "status": value.status,
+                        "evidence": list(value.evidence),
+                        "evidence_fields": list(value.evidence_fields),
+                    }
+                    for constraint_id, value in match.constraint_matches.items()
+                },
+                "eligibility": match.eligibility,
+                "exclusion_reasons": list(match.exclusion_reasons),
+            },
+        )
+        if event.id not in existing_event_ids:
+            store.append_scope_audit_event(event)
+            existing_event_ids.add(event.id)
+
+    constraint_counts: dict[str, dict[str, Any]] = {}
+    unmet_constraint_ids: list[str] = []
+    reason_codes: list[str] = []
+    for constraint in contract.constraints:
+        matching = [
+            (author_id, match)
+            for _candidate_id, author_id, match in matches
+            if match.constraint_matches[constraint.id].status == "matched"
+        ]
+        matched_authors = {author_id for author_id, _match in matching if author_id}
+        constraint_counts[constraint.id] = {
+            "matched_candidate_count": len(matching),
+            "independent_author_count": len(matched_authors),
+            "required": constraint.mode == "required",
+        }
+        if constraint.mode == "required" and len(matching) < minimum_samples:
+            unmet_constraint_ids.append(constraint.id)
+            reason_codes.append(
+                f"required_constraint_coverage_unmet:{constraint.id}"
+            )
+
+    query_group_counts: dict[str, dict[str, int]] = {}
+    for group_id in sorted(contract_group_ids):
+        group_matches = [
+            (author_id, match)
+            for _candidate_id, author_id, match in matches
+            if group_id in match.query_group_hits
+        ]
+        query_group_counts[group_id] = {
+            "candidate_count": len(group_matches),
+            "eligible_candidate_count": sum(
+                match.eligibility == "eligible" for _author_id, match in group_matches
+            ),
+            "independent_author_count": len(
+                {author_id for author_id, _match in group_matches if author_id}
+            ),
+        }
+    eligible = [
+        (author_id, match)
+        for _candidate_id, author_id, match in matches
+        if match.eligibility == "eligible"
+    ]
+    eligible_authors = {author_id for author_id, _match in eligible if author_id}
+    if len(eligible) < minimum_samples:
+        reason_codes.append("minimum_eligible_scope_samples_unmet")
+    if len(eligible_authors) < minimum_independent_authors:
+        reason_codes.append("minimum_independent_authors_unmet")
+    constraint_counts["_query_groups"] = query_group_counts
+    constraint_counts["_summary"] = {
+        "candidate_count": len(matches),
+        "eligible_candidate_count": len(eligible),
+        "independent_author_count": len(eligible_authors),
+        "minimum_samples": minimum_samples,
+        "minimum_independent_authors": minimum_independent_authors,
+        "reason_codes": reason_codes,
+    }
+    snapshot = CoverageSnapshot(
+        id="scv_"
+        + canonical_fingerprint(
+            {
+                "scope_contract_id": contract.id,
+                "candidate_ids": sorted(candidate_id for candidate_id, _author, _match in matches),
+                "constraint_counts": constraint_counts,
+            }
+        )[:24],
+        workflow_run_id=contract.workflow_run_id,
+        scope_contract_id=contract.id,
+        scope_contract_version=contract.version,
+        state="awaiting_scope_decision" if reason_codes else "satisfied",
+        constraint_counts=constraint_counts,
+        unmet_constraint_ids=tuple(unmet_constraint_ids),
+    )
+    store.save_coverage_snapshot(snapshot)
+    coverage_event = ScopeAuditEvent(
+        id=_scope_event_id(contract, "coverage_evaluated", snapshot.id),
+        workflow_run_id=contract.workflow_run_id,
+        scope_contract_id=contract.id,
+        scope_contract_version=contract.version,
+        event_name="coverage_evaluated",
+        payload={
+            "schema_version": schema_version,
+            "coverage_snapshot_id": snapshot.id,
+            "state": snapshot.state,
+            "constraint_counts": snapshot.constraint_counts,
+            "unmet_constraint_ids": list(snapshot.unmet_constraint_ids),
+            "reason_codes": reason_codes,
+        },
+    )
+    store.append_scope_audit_event(coverage_event)
+    return snapshot
+
+
+def _scope_event_id(
+    contract: ResearchScopeContract, event_name: str, subject_id: str
+) -> str:
+    return "sae_" + canonical_fingerprint(
+        {
+            "scope_contract_id": contract.id,
+            "scope_contract_version": contract.version,
+            "event_name": event_name,
+            "subject_id": subject_id,
+        }
+    )[:24]
 
 
 def evaluate_direction_coverage(
@@ -469,8 +695,12 @@ def build_packet(
 class DirectionalExecutionPipeline:
     """Persist the collect/selection/packet safe boundaries for one direction."""
 
-    def __init__(self, store: ContentResearchStore) -> None:
+    def __init__(self, store: ContentResearchStore, *, scope_store: Any | None = None) -> None:
         self._store = store
+        self._scope_store = scope_store or (
+            store if hasattr(store, "list_scope_contracts") else None
+        )
+        self._scope_contract: ResearchScopeContract | None = None
         self._canonical_sources = CanonicalSourceRegistry(store)
         self._checkpoint_started_at: dict[tuple[str, str], datetime] = {}
 
@@ -478,8 +708,11 @@ class DirectionalExecutionPipeline:
     async def open_async(
         cls, db_path: str, *, workflow_run_id: str
     ) -> DirectionalExecutionPipeline:
+        from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
+
         return cls(
-            await AsyncDirectionalPersistenceSession.open(db_path, workflow_run_id=workflow_run_id)
+            await AsyncDirectionalPersistenceSession.open(db_path, workflow_run_id=workflow_run_id),
+            scope_store=SQLiteContentResearchStore(db_path),
         )  # type: ignore[arg-type]
 
     async def _flush(self) -> None:
@@ -523,6 +756,12 @@ class DirectionalExecutionPipeline:
         # isolated instead of allowing an unscoped persisted record.
         self._workflow_run_id = workflow_run_id or f"local_{subagent_task_id}"
         self._checkpoint_started_at = {}
+        scope_contracts = (
+            self._scope_store.list_scope_contracts(self._workflow_run_id)
+            if self._scope_store is not None
+            else []
+        )
+        self._scope_contract = scope_contracts[-1] if scope_contracts else None
         frozen_groups = (
             _frozen_query_groups(policy_snapshot, direction_id)
             if policy_snapshot is not None
@@ -538,7 +777,30 @@ class DirectionalExecutionPipeline:
             candidate_limit=candidate_limit_per_query,
             run_as_of_at=run_as_of_at,
         )
-        fallback_group = _frozen_fallback_group(policy_snapshot, direction_id)
+        if self._scope_contract is not None and direction_id == "product_marketing":
+            template = groups[0]
+            groups = tuple(
+                QueryGroup(
+                    id=group.id,
+                    direction_id=direction_id,
+                    query=group.final_query,
+                    priority=index,
+                    sort=template.sort,
+                    candidate_limit=candidate_limit_per_query,
+                    time_window=template.time_window,
+                    roles=(group.execution_role,),
+                    activation="primary",
+                    normalized_identity=canonical_fingerprint(
+                        {"scope_contract_id": self._scope_contract.id, "group_id": group.id}
+                    ),
+                )
+                for index, group in enumerate(self._scope_contract.query_groups)
+            )
+        fallback_group = (
+            None
+            if self._scope_contract is not None and direction_id == "product_marketing"
+            else _frozen_fallback_group(policy_snapshot, direction_id)
+        )
         fallback_is_active = bool(
             fallback_group
             and any(
@@ -566,7 +828,11 @@ class DirectionalExecutionPipeline:
             if policy_snapshot is not None
             else {}
         )
-        plan_hash = str(locked_direction.get("query_plan_hash") or active_plan_hash)
+        plan_hash = (
+            active_plan_hash
+            if self._scope_contract is not None and direction_id == "product_marketing"
+            else str(locked_direction.get("query_plan_hash") or active_plan_hash)
+        )
         collect_fingerprint = (
             canonical_fingerprint(
                 {"frozen_plan_hash": plan_hash, "active_plan_hash": active_plan_hash}
@@ -606,6 +872,12 @@ class DirectionalExecutionPipeline:
                     "candidates": candidates,
                     "pagination": pagination,
                 },
+            )
+            await self._flush()
+            self._persist_query_group_collected_events(
+                subagent_task_id=subagent_task_id,
+                plan_hash=plan_hash,
+                pagination=pagination,
             )
 
         self._start_checkpoint(subagent_task_id, "selection")
@@ -1120,6 +1392,34 @@ class DirectionalExecutionPipeline:
                         text_end=len(fact.text),
                     )
                 ]
+            if self._scope_contract is not None and direction_id == "product_marketing":
+                match = evaluate_scope_match(
+                    source={
+                        **dict(packet.payload.get("field_projection") or {}),
+                        "retrieval_context": dict(
+                            packet.payload.get("retrieval_context") or {}
+                        ),
+                    },
+                    contract=self._scope_contract,
+                )
+                candidates = [
+                    replace(
+                        candidate,
+                        id="cc_"
+                        + canonical_fingerprint(
+                            {
+                                "candidate_id": candidate.id,
+                                "scope_contract_id": self._scope_contract.id,
+                                "scope_contract_version": self._scope_contract.version,
+                            }
+                        )[:24],
+                        payload={
+                            **candidate.payload,
+                            "scope_match": scope_match_payload(match),
+                        },
+                    )
+                    for candidate in candidates
+                ]
             candidates_by_packet.append((packet, candidates))
         comment_packets = [
             packet
@@ -1138,6 +1438,7 @@ class DirectionalExecutionPipeline:
                     packet=packet,
                     contract=contract,
                     policy_snapshot=snapshot,
+                    scope_contract=self._scope_contract,
                 )
                 is None
                 for candidate in candidates
@@ -1403,6 +1704,60 @@ class DirectionalExecutionPipeline:
                 }
             )
         return candidates, summaries
+
+    def _persist_query_group_collected_events(
+        self,
+        *,
+        subagent_task_id: str,
+        plan_hash: str,
+        pagination: list[dict[str, Any]],
+    ) -> None:
+        if self._scope_store is None or self._scope_contract is None:
+            return
+        existing_ids = {
+            event.id
+            for event in self._scope_store.list_scope_audit_events(
+                self._workflow_run_id, version=self._scope_contract.version
+            )
+        }
+        summaries = {
+            str(item.get("query_group_id") or ""): item for item in pagination
+        }
+        for group in self._scope_contract.query_groups:
+            summary = summaries.get(group.id, {})
+            pages = self._page_records(
+                subagent_task_id, "collect_page", plan_hash, group.id
+            )
+            final_page = pages[-1] if pages else None
+            event = ScopeAuditEvent(
+                id=_scope_event_id(
+                    self._scope_contract, "query_group_collected", group.id
+                ),
+                workflow_run_id=self._workflow_run_id,
+                scope_contract_id=self._scope_contract.id,
+                scope_contract_version=self._scope_contract.version,
+                event_name="query_group_collected",
+                payload={
+                    "schema_version": "content_research_scope_audit_event_v1",
+                    "query_group_id": group.id,
+                    "final_query": group.final_query,
+                    "execution_role": group.execution_role,
+                    "request_outcome": str(
+                        final_page.payload.get("status")
+                        if final_page is not None
+                        else "not_collected"
+                    ),
+                    "discovered_count": int(summary.get("actual_count") or 0),
+                    "failure_code": (
+                        final_page.payload.get("failure_reason")
+                        if final_page is not None
+                        else None
+                    ),
+                },
+            )
+            if event.id not in existing_ids:
+                self._scope_store.append_scope_audit_event(event)
+                existing_ids.add(event.id)
 
     async def _collect_required_comments(
         self,

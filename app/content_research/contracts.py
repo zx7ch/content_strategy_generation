@@ -9,7 +9,7 @@ import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from app.content_research.admission.quote_fields import CLAIM_QUOTE_FIELDS
 from app.content_research.models import utcnow
@@ -45,6 +45,26 @@ ADMISSION_REASON_CODES = (
 )
 
 AUTHOR_IDENTITY_SCHEMA_VERSION = "provider_author_identity_v1"
+
+
+@dataclass(frozen=True)
+class ScopeConstraintMatch:
+    """One constraint's evidence in a detailed candidate projection."""
+
+    status: Literal["matched", "unmatched"]
+    evidence: tuple[str, ...]
+    evidence_fields: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class CandidateScopeMatch:
+    """Frozen per-candidate result against one Scope Contract version."""
+
+    scope_contract_version: int
+    query_group_hits: tuple[str, ...]
+    constraint_matches: dict[str, ScopeConstraintMatch]
+    eligibility: Literal["eligible", "excluded"]
+    exclusion_reasons: tuple[str, ...]
 
 
 def admission_author_identity(projection: Mapping[str, Any]) -> str | None:

@@ -142,6 +142,7 @@ from app.content_research.workflow import (
 )
 from app.content_research.workflow.directional_pipeline import (
     DirectionalExecutionPipeline,
+    persist_scope_coverage_evaluation,
 )
 from app.content_research.workflow.query_planner import (
     QUERY_COMPILER_VERSION,
@@ -3543,6 +3544,85 @@ class ContentResearchService:
             retryable=result.retryable,
         )
 
+    def _persist_scope_coverage(self, workflow_run_id: str) -> Any | None:
+        contracts = self._store.list_scope_contracts(workflow_run_id)
+        if not contracts:
+            return None
+        scope_contract = contracts[-1]
+        existing = self._store.get_coverage_snapshot(
+            workflow_run_id, version=scope_contract.version
+        )
+        if existing is not None:
+            return existing
+
+        run_policy = self._store.get_run_policy_snapshot_for_workflow(workflow_run_id)
+        if run_policy is None:
+            return None
+        direction_contract = next(
+            (
+                item
+                for item in self._store.list_direction_contracts(run_policy.id)
+                if item.direction_id == "product_marketing"
+            ),
+            None,
+        )
+        if direction_contract is None:
+            return None
+        sample_policy = self._store.get_sample_policy(direction_contract.sample_policy_id)
+        if sample_policy is None:
+            return None
+
+        packets = self._store.list_directional_evidence_packets(
+            workflow_run_id, "product_marketing"
+        )
+        candidates = tuple(
+            {
+                **dict(packet.payload.get("field_projection") or {}),
+                "canonical_source_id": packet.canonical_source_id,
+                "retrieval_context": dict(
+                    packet.payload.get("retrieval_context") or {}
+                ),
+            }
+            for packet in packets
+        )
+        query_group_outcomes: dict[str, dict[str, Any]] = {
+            group.id: {
+                "status": "unknown",
+                "discovered_count": 0,
+                "failure_code": None,
+            }
+            for group in scope_contract.query_groups
+        }
+        final_pages: dict[str, StageCheckpointRecord] = {}
+        for checkpoint in self._store.list_typed_records(StageCheckpointRecord):
+            group_id = str(checkpoint.payload.get("query_group_id") or "")
+            if (
+                checkpoint.workflow_run_id != workflow_run_id
+                or checkpoint.stage_name != "collect_page"
+                or checkpoint.status != "completed"
+                or group_id not in query_group_outcomes
+            ):
+                continue
+            current = final_pages.get(group_id)
+            if current is None or int(checkpoint.payload.get("page_no") or 0) > int(
+                current.payload.get("page_no") or 0
+            ):
+                final_pages[group_id] = checkpoint
+        for group_id, checkpoint in final_pages.items():
+            query_group_outcomes[group_id] = {
+                "status": str(checkpoint.payload.get("status") or "unknown"),
+                "discovered_count": int(checkpoint.payload.get("actual_count") or 0),
+                "failure_code": checkpoint.payload.get("failure_reason"),
+            }
+        return persist_scope_coverage_evaluation(
+            store=self._store,
+            contract=scope_contract,
+            candidates=candidates,
+            query_group_outcomes=query_group_outcomes,
+            minimum_samples=sample_policy.minimum_samples,
+            minimum_independent_authors=sample_policy.minimum_independent_authors,
+        )
+
     async def _execute_formal_research(
         self,
         *,
@@ -3701,6 +3781,17 @@ class ContentResearchService:
                     workflow_run_id=brief.workflow_run_id,
                     reason=failure,
                 )
+            return
+
+        scope_coverage = self._persist_scope_coverage(brief.workflow_run_id)
+        if scope_coverage is not None and scope_coverage.state == "awaiting_scope_decision":
+            await self._workflow_runtime.wait_for_user_recovery(
+                workflow_run_id=brief.workflow_run_id,
+                reason={
+                    "code": "awaiting_scope_decision",
+                    "message": "Required Scope Contract coverage is unmet.",
+                },
+            )
             return
 
         plans = self._store.list_plans_for_brief(brief.id)
