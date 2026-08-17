@@ -52,6 +52,7 @@ from app.content_research.scope_contract import (
     ScopeDraftConfirmation,
     ScopeQueryGroup,
     ScopeQueryGroupInput,
+    build_scope_contract,
 )
 
 
@@ -490,18 +491,12 @@ class SQLiteContentResearchStore:
         return self._row_to_scope_draft(row) if row else None
 
     def confirm_scope_atomically(
-        self, draft_id: str, contract: ResearchScopeContract, event: ScopeAuditEvent
-    ) -> tuple[ResearchScopeContract, bool]:
-        _validate_payload("ScopeAuditEvent", event.payload)
-        if event.event_name != "scope_confirmed":
-            raise ValueError("scope confirmation event must be scope_confirmed")
-        if (
-            event.workflow_run_id != contract.workflow_run_id
-            or event.scope_contract_id != contract.id
-            or event.scope_contract_version != contract.version
-        ):
-            raise ValueError("scope audit event must reference the contract being confirmed")
-
+        self,
+        draft_id: str,
+        *,
+        final_queries: tuple[str, ...],
+        event_id: str,
+    ) -> tuple[ResearchScopeContract, ScopeAuditEvent, bool]:
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
@@ -517,20 +512,102 @@ class SQLiteContentResearchStore:
                 ).fetchone()
                 if contract_row is None:
                     raise RuntimeError("scope draft confirmation references a missing scope contract")
+                event_row = conn.execute(
+                    """SELECT * FROM content_research_scope_audit_events
+                       WHERE workflow_run_id = ? AND scope_contract_id = ?
+                         AND scope_contract_version = ? AND event_name = 'scope_confirmed'
+                       ORDER BY created_at ASC LIMIT 1""",
+                    (
+                        contract_row["workflow_run_id"],
+                        contract_row["id"],
+                        contract_row["version"],
+                    ),
+                ).fetchone()
+                if event_row is None:
+                    raise RuntimeError("scope draft confirmation references a missing audit event")
                 conn.commit()
-                return self._row_to_scope_contract(contract_row), False
+                return (
+                    self._row_to_scope_contract(contract_row),
+                    self._row_to_scope_audit_event(event_row),
+                    False,
+                )
 
             draft_row = conn.execute(
-                "SELECT workflow_run_id, research_plan_id FROM content_research_scope_drafts WHERE id = ?",
+                "SELECT * FROM content_research_scope_drafts WHERE id = ?",
                 (draft_id,),
             ).fetchone()
             if draft_row is None:
                 raise ValueError(f"scope draft does not exist: {draft_id}")
-            if (
-                draft_row["workflow_run_id"] != contract.workflow_run_id
-                or draft_row["research_plan_id"] != contract.research_plan_id
-            ):
-                raise ValueError("scope contract must match the persisted scope draft workflow and plan")
+            draft = self._row_to_scope_draft(draft_row)
+            if len(final_queries) != len(draft.query_groups):
+                raise ValueError("scope confirmation final query count must match the persisted draft")
+            version_row = conn.execute(
+                """SELECT COALESCE(MAX(version), 0) + 1 AS next_version
+                   FROM content_research_scope_contracts
+                   WHERE workflow_run_id = ?""",
+                (draft.workflow_run_id,),
+            ).fetchone()
+            version = int(version_row["next_version"])
+            query_groups = tuple(
+                ScopeQueryGroupInput(
+                    suggested_query=proposal.suggested_query,
+                    final_query=final_query,
+                    targeted_required_terms=proposal.targeted_required_terms,
+                )
+                for proposal, final_query in zip(
+                    draft.query_groups, final_queries, strict=True
+                )
+            )
+            contract = build_scope_contract(
+                workflow_run_id=draft.workflow_run_id,
+                research_plan_id=draft.research_plan_id,
+                version=version,
+                constraints=draft.constraints,
+                query_groups=query_groups,
+            )
+            event = ScopeAuditEvent(
+                id=event_id,
+                workflow_run_id=contract.workflow_run_id,
+                scope_contract_id=contract.id,
+                scope_contract_version=contract.version,
+                event_name="scope_confirmed",
+                payload={
+                    "schema_version": "content_research_scope_audit_event_v1",
+                    "scope_draft_id": draft.id,
+                    "structure_hash": draft.structure_hash,
+                    "scope_contract_id": contract.id,
+                    "scope_contract_version": contract.version,
+                    "constraints": [
+                        {
+                            "id": item.id,
+                            "label": item.label,
+                            "value": item.value,
+                            "mode": item.mode,
+                            "allowed_aliases": list(item.allowed_aliases),
+                        }
+                        for item in contract.constraints
+                    ],
+                    "query_groups": [
+                        {
+                            "id": item.id,
+                            "suggested_query": item.suggested_query,
+                            "final_query": item.final_query,
+                            "origin": item.origin,
+                            "execution_role": item.execution_role,
+                        }
+                        for item in contract.query_groups
+                    ],
+                    "queries": [
+                        {
+                            "query_group_id": item.id,
+                            "suggested_query": item.suggested_query,
+                            "final_query": item.final_query,
+                            "changed": item.origin == "user_edited",
+                        }
+                        for item in contract.query_groups
+                    ],
+                },
+            )
 
             self._insert_scope_contract(conn, contract)
             self._insert_scope_audit_event(conn, event)
@@ -551,7 +628,7 @@ class SQLiteContentResearchStore:
                 ),
             )
             conn.commit()
-            return contract, True
+            return contract, event, True
         except Exception:
             conn.rollback()
             raise

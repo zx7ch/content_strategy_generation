@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 import httpx
 import pytest
@@ -138,23 +139,197 @@ async def test_confirm_scope_keeps_arbitrary_user_query_and_persists_matching_au
     assert prepared.status_code == 200
     scope = prepared.json()["result"]["scope"]
 
-    scope["query_groups"][0]["final_query"] = "白衬衫通勤穿搭"
+    final_queries = [
+        "白衬衫通勤穿搭",
+        *(group["final_query"] for group in scope["query_groups"][1:]),
+    ]
     response = await scope_client.post(
         f"/content-research/workflows/{workflow_run_id}/actions",
         json={
             "action": "confirm_scope",
             "payload": {
                 "scope_draft_id": scope["id"],
-                "research_plan_id": scope["research_plan_id"],
-                "constraints": scope["constraints"],
-                "query_groups": scope["query_groups"],
+                "structure_hash": scope["structure_hash"],
+                "query_groups": [
+                    {"final_query": final_query} for final_query in final_queries
+                ],
             },
         },
     )
 
     assert response.status_code == 200
     contract = response.json()["result"]["scope_contract"]
+    store = app.state.content_research_service._store
+    persisted_draft = store.get_scope_draft(scope["id"])
+    assert persisted_draft is not None
+    persisted_contract = store.get_scope_contract(
+        workflow_run_id, version=contract["version"]
+    )
+    assert persisted_contract is not None
+    assert contract["constraints"] == scope["constraints"]
+    assert contract["query_groups"][0]["suggested_query"] == scope["query_groups"][0][
+        "suggested_query"
+    ]
     assert contract["query_groups"][0]["final_query"] == "白衬衫通勤穿搭"
     assert contract["query_groups"][0]["origin"] == "user_edited"
     assert contract["query_groups"][0]["execution_role"] == "exploratory"
-    assert response.json()["result"]["audit_event"]["event_name"] == "scope_confirmed"
+    assert persisted_contract.constraints == persisted_draft.constraints
+    assert (
+        persisted_contract.query_groups[0].suggested_query
+        == persisted_draft.query_groups[0].suggested_query
+    )
+    audit_event = response.json()["result"]["audit_event"]
+    assert audit_event["event_name"] == "scope_confirmed"
+    assert audit_event["payload"]["scope_draft_id"] == scope["id"]
+    assert audit_event["payload"]["structure_hash"] == scope["structure_hash"]
+    assert audit_event["payload"]["queries"][0] == {
+        "query_group_id": contract["query_groups"][0]["id"],
+        "suggested_query": scope["query_groups"][0]["suggested_query"],
+        "final_query": "白衬衫通勤穿搭",
+        "changed": True,
+    }
+    persisted_events = store.list_scope_audit_events(
+        workflow_run_id, version=contract["version"]
+    )
+    assert len(persisted_events) == 1
+    assert persisted_events[0].id == audit_event["id"]
+    assert persisted_events[0].payload == audit_event["payload"]
+
+
+@pytest.mark.asyncio
+async def test_confirm_scope_rejects_stale_structure_hash(scope_client):
+    workflow = await _scope_ready_workflow(scope_client)
+    workflow_run_id = workflow["presearch"]["workflow_run_id"]
+    prepared = await scope_client.post(
+        f"/content-research/workflows/{workflow_run_id}/actions",
+        json={"action": "prepare_scope", "payload": {"direction_id": "product_marketing"}},
+    )
+    scope = prepared.json()["result"]["scope"]
+
+    response = await scope_client.post(
+        f"/content-research/workflows/{workflow_run_id}/actions",
+        json={
+            "action": "confirm_scope",
+            "payload": {
+                "scope_draft_id": scope["id"],
+                "structure_hash": "stale-structure-hash",
+                "query_groups": [
+                    {"final_query": group["final_query"]}
+                    for group in scope["query_groups"]
+                ],
+            },
+        },
+    )
+
+    assert response.status_code == 422
+    assert "structure hash" in response.json()["error_message"]
+    assert app.state.content_research_service._store.list_scope_contracts(workflow_run_id) == []
+
+
+@pytest.mark.asyncio
+async def test_confirm_scope_rejects_client_owned_constraint_and_query_fields(scope_client):
+    workflow = await _scope_ready_workflow(scope_client)
+    workflow_run_id = workflow["presearch"]["workflow_run_id"]
+    prepared = await scope_client.post(
+        f"/content-research/workflows/{workflow_run_id}/actions",
+        json={"action": "prepare_scope", "payload": {"direction_id": "product_marketing"}},
+    )
+    scope = prepared.json()["result"]["scope"]
+
+    response = await scope_client.post(
+        f"/content-research/workflows/{workflow_run_id}/actions",
+        json={
+            "action": "confirm_scope",
+            "payload": {
+                "scope_draft_id": scope["id"],
+                "structure_hash": scope["structure_hash"],
+                "constraints": [
+                    {
+                        "id": "core_object",
+                        "label": "核心对象",
+                        "value": "客户端替换的核心对象",
+                        "mode": "required",
+                    }
+                ],
+                "query_groups": [
+                    {
+                        "suggested_query": "客户端替换的建议词",
+                        "targeted_required_terms": ["客户端替换的核心对象"],
+                        "final_query": group["final_query"],
+                    }
+                    for group in scope["query_groups"]
+                ],
+            },
+        },
+    )
+
+    assert response.status_code == 422
+    assert app.state.content_research_service._store.list_scope_contracts(workflow_run_id) == []
+
+
+@pytest.mark.asyncio
+async def test_confirm_scope_rejects_missing_final_query_edits(scope_client):
+    workflow = await _scope_ready_workflow(scope_client)
+    workflow_run_id = workflow["presearch"]["workflow_run_id"]
+    prepared = await scope_client.post(
+        f"/content-research/workflows/{workflow_run_id}/actions",
+        json={"action": "prepare_scope", "payload": {"direction_id": "product_marketing"}},
+    )
+    scope = prepared.json()["result"]["scope"]
+
+    response = await scope_client.post(
+        f"/content-research/workflows/{workflow_run_id}/actions",
+        json={
+            "action": "confirm_scope",
+            "payload": {
+                "scope_draft_id": scope["id"],
+                "structure_hash": scope["structure_hash"],
+                "query_groups": [
+                    {"final_query": scope["query_groups"][0]["final_query"]}
+                ],
+            },
+        },
+    )
+
+    assert response.status_code == 422
+    assert "final query count" in response.json()["error_message"]
+    assert app.state.content_research_service._store.list_scope_contracts(workflow_run_id) == []
+
+
+@pytest.mark.asyncio
+async def test_confirm_scope_rejects_draft_when_current_brief_structure_changed(scope_client):
+    workflow = await _scope_ready_workflow(scope_client)
+    workflow_run_id = workflow["presearch"]["workflow_run_id"]
+    prepared = await scope_client.post(
+        f"/content-research/workflows/{workflow_run_id}/actions",
+        json={"action": "prepare_scope", "payload": {"direction_id": "product_marketing"}},
+    )
+    scope = prepared.json()["result"]["scope"]
+    store = app.state.content_research_service._store
+    brief = store.get_brief_by_workflow(workflow_run_id)
+    assert brief is not None
+    store.save_brief(
+        replace(
+            brief,
+            payload={**brief.payload, "subject_structure_hash": "new-structure-hash"},
+        )
+    )
+
+    response = await scope_client.post(
+        f"/content-research/workflows/{workflow_run_id}/actions",
+        json={
+            "action": "confirm_scope",
+            "payload": {
+                "scope_draft_id": scope["id"],
+                "structure_hash": scope["structure_hash"],
+                "query_groups": [
+                    {"final_query": group["final_query"]}
+                    for group in scope["query_groups"]
+                ],
+            },
+        },
+    )
+
+    assert response.status_code == 422
+    assert "current brief" in response.json()["error_message"]
+    assert store.list_scope_contracts(workflow_run_id) == []

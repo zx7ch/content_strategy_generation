@@ -238,6 +238,31 @@ async def _start_formal_research(client, workflow_run_id: str):
     )
 
 
+async def _confirm_prepared_scope(client, workflow_run_id: str) -> dict:
+    prepared = await client.post(
+        f"/content-research/workflows/{workflow_run_id}/actions",
+        json={"action": "prepare_scope", "payload": {"direction_id": "product_marketing"}},
+    )
+    assert prepared.status_code == 200
+    scope = prepared.json()["result"]["scope"]
+    confirmed = await client.post(
+        f"/content-research/workflows/{workflow_run_id}/actions",
+        json={
+            "action": "confirm_scope",
+            "payload": {
+                "scope_draft_id": scope["id"],
+                "structure_hash": scope["structure_hash"],
+                "query_groups": [
+                    {"final_query": group["final_query"]}
+                    for group in scope["query_groups"]
+                ],
+            },
+        },
+    )
+    assert confirmed.status_code == 200
+    return confirmed.json()["result"]["scope_contract"]
+
+
 @pytest.mark.asyncio
 async def test_product_marketing_dispatch_guard_rejects_missing_confirmed_fields_before_enqueue(
     product_marketing_client,
@@ -438,6 +463,9 @@ async def test_product_marketing_dispatch_guard_enqueues_valid_frozen_contract(
     await _confirm_product_marketing_brief(
         product_marketing_client, presearch=presearch
     )
+    await _confirm_prepared_scope(
+        product_marketing_client, presearch["workflow_run_id"]
+    )
 
     response = await _start_formal_research(
         product_marketing_client, presearch["workflow_run_id"]
@@ -446,6 +474,24 @@ async def test_product_marketing_dispatch_guard_enqueues_valid_frozen_contract(
     assert response.status_code == 200
     assert response.json()["status"] == "queued"
     assert await _dispatch_job_count(app.state.content_research_service) == 1
+
+
+@pytest.mark.asyncio
+async def test_formal_research_requires_confirmed_scope_before_runtime_dispatch(
+    product_marketing_client,
+):
+    presearch = await _create_presearch(product_marketing_client, seed_text="夏季凉感 T恤")
+    await _confirm_product_marketing_brief(
+        product_marketing_client, presearch=presearch
+    )
+
+    response = await _start_formal_research(
+        product_marketing_client, presearch["workflow_run_id"]
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error_message"] == "scope_confirmation_required"
+    assert await _dispatch_job_count(app.state.content_research_service) == 0
 
 
 @pytest.mark.asyncio

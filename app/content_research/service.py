@@ -114,7 +114,6 @@ from app.content_research.scope_contract import (
     ScopeConstraint,
     ScopeDraftAuditEvent,
     ScopeQueryGroupInput,
-    build_scope_contract,
     build_scope_draft,
 )
 from app.content_research.sources import (
@@ -2641,31 +2640,28 @@ class ContentResearchService:
         draft = self._store.get_scope_draft(request.scope_draft_id)
         if draft is None or draft.workflow_run_id != workflow_run_id:
             raise ContentResearchValidationError("Scope draft was not found for this workflow")
-        if request.research_plan_id != draft.research_plan_id:
-            raise ContentResearchValidationError("Scope draft research plan does not match confirmation")
-        constraints = tuple(ScopeConstraint(
-            item.id, item.label, item.value, item.mode, tuple(item.allowed_aliases)
-        ) for item in request.constraints)
-        query_groups = tuple(ScopeQueryGroupInput(
-            item.suggested_query, item.final_query, tuple(item.targeted_required_terms)
-        ) for item in request.query_groups)
-        contract = build_scope_contract(
-            workflow_run_id=workflow_run_id, research_plan_id=request.research_plan_id,
-            version=len(self._store.list_scope_contracts(workflow_run_id)) + 1,
-            constraints=constraints, query_groups=query_groups,
+        brief = self._store.get_brief_by_workflow(workflow_run_id)
+        current_structure_hash = (
+            str(brief.payload.get("subject_structure_hash") or "") if brief else ""
         )
-        event = ScopeAuditEvent(
-            id=_new_id("sae"), workflow_run_id=workflow_run_id,
-            scope_contract_id=contract.id, scope_contract_version=contract.version,
-            event_name="scope_confirmed",
-            payload={
-                "schema_version": "content_research_scope_audit_event_v1", "scope_draft_id": draft.id,
-                "scope_contract_id": contract.id, "scope_contract_version": contract.version,
-                "constraints": [_scope_constraint_payload(item) for item in contract.constraints],
-                "query_groups": [_scope_query_group_payload(item) for item in contract.query_groups],
-            },
+        if request.structure_hash != draft.structure_hash:
+            raise ContentResearchValidationError(
+                "Scope confirmation structure hash does not match the persisted draft"
+            )
+        if draft.structure_hash != current_structure_hash:
+            raise ContentResearchValidationError(
+                "Scope draft structure hash does not match the current brief"
+            )
+        if len(request.query_groups) != len(draft.query_groups):
+            raise ContentResearchValidationError(
+                "Scope confirmation final query count must match the persisted draft"
+            )
+
+        contract, event, _created = self._store.confirm_scope_atomically(
+            draft.id,
+            final_queries=tuple(item.final_query for item in request.query_groups),
+            event_id=_new_id("sae"),
         )
-        self._store.save_scope_contract_with_audit_event(contract, event)
         return {"scope_contract": _scope_contract_payload(contract), "audit_event": _scope_audit_payload(event)}
 
     async def run_workflow_action(
@@ -2991,6 +2987,8 @@ class ContentResearchService:
                 suggested_action="先确认最终版调研 brief，再开始正式调研",
             )
         self._require_frozen_product_marketing_dispatch_contract(brief)
+        if not self._store.list_scope_contracts(workflow_run_id):
+            raise ContentResearchValidationError("scope_confirmation_required")
         dispatch = await self._dispatch.enqueue(
             workflow_run_id=workflow_run_id,
             provider=request.provider,
@@ -3360,6 +3358,8 @@ class ContentResearchService:
                     "Content research cannot start because its Creator thread no longer exists. "
                     "Create a new checklist from an active Creator conversation."
                 )
+        if not self._store.list_scope_contracts(workflow_run_id):
+            raise ContentResearchValidationError("scope_confirmation_required")
         await self._execute_formal_research(
             brief=brief,
             provider=request.provider,

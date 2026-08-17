@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 CONTENT_RESEARCH_API_SCHEMA_VERSION = "content_research_api_v1"
 WORKFLOW_ACTION_REQUEST_SCHEMA_VERSION = "content_research_workflow_action_request_v1"
@@ -302,25 +302,18 @@ class PrepareScopeRequest(BaseModel):
     direction_id: str = Field(min_length=1)
 
 
-class ScopeConstraintInput(BaseModel):
-    id: str = Field(min_length=1)
-    label: str = Field(min_length=1)
-    value: str = Field(min_length=1)
-    mode: str = Field(pattern="^(required|preferred)$")
-    allowed_aliases: list[str] = Field(default_factory=list)
+class ScopeFinalQueryEdit(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
-
-class ScopeQueryGroupInput(BaseModel):
-    suggested_query: str = Field(min_length=1)
     final_query: str = Field(min_length=1)
-    targeted_required_terms: list[str] = Field(default_factory=list)
 
 
 class ConfirmScopeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
     scope_draft_id: str = Field(min_length=1)
-    research_plan_id: str = Field(min_length=1)
-    constraints: list[ScopeConstraintInput] = Field(min_length=1)
-    query_groups: list[ScopeQueryGroupInput] = Field(min_length=1, max_length=3)
+    structure_hash: str = Field(min_length=1)
+    query_groups: list[ScopeFinalQueryEdit] = Field(min_length=1, max_length=3)
 
 
 class ContentResearchSubjectClarificationRequest(BaseModel):
