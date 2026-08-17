@@ -265,6 +265,45 @@ def test_scope_draft_confirmation_is_idempotent_and_persists_a_single_contract(t
     assert store.list_scope_audit_events(draft.workflow_run_id, version=1) == [first_event]
 
 
+def test_scope_draft_confirmation_replay_rejects_a_stale_current_brief(tmp_path) -> None:
+    store = SQLiteContentResearchStore(str(tmp_path / "scope-confirmation-stale-replay.db"))
+    contract = _contract(version=1)
+    draft = build_scope_draft(
+        workflow_run_id=contract.workflow_run_id,
+        research_plan_id=contract.research_plan_id,
+        structure_hash="structure_hash_1",
+        constraints=contract.constraints,
+        query_groups=(ScopeQueryGroupInput("夏季 长袖衬衫 通勤", "夏季 长袖衬衫 通勤"),),
+    )
+    store.save_scope_draft_with_audit_event(
+        draft,
+        ScopeDraftAuditEvent(
+            id="sda_stale_replay",
+            workflow_run_id=draft.workflow_run_id,
+            scope_draft_id=draft.id,
+            event_name="scope_suggested",
+            payload={"schema_version": "content_research_scope_audit_event_v1"},
+        ),
+    )
+    _save_current_brief(
+        store, workflow_run_id=draft.workflow_run_id, structure_hash=draft.structure_hash
+    )
+    first, event, created = _confirm_scope(
+        store, draft=draft, event_id="sca_stale_replay"
+    )
+    assert created is True
+
+    _save_current_brief(
+        store, workflow_run_id=draft.workflow_run_id, structure_hash="structure_hash_2"
+    )
+
+    with pytest.raises(ValueError, match="current brief"):
+        _confirm_scope(store, draft=draft, event_id="sca_stale_replay_again")
+
+    assert store.list_scope_contracts(draft.workflow_run_id) == [first]
+    assert store.list_scope_audit_events(draft.workflow_run_id, version=1) == [event]
+
+
 def test_conflicting_scope_draft_repeat_does_not_create_a_second_contract(tmp_path) -> None:
     store = SQLiteContentResearchStore(str(tmp_path / "scope-confirmation-conflict.db"))
     contract_v1 = _contract(version=1)

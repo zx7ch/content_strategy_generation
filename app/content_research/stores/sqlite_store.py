@@ -500,6 +500,27 @@ class SQLiteContentResearchStore:
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
+            draft_row = conn.execute(
+                "SELECT * FROM content_research_scope_drafts WHERE id = ?",
+                (draft_id,),
+            ).fetchone()
+            if draft_row is None:
+                raise ValueError(f"scope draft does not exist: {draft_id}")
+            draft = self._row_to_scope_draft(draft_row)
+            brief_row = conn.execute(
+                """SELECT payload_json FROM content_research_briefs
+                   WHERE workflow_run_id = ? ORDER BY updated_at DESC LIMIT 1""",
+                (draft.workflow_run_id,),
+            ).fetchone()
+            current_structure_hash = (
+                str(_loads(brief_row["payload_json"]).get("subject_structure_hash") or "")
+                if brief_row is not None
+                else ""
+            )
+            if draft.structure_hash != current_structure_hash:
+                raise ValueError(
+                    "Scope draft structure hash does not match the current brief"
+                )
             confirmation = conn.execute(
                 """SELECT scope_contract_id FROM content_research_scope_draft_confirmations
                    WHERE scope_draft_id = ?""",
@@ -532,27 +553,6 @@ class SQLiteContentResearchStore:
                     False,
                 )
 
-            draft_row = conn.execute(
-                "SELECT * FROM content_research_scope_drafts WHERE id = ?",
-                (draft_id,),
-            ).fetchone()
-            if draft_row is None:
-                raise ValueError(f"scope draft does not exist: {draft_id}")
-            draft = self._row_to_scope_draft(draft_row)
-            brief_row = conn.execute(
-                """SELECT payload_json FROM content_research_briefs
-                   WHERE workflow_run_id = ? ORDER BY updated_at DESC LIMIT 1""",
-                (draft.workflow_run_id,),
-            ).fetchone()
-            current_structure_hash = (
-                str(_loads(brief_row["payload_json"]).get("subject_structure_hash") or "")
-                if brief_row is not None
-                else ""
-            )
-            if draft.structure_hash != current_structure_hash:
-                raise ValueError(
-                    "Scope draft structure hash does not match the current brief"
-                )
             if len(final_queries) != len(draft.query_groups):
                 raise ValueError("scope confirmation final query count must match the persisted draft")
             version_row = conn.execute(
