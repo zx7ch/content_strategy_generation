@@ -138,6 +138,10 @@ _TYPED_RECORD_TABLES: dict[type[TypedPersistenceRecord], tuple[str, tuple[str, .
 }
 
 
+class RetryableLocalPersistenceError(RuntimeError):
+    """A local persistence failure that callers may safely retry."""
+
+
 class SQLiteContentResearchStore:
     """Local SQLite persistence for Content Research business records."""
 
@@ -643,6 +647,11 @@ class SQLiteContentResearchStore:
             )
             conn.commit()
             return contract, event, True
+        except sqlite3.OperationalError as exc:
+            conn.rollback()
+            if "locked" in str(exc).lower() or "busy" in str(exc).lower():
+                raise RetryableLocalPersistenceError("sqlite_write_locked") from exc
+            raise
         except Exception:
             conn.rollback()
             raise

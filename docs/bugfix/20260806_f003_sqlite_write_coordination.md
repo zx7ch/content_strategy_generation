@@ -29,6 +29,8 @@ SQLite 同一时刻仅允许一个 writer。正式调研启动时，worker 又�
 
 正式调研现在将该 workflow 已持久化的 presearch trace ID 传给每个方向任务。任务路由复用已有 trace，不再在 worker 启动时插入第二条 trace。
 
+Scope confirmation 现在也有一个短的、已分类的原子写入边界：它从 `BEGIN IMMEDIATE` 到 contract、audit event 与 confirmation link 的提交只执行本地 SQLite 读写；耗尽等待的 `locked`/`busy` 错误会转换为可重试的 `RetryableLocalPersistenceError("sqlite_write_locked")`，其他数据库错误仍会原样抛出。该边界内不做网络、LLM、Spider 或 runtime 调用。
+
 真实 run `run_770af525b4a84dbe87df3128dccc0532` 的验证结果：
 
 - 首次因锁失败后，以原 scope 重新入队；
@@ -39,6 +41,8 @@ SQLite 同一时刻仅允许一个 writer。正式调研启动时，worker 又�
 ## 未解决的技术债
 
 这不是全局 SQLite 并发治理。其他写入边界仍可能竞争，因此不能将本次修复视为“同步/异步混用已消除”。
+
+Evidence/lineage 写入与 stage checkpoint 是下一批应采用同样短事务、明确锁冲突语义的候选边界；它们尚未纳入本次 scope confirmation 定点缓解。
 
 后续基础设施任务应：
 
