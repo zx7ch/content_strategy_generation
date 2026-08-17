@@ -72,8 +72,50 @@ PACKET_FIELD_NAMES = frozenset(
         "activity_signals",
         "keyword_patterns",
         "reference_window",
+        "provider",
+        "note_type",
+        "ip_location",
+        "source_metadata",
+        "metadata",
     }
 )
+
+_SENSITIVE_METADATA_KEY_FRAGMENTS = (
+    "api_key",
+    "apikey",
+    "authorization",
+    "cookie",
+    "credential",
+    "header",
+    "password",
+    "provider_error",
+    "providererror",
+    "raw_body",
+    "raw_payload",
+    "rawbody",
+    "rawpayload",
+    "secret",
+    "session",
+    "token",
+)
+
+
+def _safe_packet_metadata(value: Any) -> Any:
+    """Preserve matchable provider metadata without persisting credentials or raw data."""
+    if isinstance(value, dict):
+        return {
+            str(key): _safe_packet_metadata(nested)
+            for key, nested in value.items()
+            if not any(
+                fragment in str(key).strip().lower().replace("-", "_")
+                for fragment in _SENSITIVE_METADATA_KEY_FRAGMENTS
+            )
+        }
+    if isinstance(value, list | tuple):
+        return [_safe_packet_metadata(item) for item in value]
+    if value is None or isinstance(value, str | int | float | bool):
+        return value
+    return None
 
 
 class OperationOutcomeUnknownError(RuntimeError):
@@ -325,7 +367,6 @@ def persist_scope_coverage_evaluation(
         constraint_counts=constraint_counts,
         unmet_constraint_ids=tuple(unmet_constraint_ids),
     )
-    store.save_coverage_snapshot(snapshot)
     coverage_event = ScopeAuditEvent(
         id=_scope_event_id(contract, "coverage_evaluated", snapshot.id),
         workflow_run_id=contract.workflow_run_id,
@@ -341,7 +382,7 @@ def persist_scope_coverage_evaluation(
             "reason_codes": reason_codes,
         },
     )
-    store.append_scope_audit_event(coverage_event)
+    store.save_coverage_snapshot_with_audit_event(snapshot, coverage_event)
     return snapshot
 
 
@@ -431,6 +472,32 @@ def compile_query_groups(
 def query_plan_hash(groups: tuple[QueryGroup, ...]) -> str:
     return canonical_fingerprint(
         {"query_groups": [_frozen_query_group_payload(item) for item in groups]}
+    )
+
+
+def _scope_query_groups(
+    *,
+    contract: ResearchScopeContract,
+    direction_id: str,
+    template: QueryGroup,
+    candidate_limit: int,
+) -> tuple[QueryGroup, ...]:
+    return tuple(
+        QueryGroup(
+            id=group.id,
+            direction_id=direction_id,
+            query=group.final_query,
+            priority=index,
+            sort=template.sort,
+            candidate_limit=candidate_limit,
+            time_window=template.time_window,
+            roles=(group.execution_role,),
+            activation="primary",
+            normalized_identity=canonical_fingerprint(
+                {"scope_contract_id": contract.id, "group_id": group.id}
+            ),
+        )
+        for index, group in enumerate(contract.query_groups)
     )
 
 
@@ -676,12 +743,16 @@ def build_packet(
     retrieval_context: dict[str, Any],
 ) -> dict[str, Any]:
     """Return the minimal immutable packet projection, excluding raw/token data."""
-    projection = {key: fields.get(key) for key in sorted(fields) if key in PACKET_FIELD_NAMES}
-    safe_context = {
-        key: value
-        for key, value in retrieval_context.items()
-        if key not in {"raw_payload", "access_token", "token", "cookie"}
+    projection = {
+        key: (
+            _safe_packet_metadata(fields.get(key))
+            if key in {"metadata", "source_metadata"}
+            else fields.get(key)
+        )
+        for key in sorted(fields)
+        if key in PACKET_FIELD_NAMES
     }
+    safe_context = _safe_packet_metadata(retrieval_context)
     value = {
         "direction_id": direction_id,
         "canonical_source_id": canonical_source_id,
@@ -701,6 +772,8 @@ class DirectionalExecutionPipeline:
             store if hasattr(store, "list_scope_contracts") else None
         )
         self._scope_contract: ResearchScopeContract | None = None
+        self._scope_query_plan_hash: str | None = None
+        self._scope_audit_event_ids: set[str] = set()
         self._canonical_sources = CanonicalSourceRegistry(store)
         self._checkpoint_started_at: dict[tuple[str, str], datetime] = {}
 
@@ -719,6 +792,36 @@ class DirectionalExecutionPipeline:
         flush = getattr(self._store, "flush", None)
         if flush is not None:
             await flush()
+
+    def _load_scope_contract(self, workflow_run_id: str) -> None:
+        scope_contracts = (
+            self._scope_store.list_scope_contracts(workflow_run_id)
+            if self._scope_store is not None
+            else []
+        )
+        self._scope_contract = scope_contracts[-1] if scope_contracts else None
+        self._scope_query_plan_hash = None
+        self._scope_audit_event_ids = (
+            {
+                event.id
+                for event in self._scope_store.list_scope_audit_events(
+                    workflow_run_id, version=self._scope_contract.version
+                )
+            }
+            if self._scope_store is not None and self._scope_contract is not None
+            else set()
+        )
+
+    def _queue_scope_audit_event(self, event: ScopeAuditEvent) -> None:
+        if event.id in self._scope_audit_event_ids:
+            return
+        append = getattr(self._store, "append_scope_audit_event", None)
+        if append is None:
+            append = getattr(self._scope_store, "append_scope_audit_event", None)
+        if append is None:
+            raise RuntimeError("scope audit persistence is unavailable")
+        append(event)
+        self._scope_audit_event_ids.add(event.id)
 
     async def execute(
         self,
@@ -756,12 +859,7 @@ class DirectionalExecutionPipeline:
         # isolated instead of allowing an unscoped persisted record.
         self._workflow_run_id = workflow_run_id or f"local_{subagent_task_id}"
         self._checkpoint_started_at = {}
-        scope_contracts = (
-            self._scope_store.list_scope_contracts(self._workflow_run_id)
-            if self._scope_store is not None
-            else []
-        )
-        self._scope_contract = scope_contracts[-1] if scope_contracts else None
+        self._load_scope_contract(self._workflow_run_id)
         frozen_groups = (
             _frozen_query_groups(policy_snapshot, direction_id)
             if policy_snapshot is not None
@@ -778,23 +876,11 @@ class DirectionalExecutionPipeline:
             run_as_of_at=run_as_of_at,
         )
         if self._scope_contract is not None and direction_id == "product_marketing":
-            template = groups[0]
-            groups = tuple(
-                QueryGroup(
-                    id=group.id,
-                    direction_id=direction_id,
-                    query=group.final_query,
-                    priority=index,
-                    sort=template.sort,
-                    candidate_limit=candidate_limit_per_query,
-                    time_window=template.time_window,
-                    roles=(group.execution_role,),
-                    activation="primary",
-                    normalized_identity=canonical_fingerprint(
-                        {"scope_contract_id": self._scope_contract.id, "group_id": group.id}
-                    ),
-                )
-                for index, group in enumerate(self._scope_contract.query_groups)
+            groups = _scope_query_groups(
+                contract=self._scope_contract,
+                direction_id=direction_id,
+                template=groups[0],
+                candidate_limit=candidate_limit_per_query,
             )
         fallback_group = (
             None
@@ -832,6 +918,11 @@ class DirectionalExecutionPipeline:
             active_plan_hash
             if self._scope_contract is not None and direction_id == "product_marketing"
             else str(locked_direction.get("query_plan_hash") or active_plan_hash)
+        )
+        self._scope_query_plan_hash = (
+            plan_hash
+            if self._scope_contract is not None and direction_id == "product_marketing"
+            else None
         )
         collect_fingerprint = (
             canonical_fingerprint(
@@ -873,12 +964,12 @@ class DirectionalExecutionPipeline:
                     "pagination": pagination,
                 },
             )
-            await self._flush()
             self._persist_query_group_collected_events(
                 subagent_task_id=subagent_task_id,
                 plan_hash=plan_hash,
                 pagination=pagination,
             )
+            await self._flush()
 
         self._start_checkpoint(subagent_task_id, "selection")
         selection = select_candidates(
@@ -1335,6 +1426,19 @@ class DirectionalExecutionPipeline:
         selection = _selection_from_payload(selection_checkpoint.payload["selection"])
         self._workflow_run_id = workflow_run_id
         self._checkpoint_started_at = {}
+        self._load_scope_contract(workflow_run_id)
+        if self._scope_contract is not None and direction_id == "product_marketing":
+            frozen_groups = _frozen_query_groups(snapshot, direction_id)
+            if frozen_groups is None:
+                raise ValueError("scope admission replay requires a frozen query plan")
+            self._scope_query_plan_hash = query_plan_hash(
+                _scope_query_groups(
+                    contract=self._scope_contract,
+                    direction_id=direction_id,
+                    template=frozen_groups[0],
+                    candidate_limit=frozen_groups[0].candidate_limit,
+                )
+            )
         self._run_admission(
             subagent_task_id,
             direction_id,
@@ -1415,7 +1519,10 @@ class DirectionalExecutionPipeline:
                         )[:24],
                         payload={
                             **candidate.payload,
-                            "scope_match": scope_match_payload(match),
+                            "scope_match": scope_match_payload(
+                                match,
+                                query_plan_hash=self._scope_query_plan_hash,
+                            ),
                         },
                     )
                     for candidate in candidates
@@ -1439,6 +1546,7 @@ class DirectionalExecutionPipeline:
                     contract=contract,
                     policy_snapshot=snapshot,
                     scope_contract=self._scope_contract,
+                    scope_query_plan_hash=self._scope_query_plan_hash,
                 )
                 is None
                 for candidate in candidates
@@ -1511,8 +1619,44 @@ class DirectionalExecutionPipeline:
         decisions: list[ClaimAdmissionDecisionRecord] = []
         for packet, candidates in candidates_by_packet:
             for candidate in candidates:
-                if self._store.get_typed_record(type(candidate), candidate.id) is None:
-                    self._store.save_claim_candidate(candidate)
+                scope_projection = dict(candidate.payload.get("scope_match") or {})
+                scope_event = None
+                if self._scope_contract is not None and scope_projection:
+                    scope_event = ScopeAuditEvent(
+                        id=_scope_event_id(
+                            self._scope_contract,
+                            "candidate_scope_evaluated",
+                            packet.canonical_source_id,
+                        ),
+                        workflow_run_id=self._workflow_run_id,
+                        scope_contract_id=self._scope_contract.id,
+                        scope_contract_version=self._scope_contract.version,
+                        event_name="candidate_scope_evaluated",
+                        payload={
+                            "schema_version": "content_research_scope_audit_event_v1",
+                            "candidate_id": packet.canonical_source_id,
+                            "claim_candidate_id": candidate.id,
+                            **scope_projection,
+                        },
+                    )
+                candidate_missing = (
+                    self._store.get_typed_record(type(candidate), candidate.id) is None
+                )
+                event_missing = (
+                    scope_event is not None
+                    and scope_event.id not in self._scope_audit_event_ids
+                )
+                save_with_audit = getattr(
+                    self._store, "save_claim_candidate_with_scope_audit_event", None
+                )
+                if candidate_missing and event_missing and save_with_audit is not None:
+                    save_with_audit(candidate, scope_event)
+                    self._scope_audit_event_ids.add(scope_event.id)
+                else:
+                    if candidate_missing:
+                        self._store.save_claim_candidate(candidate)
+                    if event_missing:
+                        self._queue_scope_audit_event(scope_event)
                 decision = (
                     ClaimAdmissionEvaluator()
                     .evaluate(
@@ -1714,12 +1858,6 @@ class DirectionalExecutionPipeline:
     ) -> None:
         if self._scope_store is None or self._scope_contract is None:
             return
-        existing_ids = {
-            event.id
-            for event in self._scope_store.list_scope_audit_events(
-                self._workflow_run_id, version=self._scope_contract.version
-            )
-        }
         summaries = {
             str(item.get("query_group_id") or ""): item for item in pagination
         }
@@ -1755,9 +1893,7 @@ class DirectionalExecutionPipeline:
                     ),
                 },
             )
-            if event.id not in existing_ids:
-                self._scope_store.append_scope_audit_event(event)
-                existing_ids.add(event.id)
+            self._queue_scope_audit_event(event)
 
     async def _collect_required_comments(
         self,

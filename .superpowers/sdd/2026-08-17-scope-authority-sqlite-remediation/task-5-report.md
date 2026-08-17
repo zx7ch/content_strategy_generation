@@ -24,6 +24,12 @@
   when the persisted Scope coverage state is `awaiting_scope_decision`.
 - Trace presentation was not changed. Coverage resolution and frontend behavior
   were not implemented.
+- Follow-up review hardening keeps the independently frozen Scope query-plan hash
+  in the candidate projection, retains safe provider metadata in evidence packets,
+  reloads Scope on packet-only admission replay, and commits collection/candidate/
+  coverage audits atomically with their owning SQLite facts.
+
+Initial implementation commit: `6471c07`.
 
 ## TDD evidence
 
@@ -80,6 +86,21 @@ FAILED ... differing _summary.reason_codes
 The subsequent minimal change added `minimum_eligible_scope_samples_unmet` when
 the count of candidates satisfying all required constraints is below policy.
 
+### Review hardening RED
+
+The post-implementation review identified two persistence-boundary gaps. Focused
+tests were added before the fixes and failed with:
+
+```text
+AssertionError: persisted source_metadata still contained cookie/access_token
+AttributeError: SQLiteContentResearchStore has no attribute
+  'save_claim_candidate_with_scope_audit_event'
+```
+
+The fixes recursively retain only safe metadata values and atomically persist a
+new claim candidate with its corresponding Scope audit event during synchronous
+packet-only replay. A forced audit-insert failure now proves transaction rollback.
+
 ## Verification
 
 Focused and adjacent regression command:
@@ -95,11 +116,28 @@ pytest tests/unit/test_content_research_scope_matching.py \
 
 Result: `113 passed in 11.93s`.
 
+Post-review focused verification (including Scope-store, replay, and API regressions):
+
+```text
+pytest tests/unit/test_content_research_scope_matching.py \
+  tests/integration/test_content_research_scope_coverage.py \
+  tests/unit/test_content_research_product_marketing_admission.py \
+  tests/integration/test_content_research_direction_pipeline_store.py \
+  tests/integration/test_content_research_scope_contract_store.py \
+  tests/e2e/test_content_research_scope_api.py \
+  tests/e2e/test_content_research_brief_confirm_api.py -q
+```
+
+Result: `129 passed in 13.71s`.
+
 Static verification:
 
 ```text
 ruff check app/content_research/contracts.py \
   app/content_research/admission/relevance.py \
+  app/content_research/async_pipeline_store.py \
+  app/content_research/stores/base.py \
+  app/content_research/stores/sqlite_store.py \
   app/content_research/workflow/directional_pipeline.py \
   app/content_research/service.py \
   tests/unit/test_content_research_scope_matching.py \

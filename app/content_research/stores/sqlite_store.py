@@ -804,6 +804,49 @@ class SQLiteContentResearchStore:
             raise ValueError(f"Coverage snapshot is append-only and already exists: {snapshot.id}") from exc
         return snapshot
 
+    def save_coverage_snapshot_with_audit_event(
+        self, snapshot: CoverageSnapshot, event: ScopeAuditEvent
+    ) -> CoverageSnapshot:
+        _validate_payload("ScopeAuditEvent", event.payload)
+        if (
+            event.workflow_run_id != snapshot.workflow_run_id
+            or event.scope_contract_id != snapshot.scope_contract_id
+            or event.scope_contract_version != snapshot.scope_contract_version
+            or event.event_name != "coverage_evaluated"
+            or event.payload.get("coverage_snapshot_id") != snapshot.id
+        ):
+            raise ValueError("coverage audit event must reference the snapshot being saved")
+        try:
+            with self._connect() as conn:
+                self._assert_scope_contract_reference(
+                    conn,
+                    workflow_run_id=snapshot.workflow_run_id,
+                    scope_contract_id=snapshot.scope_contract_id,
+                    scope_contract_version=snapshot.scope_contract_version,
+                )
+                conn.execute(
+                    """INSERT INTO content_research_scope_coverage_snapshots
+                       (id, workflow_run_id, scope_contract_id, scope_contract_version, state,
+                        constraint_counts_json, unmet_constraint_ids_json, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        snapshot.id,
+                        snapshot.workflow_run_id,
+                        snapshot.scope_contract_id,
+                        snapshot.scope_contract_version,
+                        snapshot.state,
+                        _dumps(snapshot.constraint_counts),
+                        _dumps_any_list(list(snapshot.unmet_constraint_ids)),
+                        _fmt_dt(snapshot.created_at),
+                    ),
+                )
+                self._insert_scope_audit_event(conn, event)
+        except sqlite3.IntegrityError as exc:
+            raise ValueError(
+                f"Coverage snapshot or audit event is append-only and already exists: {snapshot.id}"
+            ) from exc
+        return snapshot
+
     def get_coverage_snapshot(
         self, workflow_run_id: str, *, version: int
     ) -> CoverageSnapshot | None:
@@ -1224,21 +1267,30 @@ class SQLiteContentResearchStore:
     ) -> TypedPersistenceRecord:
         if not isinstance(record, TypedPersistenceRecord):
             raise TypeError("new persistence APIs require typed records")
+        with self._connect() as conn:
+            self._insert_typed_record(conn, table, record, values)
+        return record
+
+    @staticmethod
+    def _insert_typed_record(
+        conn: sqlite3.Connection,
+        table: str,
+        record: TypedPersistenceRecord,
+        values: dict[str, Any],
+    ) -> None:
         columns = ("id", "schema_version", *values, "payload_json", "metadata_json", "created_at")
         placeholders = ", ".join("?" for _ in columns)
-        with self._connect() as conn:
-            conn.execute(
-                f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({placeholders})",
-                (
-                    record.id,
-                    record.schema_version,
-                    *values.values(),
-                    _dumps(record.payload),
-                    _dumps(record.metadata),
-                    _fmt_dt(record.created_at),
-                ),
-            )
-        return record
+        conn.execute(
+            f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({placeholders})",
+            (
+                record.id,
+                record.schema_version,
+                *values.values(),
+                _dumps(record.payload),
+                _dumps(record.metadata),
+                _fmt_dt(record.created_at),
+            ),
+        )
 
     def _require_typed_parent(self, table: str, record_id: str, relation: str) -> None:
         with self._connect() as conn:
@@ -1378,6 +1430,49 @@ class SQLiteContentResearchStore:
         from app.content_research.admission.candidates import validate_candidate_packet
         validate_candidate_packet(record, packet)
         return self._save_typed_record("content_research_claim_candidates", record, {"workflow_run_id": record.workflow_run_id, "research_direction_id": record.research_direction_id, "evidence_packet_id": record.evidence_packet_id, "statement": record.statement, "intent_id": record.intent_id, "claim_type": record.claim_type, "requested_state": record.requested_state})  # type: ignore[return-value]
+
+    def save_claim_candidate_with_scope_audit_event(
+        self, record: ClaimCandidateRecord, event: ScopeAuditEvent
+    ) -> ClaimCandidateRecord:
+        _validate_payload("ScopeAuditEvent", event.payload)
+        if (
+            event.workflow_run_id != record.workflow_run_id
+            or event.event_name != "candidate_scope_evaluated"
+            or event.payload.get("claim_candidate_id") != record.id
+        ):
+            raise ValueError("candidate scope audit event must reference the candidate being saved")
+        packet = self.get_typed_record(DirectionalEvidencePacketRecord, record.evidence_packet_id)
+        if packet is None:
+            raise ValueError(f"missing evidence packet: {record.evidence_packet_id}")
+        from app.content_research.admission.candidates import validate_candidate_packet
+
+        validate_candidate_packet(record, packet)
+        values = {
+            "workflow_run_id": record.workflow_run_id,
+            "research_direction_id": record.research_direction_id,
+            "evidence_packet_id": record.evidence_packet_id,
+            "statement": record.statement,
+            "intent_id": record.intent_id,
+            "claim_type": record.claim_type,
+            "requested_state": record.requested_state,
+        }
+        try:
+            with self._connect() as conn:
+                self._assert_scope_contract_reference(
+                    conn,
+                    workflow_run_id=event.workflow_run_id,
+                    scope_contract_id=event.scope_contract_id,
+                    scope_contract_version=event.scope_contract_version,
+                )
+                self._insert_typed_record(
+                    conn, "content_research_claim_candidates", record, values
+                )
+                self._insert_scope_audit_event(conn, event)
+        except sqlite3.IntegrityError as exc:
+            raise ValueError(
+                f"Claim candidate or scope audit event is append-only and already exists: {record.id}"
+            ) from exc
+        return record
 
     def list_claim_candidates(self, workflow_run_id: str, research_direction_id: str) -> list[ClaimCandidateRecord]:
         with self._connect() as conn:

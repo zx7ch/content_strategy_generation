@@ -1,6 +1,16 @@
 from __future__ import annotations
 
+import pytest
+
+from app.content_research.admission.candidates import source_text_hash
+from app.content_research.persistence_models import (
+    CanonicalSourceRecord,
+    ClaimCandidateRecord,
+    DirectionalEvidencePacketRecord,
+)
 from app.content_research.scope_contract import (
+    CoverageSnapshot,
+    ScopeAuditEvent,
     ScopeConstraint,
     ScopeQueryGroupInput,
     build_scope_contract,
@@ -139,3 +149,136 @@ def test_scope_coverage_persists_exact_counts_reasons_and_corresponding_audits(
     assert coverage_event["reason_codes"] == snapshot.constraint_counts["_summary"][
         "reason_codes"
     ]
+
+
+def test_coverage_snapshot_rolls_back_when_its_audit_cannot_commit(
+    tmp_path, monkeypatch
+) -> None:
+    store = SQLiteContentResearchStore(str(tmp_path / "scope-coverage-atomic.db"))
+    contract = build_scope_contract(
+        workflow_run_id="run_scope_atomic",
+        research_plan_id="rp_scope_atomic",
+        version=1,
+        constraints=(
+            ScopeConstraint("core_object", "核心对象", "衬衫", "required"),
+        ),
+        query_groups=(ScopeQueryGroupInput("衬衫", "衬衫", ("衬衫",)),),
+    )
+    store.save_scope_contract(contract)
+    snapshot = CoverageSnapshot(
+        id="scv_atomic",
+        workflow_run_id=contract.workflow_run_id,
+        scope_contract_id=contract.id,
+        scope_contract_version=contract.version,
+        state="satisfied",
+        constraint_counts={},
+        unmet_constraint_ids=(),
+    )
+    event = ScopeAuditEvent(
+        id="sae_atomic",
+        workflow_run_id=contract.workflow_run_id,
+        scope_contract_id=contract.id,
+        scope_contract_version=contract.version,
+        event_name="coverage_evaluated",
+        payload={
+            "schema_version": "content_research_scope_audit_event_v1",
+            "coverage_snapshot_id": snapshot.id,
+        },
+    )
+
+    def fail_audit_insert(_conn, _event) -> None:
+        raise RuntimeError("audit insert failed")
+
+    monkeypatch.setattr(store, "_insert_scope_audit_event", fail_audit_insert)
+
+    with pytest.raises(RuntimeError, match="audit insert failed"):
+        store.save_coverage_snapshot_with_audit_event(snapshot, event)
+
+    assert store.get_coverage_snapshot(contract.workflow_run_id, version=1) is None
+    assert store.list_scope_audit_events(contract.workflow_run_id, version=1) == []
+
+
+def test_claim_scope_projection_rolls_back_when_its_audit_cannot_commit(
+    tmp_path, monkeypatch
+) -> None:
+    store = SQLiteContentResearchStore(str(tmp_path / "scope-candidate-atomic.db"))
+    contract = build_scope_contract(
+        workflow_run_id="run_scope_candidate_atomic",
+        research_plan_id="rp_scope_candidate_atomic",
+        version=1,
+        constraints=(ScopeConstraint("core_object", "核心对象", "衬衫", "required"),),
+        query_groups=(ScopeQueryGroupInput("衬衫", "衬衫", ("衬衫",)),),
+    )
+    store.save_scope_contract(contract)
+    source = CanonicalSourceRecord(
+        "src_scope_atomic",
+        "v1",
+        {},
+        platform="xhs",
+        platform_source_kind="note",
+        platform_source_id="note_scope_atomic",
+    )
+    store.save_canonical_source(source)
+    packet = DirectionalEvidencePacketRecord(
+        "dep_scope_atomic",
+        "v1",
+        {
+            "field_projection": {
+                "content_text": "衬衫",
+                "source_url": "https://example.test/scope-atomic",
+            },
+            "field_availability": {},
+            "retrieval_context": {},
+        },
+        workflow_run_id=contract.workflow_run_id,
+        research_direction_id="product_marketing",
+        canonical_source_id=source.id,
+        field_projection_hash="scope-atomic-packet-hash",
+    )
+    store.save_directional_evidence_packet(packet)
+    candidate = ClaimCandidateRecord(
+        "cc_scope_atomic",
+        "v2",
+        {
+            "quote_refs": [
+                {
+                    "field_path": "content_text",
+                    "quote": "衬衫",
+                    "text_start": 0,
+                    "text_end": 2,
+                    "source_text_hash": source_text_hash("衬衫"),
+                    "source_url": "https://example.test/scope-atomic",
+                }
+            ],
+            "scope_match": {"scope_contract_version": contract.version},
+        },
+        workflow_run_id=contract.workflow_run_id,
+        research_direction_id="product_marketing",
+        evidence_packet_id=packet.id,
+        statement="衬衫",
+        intent_id="product_value_expression",
+        claim_type="observation",
+    )
+    event = ScopeAuditEvent(
+        id="sae_scope_candidate_atomic",
+        workflow_run_id=contract.workflow_run_id,
+        scope_contract_id=contract.id,
+        scope_contract_version=contract.version,
+        event_name="candidate_scope_evaluated",
+        payload={
+            "schema_version": "content_research_scope_audit_event_v1",
+            "candidate_id": source.id,
+            "claim_candidate_id": candidate.id,
+        },
+    )
+
+    def fail_audit_insert(_conn, _event) -> None:
+        raise RuntimeError("audit insert failed")
+
+    monkeypatch.setattr(store, "_insert_scope_audit_event", fail_audit_insert)
+
+    with pytest.raises(RuntimeError, match="audit insert failed"):
+        store.save_claim_candidate_with_scope_audit_event(candidate, event)
+
+    assert store.get_typed_record(ClaimCandidateRecord, candidate.id) is None
+    assert store.list_scope_audit_events(contract.workflow_run_id, version=1) == []

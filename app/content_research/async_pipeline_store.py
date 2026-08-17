@@ -17,6 +17,7 @@ from app.content_research.persistence_models import (
     StageCheckpointRecord,
     TypedPersistenceRecord,
 )
+from app.content_research.scope_contract import ScopeAuditEvent
 from app.content_research.stores.sqlite_store import (
     _TYPED_RECORD_TABLES,
     _dumps,
@@ -35,6 +36,8 @@ class AsyncDirectionalPersistenceSession:
         self._db_path = db_path
         self._records: dict[type[TypedPersistenceRecord], dict[str, TypedPersistenceRecord]] = defaultdict(dict)
         self._pending: list[TypedPersistenceRecord] = []
+        self._pending_scope_events: list[ScopeAuditEvent] = []
+        self._scope_event_ids: set[str] = set()
 
     @classmethod
     async def open(
@@ -55,6 +58,14 @@ class AsyncDirectionalPersistenceSession:
                     session._records[record_type][str(row["id"])] = session._row_to_record(
                         row, record_type, fields
                     )
+            cursor = await conn.execute(
+                "SELECT id FROM content_research_scope_audit_events"
+                + (" WHERE workflow_run_id=?" if workflow_run_id is not None else ""),
+                (workflow_run_id,) if workflow_run_id is not None else (),
+            )
+            session._scope_event_ids = {
+                str(row["id"]) for row in await cursor.fetchall()
+            }
         return session
 
     def get_typed_record(self, record_type: type[T], record_id: str) -> T | None:
@@ -100,6 +111,12 @@ class AsyncDirectionalPersistenceSession:
     def save_stage_checkpoint(self, record: T) -> T:
         return self._save(record)
 
+    def append_scope_audit_event(self, event: ScopeAuditEvent) -> ScopeAuditEvent:
+        if event.id not in self._scope_event_ids:
+            self._scope_event_ids.add(event.id)
+            self._pending_scope_events.append(event)
+        return event
+
     def _save(self, record: T) -> T:
         bucket = self._records[type(record)]
         existing = bucket.get(record.id)
@@ -118,9 +135,10 @@ class AsyncDirectionalPersistenceSession:
         return record
 
     async def flush(self) -> None:
-        if not self._pending:
+        if not self._pending and not self._pending_scope_events:
             return
         pending, self._pending = self._pending, []
+        pending_scope_events, self._pending_scope_events = self._pending_scope_events, []
         async with aiosqlite.connect(self._db_path) as conn:
             await conn.execute("BEGIN IMMEDIATE")
             try:
@@ -161,10 +179,31 @@ class AsyncDirectionalPersistenceSession:
                         raise RuntimeError(
                             f"immutable persistence conflict for {table}:{record.id}"
                         )
+                for event in pending_scope_events:
+                    await conn.execute(
+                        """INSERT INTO content_research_scope_audit_events
+                           (id, workflow_run_id, scope_contract_id, scope_contract_version,
+                            event_name, payload_json, metadata_json, created_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            event.id,
+                            event.workflow_run_id,
+                            event.scope_contract_id,
+                            event.scope_contract_version,
+                            event.event_name,
+                            _dumps(event.payload),
+                            _dumps(event.metadata or {}),
+                            _fmt_dt(event.created_at),
+                        ),
+                    )
                 await conn.commit()
             except Exception:
                 await conn.rollback()
                 self._pending = [*pending, *self._pending]
+                self._pending_scope_events = [
+                    *pending_scope_events,
+                    *self._pending_scope_events,
+                ]
                 raise
 
     @staticmethod

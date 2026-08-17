@@ -73,8 +73,10 @@ def evaluate_scope_match(
     )
 
 
-def scope_match_payload(match: CandidateScopeMatch) -> dict[str, Any]:
-    return {
+def scope_match_payload(
+    match: CandidateScopeMatch, *, query_plan_hash: str | None = None
+) -> dict[str, Any]:
+    payload = {
         "scope_contract_version": match.scope_contract_version,
         "query_group_hits": list(match.query_group_hits),
         "constraint_matches": {
@@ -88,6 +90,9 @@ def scope_match_payload(match: CandidateScopeMatch) -> dict[str, Any]:
         "eligibility": match.eligibility,
         "exclusion_reasons": list(match.exclusion_reasons),
     }
+    if query_plan_hash:
+        payload["query_plan_hash"] = query_plan_hash
+    return payload
 
 
 def _scope_searchable_fields(source: Mapping[str, Any]) -> tuple[tuple[str, str], ...]:
@@ -132,6 +137,7 @@ def query_relevance_reason(
     contract: DirectionContract,
     policy_snapshot: RunPolicySnapshot,
     scope_contract: ResearchScopeContract | None = None,
+    scope_query_plan_hash: str | None = None,
 ) -> str | None:
     """Return the mandatory relevance reason unless frozen provenance and quote anchors agree."""
     relevance = frozen_query_relevance(contract, policy_snapshot)
@@ -164,7 +170,11 @@ def query_relevance_reason(
         or {}
     )
     query_plan_hash = (
-        str(context.get("query_plan_hash") or "")
+        str(
+            scope_query_plan_hash
+            or persisted_scope_match.get("query_plan_hash")
+            or ""
+        )
         if scope_contract is not None or persisted_scope_match
         else str(locked_direction.get("query_plan_hash") or "")
     )
