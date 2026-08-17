@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import sqlite3
+import threading
+
 import pytest
 
 from app.content_research.scope_contract import (
@@ -29,6 +32,17 @@ def _contract(*, version: int) -> ResearchScopeContract:
             ScopeQueryGroupInput("夏季 长袖衬衫 通勤", "夏季 长袖衬衫 通勤"),
         ),
     )
+
+
+def _confirmation_rows(db_path) -> list[tuple[str, str, str]]:
+    with sqlite3.connect(db_path) as conn:
+        return list(
+            conn.execute(
+                """SELECT scope_draft_id, scope_contract_id, workflow_run_id
+                   FROM content_research_scope_draft_confirmations
+                   ORDER BY scope_draft_id"""
+            )
+        )
 
 
 def test_scope_contract_versions_and_scope_audit_events_are_append_only(tmp_path) -> None:
@@ -254,3 +268,146 @@ def test_conflicting_scope_draft_repeat_does_not_create_a_second_contract(tmp_pa
     assert repeated == first
     assert store.list_scope_contracts(draft.workflow_run_id) == [first]
     assert store.get_scope_contract(draft.workflow_run_id, version=2) is None
+
+
+def test_scope_draft_confirmation_rejects_non_confirmation_audit_events(tmp_path) -> None:
+    db_path = tmp_path / "scope-confirmation-invalid-event.db"
+    store = SQLiteContentResearchStore(str(db_path))
+    contract = _contract(version=1)
+    draft = build_scope_draft(
+        workflow_run_id=contract.workflow_run_id,
+        research_plan_id=contract.research_plan_id,
+        structure_hash="structure_hash_1",
+        constraints=contract.constraints,
+        query_groups=(ScopeQueryGroupInput("夏季 长袖衬衫 通勤", "夏季 长袖衬衫 通勤"),),
+    )
+    store.save_scope_draft_with_audit_event(
+        draft,
+        ScopeDraftAuditEvent(
+            id="sda_invalid_event",
+            workflow_run_id=draft.workflow_run_id,
+            scope_draft_id=draft.id,
+            event_name="scope_suggested",
+            payload={"schema_version": "content_research_scope_audit_event_v1"},
+        ),
+    )
+    event = ScopeAuditEvent(
+        id="sca_rejected",
+        workflow_run_id=contract.workflow_run_id,
+        scope_contract_id=contract.id,
+        scope_contract_version=contract.version,
+        event_name="scope_rejected",
+        payload={"schema_version": "content_research_scope_audit_event_v1"},
+    )
+
+    with pytest.raises(ValueError, match="scope confirmation event must be scope_confirmed"):
+        store.confirm_scope_atomically(draft.id, contract, event)
+
+    assert store.list_scope_contracts(draft.workflow_run_id) == []
+    assert store.list_scope_audit_events(draft.workflow_run_id, version=1) == []
+    assert _confirmation_rows(db_path) == []
+
+
+def test_scope_draft_confirmation_rolls_back_contract_audit_and_link_on_late_failure(tmp_path) -> None:
+    db_path = tmp_path / "scope-confirmation-rollback.db"
+    store = SQLiteContentResearchStore(str(db_path))
+    contract = _contract(version=1)
+    draft = build_scope_draft(
+        workflow_run_id=contract.workflow_run_id,
+        research_plan_id=contract.research_plan_id,
+        structure_hash="structure_hash_1",
+        constraints=contract.constraints,
+        query_groups=(ScopeQueryGroupInput("夏季 长袖衬衫 通勤", "夏季 长袖衬衫 通勤"),),
+    )
+    store.save_scope_draft_with_audit_event(
+        draft,
+        ScopeDraftAuditEvent(
+            id="sda_rollback",
+            workflow_run_id=draft.workflow_run_id,
+            scope_draft_id=draft.id,
+            event_name="scope_suggested",
+            payload={"schema_version": "content_research_scope_audit_event_v1"},
+        ),
+    )
+    event = ScopeAuditEvent(
+        id="sca_rollback",
+        workflow_run_id=contract.workflow_run_id,
+        scope_contract_id=contract.id,
+        scope_contract_version=contract.version,
+        event_name="scope_confirmed",
+        payload={"schema_version": "content_research_scope_audit_event_v1"},
+    )
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """INSERT INTO content_research_scope_draft_confirmations
+               (scope_draft_id, scope_contract_id, workflow_run_id, created_at)
+               VALUES (?, ?, ?, ?)""",
+            ("rsd_link_already_taken", contract.id, contract.workflow_run_id, "2026-08-17T00:00:00+00:00"),
+        )
+
+    with pytest.raises(sqlite3.IntegrityError):
+        store.confirm_scope_atomically(draft.id, contract, event)
+
+    assert store.list_scope_contracts(draft.workflow_run_id) == []
+    assert store.list_scope_audit_events(draft.workflow_run_id, version=1) == []
+    assert _confirmation_rows(db_path) == [
+        ("rsd_link_already_taken", contract.id, contract.workflow_run_id)
+    ]
+
+
+def test_two_connections_racing_to_confirm_one_draft_create_one_contract(tmp_path) -> None:
+    db_path = tmp_path / "scope-confirmation-race.db"
+    first_store = SQLiteContentResearchStore(str(db_path))
+    second_store = SQLiteContentResearchStore(str(db_path))
+    contract = _contract(version=1)
+    draft = build_scope_draft(
+        workflow_run_id=contract.workflow_run_id,
+        research_plan_id=contract.research_plan_id,
+        structure_hash="structure_hash_1",
+        constraints=contract.constraints,
+        query_groups=(ScopeQueryGroupInput("夏季 长袖衬衫 通勤", "夏季 长袖衬衫 通勤"),),
+    )
+    first_store.save_scope_draft_with_audit_event(
+        draft,
+        ScopeDraftAuditEvent(
+            id="sda_race",
+            workflow_run_id=draft.workflow_run_id,
+            scope_draft_id=draft.id,
+            event_name="scope_suggested",
+            payload={"schema_version": "content_research_scope_audit_event_v1"},
+        ),
+    )
+    event = ScopeAuditEvent(
+        id="sca_race",
+        workflow_run_id=contract.workflow_run_id,
+        scope_contract_id=contract.id,
+        scope_contract_version=contract.version,
+        event_name="scope_confirmed",
+        payload={"schema_version": "content_research_scope_audit_event_v1"},
+    )
+    barrier = threading.Barrier(2)
+    results: list[tuple[ResearchScopeContract, bool]] = []
+    errors: list[BaseException] = []
+
+    def confirm(store: SQLiteContentResearchStore) -> None:
+        try:
+            barrier.wait()
+            results.append(store.confirm_scope_atomically(draft.id, contract, event))
+        except BaseException as exc:
+            errors.append(exc)
+
+    first = threading.Thread(target=confirm, args=(first_store,))
+    second = threading.Thread(target=confirm, args=(second_store,))
+    first.start()
+    second.start()
+    first.join(timeout=5)
+    second.join(timeout=5)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert errors == []
+    assert sorted(created for _, created in results) == [False, True]
+    assert [confirmed for confirmed, _ in results] == [contract, contract]
+    assert first_store.list_scope_contracts(draft.workflow_run_id) == [contract]
+    assert first_store.list_scope_audit_events(draft.workflow_run_id, version=1) == [event]
+    assert _confirmation_rows(db_path) == [(draft.id, contract.id, contract.workflow_run_id)]

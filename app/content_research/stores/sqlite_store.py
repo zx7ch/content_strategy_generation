@@ -493,6 +493,8 @@ class SQLiteContentResearchStore:
         self, draft_id: str, contract: ResearchScopeContract, event: ScopeAuditEvent
     ) -> tuple[ResearchScopeContract, bool]:
         _validate_payload("ScopeAuditEvent", event.payload)
+        if event.event_name != "scope_confirmed":
+            raise ValueError("scope confirmation event must be scope_confirmed")
         if (
             event.workflow_run_id != contract.workflow_run_id
             or event.scope_contract_id != contract.id
