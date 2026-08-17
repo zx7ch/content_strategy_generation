@@ -30,6 +30,7 @@ from app.content_research.api_schemas import (
     ContentResearchLiteReportResponse,
     ContentResearchPlanResponse,
     ContentResearchPresearchResponse,
+    ContentResearchScopeProjectionResponse,
     ContentResearchSourceCollectionRequest,
     ContentResearchSourceCollectionResponse,
     ContentResearchSubagentTaskResponse,
@@ -1582,6 +1583,52 @@ class ContentResearchService:
         return ContentResearchWorkflowEventsResponse(
             workflow_run_id=workflow_run_id,
             events=await self._workflow_runtime.list_events(workflow_run_id),
+        )
+
+    def get_scope_projection(
+        self, workflow_run_id: str, *, version: int | None = None
+    ) -> ContentResearchScopeProjectionResponse:
+        brief = self._store.get_brief_by_workflow(workflow_run_id)
+        if brief is None:
+            raise ContentResearchNotFoundError(
+                f"Content research workflow not found: {workflow_run_id}"
+            )
+        draft = self._store.get_latest_scope_draft(workflow_run_id)
+        if draft is None:
+            raise ContentResearchNotFoundError(
+                f"Scope draft not found for workflow: {workflow_run_id}"
+            )
+        if version is None:
+            contracts = self._store.list_scope_contracts(workflow_run_id)
+            contract = contracts[-1] if contracts else None
+        else:
+            contract = self._store.get_scope_contract(workflow_run_id, version=version)
+        if contract is None:
+            requested = str(version) if version is not None else "latest"
+            raise ContentResearchNotFoundError(
+                f"Scope contract version {requested} not found for workflow: {workflow_run_id}"
+            )
+
+        audit_events = [
+            _scope_draft_audit_payload(event)
+            for event in self._store.list_scope_draft_audit_events(
+                workflow_run_id, scope_draft_id=draft.id
+            )
+        ]
+        audit_events.extend(
+            _scope_audit_payload(event)
+            for event in self._store.list_scope_audit_events(
+                workflow_run_id, version=contract.version
+            )
+        )
+        return ContentResearchScopeProjectionResponse(
+            workflow_run_id=workflow_run_id,
+            draft=_scope_draft_payload(draft),
+            scope_contract=_scope_contract_payload(contract),
+            audit_events=sorted(
+                (safe_public_projection(event) for event in audit_events),
+                key=lambda event: (str(event["created_at"]), str(event["id"])),
+            ),
         )
 
     async def get_workflow_trace(self, workflow_run_id: str) -> ContentResearchTraceResponse:

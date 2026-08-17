@@ -162,6 +162,16 @@ class ContentResearchWorkflowEventsResponse(BaseModel):
     events: list[dict] = Field(default_factory=list)
 
 
+class ContentResearchScopeProjectionResponse(BaseModel):
+    """Minimal durable projection of a workflow's confirmed Scope facts."""
+
+    schema_version: str = CONTENT_RESEARCH_API_SCHEMA_VERSION
+    workflow_run_id: str
+    draft: dict
+    scope_contract: dict
+    audit_events: list[dict] = Field(default_factory=list)
+
+
 class ContentResearchTraceResponse(BaseModel):
     schema_version: str = CONTENT_RESEARCH_API_SCHEMA_VERSION
     workflow_run_id: str

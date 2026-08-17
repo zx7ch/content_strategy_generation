@@ -30,6 +30,7 @@ from app.content_research.api_schemas import (
     ContentResearchLLMConfigurationResponse,
     ContentResearchPresearchRequest,
     ContentResearchPresearchResponse,
+    ContentResearchScopeProjectionResponse,
     ContentResearchSourceCollectionRequest,
     ContentResearchSourceCollectionResponse,
     ContentResearchTraceResponse,
@@ -40,9 +41,9 @@ from app.content_research.api_schemas import (
     HumanDecisionRequest,
     HumanDecisionResponse,
     HumanDecisionsResponse,
-    XHSQRLoginResponse,
     XHSLoginStatusResponse,
     XHSManualCookieRequest,
+    XHSQRLoginResponse,
 )
 from app.content_research.presearch.service import PresearchService
 from app.content_research.service import (
@@ -148,11 +149,11 @@ from app.models.session import Session, SessionLifecycleState, SessionStage
 from app.models.workflow import WorkflowArtifactType
 from app.services.conversation_orchestrator import ConversationOrchestrator
 from app.services.creator_intent_router import ACTIVE_JOB_STATUSES, IntentContext, classify_intent
-from app.services.llm.tracked_client import build_default_llm_service
 from app.services.llm.configuration import LLMConfigurationCandidate
 from app.services.llm.configuration_service import LiteLLMConfigurationService
 from app.services.llm.configuration_store import SQLiteLLMConfigurationStore
 from app.services.llm.providers.openai_compatible import OpenAICompatibleAdapter
+from app.services.llm.tracked_client import build_default_llm_service
 from app.services.llm.usage_tracker import (
     LLMUsageEvent,
     LLMUsageStepSummary,
@@ -1154,6 +1155,22 @@ async def get_content_research_workflow_events(
     service = _get_content_research_service(request)
     try:
         return await service.list_workflow_events(workflow_run_id)
+    except Exception as exc:  # noqa: BLE001
+        raise _content_research_error(exc) from exc
+
+
+@app.get(
+    "/content-research/workflows/{workflow_run_id}/scope",
+    response_model=ContentResearchScopeProjectionResponse,
+)
+async def get_content_research_scope_projection(
+    workflow_run_id: str,
+    request: Request,
+    version: int | None = Query(default=None, ge=1),
+) -> ContentResearchScopeProjectionResponse:
+    service = _get_content_research_service(request)
+    try:
+        return service.get_scope_projection(workflow_run_id, version=version)
     except Exception as exc:  # noqa: BLE001
         raise _content_research_error(exc) from exc
 

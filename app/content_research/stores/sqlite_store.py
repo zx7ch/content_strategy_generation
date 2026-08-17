@@ -494,6 +494,28 @@ class SQLiteContentResearchStore:
             ).fetchone()
         return self._row_to_scope_draft(row) if row else None
 
+    def get_latest_scope_draft(self, workflow_run_id: str) -> ResearchScopeDraft | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """SELECT * FROM content_research_scope_drafts
+                   WHERE workflow_run_id = ?
+                   ORDER BY created_at DESC, id DESC LIMIT 1""",
+                (workflow_run_id,),
+            ).fetchone()
+        return self._row_to_scope_draft(row) if row else None
+
+    def list_scope_draft_audit_events(
+        self, workflow_run_id: str, *, scope_draft_id: str
+    ) -> list[ScopeDraftAuditEvent]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """SELECT * FROM content_research_scope_draft_audit_events
+                   WHERE workflow_run_id = ? AND scope_draft_id = ?
+                   ORDER BY created_at ASC, id ASC""",
+                (workflow_run_id, scope_draft_id),
+            ).fetchall()
+        return [self._row_to_scope_draft_audit_event(row) for row in rows]
+
     def confirm_scope_atomically(
         self,
         draft_id: str,
@@ -1600,6 +1622,17 @@ class SQLiteContentResearchStore:
             id=row["id"], workflow_run_id=row["workflow_run_id"],
             research_plan_id=row["research_plan_id"], structure_hash=row["structure_hash"],
             constraints=constraints, query_groups=groups, created_at=_parse_dt(row["created_at"]),
+        )
+
+    @staticmethod
+    def _row_to_scope_draft_audit_event(row: sqlite3.Row) -> ScopeDraftAuditEvent:
+        return ScopeDraftAuditEvent(
+            id=row["id"],
+            workflow_run_id=row["workflow_run_id"],
+            scope_draft_id=row["scope_draft_id"],
+            event_name=row["event_name"],
+            payload=_loads(row["payload_json"]),
+            created_at=_parse_dt(row["created_at"]),
         )
 
     @staticmethod

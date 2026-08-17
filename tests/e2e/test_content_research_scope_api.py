@@ -380,3 +380,57 @@ async def test_confirm_scope_rechecks_current_brief_inside_atomic_confirmation(s
     assert response.status_code == 422
     assert "current brief" in response.json()["error_message"]
     assert store.list_scope_contracts(workflow_run_id) == []
+
+
+@pytest.mark.asyncio
+async def test_scope_projection_recovers_persisted_draft_contract_and_audits(scope_client):
+    """A scope read must be reconstructed from the immutable SQLite records."""
+    workflow = await _scope_ready_workflow(scope_client)
+    workflow_run_id = workflow["presearch"]["workflow_run_id"]
+    prepared = await scope_client.post(
+        f"/content-research/workflows/{workflow_run_id}/actions",
+        json={"action": "prepare_scope", "payload": {"direction_id": "product_marketing"}},
+    )
+    assert prepared.status_code == 200
+    prepared_draft_id = prepared.json()["result"]["scope"]["id"]
+    confirmed = await scope_client.post(
+        f"/content-research/workflows/{workflow_run_id}/actions",
+        json={
+            "action": "confirm_scope",
+            "payload": {
+                "scope_draft_id": prepared_draft_id,
+                "structure_hash": prepared.json()["result"]["scope"]["structure_hash"],
+                "query_groups": [
+                    {"final_query": group["final_query"]}
+                    for group in prepared.json()["result"]["scope"]["query_groups"]
+                ],
+            },
+        },
+    )
+    assert confirmed.status_code == 200
+    confirmed_contract_id = confirmed.json()["result"]["scope_contract"]["id"]
+
+    response = await scope_client.get(f"/content-research/workflows/{workflow_run_id}/scope")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["draft"]["id"] == prepared_draft_id
+    assert body["scope_contract"]["id"] == confirmed_contract_id
+    assert [event["event_name"] for event in body["audit_events"]] == [
+        "scope_suggested",
+        "scope_confirmed",
+    ]
+    assert isinstance(body["draft"]["created_at"], str)
+    assert isinstance(body["scope_contract"]["created_at"], str)
+    assert all(isinstance(event["created_at"], str) for event in body["audit_events"])
+
+    versioned = await scope_client.get(
+        f"/content-research/workflows/{workflow_run_id}/scope?version=1"
+    )
+    assert versioned.status_code == 200
+    assert versioned.json()["scope_contract"]["id"] == confirmed_contract_id
+
+    missing_version = await scope_client.get(
+        f"/content-research/workflows/{workflow_run_id}/scope?version=2"
+    )
+    assert missing_version.status_code == 404
+    assert missing_version.json()["error_code"] == "CONTENT_RESEARCH_PRESEARCH_NOT_FOUND"
