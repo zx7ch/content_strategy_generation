@@ -490,6 +490,7 @@ async def test_formal_research_requires_confirmed_scope_before_runtime_dispatch(
     )
 
     assert response.status_code == 422
+    assert response.json()["detail"]["message"] == "scope_confirmation_required"
     assert response.json()["error_message"] == "scope_confirmation_required"
     assert await _dispatch_job_count(app.state.content_research_service) == 0
 

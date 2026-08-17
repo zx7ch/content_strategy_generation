@@ -2640,17 +2640,9 @@ class ContentResearchService:
         draft = self._store.get_scope_draft(request.scope_draft_id)
         if draft is None or draft.workflow_run_id != workflow_run_id:
             raise ContentResearchValidationError("Scope draft was not found for this workflow")
-        brief = self._store.get_brief_by_workflow(workflow_run_id)
-        current_structure_hash = (
-            str(brief.payload.get("subject_structure_hash") or "") if brief else ""
-        )
         if request.structure_hash != draft.structure_hash:
             raise ContentResearchValidationError(
                 "Scope confirmation structure hash does not match the persisted draft"
-            )
-        if draft.structure_hash != current_structure_hash:
-            raise ContentResearchValidationError(
-                "Scope draft structure hash does not match the current brief"
             )
         if len(request.query_groups) != len(draft.query_groups):
             raise ContentResearchValidationError(

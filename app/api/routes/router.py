@@ -203,11 +203,13 @@ class APIError(Exception):
         error_code: str,
         error_message: str,
         error_details: dict[str, Any] | None = None,
+        detail: dict[str, Any] | None = None,
         retryable: bool = False,
         suggested_action: str | None = None,
     ) -> None:
         super().__init__(error_message)
         self.status_code = status_code
+        self.detail = detail
         self.payload = ErrorResponse(
             error_code=error_code,
             error_message=error_message,
@@ -280,7 +282,10 @@ async def add_private_network_access_header(request: Request, call_next):
 
 @app.exception_handler(APIError)
 async def handle_api_error(_request: Request, exc: APIError) -> JSONResponse:
-    return JSONResponse(status_code=exc.status_code, content=exc.payload.model_dump(mode="json"))
+    content = exc.payload.model_dump(mode="json")
+    if exc.detail is not None:
+        content["detail"] = exc.detail
+    return JSONResponse(status_code=exc.status_code, content=content)
 
 
 @app.exception_handler(RequestValidationError)
@@ -895,6 +900,9 @@ def _content_research_error(exc: Exception) -> APIError:
             status_code=422,
             error_code=error_code,
             error_message=str(exc),
+            detail={"message": str(exc)}
+            if str(exc) == "scope_confirmation_required"
+            else None,
         )
     return APIError(
         status_code=500,

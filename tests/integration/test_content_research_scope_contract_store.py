@@ -5,6 +5,7 @@ import threading
 
 import pytest
 
+from app.content_research.models import ResearchBriefRecord
 from app.content_research.scope_contract import (
     CoverageSnapshot,
     ResearchScopeContract,
@@ -58,6 +59,24 @@ def _confirm_scope(
         final_queries=final_queries
         or tuple(group.final_query for group in draft.query_groups),
         event_id=event_id,
+    )
+
+
+def _save_current_brief(
+    store: SQLiteContentResearchStore, *, workflow_run_id: str, structure_hash: str
+) -> None:
+    store.save_brief(
+        ResearchBriefRecord(
+            id=f"brief_{workflow_run_id}",
+            workflow_run_id=workflow_run_id,
+            thread_id="thread_scope",
+            schema_version="content_research_brief_v1",
+            status="ready",
+            payload={
+                "schema_version": "content_research_brief_v1",
+                "subject_structure_hash": structure_hash,
+            },
+        )
     )
 
 
@@ -219,6 +238,9 @@ def test_scope_draft_confirmation_is_idempotent_and_persists_a_single_contract(t
             payload={"schema_version": "content_research_scope_audit_event_v1"},
         ),
     )
+    _save_current_brief(
+        store, workflow_run_id=draft.workflow_run_id, structure_hash=draft.structure_hash
+    )
     event_v1 = ScopeAuditEvent(
         id="sca_confirmed_v1",
         workflow_run_id=contract_v1.workflow_run_id,
@@ -263,6 +285,9 @@ def test_conflicting_scope_draft_repeat_does_not_create_a_second_contract(tmp_pa
             event_name="scope_suggested",
             payload={"schema_version": "content_research_scope_audit_event_v1"},
         ),
+    )
+    _save_current_brief(
+        store, workflow_run_id=draft.workflow_run_id, structure_hash=draft.structure_hash
     )
     event_v1 = ScopeAuditEvent(
         id="sca_conflict_v1",
@@ -317,6 +342,9 @@ def test_scope_draft_confirmation_constructs_confirmation_audit_event(tmp_path) 
             payload={"schema_version": "content_research_scope_audit_event_v1"},
         ),
     )
+    _save_current_brief(
+        store, workflow_run_id=draft.workflow_run_id, structure_hash=draft.structure_hash
+    )
     confirmed, event, created = _confirm_scope(
         store,
         draft=draft,
@@ -354,6 +382,9 @@ def test_scope_draft_confirmation_rolls_back_contract_audit_and_link_on_late_fai
             event_name="scope_suggested",
             payload={"schema_version": "content_research_scope_audit_event_v1"},
         ),
+    )
+    _save_current_brief(
+        store, workflow_run_id=draft.workflow_run_id, structure_hash=draft.structure_hash
     )
     event = ScopeAuditEvent(
         id="sca_rollback",
@@ -402,6 +433,11 @@ def test_two_connections_racing_to_confirm_one_draft_create_one_contract(tmp_pat
             event_name="scope_suggested",
             payload={"schema_version": "content_research_scope_audit_event_v1"},
         ),
+    )
+    _save_current_brief(
+        first_store,
+        workflow_run_id=draft.workflow_run_id,
+        structure_hash=draft.structure_hash,
     )
     event = ScopeAuditEvent(
         id="sca_race",
@@ -455,7 +491,7 @@ def test_two_connections_confirming_distinct_drafts_allocate_distinct_versions(t
         build_scope_draft(
             workflow_run_id=base_contract.workflow_run_id,
             research_plan_id=f"rp_scope_{index}",
-            structure_hash=f"structure_hash_{index}",
+            structure_hash="structure_hash_shared",
             constraints=base_contract.constraints,
             query_groups=(
                 ScopeQueryGroupInput(
@@ -478,6 +514,11 @@ def test_two_connections_confirming_distinct_drafts_allocate_distinct_versions(t
                 payload={"schema_version": "content_research_scope_audit_event_v1"},
             ),
         )
+    _save_current_brief(
+        first_store,
+        workflow_run_id=base_contract.workflow_run_id,
+        structure_hash="structure_hash_shared",
+    )
     barrier = threading.Barrier(2)
     results: list[tuple[ResearchScopeContract, ScopeAuditEvent, bool]] = []
     errors: list[BaseException] = []

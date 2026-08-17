@@ -333,3 +333,50 @@ async def test_confirm_scope_rejects_draft_when_current_brief_structure_changed(
     assert response.status_code == 422
     assert "current brief" in response.json()["error_message"]
     assert store.list_scope_contracts(workflow_run_id) == []
+
+
+@pytest.mark.asyncio
+async def test_confirm_scope_rechecks_current_brief_inside_atomic_confirmation(scope_client, monkeypatch):
+    workflow = await _scope_ready_workflow(scope_client)
+    workflow_run_id = workflow["presearch"]["workflow_run_id"]
+    prepared = await scope_client.post(
+        f"/content-research/workflows/{workflow_run_id}/actions",
+        json={"action": "prepare_scope", "payload": {"direction_id": "product_marketing"}},
+    )
+    scope = prepared.json()["result"]["scope"]
+    store = app.state.content_research_service._store
+    original_confirm = store.confirm_scope_atomically
+
+    def update_brief_then_confirm(*args, **kwargs):
+        brief = store.get_brief_by_workflow(workflow_run_id)
+        assert brief is not None
+        store.save_brief(
+            replace(
+                brief,
+                payload={
+                    **brief.payload,
+                    "subject_structure_hash": "interleaved-structure-hash",
+                },
+            )
+        )
+        return original_confirm(*args, **kwargs)
+
+    monkeypatch.setattr(store, "confirm_scope_atomically", update_brief_then_confirm)
+    response = await scope_client.post(
+        f"/content-research/workflows/{workflow_run_id}/actions",
+        json={
+            "action": "confirm_scope",
+            "payload": {
+                "scope_draft_id": scope["id"],
+                "structure_hash": scope["structure_hash"],
+                "query_groups": [
+                    {"final_query": group["final_query"]}
+                    for group in scope["query_groups"]
+                ],
+            },
+        },
+    )
+
+    assert response.status_code == 422
+    assert "current brief" in response.json()["error_message"]
+    assert store.list_scope_contracts(workflow_run_id) == []
