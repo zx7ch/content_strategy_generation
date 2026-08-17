@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -22,6 +23,7 @@ P0_WORKFLOW_ACTIONS = (
     "repair_from_persisted_packets",
     "prepare_scope",
     "confirm_scope",
+    "resolve_coverage",
 )
 
 
@@ -324,6 +326,19 @@ class ConfirmScopeRequest(BaseModel):
     scope_draft_id: str = Field(min_length=1)
     structure_hash: str = Field(min_length=1)
     query_groups: list[ScopeFinalQueryEdit] = Field(min_length=1, max_length=3)
+
+
+class ResolveCoverageRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    scope_contract_version: int = Field(ge=1)
+    resolution: Literal[
+        "expand_required_constraint",
+        "generate_limited_report",
+        "relax_constraint",
+    ]
+    constraint_id: str | None = Field(default=None, min_length=1)
+    supplementary_queries: list[str] = Field(default_factory=list, max_length=2)
 
 
 class ContentResearchSubjectClarificationRequest(BaseModel):

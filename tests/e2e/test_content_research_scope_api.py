@@ -8,6 +8,7 @@ import pytest
 
 from app.api.routes.router import app
 from app.content_research.presearch.service import PresearchService
+from app.content_research.scope_contract import CoverageSnapshot, ScopeAuditEvent
 from app.content_research.service import ContentResearchService
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
 from app.services.llm.types import LLMResponse, TokenUsage
@@ -100,6 +101,71 @@ async def _scope_ready_workflow(client: httpx.AsyncClient) -> dict:
     return {"presearch": brief, "summary": confirmed.json()}
 
 
+async def _confirmed_scope_with_unmet_season(client: httpx.AsyncClient) -> tuple[str, dict]:
+    workflow = await _scope_ready_workflow(client)
+    workflow_run_id = workflow["presearch"]["workflow_run_id"]
+    prepared = await client.post(
+        f"/content-research/workflows/{workflow_run_id}/actions",
+        json={"action": "prepare_scope", "payload": {"direction_id": "product_marketing"}},
+    )
+    scope = prepared.json()["result"]["scope"]
+    confirmed = await client.post(
+        f"/content-research/workflows/{workflow_run_id}/actions",
+        json={
+            "action": "confirm_scope",
+            "payload": {
+                "scope_draft_id": scope["id"],
+                "structure_hash": scope["structure_hash"],
+                "query_groups": [
+                    {"final_query": group["final_query"]}
+                    for group in scope["query_groups"]
+                ],
+            },
+        },
+    )
+    contract = confirmed.json()["result"]["scope_contract"]
+    store = app.state.content_research_service._store
+    snapshot = CoverageSnapshot(
+        id="scv_api_unmet_season",
+        workflow_run_id=workflow_run_id,
+        scope_contract_id=contract["id"],
+        scope_contract_version=contract["version"],
+        state="awaiting_scope_decision",
+        constraint_counts={
+            "season": {
+                "matched_candidate_count": 1,
+                "independent_author_count": 1,
+                "required": True,
+            },
+            "_summary": {
+                "minimum_samples": 2,
+                "minimum_independent_authors": 2,
+                "reason_codes": ["required_constraint_coverage_unmet:season"],
+            },
+        },
+        unmet_constraint_ids=("season",),
+    )
+    store.save_coverage_snapshot_with_audit_event(
+        snapshot,
+        ScopeAuditEvent(
+            id="sae_api_coverage_evaluated",
+            workflow_run_id=workflow_run_id,
+            scope_contract_id=contract["id"],
+            scope_contract_version=contract["version"],
+            event_name="coverage_evaluated",
+            payload={
+                "schema_version": "content_research_scope_audit_event_v1",
+                "coverage_snapshot_id": snapshot.id,
+                "state": snapshot.state,
+                "constraint_counts": snapshot.constraint_counts,
+                "unmet_constraint_ids": ["season"],
+                "reason_codes": ["required_constraint_coverage_unmet:season"],
+            },
+        ),
+    )
+    return workflow_run_id, contract
+
+
 @pytest.mark.asyncio
 async def test_prepare_scope_preserves_summer_commute_constraints_and_audits_draft(scope_client):
     workflow = await _scope_ready_workflow(scope_client)
@@ -126,6 +192,209 @@ async def test_prepare_scope_preserves_summer_commute_constraints_and_audits_dra
     )
     assert scope["audit_event"]["event_name"] == "scope_suggested"
     assert scope["audit_event"]["scope_draft_id"] == scope["id"]
+
+
+@pytest.mark.asyncio
+async def test_generate_limited_report_resolution_preserves_v1_and_exact_season_decision(
+    scope_client,
+):
+    """Removing explicit limited-report authorization must make this test fail."""
+    workflow_run_id, contract_v1 = await _confirmed_scope_with_unmet_season(scope_client)
+
+    response = await scope_client.post(
+        f"/content-research/workflows/{workflow_run_id}/actions",
+        json={
+            "action": "resolve_coverage",
+            "payload": {
+                "scope_contract_version": 1,
+                "resolution": "generate_limited_report",
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    result = response.json()["result"]
+    assert result["report_mode"] == "limited"
+    assert result["scope_contract"] == contract_v1
+    assert result["unmet_constraint_ids"] == ["season"]
+    assert result["audit_event"]["event_name"] == "coverage_resolved"
+    assert result["audit_event"]["payload"]["resolution"] == "generate_limited_report"
+    store = app.state.content_research_service._store
+    assert [contract.version for contract in store.list_scope_contracts(workflow_run_id)] == [1]
+
+
+@pytest.mark.asyncio
+async def test_expand_required_constraint_creates_v2_from_only_user_supplied_queries(
+    scope_client,
+):
+    """Synthesizing expansion queries or mutating v1 must make this test fail."""
+    workflow_run_id, contract_v1 = await _confirmed_scope_with_unmet_season(scope_client)
+    supplementary_queries = ["夏季 防晒 长袖衬衫", "夏季 透气 衬衫"]
+
+    response = await scope_client.post(
+        f"/content-research/workflows/{workflow_run_id}/actions",
+        json={
+            "action": "resolve_coverage",
+            "payload": {
+                "scope_contract_version": 1,
+                "resolution": "expand_required_constraint",
+                "constraint_id": "season",
+                "supplementary_queries": supplementary_queries,
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    result = response.json()["result"]
+    contract_v2 = result["scope_contract"]
+    assert contract_v2["version"] == 2
+    assert [group["final_query"] for group in contract_v2["query_groups"]] == supplementary_queries
+    assert {group["execution_role"] for group in contract_v2["query_groups"]} == {
+        "supplementary"
+    }
+    assert result["audit_event"]["payload"]["resolution"] == "expand_required_constraint"
+    assert result["audit_event"]["payload"]["source_scope_contract_version"] == 1
+    assert result["audit_event"]["payload"]["resulting_scope_contract_version"] == 2
+    store = app.state.content_research_service._store
+    persisted_v1 = store.get_scope_contract(workflow_run_id, version=1)
+    assert persisted_v1 is not None
+    assert [group.final_query for group in persisted_v1.query_groups] == [
+        group["final_query"] for group in contract_v1["query_groups"]
+    ]
+
+
+@pytest.mark.asyncio
+async def test_relax_constraint_creates_v2_and_keeps_v1_required(scope_client):
+    """Mutating the frozen constraint instead of versioning it must make this test fail."""
+    workflow_run_id, _contract_v1 = await _confirmed_scope_with_unmet_season(scope_client)
+
+    response = await scope_client.post(
+        f"/content-research/workflows/{workflow_run_id}/actions",
+        json={
+            "action": "resolve_coverage",
+            "payload": {
+                "scope_contract_version": 1,
+                "resolution": "relax_constraint",
+                "constraint_id": "season",
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    result = response.json()["result"]
+    contract_v2 = result["scope_contract"]
+    assert contract_v2["version"] == 2
+    assert next(item for item in contract_v2["constraints"] if item["id"] == "season")[
+        "mode"
+    ] == "preferred"
+    assert result["audit_event"]["payload"]["resolution"] == "relax_constraint"
+    store = app.state.content_research_service._store
+    persisted_v1 = store.get_scope_contract(workflow_run_id, version=1)
+    assert persisted_v1 is not None
+    assert next(item for item in persisted_v1.constraints if item.id == "season").mode == "required"
+
+
+@pytest.mark.asyncio
+async def test_resolve_coverage_rejects_unknown_outcome_without_writing(scope_client):
+    workflow_run_id, _contract_v1 = await _confirmed_scope_with_unmet_season(scope_client)
+
+    response = await scope_client.post(
+        f"/content-research/workflows/{workflow_run_id}/actions",
+        json={
+            "action": "resolve_coverage",
+            "payload": {
+                "scope_contract_version": 1,
+                "resolution": "silently_broaden",
+            },
+        },
+    )
+
+    assert response.status_code == 422
+    store = app.state.content_research_service._store
+    assert [contract.version for contract in store.list_scope_contracts(workflow_run_id)] == [1]
+    assert all(
+        event.event_name != "coverage_resolved"
+        for event in store.list_scope_audit_events(workflow_run_id, version=1)
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "scope_contract_version": 1,
+            "resolution": "expand_required_constraint",
+            "constraint_id": "season",
+            "supplementary_queries": ["夏季 防晒 长袖衬衫"],
+        },
+        {
+            "scope_contract_version": 1,
+            "resolution": "relax_constraint",
+            "constraint_id": "season",
+        },
+    ],
+)
+async def test_versioned_coverage_resolution_replays_after_lost_response(
+    scope_client, payload
+):
+    """Removing persisted-command replay must make this test fail."""
+    workflow_run_id, _contract_v1 = await _confirmed_scope_with_unmet_season(scope_client)
+    endpoint = f"/content-research/workflows/{workflow_run_id}/actions"
+
+    first = await scope_client.post(
+        endpoint, json={"action": "resolve_coverage", "payload": payload}
+    )
+    replay = await scope_client.post(
+        endpoint, json={"action": "resolve_coverage", "payload": payload}
+    )
+
+    assert first.status_code == 200
+    assert replay.status_code == 200
+    assert replay.json()["result"] == first.json()["result"]
+    store = app.state.content_research_service._store
+    assert [contract.version for contract in store.list_scope_contracts(workflow_run_id)] == [1, 2]
+    assert len(
+        [
+            event
+            for event in store.list_scope_audit_events(workflow_run_id, version=2)
+            if event.event_name == "coverage_resolved"
+        ]
+    ) == 1
+
+
+@pytest.mark.asyncio
+async def test_limited_resolution_reconciles_a_concurrent_duplicate(scope_client, monkeypatch):
+    """Propagating a concurrent deterministic duplicate must make this test fail."""
+    workflow_run_id, _contract_v1 = await _confirmed_scope_with_unmet_season(scope_client)
+    store = app.state.content_research_service._store
+    append = store.append_scope_audit_event
+
+    def append_after_competing_writer(event):
+        append(event)
+        return append(event)
+
+    monkeypatch.setattr(store, "append_scope_audit_event", append_after_competing_writer)
+    response = await scope_client.post(
+        f"/content-research/workflows/{workflow_run_id}/actions",
+        json={
+            "action": "resolve_coverage",
+            "payload": {
+                "scope_contract_version": 1,
+                "resolution": "generate_limited_report",
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["result"]["report_mode"] == "limited"
+    assert len(
+        [
+            event
+            for event in store.list_scope_audit_events(workflow_run_id, version=1)
+            if event.event_name == "coverage_resolved"
+        ]
+    ) == 1
 
 
 @pytest.mark.asyncio

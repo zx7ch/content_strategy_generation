@@ -15,6 +15,7 @@ from app.content_research.reporting.read_model import (
     PublishedReportNotFoundError,
     PublishedReportReader,
 )
+from app.content_research.scope_contract import ScopeAuditEvent
 from app.content_research.stores.base import ContentResearchStore
 from app.memory.workflow_store import WorkflowStore
 
@@ -77,6 +78,7 @@ class LiteReportReader:
         publication_id: str | None = None,
         citation_group_ids: list[str] | None = None,
     ) -> dict[str, Any]:
+        scope_projection = self._scope_projection(workflow_run_id)
         try:
             report = await self._published.read(
                 workflow_run_id=workflow_run_id,
@@ -106,7 +108,147 @@ class LiteReportReader:
                 raise
             return await self._recoverable_projection(workflow_run_id)
         report.update(self._governed_marketing_fields(report))
-        return self._published_projection(report, citation_group_ids=citation_group_ids)
+        projection = self._published_projection(
+            report, citation_group_ids=citation_group_ids
+        )
+        if scope_projection is not None:
+            projection = self._apply_scope_projection(projection, scope_projection)
+            self._record_scope_projection(workflow_run_id, scope_projection)
+        return projection
+
+    def _scope_projection(self, workflow_run_id: str) -> dict[str, Any] | None:
+        contracts = self._store.list_scope_contracts(workflow_run_id)
+        if not contracts:
+            return None
+        contract = contracts[-1]
+        snapshot = self._store.get_coverage_snapshot(
+            workflow_run_id, version=contract.version
+        )
+        if snapshot is None:
+            if any(
+                self._store.get_coverage_snapshot(
+                    workflow_run_id, version=previous.version
+                )
+                is not None
+                for previous in contracts[:-1]
+            ):
+                raise PublishedReportNotFoundError(
+                    "report scope decision is pending collection for the latest contract"
+                )
+            return None
+        events = self._store.list_scope_audit_events(
+            workflow_run_id, version=contract.version
+        )
+        authorization = next(
+            (
+                event
+                for event in reversed(events)
+                if event.event_name == "coverage_resolved"
+                and event.payload.get("coverage_snapshot_id") == snapshot.id
+                and event.payload.get("resolution") == "generate_limited_report"
+            ),
+            None,
+        )
+        if snapshot.state == "awaiting_scope_decision" and authorization is None:
+            raise PublishedReportNotFoundError("report scope decision is pending")
+        report_mode = "limited" if authorization is not None else "normal"
+        limitations = (
+            _scope_limitations(contract, snapshot)
+            if report_mode == "limited"
+            else []
+        )
+        return {
+            "contract": contract,
+            "coverage": snapshot,
+            "report_mode": report_mode,
+            "limitations": limitations,
+        }
+
+    @staticmethod
+    def _apply_scope_projection(
+        projection: dict[str, Any], scope: dict[str, Any]
+    ) -> dict[str, Any]:
+        contract = scope["contract"]
+        snapshot = scope["coverage"]
+        projection["frozen_scope"].update(
+            {
+                "scope_contract_version": contract.version,
+                "query_groups": [
+                    {
+                        "id": group.id,
+                        "suggested_query": group.suggested_query,
+                        "final_query": group.final_query,
+                        "origin": group.origin,
+                        "execution_role": group.execution_role,
+                    }
+                    for group in contract.query_groups
+                ],
+                "constraint_counts": snapshot.constraint_counts,
+                "unmet_constraint_ids": list(snapshot.unmet_constraint_ids),
+            }
+        )
+        projection["status_strip"]["report_mode"] = scope["report_mode"]
+        projection["sections"]["limitations_scope"] = [
+            *projection["sections"]["limitations_scope"],
+            *scope["limitations"],
+        ]
+        return projection
+
+    def _record_scope_projection(
+        self, workflow_run_id: str, scope: dict[str, Any]
+    ) -> None:
+        contract = scope["contract"]
+        snapshot = scope["coverage"]
+        payload = {
+            "schema_version": "content_research_scope_audit_event_v1",
+            "coverage_snapshot_id": snapshot.id,
+            "resolution": (
+                "generate_limited_report"
+                if scope["report_mode"] == "limited"
+                else "coverage_satisfied"
+            ),
+            "report_mode": scope["report_mode"],
+            "scope_contract_version": contract.version,
+            "query_groups": [
+                {
+                    "query_group_id": group.id,
+                    "final_query": group.final_query,
+                    "execution_role": group.execution_role,
+                }
+                for group in contract.query_groups
+            ],
+            "constraint_counts": snapshot.constraint_counts,
+            "unmet_constraint_ids": list(snapshot.unmet_constraint_ids),
+            "limitations": scope["limitations"],
+        }
+        event = ScopeAuditEvent(
+            id=_stable_id(
+                "sae",
+                {
+                    "scope_contract_id": contract.id,
+                    "coverage_snapshot_id": snapshot.id,
+                    "event_name": "report_scope_projected",
+                    "report_mode": scope["report_mode"],
+                },
+            ),
+            workflow_run_id=workflow_run_id,
+            scope_contract_id=contract.id,
+            scope_contract_version=contract.version,
+            event_name="report_scope_projected",
+            payload=payload,
+        )
+        existing = self._store.list_scope_audit_events(
+            workflow_run_id, version=contract.version
+        )
+        if not any(item.id == event.id for item in existing):
+            try:
+                self._store.append_scope_audit_event(event)
+            except ValueError:
+                concurrent = self._store.list_scope_audit_events(
+                    workflow_run_id, version=contract.version
+                )
+                if not any(item.id == event.id for item in concurrent):
+                    raise
 
     def _governed_marketing_fields(self, report: dict[str, Any]) -> dict[str, Any]:
         publication = report.get("publication")
@@ -345,6 +487,41 @@ def _frozen_scope(report: dict[str, Any]) -> dict[str, Any]:
         "direction_ids": list(release.get("direction_ids") or []),
         "report_compose_mode": publication.get("compose_mode") or "prose",
     }
+
+
+def _scope_limitations(contract: Any, snapshot: Any) -> list[dict[str, Any]]:
+    summary = snapshot.constraint_counts.get("_summary", {})
+    by_id = {constraint.id: constraint for constraint in contract.constraints}
+    limitations: list[dict[str, Any]] = []
+    for constraint_id in snapshot.unmet_constraint_ids:
+        constraint = by_id.get(constraint_id)
+        if constraint is None:
+            raise PublishedReportNotFoundError(
+                "coverage snapshot references an unknown scope constraint"
+            )
+        counts = snapshot.constraint_counts.get(constraint_id, {})
+        matched = int(counts.get("matched_candidate_count") or 0)
+        authors = int(counts.get("independent_author_count") or 0)
+        minimum_samples = int(summary.get("minimum_samples") or 0)
+        minimum_authors = int(summary.get("minimum_independent_authors") or 0)
+        limitations.append(
+            {
+                "constraint_id": constraint.id,
+                "constraint_label": constraint.label,
+                "constraint_value": constraint.value,
+                "reason_code": f"required_constraint_coverage_unmet:{constraint.id}",
+                "matched_candidate_count": matched,
+                "independent_author_count": authors,
+                "minimum_samples": minimum_samples,
+                "minimum_independent_authors": minimum_authors,
+                "message": (
+                    f"Required constraint {constraint.label} ({constraint.value}) has "
+                    f"{matched} matching candidates and {authors} independent authors; "
+                    f"minimums are {minimum_samples} and {minimum_authors}."
+                ),
+            }
+        )
+    return limitations
 
 
 def _marketing_conclusion_projection(

@@ -16,6 +16,13 @@ from app.content_research.reporting.lite_read_model import (
     _direction_states,
 )
 from app.content_research.reporting.publication_materializer import ReportPublicationMaterializer
+from app.content_research.scope_contract import (
+    CoverageSnapshot,
+    ScopeAuditEvent,
+    ScopeConstraint,
+    ScopeQueryGroupInput,
+    build_scope_contract,
+)
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
 from app.memory.thread_store import ThreadStore
 from app.memory.workflow_store import WorkflowStore
@@ -213,6 +220,7 @@ async def _project_formal_cards(
     artifact_payload_mutator=None,
     citation_group_ids=None,
     marketing_conclusions=None,
+    before_read=None,
 ):
     db_path = str(tmp_path / "lite-projection-guard.db")
     store = SQLiteContentResearchStore(db_path)
@@ -298,10 +306,174 @@ async def _project_formal_cards(
                 (json.dumps(payload), artifact.artifact_id),
             )
 
+    if before_read is not None:
+        before_read(store, run.run_id)
+
     return await LiteReportReader(store, db_path).read(
         workflow_run_id=run.run_id,
         citation_group_ids=citation_group_ids,
     )
+
+
+def _persist_unmet_season_scope(store, workflow_run_id: str, *, authorize_limited: bool) -> None:
+    contract = build_scope_contract(
+        workflow_run_id=workflow_run_id,
+        research_plan_id="rp_limited_scope",
+        version=1,
+        constraints=(
+            ScopeConstraint("core_object", "核心对象", "长袖衬衫", "required"),
+            ScopeConstraint("season", "季节", "夏季", "required"),
+        ),
+        query_groups=(
+            ScopeQueryGroupInput("夏季 长袖衬衫", "夏季 长袖衬衫", ("夏季", "长袖衬衫")),
+        ),
+    )
+    store.save_scope_contract(contract)
+    snapshot = CoverageSnapshot(
+        id="scv_limited_season",
+        workflow_run_id=workflow_run_id,
+        scope_contract_id=contract.id,
+        scope_contract_version=1,
+        state="awaiting_scope_decision",
+        constraint_counts={
+            "core_object": {
+                "matched_candidate_count": 2,
+                "independent_author_count": 2,
+                "required": True,
+            },
+            "season": {
+                "matched_candidate_count": 1,
+                "independent_author_count": 1,
+                "required": True,
+            },
+            "_summary": {
+                "minimum_samples": 2,
+                "minimum_independent_authors": 2,
+                "reason_codes": ["required_constraint_coverage_unmet:season"],
+            },
+        },
+        unmet_constraint_ids=("season",),
+    )
+    store.save_coverage_snapshot(snapshot)
+    if authorize_limited:
+        store.append_scope_audit_event(
+            ScopeAuditEvent(
+                id="sae_limited_season",
+                workflow_run_id=workflow_run_id,
+                scope_contract_id=contract.id,
+                scope_contract_version=1,
+                event_name="coverage_resolved",
+                payload={
+                    "schema_version": "content_research_scope_audit_event_v1",
+                    "coverage_snapshot_id": snapshot.id,
+                    "resolution": "generate_limited_report",
+                    "source_scope_contract_version": 1,
+                    "resulting_scope_contract_version": 1,
+                    "report_mode": "limited",
+                    "unmet_constraint_ids": ["season"],
+                    "constraint_counts": snapshot.constraint_counts,
+                },
+            )
+        )
+
+
+@pytest.mark.asyncio
+async def test_lite_reader_blocks_published_report_while_scope_resolution_is_pending(tmp_path):
+    """Removing the pending-scope authorization guard must make this test fail."""
+    with pytest.raises(PublishedReportNotFoundError, match="scope decision is pending"):
+        await _project_formal_cards(
+            tmp_path,
+            claim_cards=[_card("cc_pending", "cad_pending")],
+            citation_groups=[_citation("citation_pending", "cc_pending", "cad_pending")],
+            before_read=lambda store, run_id: _persist_unmet_season_scope(
+                store, run_id, authorize_limited=False
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_limited_lite_report_projects_exact_season_limitation_and_audit(tmp_path):
+    """Dropping the frozen season limitation or its audit must make this test fail."""
+    persisted = {}
+
+    def persist_scope(store, run_id):
+        _persist_unmet_season_scope(store, run_id, authorize_limited=True)
+        persisted.update(store=store, run_id=run_id)
+
+    report = await _project_formal_cards(
+        tmp_path,
+        claim_cards=[_card("cc_limited", "cad_limited")],
+        citation_groups=[_citation("citation_limited", "cc_limited", "cad_limited")],
+        before_read=persist_scope,
+    )
+
+    assert report["status_strip"]["report_mode"] == "limited"
+    assert report["frozen_scope"]["scope_contract_version"] == 1
+    assert report["frozen_scope"]["unmet_constraint_ids"] == ["season"]
+    assert report["frozen_scope"]["constraint_counts"]["season"] == {
+        "matched_candidate_count": 1,
+        "independent_author_count": 1,
+        "required": True,
+    }
+    limitation = next(
+        item
+        for item in report["sections"]["limitations_scope"]
+        if item.get("constraint_id") == "season"
+    )
+    assert limitation["constraint_value"] == "夏季"
+    assert limitation["matched_candidate_count"] == 1
+    assert limitation["minimum_samples"] == 2
+    projected_events = [
+        event
+        for event in persisted["store"].list_scope_audit_events(
+            persisted["run_id"], version=1
+        )
+        if event.event_name == "report_scope_projected"
+    ]
+    assert len(projected_events) == 1
+    assert projected_events[0].payload["report_mode"] == "limited"
+    assert projected_events[0].payload["resolution"] == "generate_limited_report"
+    assert projected_events[0].payload["unmet_constraint_ids"] == ["season"]
+    assert projected_events[0].payload["limitations"] == [limitation]
+
+
+@pytest.mark.asyncio
+async def test_lite_report_read_reconciles_concurrent_projection_event(tmp_path, monkeypatch):
+    """Propagating a concurrent deterministic audit duplicate must make this test fail."""
+    persisted = {}
+
+    def persist_scope_and_install_race(store, run_id):
+        _persist_unmet_season_scope(store, run_id, authorize_limited=True)
+        append = store.append_scope_audit_event
+
+        def append_after_competing_reader(event):
+            append(event)
+            return append(event)
+
+        monkeypatch.setattr(
+            store, "append_scope_audit_event", append_after_competing_reader
+        )
+        persisted.update(store=store, run_id=run_id)
+
+    report = await _project_formal_cards(
+        tmp_path,
+        claim_cards=[_card("cc_concurrent", "cad_concurrent")],
+        citation_groups=[
+            _citation("citation_concurrent", "cc_concurrent", "cad_concurrent")
+        ],
+        before_read=persist_scope_and_install_race,
+    )
+
+    assert report["status_strip"]["report_mode"] == "limited"
+    assert len(
+        [
+            event
+            for event in persisted["store"].list_scope_audit_events(
+                persisted["run_id"], version=1
+            )
+            if event.event_name == "report_scope_projected"
+        ]
+    ) == 1
 
 
 def _card(

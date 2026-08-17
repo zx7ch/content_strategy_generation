@@ -45,6 +45,7 @@ from app.content_research.api_schemas import (
     HumanDecisionResponse,
     HumanDecisionsResponse,
     PrepareScopeRequest,
+    ResolveCoverageRequest,
     SnapshotResponse,
 )
 from app.content_research.async_dispatch import AsyncFormalResearchDispatchRepository
@@ -115,6 +116,7 @@ from app.content_research.scope_contract import (
     ScopeConstraint,
     ScopeDraftAuditEvent,
     ScopeQueryGroupInput,
+    build_scope_contract,
     build_scope_draft,
 )
 from app.content_research.sources import (
@@ -1809,7 +1811,10 @@ class ContentResearchService:
                 "published report not found",
                 "published report artifact is missing",
                 "published report is not ready",
-            } or message.startswith("requested citation groups are absent"):
+                "report scope decision is pending",
+            } or message.startswith(
+                ("requested citation groups are absent", "report scope decision is pending")
+            ):
                 raise ContentResearchNotFoundError(message) from exc
             raise ContentResearchReportIntegrityError(message) from exc
         return ContentResearchLiteReportResponse(**payload)
@@ -2704,6 +2709,216 @@ class ContentResearchService:
         )
         return {"scope_contract": _scope_contract_payload(contract), "audit_event": _scope_audit_payload(event)}
 
+    def _resolve_coverage(
+        self, *, workflow_run_id: str, request: ResolveCoverageRequest
+    ) -> dict[str, Any]:
+        contracts = self._store.list_scope_contracts(workflow_run_id)
+        contract = self._store.get_scope_contract(
+            workflow_run_id, version=request.scope_contract_version
+        )
+        if contract is None:
+            raise ContentResearchValidationError(
+                "Coverage resolution Scope Contract version was not found"
+            )
+        snapshot = self._store.get_coverage_snapshot(
+            workflow_run_id, version=contract.version
+        )
+        if snapshot is None or snapshot.state != "awaiting_scope_decision":
+            raise ContentResearchValidationError(
+                "Coverage resolution requires persisted unmet coverage"
+            )
+        replay = _find_coverage_resolution_replay(
+            store=self._store,
+            workflow_run_id=workflow_run_id,
+            contracts=contracts,
+            snapshot=snapshot,
+            request=request,
+        )
+        if replay is not None:
+            replay_contract, replay_event = replay
+            return _coverage_resolution_result(
+                contract=replay_contract,
+                snapshot=snapshot,
+                event=replay_event,
+            )
+        if contract.version != contracts[-1].version:
+            raise ContentResearchValidationError(
+                "Coverage resolution must reference the latest Scope Contract version"
+            )
+        if any(
+            event.event_name == "coverage_resolved"
+            and event.payload.get("coverage_snapshot_id") == snapshot.id
+            for candidate in contracts
+            for event in self._store.list_scope_audit_events(
+                workflow_run_id, version=candidate.version
+            )
+        ):
+            raise ContentResearchValidationError(
+                "Coverage snapshot already has a different persisted resolution"
+            )
+        if request.resolution != "generate_limited_report":
+            target = next(
+                (
+                    item
+                    for item in contract.constraints
+                    if item.id == request.constraint_id
+                    and item.id in snapshot.unmet_constraint_ids
+                    and item.mode == "required"
+                ),
+                None,
+            )
+            if target is None:
+                raise ContentResearchValidationError(
+                    "Coverage resolution constraint must be an unmet required constraint"
+                )
+            if request.resolution == "expand_required_constraint":
+                queries = tuple(
+                    query.strip() for query in request.supplementary_queries if query.strip()
+                )
+                if not 1 <= len(queries) <= 2 or len(set(queries)) != len(queries):
+                    raise ContentResearchValidationError(
+                        "Coverage expansion requires one or two distinct user-supplied queries"
+                    )
+                next_contract = build_scope_contract(
+                    workflow_run_id=workflow_run_id,
+                    research_plan_id=contract.research_plan_id,
+                    version=contract.version + 1,
+                    constraints=contract.constraints,
+                    query_groups=tuple(
+                        ScopeQueryGroupInput(query, query, (target.value,))
+                        for query in queries
+                    ),
+                )
+                if any(
+                    group.execution_role != "supplementary"
+                    for group in next_contract.query_groups
+                ):
+                    raise ContentResearchValidationError(
+                        "Coverage expansion queries must explicitly target only the selected constraint"
+                    )
+                event = _coverage_resolution_event(
+                    contract=next_contract,
+                    snapshot=snapshot,
+                    resolution=request.resolution,
+                    source_scope_contract_version=contract.version,
+                    constraint_id=target.id,
+                    report_mode="withheld",
+                    details={"supplementary_queries": list(queries)},
+                )
+                try:
+                    self._store.save_scope_contract_with_audit_event(next_contract, event)
+                except ValueError:
+                    replay = _find_coverage_resolution_replay(
+                        store=self._store,
+                        workflow_run_id=workflow_run_id,
+                        contracts=self._store.list_scope_contracts(workflow_run_id),
+                        snapshot=snapshot,
+                        request=request,
+                    )
+                    if replay is None:
+                        raise
+                    next_contract, event = replay
+                return _coverage_resolution_result(
+                    contract=next_contract, snapshot=snapshot, event=event
+                )
+
+            if request.supplementary_queries:
+                raise ContentResearchValidationError(
+                    "Constraint relaxation does not accept supplementary queries"
+                )
+            relaxed_constraints = tuple(
+                replace(item, mode="preferred") if item.id == target.id else item
+                for item in contract.constraints
+            )
+            required_values = tuple(
+                item.value for item in relaxed_constraints if item.mode == "required"
+            )
+            next_contract = build_scope_contract(
+                workflow_run_id=workflow_run_id,
+                research_plan_id=contract.research_plan_id,
+                version=contract.version + 1,
+                constraints=relaxed_constraints,
+                query_groups=tuple(
+                    ScopeQueryGroupInput(
+                        group.suggested_query,
+                        group.final_query,
+                        tuple(value for value in required_values if value in group.final_query),
+                    )
+                    for group in contract.query_groups
+                ),
+            )
+            event = _coverage_resolution_event(
+                contract=next_contract,
+                snapshot=snapshot,
+                resolution=request.resolution,
+                source_scope_contract_version=contract.version,
+                constraint_id=target.id,
+                report_mode="withheld",
+                details={"previous_mode": "required", "new_mode": "preferred"},
+            )
+            try:
+                self._store.save_scope_contract_with_audit_event(next_contract, event)
+            except ValueError:
+                replay = _find_coverage_resolution_replay(
+                    store=self._store,
+                    workflow_run_id=workflow_run_id,
+                    contracts=self._store.list_scope_contracts(workflow_run_id),
+                    snapshot=snapshot,
+                    request=request,
+                )
+                if replay is None:
+                    raise
+                next_contract, event = replay
+            return _coverage_resolution_result(
+                contract=next_contract, snapshot=snapshot, event=event
+            )
+
+        if request.constraint_id is not None or request.supplementary_queries:
+            raise ContentResearchValidationError(
+                "Limited-report resolution does not accept constraint changes or queries"
+            )
+
+        event = ScopeAuditEvent(
+            id="sae_"
+            + canonical_fingerprint(
+                {
+                    "scope_contract_id": contract.id,
+                    "coverage_snapshot_id": snapshot.id,
+                    "resolution": request.resolution,
+                }
+            )[:24],
+            workflow_run_id=workflow_run_id,
+            scope_contract_id=contract.id,
+            scope_contract_version=contract.version,
+            event_name="coverage_resolved",
+            payload={
+                "schema_version": "content_research_scope_audit_event_v1",
+                "coverage_snapshot_id": snapshot.id,
+                "resolution": request.resolution,
+                "source_scope_contract_version": contract.version,
+                "resulting_scope_contract_version": contract.version,
+                "report_mode": "limited",
+                "unmet_constraint_ids": list(snapshot.unmet_constraint_ids),
+                "constraint_counts": snapshot.constraint_counts,
+            },
+        )
+        try:
+            self._store.append_scope_audit_event(event)
+        except ValueError:
+            replay = _find_coverage_resolution_replay(
+                store=self._store,
+                workflow_run_id=workflow_run_id,
+                contracts=self._store.list_scope_contracts(workflow_run_id),
+                snapshot=snapshot,
+                request=request,
+            )
+            if replay is None:
+                raise
+            contract, event = replay
+        return _coverage_resolution_result(
+            contract=contract, snapshot=snapshot, event=event
+        )
+
     async def run_workflow_action(
         self,
         *,
@@ -2796,6 +3011,19 @@ class ContentResearchService:
                 action=action,
                 status="completed",
                 result=confirmed,
+                local_cache_id=brief.id,
+            )
+
+        if action == "resolve_coverage":
+            resolved = self._resolve_coverage(
+                workflow_run_id=workflow_run_id,
+                request=ResolveCoverageRequest(**request.payload),
+            )
+            return self._action_response(
+                workflow_run_id=workflow_run_id,
+                action=action,
+                status="completed",
+                result=resolved,
                 local_cache_id=brief.id,
             )
 
@@ -3784,7 +4012,23 @@ class ContentResearchService:
             return
 
         scope_coverage = self._persist_scope_coverage(brief.workflow_run_id)
-        if scope_coverage is not None and scope_coverage.state == "awaiting_scope_decision":
+        limited_report_authorized = (
+            scope_coverage is not None
+            and any(
+                event.event_name == "coverage_resolved"
+                and event.payload.get("coverage_snapshot_id") == scope_coverage.id
+                and event.payload.get("resolution") == "generate_limited_report"
+                for event in self._store.list_scope_audit_events(
+                    brief.workflow_run_id,
+                    version=scope_coverage.scope_contract_version,
+                )
+            )
+        )
+        if (
+            scope_coverage is not None
+            and scope_coverage.state == "awaiting_scope_decision"
+            and not limited_report_authorized
+        ):
             await self._workflow_runtime.wait_for_user_recovery(
                 workflow_run_id=brief.workflow_run_id,
                 reason={
@@ -4956,6 +5200,94 @@ def _scope_audit_payload(event: ScopeAuditEvent) -> dict[str, Any]:
         "scope_contract_version": event.scope_contract_version,
         "event_name": event.event_name, "payload": event.payload,
         "created_at": event.created_at.isoformat(),
+    }
+
+
+def _coverage_resolution_event(
+    *,
+    contract: Any,
+    snapshot: Any,
+    resolution: str,
+    source_scope_contract_version: int,
+    constraint_id: str,
+    report_mode: str,
+    details: dict[str, Any],
+) -> ScopeAuditEvent:
+    payload = {
+        "schema_version": "content_research_scope_audit_event_v1",
+        "coverage_snapshot_id": snapshot.id,
+        "resolution": resolution,
+        "constraint_id": constraint_id,
+        "source_scope_contract_version": source_scope_contract_version,
+        "resulting_scope_contract_version": contract.version,
+        "report_mode": report_mode,
+        "unmet_constraint_ids": list(snapshot.unmet_constraint_ids),
+        "constraint_counts": snapshot.constraint_counts,
+        **details,
+    }
+    return ScopeAuditEvent(
+        id="sae_"
+        + canonical_fingerprint(
+            {
+                "scope_contract_id": contract.id,
+                "coverage_snapshot_id": snapshot.id,
+                "resolution": resolution,
+            }
+        )[:24],
+        workflow_run_id=contract.workflow_run_id,
+        scope_contract_id=contract.id,
+        scope_contract_version=contract.version,
+        event_name="coverage_resolved",
+        payload=payload,
+    )
+
+
+def _find_coverage_resolution_replay(
+    *,
+    store: Any,
+    workflow_run_id: str,
+    contracts: list[Any],
+    snapshot: Any,
+    request: ResolveCoverageRequest,
+) -> tuple[Any, ScopeAuditEvent] | None:
+    requested_queries = [
+        query.strip() for query in request.supplementary_queries if query.strip()
+    ]
+    for candidate in contracts:
+        for event in store.list_scope_audit_events(
+            workflow_run_id, version=candidate.version
+        ):
+            payload = event.payload
+            if (
+                event.event_name != "coverage_resolved"
+                or payload.get("coverage_snapshot_id") != snapshot.id
+                or payload.get("source_scope_contract_version")
+                != request.scope_contract_version
+                or payload.get("resolution") != request.resolution
+                or payload.get("constraint_id") != request.constraint_id
+                or list(payload.get("supplementary_queries") or [])
+                != requested_queries
+            ):
+                continue
+            resulting_version = int(
+                payload.get("resulting_scope_contract_version") or 0
+            )
+            result_contract = store.get_scope_contract(
+                workflow_run_id, version=resulting_version
+            )
+            if result_contract is not None:
+                return result_contract, event
+    return None
+
+
+def _coverage_resolution_result(
+    *, contract: Any, snapshot: Any, event: ScopeAuditEvent
+) -> dict[str, Any]:
+    return {
+        "report_mode": str(event.payload.get("report_mode") or "withheld"),
+        "scope_contract": _scope_contract_payload(contract),
+        "unmet_constraint_ids": list(snapshot.unmet_constraint_ids),
+        "audit_event": _scope_audit_payload(event),
     }
 
 
