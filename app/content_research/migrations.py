@@ -545,12 +545,26 @@ CREATE TABLE content_research_scope_draft_audit_events (
 """
 
 
+_V22_SCOPE_DRAFT_CONFIRMATION_SQL = """
+CREATE TABLE content_research_scope_draft_confirmations (
+    scope_draft_id TEXT PRIMARY KEY,
+    scope_contract_id TEXT NOT NULL UNIQUE,
+    workflow_run_id TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+"""
+
+
 def _apply_0020(conn: sqlite3.Connection) -> None:
     conn.executescript(_V20_SCOPE_COVERAGE_SQL)
 
 
 def _apply_0021(conn: sqlite3.Connection) -> None:
     conn.executescript(_V21_SCOPE_DRAFT_SQL)
+
+
+def _apply_0022(conn: sqlite3.Connection) -> None:
+    conn.executescript(_V22_SCOPE_DRAFT_CONFIRMATION_SQL)
 
 
 def _apply_0015(conn: sqlite3.Connection) -> None:
@@ -609,6 +623,7 @@ def _expected_checksums(migration_0002_sql: str, legacy_checksum: str) -> dict[s
         "0019": hashlib.sha256(_V19_SCOPE_CONTRACT_SQL.encode("utf-8")).hexdigest(),
         "0020": hashlib.sha256(_V20_SCOPE_COVERAGE_SQL.encode("utf-8")).hexdigest(),
         "0021": hashlib.sha256(_V21_SCOPE_DRAFT_SQL.encode("utf-8")).hexdigest(),
+        "0022": hashlib.sha256(_V22_SCOPE_DRAFT_CONFIRMATION_SQL.encode("utf-8")).hexdigest(),
     }
 
 
@@ -835,6 +850,13 @@ def apply_content_research_migrations(
                 name="lite_scope_drafts",
                 checksum=expected_checksums["0021"],
                 apply=lambda: _apply_0021(conn),
+            )
+            _apply_migration(
+                conn,
+                version="0022",
+                name="lite_scope_draft_confirmations",
+                checksum=expected_checksums["0022"],
+                apply=lambda: _apply_0022(conn),
             )
         except Exception:
             conn.rollback()

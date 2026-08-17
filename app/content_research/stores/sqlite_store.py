@@ -49,6 +49,7 @@ from app.content_research.scope_contract import (
     ScopeAuditEvent,
     ScopeConstraint,
     ScopeDraftAuditEvent,
+    ScopeDraftConfirmation,
     ScopeQueryGroup,
     ScopeQueryGroupInput,
 )
@@ -487,6 +488,73 @@ class SQLiteContentResearchStore:
                 "SELECT * FROM content_research_scope_drafts WHERE id = ?", (scope_draft_id,)
             ).fetchone()
         return self._row_to_scope_draft(row) if row else None
+
+    def confirm_scope_atomically(
+        self, draft_id: str, contract: ResearchScopeContract, event: ScopeAuditEvent
+    ) -> tuple[ResearchScopeContract, bool]:
+        _validate_payload("ScopeAuditEvent", event.payload)
+        if (
+            event.workflow_run_id != contract.workflow_run_id
+            or event.scope_contract_id != contract.id
+            or event.scope_contract_version != contract.version
+        ):
+            raise ValueError("scope audit event must reference the contract being confirmed")
+
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            confirmation = conn.execute(
+                """SELECT scope_contract_id FROM content_research_scope_draft_confirmations
+                   WHERE scope_draft_id = ?""",
+                (draft_id,),
+            ).fetchone()
+            if confirmation is not None:
+                contract_row = conn.execute(
+                    "SELECT * FROM content_research_scope_contracts WHERE id = ?",
+                    (confirmation["scope_contract_id"],),
+                ).fetchone()
+                if contract_row is None:
+                    raise RuntimeError("scope draft confirmation references a missing scope contract")
+                conn.commit()
+                return self._row_to_scope_contract(contract_row), False
+
+            draft_row = conn.execute(
+                "SELECT workflow_run_id, research_plan_id FROM content_research_scope_drafts WHERE id = ?",
+                (draft_id,),
+            ).fetchone()
+            if draft_row is None:
+                raise ValueError(f"scope draft does not exist: {draft_id}")
+            if (
+                draft_row["workflow_run_id"] != contract.workflow_run_id
+                or draft_row["research_plan_id"] != contract.research_plan_id
+            ):
+                raise ValueError("scope contract must match the persisted scope draft workflow and plan")
+
+            self._insert_scope_contract(conn, contract)
+            self._insert_scope_audit_event(conn, event)
+            confirmation_record = ScopeDraftConfirmation(
+                draft_id=draft_id,
+                scope_contract_id=contract.id,
+                workflow_run_id=contract.workflow_run_id,
+            )
+            conn.execute(
+                """INSERT INTO content_research_scope_draft_confirmations
+                   (scope_draft_id, scope_contract_id, workflow_run_id, created_at)
+                   VALUES (?, ?, ?, ?)""",
+                (
+                    confirmation_record.draft_id,
+                    confirmation_record.scope_contract_id,
+                    confirmation_record.workflow_run_id,
+                    _fmt_dt(confirmation_record.created_at),
+                ),
+            )
+            conn.commit()
+            return contract, True
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     def save_scope_contract(self, contract: ResearchScopeContract) -> ResearchScopeContract:
         try:

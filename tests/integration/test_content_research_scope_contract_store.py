@@ -167,3 +167,90 @@ def test_contract_rolls_back_when_atomic_confirmation_event_insert_fails(tmp_pat
         store.save_scope_contract_with_audit_event(contract, duplicate_event)
 
     assert store.get_scope_contract(contract.workflow_run_id, version=1) is None
+
+
+def test_scope_draft_confirmation_is_idempotent_and_persists_a_single_contract(tmp_path) -> None:
+    store = SQLiteContentResearchStore(str(tmp_path / "scope-confirmation.db"))
+    contract_v1 = _contract(version=1)
+    draft = build_scope_draft(
+        workflow_run_id=contract_v1.workflow_run_id,
+        research_plan_id=contract_v1.research_plan_id,
+        structure_hash="structure_hash_1",
+        constraints=contract_v1.constraints,
+        query_groups=(ScopeQueryGroupInput("夏季 长袖衬衫 通勤", "夏季 长袖衬衫 通勤"),),
+    )
+    store.save_scope_draft_with_audit_event(
+        draft,
+        ScopeDraftAuditEvent(
+            id="sda_confirmed",
+            workflow_run_id=draft.workflow_run_id,
+            scope_draft_id=draft.id,
+            event_name="scope_suggested",
+            payload={"schema_version": "content_research_scope_audit_event_v1"},
+        ),
+    )
+    event_v1 = ScopeAuditEvent(
+        id="sca_confirmed_v1",
+        workflow_run_id=contract_v1.workflow_run_id,
+        scope_contract_id=contract_v1.id,
+        scope_contract_version=contract_v1.version,
+        event_name="scope_confirmed",
+        payload={"schema_version": "content_research_scope_audit_event_v1"},
+    )
+
+    first, created = store.confirm_scope_atomically(draft.id, contract_v1, event_v1)
+    second, repeated = store.confirm_scope_atomically(draft.id, contract_v1, event_v1)
+
+    assert created is True
+    assert repeated is False
+    assert second == first
+    assert store.list_scope_contracts(draft.workflow_run_id) == [first]
+    assert store.list_scope_audit_events(draft.workflow_run_id, version=1) == [event_v1]
+
+
+def test_conflicting_scope_draft_repeat_does_not_create_a_second_contract(tmp_path) -> None:
+    store = SQLiteContentResearchStore(str(tmp_path / "scope-confirmation-conflict.db"))
+    contract_v1 = _contract(version=1)
+    contract_v2 = _contract(version=2)
+    draft = build_scope_draft(
+        workflow_run_id=contract_v1.workflow_run_id,
+        research_plan_id=contract_v1.research_plan_id,
+        structure_hash="structure_hash_1",
+        constraints=contract_v1.constraints,
+        query_groups=(ScopeQueryGroupInput("夏季 长袖衬衫 通勤", "夏季 长袖衬衫 通勤"),),
+    )
+    store.save_scope_draft_with_audit_event(
+        draft,
+        ScopeDraftAuditEvent(
+            id="sda_conflict",
+            workflow_run_id=draft.workflow_run_id,
+            scope_draft_id=draft.id,
+            event_name="scope_suggested",
+            payload={"schema_version": "content_research_scope_audit_event_v1"},
+        ),
+    )
+    event_v1 = ScopeAuditEvent(
+        id="sca_conflict_v1",
+        workflow_run_id=contract_v1.workflow_run_id,
+        scope_contract_id=contract_v1.id,
+        scope_contract_version=contract_v1.version,
+        event_name="scope_confirmed",
+        payload={"schema_version": "content_research_scope_audit_event_v1"},
+    )
+    event_v2 = ScopeAuditEvent(
+        id="sca_conflict_v2",
+        workflow_run_id=contract_v2.workflow_run_id,
+        scope_contract_id=contract_v2.id,
+        scope_contract_version=contract_v2.version,
+        event_name="scope_confirmed",
+        payload={"schema_version": "content_research_scope_audit_event_v1"},
+    )
+
+    first, created = store.confirm_scope_atomically(draft.id, contract_v1, event_v1)
+    repeated, created_again = store.confirm_scope_atomically(draft.id, contract_v2, event_v2)
+
+    assert created is True
+    assert created_again is False
+    assert repeated == first
+    assert store.list_scope_contracts(draft.workflow_run_id) == [first]
+    assert store.get_scope_contract(draft.workflow_run_id, version=2) is None

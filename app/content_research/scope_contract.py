@@ -65,6 +65,18 @@ class ResearchScopeDraft:
 
 
 @dataclass(frozen=True)
+class ScopeDraftConfirmation:
+    draft_id: str
+    scope_contract_id: str
+    workflow_run_id: str
+    created_at: datetime = field(default_factory=utcnow)
+
+    def __post_init__(self) -> None:
+        if not all((self.draft_id.strip(), self.scope_contract_id.strip(), self.workflow_run_id.strip())):
+            raise ValueError("scope draft confirmation identity is required")
+
+
+@dataclass(frozen=True)
 class ScopeDraftAuditEvent:
     id: str
     workflow_run_id: str
