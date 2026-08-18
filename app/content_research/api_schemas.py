@@ -165,13 +165,17 @@ class ContentResearchWorkflowEventsResponse(BaseModel):
 
 
 class ContentResearchScopeProjectionResponse(BaseModel):
-    """Minimal durable projection of a workflow's confirmed Scope facts."""
+    """Read-only durable projection of a workflow's Scope authority."""
 
     schema_version: str = CONTENT_RESEARCH_API_SCHEMA_VERSION
     workflow_run_id: str
+    state: Literal["awaiting_confirmation", "confirmed", "superseded"]
     draft: dict
-    scope_contract: dict
+    scope_contract: dict | None = None
     audit_events: list[dict] = Field(default_factory=list)
+    allowed_actions: list[dict] = Field(default_factory=list)
+    coverage_snapshot: dict | None = None
+    allowed_resolutions: list[dict] = Field(default_factory=list)
 
 
 class ContentResearchTraceResponse(BaseModel):

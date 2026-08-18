@@ -125,8 +125,7 @@ async def _confirmed_scope_with_unmet_season(client: httpx.AsyncClient) -> tuple
                 "scope_draft_id": scope["id"],
                 "structure_hash": scope["structure_hash"],
                 "query_groups": [
-                    {"final_query": group["final_query"]}
-                    for group in scope["query_groups"]
+                    {"final_query": group["final_query"]} for group in scope["query_groups"]
                 ],
             },
         },
@@ -247,9 +246,7 @@ async def test_generate_limited_report_resolution_preserves_v1_and_exact_season_
 async def test_limited_continuation_reaches_report_execution_without_source_tasks(
     scope_client, monkeypatch
 ):
-    workflow_run_id, _contract_v1 = await _confirmed_scope_with_unmet_season(
-        scope_client
-    )
+    workflow_run_id, _contract_v1 = await _confirmed_scope_with_unmet_season(scope_client)
     response = await scope_client.post(
         f"/content-research/workflows/{workflow_run_id}/actions",
         json={
@@ -324,9 +321,7 @@ async def test_expand_required_constraint_retains_v1_and_authorizes_collection(
 async def test_supplementary_continuation_executes_only_its_authorized_task(
     scope_client, monkeypatch
 ):
-    workflow_run_id, _contract_v1 = await _confirmed_scope_with_unmet_season(
-        scope_client
-    )
+    workflow_run_id, _contract_v1 = await _confirmed_scope_with_unmet_season(scope_client)
     response = await scope_client.post(
         f"/content-research/workflows/{workflow_run_id}/actions",
         json={
@@ -389,9 +384,10 @@ async def test_relax_constraint_creates_v2_and_keeps_v1_required(scope_client):
     result = response.json()["result"]
     contract_v2 = result["scope_contract"]
     assert contract_v2["version"] == 2
-    assert next(item for item in contract_v2["constraints"] if item["id"] == "season")[
-        "mode"
-    ] == "preferred"
+    assert (
+        next(item for item in contract_v2["constraints"] if item["id"] == "season")["mode"]
+        == "preferred"
+    )
     assert result["audit_event"]["payload"]["resolution"] == "relax_constraint"
     store = app.state.content_research_service._store
     persisted_v1 = store.get_scope_contract(workflow_run_id, version=1)
@@ -444,9 +440,7 @@ async def test_resolve_coverage_rejects_unknown_outcome_without_writing(scope_cl
         },
     ],
 )
-async def test_versioned_coverage_resolution_replays_after_lost_response(
-    scope_client, payload
-):
+async def test_versioned_coverage_resolution_replays_after_lost_response(scope_client, payload):
     """Removing persisted-command replay must make this test fail."""
     workflow_run_id, _contract_v1 = await _confirmed_scope_with_unmet_season(scope_client)
     endpoint = f"/content-research/workflows/{workflow_run_id}/actions"
@@ -463,19 +457,24 @@ async def test_versioned_coverage_resolution_replays_after_lost_response(
     assert replay.json()["result"] == first.json()["result"]
     store = app.state.content_research_service._store
     expected_versions = [1, 2] if payload["resolution"] == "relax_constraint" else [1]
-    assert [contract.version for contract in store.list_scope_contracts(workflow_run_id)] == expected_versions
+    assert [
+        contract.version for contract in store.list_scope_contracts(workflow_run_id)
+    ] == expected_versions
     assert len(store.list_scope_execution_authorizations(workflow_run_id)) == 1
     assert len(store.list_scope_execution_continuations(workflow_run_id)) == 1
     resulting_version = 2 if payload["resolution"] == "relax_constraint" else 1
-    assert len(
-        [
-            event
-            for event in store.list_scope_audit_events(
-                workflow_run_id, version=resulting_version
-            )
-            if event.event_name == "coverage_resolved"
-        ]
-    ) == 1
+    assert (
+        len(
+            [
+                event
+                for event in store.list_scope_audit_events(
+                    workflow_run_id, version=resulting_version
+                )
+                if event.event_name == "coverage_resolved"
+            ]
+        )
+        == 1
+    )
 
 
 @pytest.mark.asyncio
@@ -525,25 +524,24 @@ async def test_limited_resolution_reconciles_competing_atomic_calls(scope_client
         },
     }
     first, second = await asyncio.gather(
-        scope_client.post(
-            f"/content-research/workflows/{workflow_run_id}/actions", json=request
-        ),
-        scope_client.post(
-            f"/content-research/workflows/{workflow_run_id}/actions", json=request
-        ),
+        scope_client.post(f"/content-research/workflows/{workflow_run_id}/actions", json=request),
+        scope_client.post(f"/content-research/workflows/{workflow_run_id}/actions", json=request),
     )
 
     assert first.status_code == second.status_code == 200
     assert first.json()["result"] == second.json()["result"]
     assert len(store.list_scope_execution_authorizations(workflow_run_id)) == 1
     assert len(store.list_scope_execution_continuations(workflow_run_id)) == 1
-    assert len(
-        [
-            event
-            for event in store.list_scope_audit_events(workflow_run_id, version=1)
-            if event.event_name == "coverage_resolved"
-        ]
-    ) == 1
+    assert (
+        len(
+            [
+                event
+                for event in store.list_scope_audit_events(workflow_run_id, version=1)
+                if event.event_name == "coverage_resolved"
+            ]
+        )
+        == 1
+    )
 
 
 @pytest.mark.asyncio
@@ -603,9 +601,7 @@ async def test_confirm_scope_keeps_arbitrary_user_query_and_persists_matching_au
             "payload": {
                 "scope_draft_id": scope["id"],
                 "structure_hash": scope["structure_hash"],
-                "query_groups": [
-                    {"final_query": final_query} for final_query in final_queries
-                ],
+                "query_groups": [{"final_query": final_query} for final_query in final_queries],
             },
         },
     )
@@ -615,14 +611,13 @@ async def test_confirm_scope_keeps_arbitrary_user_query_and_persists_matching_au
     store = app.state.content_research_service._store
     persisted_draft = store.get_scope_draft(scope["id"])
     assert persisted_draft is not None
-    persisted_contract = store.get_scope_contract(
-        workflow_run_id, version=contract["version"]
-    )
+    persisted_contract = store.get_scope_contract(workflow_run_id, version=contract["version"])
     assert persisted_contract is not None
     assert contract["constraints"] == scope["constraints"]
-    assert contract["query_groups"][0]["suggested_query"] == scope["query_groups"][0][
-        "suggested_query"
-    ]
+    assert (
+        contract["query_groups"][0]["suggested_query"]
+        == scope["query_groups"][0]["suggested_query"]
+    )
     assert contract["query_groups"][0]["final_query"] == "白衬衫通勤穿搭"
     assert contract["query_groups"][0]["origin"] == "user_edited"
     assert contract["query_groups"][0]["execution_role"] == "exploratory"
@@ -641,9 +636,7 @@ async def test_confirm_scope_keeps_arbitrary_user_query_and_persists_matching_au
         "final_query": "白衬衫通勤穿搭",
         "changed": True,
     }
-    persisted_events = store.list_scope_audit_events(
-        workflow_run_id, version=contract["version"]
-    )
+    persisted_events = store.list_scope_audit_events(workflow_run_id, version=contract["version"])
     assert len(persisted_events) == 1
     assert persisted_events[0].id == audit_event["id"]
     assert persisted_events[0].payload == audit_event["payload"]
@@ -667,8 +660,7 @@ async def test_confirm_scope_rejects_stale_structure_hash(scope_client):
                 "scope_draft_id": scope["id"],
                 "structure_hash": "stale-structure-hash",
                 "query_groups": [
-                    {"final_query": group["final_query"]}
-                    for group in scope["query_groups"]
+                    {"final_query": group["final_query"]} for group in scope["query_groups"]
                 ],
             },
         },
@@ -737,9 +729,7 @@ async def test_confirm_scope_rejects_missing_final_query_edits(scope_client):
             "payload": {
                 "scope_draft_id": scope["id"],
                 "structure_hash": scope["structure_hash"],
-                "query_groups": [
-                    {"final_query": scope["query_groups"][0]["final_query"]}
-                ],
+                "query_groups": [{"final_query": scope["query_groups"][0]["final_query"]}],
             },
         },
     )
@@ -776,8 +766,7 @@ async def test_confirm_scope_rejects_draft_when_current_brief_structure_changed(
                 "scope_draft_id": scope["id"],
                 "structure_hash": scope["structure_hash"],
                 "query_groups": [
-                    {"final_query": group["final_query"]}
-                    for group in scope["query_groups"]
+                    {"final_query": group["final_query"]} for group in scope["query_groups"]
                 ],
             },
         },
@@ -789,7 +778,9 @@ async def test_confirm_scope_rejects_draft_when_current_brief_structure_changed(
 
 
 @pytest.mark.asyncio
-async def test_confirm_scope_rechecks_current_brief_inside_atomic_confirmation(scope_client, monkeypatch):
+async def test_confirm_scope_rechecks_current_brief_inside_atomic_confirmation(
+    scope_client, monkeypatch
+):
     workflow = await _scope_ready_workflow(scope_client)
     workflow_run_id = workflow["presearch"]["workflow_run_id"]
     prepared = await scope_client.post(
@@ -823,8 +814,7 @@ async def test_confirm_scope_rechecks_current_brief_inside_atomic_confirmation(s
                 "scope_draft_id": scope["id"],
                 "structure_hash": scope["structure_hash"],
                 "query_groups": [
-                    {"final_query": group["final_query"]}
-                    for group in scope["query_groups"]
+                    {"final_query": group["final_query"]} for group in scope["query_groups"]
                 ],
             },
         },
@@ -887,3 +877,147 @@ async def test_scope_projection_recovers_persisted_draft_contract_and_audits(sco
     )
     assert missing_version.status_code == 404
     assert missing_version.json()["error_code"] == "CONTENT_RESEARCH_PRESEARCH_NOT_FOUND"
+
+
+@pytest.mark.asyncio
+async def test_scope_projection_returns_pending_draft_with_confirm_command_without_writes(
+    scope_client,
+):
+    """Rejecting a persisted pending Draft or writing during its read must fail this test."""
+    workflow = await _scope_ready_workflow(scope_client)
+    workflow_run_id = workflow["presearch"]["workflow_run_id"]
+    prepared = await scope_client.post(
+        f"/content-research/workflows/{workflow_run_id}/actions",
+        json={"action": "prepare_scope", "payload": {"direction_id": "product_marketing"}},
+    )
+    assert prepared.status_code == 200
+    draft = prepared.json()["result"]["scope"]
+    store = app.state.content_research_service._store
+    before = {
+        "drafts": len([store.get_latest_scope_draft(workflow_run_id)]),
+        "contracts": len(store.list_scope_contracts(workflow_run_id)),
+        "draft_audits": len(
+            store.list_scope_draft_audit_events(workflow_run_id, scope_draft_id=draft["id"])
+        ),
+    }
+
+    response = await scope_client.get(f"/content-research/workflows/{workflow_run_id}/scope")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["state"] == "awaiting_confirmation"
+    assert body["draft"]["id"] == draft["id"]
+    assert body["scope_contract"] is None
+    assert [event["event_name"] for event in body["audit_events"]] == ["scope_suggested"]
+    assert body["allowed_actions"] == [
+        {
+            "action": "confirm_scope",
+            "available": True,
+            "scope_draft_id": draft["id"],
+            "structure_hash": draft["structure_hash"],
+            "query_groups": draft["query_groups"],
+        }
+    ]
+    assert body["coverage_snapshot"] is None
+    assert body["allowed_resolutions"] == []
+    after = {
+        "drafts": len([store.get_latest_scope_draft(workflow_run_id)]),
+        "contracts": len(store.list_scope_contracts(workflow_run_id)),
+        "draft_audits": len(
+            store.list_scope_draft_audit_events(workflow_run_id, scope_draft_id=draft["id"])
+        ),
+    }
+    assert after == before
+
+
+@pytest.mark.asyncio
+async def test_confirmed_scope_projection_includes_current_action_metadata(scope_client):
+    """Dropping explicit confirmed-state action metadata must fail this test."""
+    workflow_run_id, contract = await _confirmed_scope_with_unmet_season(scope_client)
+
+    response = await scope_client.get(f"/content-research/workflows/{workflow_run_id}/scope")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["state"] == "confirmed"
+    assert body["scope_contract"] == contract
+    assert body["allowed_actions"] == [
+        {
+            "action": "resolve_coverage",
+            "available": True,
+            "scope_contract_version": contract["version"],
+            "coverage_snapshot_id": "scv_api_unmet_season",
+        }
+    ]
+    assert body["coverage_snapshot"]["id"] == "scv_api_unmet_season"
+
+
+@pytest.mark.asyncio
+async def test_scope_projection_only_offers_required_constraint_resolutions(scope_client):
+    """Offering expansion for global-only shortfalls or the wrong constraint must fail."""
+    workflow_run_id, contract = await _confirmed_scope_with_unmet_season(scope_client)
+    store = app.state.content_research_service._store
+    global_only_snapshot = CoverageSnapshot(
+        id="scv_api_global_shortfall",
+        workflow_run_id=workflow_run_id,
+        scope_contract_id=contract["id"],
+        scope_contract_version=contract["version"],
+        state="awaiting_scope_decision",
+        constraint_counts={
+            "_summary": {
+                "minimum_samples": 9,
+                "minimum_independent_authors": 9,
+                "reason_codes": ["minimum_samples_unmet", "minimum_independent_authors_unmet"],
+            }
+        },
+        unmet_constraint_ids=(),
+        execution_revision=2,
+    )
+    store.save_coverage_snapshot(global_only_snapshot)
+
+    global_response = await scope_client.get(f"/content-research/workflows/{workflow_run_id}/scope")
+
+    assert global_response.status_code == 200
+    global_resolutions = {
+        item["action"]: item for item in global_response.json()["allowed_resolutions"]
+    }
+    assert global_resolutions["generate_limited_report"] == {
+        "action": "generate_limited_report",
+        "available": True,
+        "valid_constraint_ids": [],
+        "supplementary_queries_required": False,
+        "unavailable_reason": None,
+    }
+    for action in ("expand_required_constraint", "relax_constraint"):
+        assert global_resolutions[action] == {
+            "action": action,
+            "available": False,
+            "valid_constraint_ids": [],
+            "supplementary_queries_required": action == "expand_required_constraint",
+            "unavailable_reason": "no_unmet_required_constraints",
+        }
+
+    required_snapshot = store.get_coverage_snapshot(
+        workflow_run_id, version=contract["version"], execution_revision=1
+    )
+    assert required_snapshot is not None
+    store.save_coverage_snapshot(
+        replace(
+            required_snapshot,
+            id="scv_api_only_scenario",
+            execution_revision=3,
+            unmet_constraint_ids=("scenario",),
+        )
+    )
+    required_response = await scope_client.get(
+        f"/content-research/workflows/{workflow_run_id}/scope"
+    )
+
+    assert required_response.status_code == 200
+    required_resolutions = {
+        item["action"]: item for item in required_response.json()["allowed_resolutions"]
+    }
+    assert required_resolutions["expand_required_constraint"]["valid_constraint_ids"] == [
+        "scenario"
+    ]
+    assert required_resolutions["relax_constraint"]["valid_constraint_ids"] == ["scenario"]

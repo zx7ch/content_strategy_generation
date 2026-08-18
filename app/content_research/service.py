@@ -1011,9 +1011,7 @@ class ContentResearchService:
                 f"Content research workflow not found: {workflow_run_id}"
             )
         payload = brief.payload
-        if confirmation.subject_structure_hash != str(
-            payload.get("subject_structure_hash") or ""
-        ):
+        if confirmation.subject_structure_hash != str(payload.get("subject_structure_hash") or ""):
             raise ContentResearchValidationError("stale subject structure")
         if str(payload.get("status") or "") != "subject_needs_confirmation":
             raise ContentResearchValidationError(
@@ -1024,9 +1022,7 @@ class ContentResearchService:
         research_intent = _normalized_subject_term(confirmation.research_intent)
         contexts = _normalized_subject_contexts(confirmation.context_modifiers)
         if not core_object or not research_intent:
-            raise ContentResearchValidationError(
-                "core_object and research_intent are required"
-            )
+            raise ContentResearchValidationError("core_object and research_intent are required")
         if len(contexts) > 8:
             raise ContentResearchValidationError("at most 8 context modifiers are allowed")
         structure = SubjectStructure(
@@ -1072,9 +1068,7 @@ class ContentResearchService:
                     {
                         "structure_hash": payload.get("subject_structure_hash"),
                         "state": payload.get("subject_structure_state"),
-                        "reason_codes": list(
-                            payload.get("subject_structure_reason_codes") or []
-                        ),
+                        "reason_codes": list(payload.get("subject_structure_reason_codes") or []),
                     },
                 ],
             },
@@ -1207,9 +1201,7 @@ class ContentResearchService:
             "research_intents[0]",
             "context_modifiers",
         ]
-        persisted_fields = list(
-            brief.payload.get("subject_structure_user_confirmed_fields") or []
-        )
+        persisted_fields = list(brief.payload.get("subject_structure_user_confirmed_fields") or [])
         if all(field in persisted_fields for field in required_fields):
             return brief
 
@@ -1223,9 +1215,7 @@ class ContentResearchService:
         research_intent = _normalized_subject_term(submitted.research_intent)
         contexts = _normalized_subject_contexts(submitted.context_modifiers)
         if not core_object or not research_intent:
-            raise ContentResearchValidationError(
-                "core_object and research_intent are required"
-            )
+            raise ContentResearchValidationError("core_object and research_intent are required")
         if len(contexts) > 8:
             raise ContentResearchValidationError("at most 8 context modifiers are allowed")
         structure = SubjectStructure(
@@ -1234,8 +1224,7 @@ class ContentResearchService:
                 str(brief.payload.get("seed_text") or core_object)
             ),
             subject_type=str(
-                (brief.payload.get("subject_structure") or {}).get("subject_type")
-                or "unknown"
+                (brief.payload.get("subject_structure") or {}).get("subject_type") or "unknown"
             ),
             core_entities=(
                 SubjectEntity(
@@ -1276,18 +1265,15 @@ class ContentResearchService:
         plan_id = _new_id("rp")
         run_as_of_at = utcnow()
         frozen_structure = dict(brief.payload.get("subject_structure") or {})
-        confirmed_fields = list(
-            brief.payload.get("subject_structure_user_confirmed_fields") or []
-        )
+        confirmed_fields = list(brief.payload.get("subject_structure_user_confirmed_fields") or [])
         required_fields = {
             "core_entities[0]",
             "research_intents[0]",
             "context_modifiers",
         }
-        if (
-            brief.payload.get("subject_structure_authority") == "user_confirmed"
-            and required_fields.issubset(confirmed_fields)
-        ):
+        if brief.payload.get(
+            "subject_structure_authority"
+        ) == "user_confirmed" and required_fields.issubset(confirmed_fields):
             normalized_input = " ".join(
                 item
                 for item in (
@@ -1296,8 +1282,14 @@ class ContentResearchService:
                         for entity in frozen_structure.get("core_entities") or ()
                         if isinstance(entity, dict)
                     ),
-                    *(str(value).strip() for value in frozen_structure.get("research_intents") or ()),
-                    *(str(value).strip() for value in frozen_structure.get("context_modifiers") or ()),
+                    *(
+                        str(value).strip()
+                        for value in frozen_structure.get("research_intents") or ()
+                    ),
+                    *(
+                        str(value).strip()
+                        for value in frozen_structure.get("context_modifiers") or ()
+                    ),
                 )
                 if item
             )
@@ -1628,12 +1620,15 @@ class ContentResearchService:
             raise ContentResearchNotFoundError(
                 f"Scope draft not found for workflow: {workflow_run_id}"
             )
-        if version is None:
-            contracts = self._store.list_scope_contracts(workflow_run_id)
-            contract = contracts[-1] if contracts else None
-        else:
-            contract = self._store.get_scope_contract(workflow_run_id, version=version)
-        if contract is None:
+        contracts = self._store.list_scope_contracts(workflow_run_id)
+        contract = (
+            contracts[-1]
+            if version is None and contracts
+            else self._store.get_scope_contract(workflow_run_id, version=version)
+            if version is not None
+            else None
+        )
+        if contract is None and (version is not None or contracts):
             requested = str(version) if version is not None else "latest"
             raise ContentResearchNotFoundError(
                 f"Scope contract version {requested} not found for workflow: {workflow_run_id}"
@@ -1645,19 +1640,51 @@ class ContentResearchService:
                 workflow_run_id, scope_draft_id=draft.id
             )
         ]
-        audit_events.extend(
-            _scope_audit_payload(event)
-            for event in self._store.list_scope_audit_events(
-                workflow_run_id, version=contract.version
+        if contract is not None:
+            audit_events.extend(
+                _scope_audit_payload(event)
+                for event in self._store.list_scope_audit_events(
+                    workflow_run_id, version=contract.version
+                )
             )
+        coverage_snapshot = (
+            self._store.get_coverage_snapshot(workflow_run_id, version=contract.version)
+            if contract is not None
+            else None
+        )
+        is_superseded = contract is not None and contract.version != contracts[-1].version
+        authorizations = self._store.list_scope_execution_authorizations(workflow_run_id)
+        allowed_actions = _scope_projection_actions(
+            draft=draft,
+            contract=contract,
+            coverage_snapshot=coverage_snapshot,
+            authorizations=authorizations,
         )
         return ContentResearchScopeProjectionResponse(
             workflow_run_id=workflow_run_id,
+            state=(
+                "awaiting_confirmation"
+                if contract is None
+                else "superseded"
+                if is_superseded
+                else "confirmed"
+            ),
             draft=_scope_draft_payload(draft),
-            scope_contract=_scope_contract_payload(contract),
+            scope_contract=_scope_contract_payload(contract) if contract is not None else None,
             audit_events=sorted(
                 (safe_public_projection(event) for event in audit_events),
                 key=lambda event: (str(event["created_at"]), str(event["id"])),
+            ),
+            allowed_actions=allowed_actions,
+            coverage_snapshot=(
+                _coverage_snapshot_payload(coverage_snapshot)
+                if coverage_snapshot is not None
+                else None
+            ),
+            allowed_resolutions=_scope_projection_resolutions(
+                contract=contract,
+                coverage_snapshot=coverage_snapshot,
+                authorizations=authorizations,
             ),
         )
 
@@ -1949,9 +1976,7 @@ class ContentResearchService:
             "report": report.model_dump(mode="json"),
         }
 
-    async def repair_from_persisted_packets(
-        self, workflow_run_id: str
-    ) -> dict[str, Any]:
+    async def repair_from_persisted_packets(self, workflow_run_id: str) -> dict[str, Any]:
         """Offer packet-only recovery only for the eligible evidence-only report."""
         report = await self.get_lite_report(workflow_run_id=workflow_run_id)
         publication = report.publication
@@ -2062,9 +2087,7 @@ class ContentResearchService:
                 raise ContentResearchValidationError(
                     "Historical relevance revision produced an invalid subject structure"
                 )
-            subject_structure = subject_structure_payload(
-                outcome.checklist.subject_structure
-            )
+            subject_structure = subject_structure_payload(outcome.checklist.subject_structure)
 
         revised_relevance: dict[str, dict[str, Any]] = {}
         revised_contracts: dict[str, DirectionContract] = {}
@@ -2218,16 +2241,12 @@ class ContentResearchService:
             key=lambda item: (item.created_at, item.id),
         )
         conclusion_fingerprint = (
-            conclusion_checkpoints[-1].input_fingerprint
-            if conclusion_checkpoints
-            else None
+            conclusion_checkpoints[-1].input_fingerprint if conclusion_checkpoints else None
         )
         conclusion_candidates = {
             item.id: item
             for item in (
-                self._store.list_marketing_conclusion_candidates(
-                    workflow_run_id, plan_id
-                )
+                self._store.list_marketing_conclusion_candidates(workflow_run_id, plan_id)
                 if plan_id is not None
                 else []
             )
@@ -2235,9 +2254,7 @@ class ContentResearchService:
         conclusion_decisions = [
             item
             for item in (
-                self._store.list_marketing_conclusion_decisions(
-                    workflow_run_id, plan_id
-                )
+                self._store.list_marketing_conclusion_decisions(workflow_run_id, plan_id)
                 if plan_id is not None
                 else []
             )
@@ -2333,10 +2350,7 @@ class ContentResearchService:
             and all(item.status in {"completed", "partial_completed", "failed"} for item in tasks)
             else "pending"
         )
-        marketing_states = {
-            str(item.get("state") or "")
-            for item in marketing_conclusions
-        }
+        marketing_states = {str(item.get("state") or "") for item in marketing_conclusions}
         publication_state = (
             "partial_verified_report"
             if "selected" in marketing_states
@@ -2653,19 +2667,27 @@ class ContentResearchService:
     def _prepare_scope(self, *, brief: ResearchBriefRecord, direction_id: str) -> dict[str, Any]:
         plans = self._store.list_plans_for_brief(brief.id)
         if not plans:
-            raise ContentResearchValidationError("Cannot prepare scope before confirming the research brief")
+            raise ContentResearchValidationError(
+                "Cannot prepare scope before confirming the research brief"
+            )
         plan = plans[-1]
         direction_ids = {
             str(item.payload.get("direction_id") or "")
             for item in self._store.list_directions_for_plan(plan.id)
         }
         if direction_id not in direction_ids:
-            raise ContentResearchValidationError("Scope direction is not part of the confirmed research plan")
+            raise ContentResearchValidationError(
+                "Scope direction is not part of the confirmed research plan"
+            )
         structure_payload = dict(brief.payload.get("subject_structure") or {})
         normalized_input = " ".join(
             str(item).strip()
             for item in (
-                *(entry.get("canonical_name") for entry in structure_payload.get("core_entities") or () if isinstance(entry, dict)),
+                *(
+                    entry.get("canonical_name")
+                    for entry in structure_payload.get("core_entities") or ()
+                    if isinstance(entry, dict)
+                ),
                 *(structure_payload.get("research_intents") or ()),
                 *(structure_payload.get("context_modifiers") or ()),
             )
@@ -2673,41 +2695,64 @@ class ContentResearchService:
         )
         decision = parse_subject_structure(structure_payload, normalized_input=normalized_input)
         if decision.state != "confirmed" or decision.structure is None:
-            raise ContentResearchValidationError("Cannot prepare scope from an unconfirmed subject structure")
+            raise ContentResearchValidationError(
+                "Cannot prepare scope from an unconfirmed subject structure"
+            )
         structure = decision.structure
         core = structure.core_entities[0]
         constraints = [
-            ScopeConstraint("core_object", "核心对象", core.canonical_name, "required", tuple(
-                value for value in core.raw_mentions if value != core.canonical_name
-            ))
+            ScopeConstraint(
+                "core_object",
+                "核心对象",
+                core.canonical_name,
+                "required",
+                tuple(value for value in core.raw_mentions if value != core.canonical_name),
+            )
         ]
         required_terms = [core.canonical_name]
         for index, context in enumerate(structure.context_modifiers, start=1):
             constraint_id = "season" if _is_season_context(context) else f"context_{index}"
-            constraints.append(ScopeConstraint(
-                constraint_id, "季节" if constraint_id == "season" else "上下文", context, "required"
-            ))
+            constraints.append(
+                ScopeConstraint(
+                    constraint_id,
+                    "季节" if constraint_id == "season" else "上下文",
+                    context,
+                    "required",
+                )
+            )
             required_terms.append(context)
         if structure.research_intents:
-            constraints.append(ScopeConstraint("scenario", "研究场景", structure.research_intents[0], "required"))
+            constraints.append(
+                ScopeConstraint("scenario", "研究场景", structure.research_intents[0], "required")
+            )
             required_terms.append(structure.research_intents[0])
         full_query = " ".join(required_terms)
         intent_query = " ".join((core.canonical_name, *structure.research_intents[:1]))
         draft = build_scope_draft(
-            workflow_run_id=brief.workflow_run_id, research_plan_id=plan.id,
+            workflow_run_id=brief.workflow_run_id,
+            research_plan_id=plan.id,
             structure_hash=str(brief.payload.get("subject_structure_hash") or ""),
             constraints=tuple(constraints),
             query_groups=(
                 ScopeQueryGroupInput(full_query, full_query, tuple(required_terms)),
-                ScopeQueryGroupInput(core.canonical_name, core.canonical_name, (core.canonical_name,)),
-                ScopeQueryGroupInput(intent_query, intent_query, (core.canonical_name, *structure.research_intents[:1])),
+                ScopeQueryGroupInput(
+                    core.canonical_name, core.canonical_name, (core.canonical_name,)
+                ),
+                ScopeQueryGroupInput(
+                    intent_query,
+                    intent_query,
+                    (core.canonical_name, *structure.research_intents[:1]),
+                ),
             ),
         )
         event = ScopeDraftAuditEvent(
-            id=_new_id("sae"), workflow_run_id=brief.workflow_run_id, scope_draft_id=draft.id,
+            id=_new_id("sae"),
+            workflow_run_id=brief.workflow_run_id,
+            scope_draft_id=draft.id,
             event_name="scope_suggested",
             payload={
-                "schema_version": "content_research_scope_audit_event_v1", "scope_draft_id": draft.id,
+                "schema_version": "content_research_scope_audit_event_v1",
+                "scope_draft_id": draft.id,
                 "structure_hash": draft.structure_hash,
                 "constraints": [_scope_constraint_payload(item) for item in draft.constraints],
                 "query_groups": [_scope_query_input_payload(item) for item in draft.query_groups],
@@ -2716,7 +2761,9 @@ class ContentResearchService:
         self._store.save_scope_draft_with_audit_event(draft, event)
         return {**_scope_draft_payload(draft), "audit_event": _scope_draft_audit_payload(event)}
 
-    def _confirm_scope(self, *, workflow_run_id: str, request: ConfirmScopeRequest) -> dict[str, Any]:
+    def _confirm_scope(
+        self, *, workflow_run_id: str, request: ConfirmScopeRequest
+    ) -> dict[str, Any]:
         draft = self._store.get_scope_draft(request.scope_draft_id)
         if draft is None or draft.workflow_run_id != workflow_run_id:
             raise ContentResearchValidationError("Scope draft was not found for this workflow")
@@ -2734,7 +2781,10 @@ class ContentResearchService:
             final_queries=tuple(item.final_query for item in request.query_groups),
             event_id=_new_id("sae"),
         )
-        return {"scope_contract": _scope_contract_payload(contract), "audit_event": _scope_audit_payload(event)}
+        return {
+            "scope_contract": _scope_contract_payload(contract),
+            "audit_event": _scope_audit_payload(event),
+        }
 
     async def _resolve_coverage(
         self, *, workflow_run_id: str, request: ResolveCoverageRequest
@@ -2746,9 +2796,7 @@ class ContentResearchService:
             raise ContentResearchValidationError(
                 "Coverage resolution Scope Contract version was not found"
             )
-        snapshot = self._store.get_coverage_snapshot(
-            workflow_run_id, version=contract.version
-        )
+        snapshot = self._store.get_coverage_snapshot(workflow_run_id, version=contract.version)
         if snapshot is None or snapshot.state != "awaiting_scope_decision":
             raise ContentResearchValidationError(
                 "Coverage resolution requires persisted unmet coverage"
@@ -2788,8 +2836,7 @@ class ContentResearchService:
                     version=contract.version,
                     constraints=contract.constraints,
                     query_groups=tuple(
-                        ScopeQueryGroupInput(query, query, (target.value,))
-                        for query in queries
+                        ScopeQueryGroupInput(query, query, (target.value,)) for query in queries
                     ),
                 )
                 if any(
@@ -2844,9 +2891,7 @@ class ContentResearchService:
             details=details,
         )
         execution_revision = (
-            1
-            if successor_scope_contract is not None
-            else snapshot.execution_revision + 1
+            1 if successor_scope_contract is not None else snapshot.execution_revision + 1
         )
         authorization = ScopeExecutionAuthorization(
             id="sea_"
@@ -2928,9 +2973,7 @@ class ContentResearchService:
         the same action reuses that authorization and retries this idempotent
         wake instead of recording another decision.
         """
-        self._store.requeue_scope_execution_continuation(
-            continuation.authorization_id
-        )
+        self._store.requeue_scope_execution_continuation(continuation.authorization_id)
         if self._dispatch_wake_event is not None:
             self._dispatch_wake_event.set()
 
@@ -2988,9 +3031,7 @@ class ContentResearchService:
             )
 
         if action == "confirm_subject_structure":
-            confirmation = ContentResearchSubjectStructureConfirmationRequest(
-                **request.payload
-            )
+            confirmation = ContentResearchSubjectStructureConfirmationRequest(**request.payload)
             response = await self.confirm_subject_structure(
                 workflow_run_id=workflow_run_id,
                 confirmation=confirmation,
@@ -3113,8 +3154,7 @@ class ContentResearchService:
                     )
                 if (
                     runtime_status == "failed"
-                    and str(runtime_run.get("error_code") or "")
-                    == "report_publication_failed"
+                    and str(runtime_run.get("error_code") or "") == "report_publication_failed"
                 ):
                     formal_result = await self._retry_failed_report_publication(
                         workflow_run_id=workflow_run_id,
@@ -3131,9 +3171,7 @@ class ContentResearchService:
                     checkpoint.workflow_run_id == workflow_run_id
                     and checkpoint.stage_name == "marketing_conclusion"
                     and checkpoint.status == "waiting_user"
-                    for checkpoint in self._store.list_typed_records(
-                        StageCheckpointRecord
-                    )
+                    for checkpoint in self._store.list_typed_records(StageCheckpointRecord)
                 )
                 if runtime_status == "waiting_user":
                     child_task_ids = (
@@ -3142,9 +3180,7 @@ class ContentResearchService:
                         else self._requeue_recoverable_tasks(
                             workflow_run_id,
                             provider=source_request.provider,
-                            runtime_child_tasks=list(
-                                runtime_snapshot.get("child_tasks") or []
-                            ),
+                            runtime_child_tasks=list(runtime_snapshot.get("child_tasks") or []),
                         )
                     )
                     await self._workflow_runtime.restart_formal_research_step(
@@ -3233,9 +3269,7 @@ class ContentResearchService:
             status="completed",
             task_count=len(tasks),
             completed_task_count=sum(task.status == "completed" for task in tasks),
-            partial_completed_task_count=sum(
-                task.status == "partial_completed" for task in tasks
-            ),
+            partial_completed_task_count=sum(task.status == "partial_completed" for task in tasks),
             failed_tasks=[],
             provider=request.provider,
             source_kind=request.source_kind,
@@ -3300,18 +3334,13 @@ class ContentResearchService:
         snapshot = self._store.get_run_policy_snapshot_for_workflow(brief.workflow_run_id)
         effective_policy = dict(snapshot.effective_policy) if snapshot is not None else {}
         locked_plan = effective_policy.get("locked_query_plan")
-        directions = (
-            locked_plan.get("directions")
-            if isinstance(locked_plan, dict)
-            else None
-        )
+        directions = locked_plan.get("directions") if isinstance(locked_plan, dict) else None
         requested_directions_value = effective_policy.get("requested_direction_ids")
         if (
             not isinstance(requested_directions_value, list | tuple)
             or not requested_directions_value
             or any(
-                not isinstance(item, str) or not item.strip()
-                for item in requested_directions_value
+                not isinstance(item, str) or not item.strip() for item in requested_directions_value
             )
         ):
             raise ContentResearchValidationError(
@@ -3329,8 +3358,7 @@ class ContentResearchService:
         structure = brief.payload.get("subject_structure")
         if (
             brief.payload.get("subject_structure_state") != "confirmed"
-            or brief.payload.get("subject_structure_user_confirmed_fields")
-            != required_fields
+            or brief.payload.get("subject_structure_user_confirmed_fields") != required_fields
             or not isinstance(structure, dict)
         ):
             raise ContentResearchValidationError(
@@ -3345,9 +3373,7 @@ class ContentResearchService:
             )
         first_entity = core_entities[0] if core_entities else None
         core = _normalized_subject_term(
-            str(first_entity.get("canonical_name") or "")
-            if isinstance(first_entity, dict)
-            else ""
+            str(first_entity.get("canonical_name") or "") if isinstance(first_entity, dict) else ""
         )
         first_intent = _normalized_subject_term(
             str(research_intents[0] or "") if research_intents else ""
@@ -3367,11 +3393,7 @@ class ContentResearchService:
                 "Product marketing dispatch requires a valid locked query plan"
             )
         marketing_plan = directions.get("product_marketing")
-        groups = (
-            marketing_plan.get("query_groups")
-            if isinstance(marketing_plan, dict)
-            else None
-        )
+        groups = marketing_plan.get("query_groups") if isinstance(marketing_plan, dict) else None
         if not isinstance(groups, list):
             raise ContentResearchValidationError(
                 "Product marketing dispatch requires a valid locked query plan"
@@ -3809,9 +3831,7 @@ class ContentResearchService:
             or contracts[-1]
         )
         source_snapshot = (
-            self._store.get_coverage_snapshot_by_id(
-                execution_authorization.coverage_snapshot_id
-            )
+            self._store.get_coverage_snapshot_by_id(execution_authorization.coverage_snapshot_id)
             if execution_authorization is not None
             else None
         )
@@ -3856,9 +3876,7 @@ class ContentResearchService:
             {
                 **dict(packet.payload.get("field_projection") or {}),
                 "canonical_source_id": packet.canonical_source_id,
-                "retrieval_context": dict(
-                    packet.payload.get("retrieval_context") or {}
-                ),
+                "retrieval_context": dict(packet.payload.get("retrieval_context") or {}),
             }
             for packet in packets
         )
@@ -3920,13 +3938,9 @@ class ContentResearchService:
             source_snapshot=source_snapshot,
         )
 
-    async def execute_scope_continuation(
-        self, continuation: ScopeExecutionContinuation
-    ) -> None:
+    async def execute_scope_continuation(self, continuation: ScopeExecutionContinuation) -> None:
         """Execute only the work owned by one persisted authorization command."""
-        authorization = self._store.get_scope_execution_authorization(
-            continuation.authorization_id
-        )
+        authorization = self._store.get_scope_execution_authorization(continuation.authorization_id)
         if authorization is None:
             raise ContentResearchValidationError(
                 "scope execution continuation authorization was not found"
@@ -3964,9 +3978,7 @@ class ContentResearchService:
         if runtime_status == "waiting_user" or (
             runtime_status == "running" and formal_step_status == "retrying"
         ):
-            restart = getattr(
-                self._workflow_runtime, "restart_formal_research_step", None
-            )
+            restart = getattr(self._workflow_runtime, "restart_formal_research_step", None)
             if callable(restart):
                 await restart(
                     workflow_run_id=continuation.workflow_run_id,
@@ -4005,22 +4017,23 @@ class ContentResearchService:
                 if str(task.metadata.get("scope_execution_authorization_id") or "")
                 == authorization.id
             ]
-            task_id = "crt_" + canonical_fingerprint(
-                {
-                    "authorization_id": authorization.id,
-                    "direction_id": "product_marketing",
-                    "attempt": len(prior_attempts) + 1,
-                }
-            )[:24]
+            task_id = (
+                "crt_"
+                + canonical_fingerprint(
+                    {
+                        "authorization_id": authorization.id,
+                        "direction_id": "product_marketing",
+                        "attempt": len(prior_attempts) + 1,
+                    }
+                )[:24]
+            )
             existing_task = self._store.get_subagent_task(task_id)
             if existing_task is None:
                 input_payload = dict(base_task.payload.get("input_payload") or {})
                 input_payload["scope_execution"] = {
                     "authorization_id": authorization.id,
                     "execution_revision": authorization.execution_revision,
-                    "supplementary_queries": list(
-                        continuation.supplementary_queries
-                    ),
+                    "supplementary_queries": list(continuation.supplementary_queries),
                 }
                 payload = {
                     **base_task.payload,
@@ -4077,9 +4090,7 @@ class ContentResearchService:
             task
             for task in tasks
             if task.status in {"queued", "pending", "failed"}
-            and (
-                executable_task_ids is None or task.id in executable_task_ids
-            )
+            and (executable_task_ids is None or task.id in executable_task_ids)
         ]
         workflow_traces = self._store.list_traces_for_workflow(brief.workflow_run_id)
         trace_id = workflow_traces[0].id if workflow_traces else None
@@ -4254,15 +4265,12 @@ class ContentResearchService:
             brief.workflow_run_id,
             execution_authorization=execution_authorization,
         )
-        limited_report_authorized = (
-            scope_coverage is not None
-            and any(
-                authorization.coverage_snapshot_id == scope_coverage.id
-                and authorization.resolution == "generate_limited_report"
-                and authorization.state == "authorized_limited_report"
-                for authorization in self._store.list_scope_execution_authorizations(
-                    brief.workflow_run_id
-                )
+        limited_report_authorized = scope_coverage is not None and any(
+            authorization.coverage_snapshot_id == scope_coverage.id
+            and authorization.resolution == "generate_limited_report"
+            and authorization.state == "authorized_limited_report"
+            for authorization in self._store.list_scope_execution_authorizations(
+                brief.workflow_run_id
             )
         )
         if (
@@ -4304,9 +4312,7 @@ class ContentResearchService:
             ]
         )
 
-        run_policy = self._store.get_run_policy_snapshot_for_workflow(
-            brief.workflow_run_id
-        )
+        run_policy = self._store.get_run_policy_snapshot_for_workflow(brief.workflow_run_id)
         if run_policy is not None and isinstance(
             run_policy.effective_policy.get("marketing_conclusion_policy"), dict
         ):
@@ -4404,16 +4410,12 @@ class ContentResearchService:
             )
         candidates_by_id = {
             item.id: item
-            for item in self._store.list_claim_candidates(
-                workflow_run_id, "product_marketing"
-            )
+            for item in self._store.list_claim_candidates(workflow_run_id, "product_marketing")
         }
         admitted_claims = sorted(
             (
                 (decision, candidates_by_id[decision.claim_candidate_id])
-                for decision in self._store.list_typed_records(
-                    ClaimAdmissionDecisionRecord
-                )
+                for decision in self._store.list_typed_records(ClaimAdmissionDecisionRecord)
                 if decision.policy_snapshot_id == policy.id
                 and decision.research_direction_id == "product_marketing"
                 and decision.decision == "admitted"
@@ -4467,9 +4469,7 @@ class ContentResearchService:
                     llm=self._analysis_llm,
                     llm_scope={
                         "llm_scope": {
-                            "workspace_id": str(
-                                brief.payload.get("workspace_id") or ""
-                            ),
+                            "workspace_id": str(brief.payload.get("workspace_id") or ""),
                             "user_id": str(brief.payload.get("user_id") or ""),
                         }
                     },
@@ -4495,9 +4495,7 @@ class ContentResearchService:
             )
         except (LLMProviderFailure, MarketingConclusionAnalysisError) as exc:
             failure_code = (
-                exc.code
-                if isinstance(exc, LLMProviderFailure)
-                else "llm_protocol_incompatible"
+                exc.code if isinstance(exc, LLMProviderFailure) else "llm_protocol_incompatible"
             )
             failure_payload = {
                 "schema_version": "content_research_marketing_conclusion_checkpoint_v1",
@@ -4566,8 +4564,7 @@ class ContentResearchService:
             self._store.save_marketing_conclusion_candidate(candidate)
         for track, track_evaluation in evaluation.tracks.items():
             additional_qualified_count = sum(
-                outcome.track == track
-                and outcome.candidate_id != track_evaluation.candidate_id
+                outcome.track == track and outcome.candidate_id != track_evaluation.candidate_id
                 for outcome in evaluation.catalog
             )
             decision_id = f"mcd_{canonical_fingerprint({'input': fingerprint, 'track': track, 'state': track_evaluation.state})[:24]}"
@@ -4646,15 +4643,12 @@ class ContentResearchService:
         matching_snapshot_ids = {
             item.id
             for item in self._store.list_result_snapshots_for_workflow(workflow_run_id)
-            if item.metadata.get("governed_input_fingerprint")
-            == governed_input_fingerprint
+            if item.metadata.get("governed_input_fingerprint") == governed_input_fingerprint
         }
         existing_publication = next(
             (
                 item
-                for item in reversed(
-                    self._store.list_typed_records(ReportPublicationRecord)
-                )
+                for item in reversed(self._store.list_typed_records(ReportPublicationRecord))
                 if item.workflow_run_id == workflow_run_id
                 and item.research_plan_id == plans[-1].id
                 and item.governed_snapshot_id in matching_snapshot_ids
@@ -5163,7 +5157,9 @@ def _normalized_subject_term(value: str) -> str:
 
 
 def _normalized_subject_contexts(value: str | list[str]) -> list[str]:
-    raw_values = value.replace("、", ",").replace("，", ",").split(",") if isinstance(value, str) else value
+    raw_values = (
+        value.replace("、", ",").replace("，", ",").split(",") if isinstance(value, str) else value
+    )
     contexts: list[str] = []
     seen: set[str] = set()
     for raw in raw_values:
@@ -5386,29 +5382,38 @@ def _is_season_context(value: str) -> bool:
 
 def _scope_constraint_payload(item: ScopeConstraint) -> dict[str, Any]:
     return {
-        "id": item.id, "label": item.label, "value": item.value, "mode": item.mode,
+        "id": item.id,
+        "label": item.label,
+        "value": item.value,
+        "mode": item.mode,
         "allowed_aliases": list(item.allowed_aliases),
     }
 
 
 def _scope_query_input_payload(item: ScopeQueryGroupInput) -> dict[str, Any]:
     return {
-        "suggested_query": item.suggested_query, "final_query": item.final_query,
+        "suggested_query": item.suggested_query,
+        "final_query": item.final_query,
         "targeted_required_terms": list(item.targeted_required_terms),
     }
 
 
 def _scope_query_group_payload(item: Any) -> dict[str, Any]:
     return {
-        "id": item.id, "suggested_query": item.suggested_query, "final_query": item.final_query,
-        "origin": item.origin, "execution_role": item.execution_role,
+        "id": item.id,
+        "suggested_query": item.suggested_query,
+        "final_query": item.final_query,
+        "origin": item.origin,
+        "execution_role": item.execution_role,
     }
 
 
 def _scope_draft_payload(draft: ResearchScopeDraft) -> dict[str, Any]:
     return {
-        "id": draft.id, "workflow_run_id": draft.workflow_run_id,
-        "research_plan_id": draft.research_plan_id, "structure_hash": draft.structure_hash,
+        "id": draft.id,
+        "workflow_run_id": draft.workflow_run_id,
+        "research_plan_id": draft.research_plan_id,
+        "structure_hash": draft.structure_hash,
         "constraints": [_scope_constraint_payload(item) for item in draft.constraints],
         "query_groups": [_scope_query_input_payload(item) for item in draft.query_groups],
         "created_at": draft.created_at.isoformat(),
@@ -5417,16 +5422,21 @@ def _scope_draft_payload(draft: ResearchScopeDraft) -> dict[str, Any]:
 
 def _scope_draft_audit_payload(event: ScopeDraftAuditEvent) -> dict[str, Any]:
     return {
-        "id": event.id, "workflow_run_id": event.workflow_run_id,
-        "scope_draft_id": event.scope_draft_id, "event_name": event.event_name,
-        "payload": event.payload, "created_at": event.created_at.isoformat(),
+        "id": event.id,
+        "workflow_run_id": event.workflow_run_id,
+        "scope_draft_id": event.scope_draft_id,
+        "event_name": event.event_name,
+        "payload": event.payload,
+        "created_at": event.created_at.isoformat(),
     }
 
 
 def _scope_contract_payload(contract: Any) -> dict[str, Any]:
     return {
-        "id": contract.id, "workflow_run_id": contract.workflow_run_id,
-        "research_plan_id": contract.research_plan_id, "version": contract.version,
+        "id": contract.id,
+        "workflow_run_id": contract.workflow_run_id,
+        "research_plan_id": contract.research_plan_id,
+        "version": contract.version,
         "schema_version": contract.schema_version,
         "constraints": [_scope_constraint_payload(item) for item in contract.constraints],
         "query_groups": [_scope_query_group_payload(item) for item in contract.query_groups],
@@ -5436,10 +5446,12 @@ def _scope_contract_payload(contract: Any) -> dict[str, Any]:
 
 def _scope_audit_payload(event: ScopeAuditEvent) -> dict[str, Any]:
     return {
-        "id": event.id, "workflow_run_id": event.workflow_run_id,
+        "id": event.id,
+        "workflow_run_id": event.workflow_run_id,
         "scope_contract_id": event.scope_contract_id,
         "scope_contract_version": event.scope_contract_version,
-        "event_name": event.event_name, "payload": event.payload,
+        "event_name": event.event_name,
+        "payload": event.payload,
         "created_at": event.created_at.isoformat(),
     }
 
@@ -5458,6 +5470,113 @@ def _scope_execution_authorization_payload(
         "state": authorization.state,
         "created_at": authorization.created_at.isoformat(),
     }
+
+
+def _coverage_snapshot_payload(snapshot: Any) -> dict[str, Any]:
+    return {
+        "id": snapshot.id,
+        "workflow_run_id": snapshot.workflow_run_id,
+        "scope_contract_id": snapshot.scope_contract_id,
+        "scope_contract_version": snapshot.scope_contract_version,
+        "execution_revision": snapshot.execution_revision,
+        "execution_authorization_id": snapshot.execution_authorization_id,
+        "source_coverage_snapshot_id": snapshot.source_coverage_snapshot_id,
+        "state": snapshot.state,
+        "constraint_counts": snapshot.constraint_counts,
+        "unmet_constraint_ids": list(snapshot.unmet_constraint_ids),
+        "created_at": snapshot.created_at.isoformat(),
+    }
+
+
+def _scope_projection_actions(
+    *,
+    draft: ResearchScopeDraft,
+    contract: Any | None,
+    coverage_snapshot: Any | None,
+    authorizations: list[ScopeExecutionAuthorization],
+) -> list[dict[str, Any]]:
+    if contract is None:
+        return [
+            {
+                "action": "confirm_scope",
+                "available": True,
+                "scope_draft_id": draft.id,
+                "structure_hash": draft.structure_hash,
+                "query_groups": [_scope_query_input_payload(item) for item in draft.query_groups],
+            }
+        ]
+    if (
+        coverage_snapshot is None
+        or coverage_snapshot.state != "awaiting_scope_decision"
+        or any(item.coverage_snapshot_id == coverage_snapshot.id for item in authorizations)
+    ):
+        return []
+    return [
+        {
+            "action": "resolve_coverage",
+            "available": True,
+            "scope_contract_version": contract.version,
+            "coverage_snapshot_id": coverage_snapshot.id,
+        }
+    ]
+
+
+def _scope_projection_resolutions(
+    *,
+    contract: Any | None,
+    coverage_snapshot: Any | None,
+    authorizations: list[ScopeExecutionAuthorization],
+) -> list[dict[str, Any]]:
+    if contract is None or coverage_snapshot is None:
+        return []
+    authorized = any(item.coverage_snapshot_id == coverage_snapshot.id for item in authorizations)
+    valid_constraint_ids = [
+        item.id
+        for item in contract.constraints
+        if item.id in coverage_snapshot.unmet_constraint_ids and item.mode == "required"
+    ]
+    decision_open = coverage_snapshot.state == "awaiting_scope_decision" and not authorized
+    no_required_constraint_reason = "no_unmet_required_constraints"
+    closed_reason = (
+        "coverage_resolution_already_authorized"
+        if authorized
+        else "coverage_resolution_not_required"
+    )
+    return [
+        {
+            "action": "expand_required_constraint",
+            "available": decision_open and bool(valid_constraint_ids),
+            "valid_constraint_ids": valid_constraint_ids if decision_open else [],
+            "supplementary_queries_required": True,
+            "unavailable_reason": (
+                None
+                if decision_open and valid_constraint_ids
+                else no_required_constraint_reason
+                if decision_open
+                else closed_reason
+            ),
+        },
+        {
+            "action": "generate_limited_report",
+            "available": decision_open,
+            "valid_constraint_ids": [],
+            "supplementary_queries_required": False,
+            "unavailable_reason": None if decision_open else closed_reason,
+        },
+        {
+            "action": "relax_constraint",
+            "available": decision_open and bool(valid_constraint_ids),
+            "valid_constraint_ids": valid_constraint_ids if decision_open else [],
+            "supplementary_queries_required": False,
+            "unavailable_reason": (
+                None
+                if decision_open and valid_constraint_ids
+                else no_required_constraint_reason
+                if decision_open
+                else closed_reason
+            ),
+        },
+    ]
 
 
 def _coverage_resolution_event(
@@ -5522,11 +5641,7 @@ def _publication_lineage_is_materializable(
     decision = store.get_typed_record(
         ReportFaithfulnessDecisionRecord, publication.faithfulness_decision_id
     )
-    return (
-        draft is not None
-        and decision is not None
-        and decision.report_draft_id == draft.id
-    )
+    return draft is not None and decision is not None and decision.report_draft_id == draft.id
 
 
 def _admitted_claim_ids_for_run(store: Any, workflow_run_id: str) -> list[str]:
