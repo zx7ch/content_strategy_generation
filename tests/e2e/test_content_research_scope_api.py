@@ -1031,6 +1031,33 @@ async def test_confirmed_scope_projection_includes_current_action_metadata(scope
 
 
 @pytest.mark.asyncio
+async def test_scope_projection_exposes_initial_unresolved_coverage_without_authorization(
+    scope_client,
+):
+    """Hiding a genuine initial coverage snapshot must fail this test."""
+    workflow_run_id, contract = await _confirmed_scope_with_unmet_season(scope_client)
+
+    response = await scope_client.get(f"/content-research/workflows/{workflow_run_id}/scope")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["coverage_snapshot"]["id"] == "scv_api_unmet_season"
+    assert body["coverage_snapshot"]["execution_revision"] == 1
+    assert body["coverage_snapshot"]["execution_authorization_id"] is None
+    assert body["allowed_actions"] == [
+        {
+            "action": "resolve_coverage",
+            "available": True,
+            "scope_contract_version": contract["version"],
+            "coverage_snapshot_id": "scv_api_unmet_season",
+        }
+    ]
+    resolutions = {item["action"]: item for item in body["allowed_resolutions"]}
+    assert resolutions["expand_required_constraint"]["valid_constraint_ids"] == ["season"]
+    assert resolutions["relax_constraint"]["valid_constraint_ids"] == ["season"]
+
+
+@pytest.mark.asyncio
 async def test_scope_projection_only_offers_required_constraint_resolutions(scope_client):
     """Offering expansion for global-only shortfalls or the wrong constraint must fail."""
     workflow_run_id, contract = await _confirmed_scope_with_unmet_season(scope_client)

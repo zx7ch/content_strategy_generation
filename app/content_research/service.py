@@ -1674,6 +1674,17 @@ class ContentResearchService:
             and coverage_snapshot.execution_authorization_id != current_authorization.id
         ):
             coverage_snapshot = None
+        if current_authorization is None and contract is not None:
+            coverage_snapshot = self._store.get_coverage_snapshot(
+                workflow_run_id,
+                version=contract.version,
+                execution_revision=1,
+            )
+            if (
+                coverage_snapshot is not None
+                and coverage_snapshot.execution_authorization_id is not None
+            ):
+                coverage_snapshot = None
         allowed_actions = _scope_projection_actions(
             draft=draft,
             contract=contract,
