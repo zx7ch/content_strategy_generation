@@ -244,3 +244,58 @@ async def test_limited_continuation_replays_then_publishes_through_real_worker(
     report = await client.get(f"/content-research/workflows/{workflow_run_id}/lite-report")
     assert report.status_code == 200, report.text
     assert report.json()["publication"]["state"] == "evidence_only_report"
+
+
+@pytest.mark.asyncio
+async def test_failed_expand_replay_uses_a_new_worker_attempt_and_reaches_coverage(
+    continuation_harness,
+):
+    client, service, worker, adapter, db_path = continuation_harness
+    workflow_run_id, original_scope = await _confirmed_scope_awaiting_coverage(
+        client, worker, db_path
+    )
+    adapter.calls.clear()
+    adapter.discover_queries.clear()
+    adapter.discover_failure_reason = "timeout"
+    endpoint = f"/content-research/workflows/{workflow_run_id}/actions"
+    request = {
+        "action": "resolve_coverage",
+        "payload": {
+            "scope_contract_version": 1,
+            "resolution": "expand_required_constraint",
+            "constraint_id": "core_object",
+            "supplementary_queries": ["长袖衬衫 防晒"],
+        },
+    }
+
+    first = await client.post(endpoint, json=request)
+    assert first.status_code == 200, first.text
+    authorization = first.json()["result"]["execution_authorization"]
+    assert first.json()["result"]["scope_contract"] == original_scope
+    assert await worker.run_once()
+    assert len(adapter.discover_queries) == 1
+    assert service._store.list_scope_execution_continuations(workflow_run_id)[0].state == "failed"
+
+    adapter.discover_failure_reason = None
+    replay = await client.post(endpoint, json=request)
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["result"]["execution_authorization"] == authorization
+    assert await worker.run_once()
+    assert len(adapter.discover_queries) == 2
+    continuation = service._store.list_scope_execution_continuations(workflow_run_id)[0]
+    assert continuation.state == "completed"
+    continuation_tasks = [
+        task
+        for task in service._store.list_subagent_tasks_for_workflow(workflow_run_id)
+        if task.metadata.get("scope_execution_authorization_id") == authorization["id"]
+    ]
+    assert [task.metadata["scope_execution_attempt"] for task in continuation_tasks] == [1, 2]
+    assert {task.status for task in continuation_tasks} == {"failed", "completed"}
+    snapshot = service._store.get_coverage_snapshot(
+        workflow_run_id,
+        version=1,
+        execution_revision=authorization["execution_revision"],
+    )
+    assert snapshot is not None
+    assert snapshot.execution_authorization_id == authorization["id"]
+    assert [scope.version for scope in service._store.list_scope_contracts(workflow_run_id)] == [1]
