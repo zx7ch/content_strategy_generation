@@ -1622,13 +1622,13 @@ class ContentResearchService:
             )
         contracts = self._store.list_scope_contracts(workflow_run_id)
         contract = (
-            contracts[-1]
-            if version is None and contracts
+            None
+            if not contracts
+            else contracts[-1]
+            if version is None
             else self._store.get_scope_contract(workflow_run_id, version=version)
-            if version is not None
-            else None
         )
-        if contract is None and (version is not None or contracts):
+        if contract is None and contracts:
             requested = str(version) if version is not None else "latest"
             raise ContentResearchNotFoundError(
                 f"Scope contract version {requested} not found for workflow: {workflow_run_id}"
@@ -1647,13 +1647,33 @@ class ContentResearchService:
                     workflow_run_id, version=contract.version
                 )
             )
-        coverage_snapshot = (
-            self._store.get_coverage_snapshot(workflow_run_id, version=contract.version)
-            if contract is not None
-            else None
-        )
         is_superseded = contract is not None and contract.version != contracts[-1].version
         authorizations = self._store.list_scope_execution_authorizations(workflow_run_id)
+        current_authorization = max(
+            (
+                item
+                for item in authorizations
+                if contract is not None
+                and item.scope_contract_id == contract.id
+                and item.scope_contract_version == contract.version
+            ),
+            key=lambda item: (item.execution_revision, item.created_at, item.id),
+            default=None,
+        )
+        coverage_snapshot = (
+            self._store.get_coverage_snapshot(
+                workflow_run_id,
+                version=contract.version,
+                execution_revision=current_authorization.execution_revision,
+            )
+            if current_authorization is not None and contract is not None
+            else None
+        )
+        if (
+            coverage_snapshot is not None
+            and coverage_snapshot.execution_authorization_id != current_authorization.id
+        ):
+            coverage_snapshot = None
         allowed_actions = _scope_projection_actions(
             draft=draft,
             contract=contract,

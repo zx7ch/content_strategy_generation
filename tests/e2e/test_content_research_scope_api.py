@@ -173,6 +173,47 @@ async def _confirmed_scope_with_unmet_season(client: httpx.AsyncClient) -> tuple
     return workflow_run_id, contract
 
 
+async def _authorized_continuation_snapshot(
+    client: httpx.AsyncClient,
+    *,
+    workflow_run_id: str,
+    contract: dict,
+    snapshot_id: str,
+    constraint_counts: dict,
+    unmet_constraint_ids: tuple[str, ...],
+) -> dict:
+    """Persist the next coverage evaluation owned by a resolved continuation."""
+    resolution = await client.post(
+        f"/content-research/workflows/{workflow_run_id}/actions",
+        json={
+            "action": "resolve_coverage",
+            "payload": {
+                "scope_contract_version": contract["version"],
+                "resolution": "expand_required_constraint",
+                "constraint_id": "season",
+                "supplementary_queries": ["夏季 防晒 长袖衬衫"],
+            },
+        },
+    )
+    assert resolution.status_code == 200
+    authorization = resolution.json()["result"]["execution_authorization"]
+    store = app.state.content_research_service._store
+    snapshot = CoverageSnapshot(
+        id=snapshot_id,
+        workflow_run_id=workflow_run_id,
+        scope_contract_id=contract["id"],
+        scope_contract_version=contract["version"],
+        state="awaiting_scope_decision",
+        constraint_counts=constraint_counts,
+        unmet_constraint_ids=unmet_constraint_ids,
+        execution_revision=authorization["execution_revision"],
+        execution_authorization_id=authorization["id"],
+        source_coverage_snapshot_id=authorization["coverage_snapshot_id"],
+    )
+    store.save_coverage_snapshot(snapshot)
+    return {"authorization": authorization, "snapshot": snapshot}
+
+
 @pytest.mark.asyncio
 async def test_prepare_scope_preserves_summer_commute_constraints_and_audits_draft(scope_client):
     workflow = await _scope_ready_workflow(scope_client)
@@ -893,15 +934,31 @@ async def test_scope_projection_returns_pending_draft_with_confirm_command_witho
     assert prepared.status_code == 200
     draft = prepared.json()["result"]["scope"]
     store = app.state.content_research_service._store
-    before = {
-        "drafts": len([store.get_latest_scope_draft(workflow_run_id)]),
-        "contracts": len(store.list_scope_contracts(workflow_run_id)),
-        "draft_audits": len(
-            store.list_scope_draft_audit_events(workflow_run_id, scope_draft_id=draft["id"])
-        ),
-    }
 
-    response = await scope_client.get(f"/content-research/workflows/{workflow_run_id}/scope")
+    def persisted_scope_counts() -> dict[str, int]:
+        with store._connect() as conn:
+            return {
+                "drafts": conn.execute(
+                    "SELECT COUNT(*) FROM content_research_scope_drafts WHERE workflow_run_id = ?",
+                    (workflow_run_id,),
+                ).fetchone()[0],
+                "contracts": conn.execute(
+                    "SELECT COUNT(*) FROM content_research_scope_contracts WHERE workflow_run_id = ?",
+                    (workflow_run_id,),
+                ).fetchone()[0],
+                "draft_audits": conn.execute(
+                    "SELECT COUNT(*) FROM content_research_scope_draft_audit_events WHERE workflow_run_id = ?",
+                    (workflow_run_id,),
+                ).fetchone()[0],
+                "scope_audits": conn.execute(
+                    "SELECT COUNT(*) FROM content_research_scope_audit_events WHERE workflow_run_id = ?",
+                    (workflow_run_id,),
+                ).fetchone()[0],
+            }
+
+    before = persisted_scope_counts()
+
+    response = await scope_client.get(f"/content-research/workflows/{workflow_run_id}/scope?version=99")
 
     assert response.status_code == 200
     body = response.json()
@@ -920,20 +977,38 @@ async def test_scope_projection_returns_pending_draft_with_confirm_command_witho
     ]
     assert body["coverage_snapshot"] is None
     assert body["allowed_resolutions"] == []
-    after = {
-        "drafts": len([store.get_latest_scope_draft(workflow_run_id)]),
-        "contracts": len(store.list_scope_contracts(workflow_run_id)),
-        "draft_audits": len(
-            store.list_scope_draft_audit_events(workflow_run_id, scope_draft_id=draft["id"])
-        ),
-    }
+    after = persisted_scope_counts()
     assert after == before
 
 
 @pytest.mark.asyncio
 async def test_confirmed_scope_projection_includes_current_action_metadata(scope_client):
-    """Dropping explicit confirmed-state action metadata must fail this test."""
+    """An unbound newer snapshot must not override the authorized continuation."""
     workflow_run_id, contract = await _confirmed_scope_with_unmet_season(scope_client)
+    continuation = await _authorized_continuation_snapshot(
+        scope_client,
+        workflow_run_id=workflow_run_id,
+        contract=contract,
+        snapshot_id="scv_api_authorized_continuation",
+        constraint_counts={
+            "scenario": {"required": True},
+            "_summary": {"reason_codes": ["required_constraint_coverage_unmet:scenario"]},
+        },
+        unmet_constraint_ids=("scenario",),
+    )
+    store = app.state.content_research_service._store
+    store.save_coverage_snapshot(
+        CoverageSnapshot(
+            id="scv_api_unbound_higher_revision",
+            workflow_run_id=workflow_run_id,
+            scope_contract_id=contract["id"],
+            scope_contract_version=contract["version"],
+            state="awaiting_scope_decision",
+            constraint_counts={"_summary": {"reason_codes": ["minimum_samples_unmet"]}},
+            unmet_constraint_ids=(),
+            execution_revision=continuation["snapshot"].execution_revision + 1,
+        )
+    )
 
     response = await scope_client.get(f"/content-research/workflows/{workflow_run_id}/scope")
 
@@ -946,23 +1021,24 @@ async def test_confirmed_scope_projection_includes_current_action_metadata(scope
             "action": "resolve_coverage",
             "available": True,
             "scope_contract_version": contract["version"],
-            "coverage_snapshot_id": "scv_api_unmet_season",
+            "coverage_snapshot_id": "scv_api_authorized_continuation",
         }
     ]
-    assert body["coverage_snapshot"]["id"] == "scv_api_unmet_season"
+    assert body["coverage_snapshot"]["id"] == "scv_api_authorized_continuation"
+    resolutions = {item["action"]: item for item in body["allowed_resolutions"]}
+    assert resolutions["expand_required_constraint"]["valid_constraint_ids"] == ["scenario"]
+    assert resolutions["relax_constraint"]["valid_constraint_ids"] == ["scenario"]
 
 
 @pytest.mark.asyncio
 async def test_scope_projection_only_offers_required_constraint_resolutions(scope_client):
     """Offering expansion for global-only shortfalls or the wrong constraint must fail."""
     workflow_run_id, contract = await _confirmed_scope_with_unmet_season(scope_client)
-    store = app.state.content_research_service._store
-    global_only_snapshot = CoverageSnapshot(
-        id="scv_api_global_shortfall",
+    continuation = await _authorized_continuation_snapshot(
+        scope_client,
         workflow_run_id=workflow_run_id,
-        scope_contract_id=contract["id"],
-        scope_contract_version=contract["version"],
-        state="awaiting_scope_decision",
+        contract=contract,
+        snapshot_id="scv_api_global_shortfall",
         constraint_counts={
             "_summary": {
                 "minimum_samples": 9,
@@ -971,9 +1047,8 @@ async def test_scope_projection_only_offers_required_constraint_resolutions(scop
             }
         },
         unmet_constraint_ids=(),
-        execution_revision=2,
     )
-    store.save_coverage_snapshot(global_only_snapshot)
+    assert continuation["snapshot"].execution_authorization_id
 
     global_response = await scope_client.get(f"/content-research/workflows/{workflow_run_id}/scope")
 
@@ -996,28 +1071,3 @@ async def test_scope_projection_only_offers_required_constraint_resolutions(scop
             "supplementary_queries_required": action == "expand_required_constraint",
             "unavailable_reason": "no_unmet_required_constraints",
         }
-
-    required_snapshot = store.get_coverage_snapshot(
-        workflow_run_id, version=contract["version"], execution_revision=1
-    )
-    assert required_snapshot is not None
-    store.save_coverage_snapshot(
-        replace(
-            required_snapshot,
-            id="scv_api_only_scenario",
-            execution_revision=3,
-            unmet_constraint_ids=("scenario",),
-        )
-    )
-    required_response = await scope_client.get(
-        f"/content-research/workflows/{workflow_run_id}/scope"
-    )
-
-    assert required_response.status_code == 200
-    required_resolutions = {
-        item["action"]: item for item in required_response.json()["allowed_resolutions"]
-    }
-    assert required_resolutions["expand_required_constraint"]["valid_constraint_ids"] == [
-        "scenario"
-    ]
-    assert required_resolutions["relax_constraint"]["valid_constraint_ids"] == ["scenario"]
