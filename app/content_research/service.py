@@ -599,12 +599,37 @@ class WorkflowRunManagerRuntime:
     ) -> dict:
         """Resume a waiting Content Research run and restart its retryable parent step."""
         async with WorkflowRunManager(self._db_path) as manager:
-            run, recovered_children = await manager.restart_step_and_retry_children(
-                workflow_run_id,
-                step_name="formal_research",
-                child_task_ids=child_task_ids,
-                resume_parent=resume_parent,
+            snapshot = await self.get_runtime_snapshot(workflow_run_id)
+            run_status = str((snapshot.get("run") or {}).get("status") or "")
+            formal_step = next(
+                (
+                    step
+                    for step in snapshot.get("steps") or []
+                    if step.get("step_name") == "formal_research"
+                ),
+                {},
             )
+            formal_status = str(formal_step.get("status") or "")
+            if run_status == "running" and formal_status == "retrying":
+                # Legacy v23 scope decisions can leave the parent running while
+                # formal_research is retrying.  This is already a resumed run;
+                # only start the retrying step, rather than calling resume_run
+                # (which is intentionally invalid for ordinary running runs).
+                await manager.start_step(workflow_run_id, "formal_research")
+                run = None
+                recovered_children = []
+            elif run_status == "running" and formal_status == "running":
+                # A reclaimed continuation may observe its own prior restart.
+                # Treat that state as an idempotent claim, without reopening it.
+                run = None
+                recovered_children = []
+            else:
+                run, recovered_children = await manager.restart_step_and_retry_children(
+                    workflow_run_id,
+                    step_name="formal_research",
+                    child_task_ids=child_task_ids,
+                    resume_parent=resume_parent,
+                )
             run_status = run.status.value if run is not None else "running"
         return {
             "workflow_run_id": workflow_run_id,
@@ -3926,7 +3951,19 @@ class ContentResearchService:
             or runtime_snapshot.get("run_status")
             or ""
         )
-        if runtime_status == "waiting_user":
+        formal_step_status = str(
+            next(
+                (
+                    step.get("status")
+                    for step in runtime_snapshot.get("steps") or []
+                    if step.get("step_name") == "formal_research"
+                ),
+                "",
+            )
+        )
+        if runtime_status == "waiting_user" or (
+            runtime_status == "running" and formal_step_status == "retrying"
+        ):
             restart = getattr(
                 self._workflow_runtime, "restart_formal_research_step", None
             )
@@ -4043,6 +4080,30 @@ class ContentResearchService:
             )
         )
         terminal_by_id = {task.id: task for task in terminals}
+        # Continuation tasks deliberately have no workflow child: they are
+        # authorized follow-up collection, not a replay of the completed
+        # initial child.  Their failures must nevertheless fail the durable
+        # continuation so its exact action replay can reclaim it.
+        if executable_task_ids is not None:
+            failed_continuations = [
+                task
+                for task_id in executable_task_ids
+                if (task := terminal_by_id.get(task_id) or self._store.get_subagent_task(task_id))
+                is not None
+                and task.status in {"failed", "outcome_unknown"}
+            ]
+            if failed_continuations:
+                task = failed_continuations[0]
+                output = dict(task.payload.get("output_payload") or {})
+                raise ContentResearchValidationError(
+                    "Authorized scope continuation task failed: "
+                    + str(
+                        (output.get("metadata") or {}).get("blocking_failure_code")
+                        or output.get("failure_reason")
+                        or output.get("error_message")
+                        or task.status
+                    )
+                )
         runtime_state = await self._workflow_runtime.get_runtime_snapshot(brief.workflow_run_id)
         if runtime_state.get("run_status") == "pausing":
             await self._workflow_runtime.acknowledge_pause_at_safe_boundary(

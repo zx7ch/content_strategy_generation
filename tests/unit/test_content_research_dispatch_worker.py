@@ -42,6 +42,12 @@ class FakeContinuationService(FakeFormalResearchService):
         self.continuations.append(continuation)
 
 
+class FailingContinuationService(FakeContinuationService):
+    async def execute_scope_continuation(self, continuation):
+        await super().execute_scope_continuation(continuation)
+        raise RuntimeError("authorized supplementary collection failed")
+
+
 @pytest.mark.asyncio
 async def test_async_idle_dispatch_claim_does_not_acquire_a_sqlite_writer_lock(tmp_path):
     store = SQLiteContentResearchStore(str(tmp_path / "dispatch.db"))
@@ -126,6 +132,41 @@ async def test_worker_claims_persisted_scope_continuation_with_its_queries(tmp_p
     assert claimed.state == "running"
     persisted = store.list_scope_execution_continuations("run-worker")[0]
     assert persisted.state == "completed"
+
+
+@pytest.mark.asyncio
+async def test_failed_scope_continuation_is_reclaimed_only_by_exact_action_replay(tmp_path):
+    store = SQLiteContentResearchStore(str(tmp_path / "continuation-failure.db"))
+    continuation = ScopeExecutionContinuation(
+        id="sec-failure",
+        authorization_id="sea-failure",
+        workflow_run_id="run-failure",
+        execution_revision=2,
+        operation="supplementary_collection",
+        supplementary_queries=("夏季 防晒 长袖衬衫",),
+        state="pending",
+    )
+    store.save_scope_execution_continuation(continuation)
+    failing = FailingContinuationService()
+    worker = ContentResearchDispatchWorker(store=store, service_factory=lambda: failing)
+
+    assert await worker.run_once() is True
+    failed = store.list_scope_execution_continuations("run-failure")[0]
+    assert failed.state == "failed"
+    with store._connect() as conn:
+        last_error = conn.execute(
+            "SELECT last_error FROM content_research_scope_execution_continuations WHERE authorization_id=?",
+            (continuation.authorization_id,),
+        ).fetchone()[0]
+    assert "authorized supplementary collection failed" in (last_error or "")
+
+    store.requeue_scope_execution_continuation(continuation.authorization_id)
+    recovered = store.list_scope_execution_continuations("run-failure")[0]
+    assert recovered.state == "pending"
+    succeeding = FakeContinuationService()
+    retry_worker = ContentResearchDispatchWorker(store=store, service_factory=lambda: succeeding)
+    assert await retry_worker.run_once() is True
+    assert store.list_scope_execution_continuations("run-failure")[0].state == "completed"
 
 
 @pytest.mark.asyncio

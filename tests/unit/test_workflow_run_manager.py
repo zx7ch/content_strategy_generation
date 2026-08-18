@@ -589,6 +589,36 @@ async def test_formal_recovery_action_consumes_one_child_recovery_attempt(tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_legacy_running_retrying_formal_step_is_started_idempotently(tmp_path):
+    db_path = str(tmp_path / "legacy_scope_continuation.db")
+    async with WorkflowRunManager(db_path) as manager:
+        run = await manager.start_run(thread_id="thread-legacy", user_id="user-1")
+        await manager.initialize_steps(
+            run.run_id,
+            [{"step_name": "formal_research", "phase": "retrieval", "max_attempts": 3}],
+        )
+        await manager.start_step(run.run_id, "formal_research")
+        await manager.retry_step(run.run_id, "formal_research", "legacy scope decision")
+
+    runtime = WorkflowRunManagerRuntime(db_path)
+    await runtime.restart_formal_research_step(
+        workflow_run_id=run.run_id, child_task_ids=[]
+    )
+    # A reclaimed lease sees the already-started state and must not try to
+    # resume a running parent or start the step again.
+    await runtime.restart_formal_research_step(
+        workflow_run_id=run.run_id, child_task_ids=[]
+    )
+
+    async with WorkflowStore(db_path) as store:
+        recovered_run = await store.get_run(run.run_id)
+        recovered_steps = await store.list_steps(run.run_id)
+    assert recovered_run is not None
+    assert recovered_run.status == WorkflowRunStatus.RUNNING
+    assert recovered_steps[0].status.value == "running"
+
+
+@pytest.mark.asyncio
 async def test_state_update_and_event_append_succeed_together(manager):
     run = await manager.start_run(thread_id="thread-1", user_id="user-1")
 
