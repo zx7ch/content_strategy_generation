@@ -3992,8 +3992,25 @@ class ContentResearchService:
                 raise ContentResearchValidationError(
                     "supplementary collection requires the initial product marketing task"
                 )
+            # A failed collection keeps its task and operation checkpoints as
+            # immutable evidence.  An exact replay must therefore use a fresh
+            # authorization-owned attempt namespace; reusing the old task ID
+            # would make the router restore its terminal failure and skip the
+            # provider call forever.
+            prior_attempts = [
+                task
+                for task in self._store.list_subagent_tasks_for_workflow(
+                    continuation.workflow_run_id
+                )
+                if str(task.metadata.get("scope_execution_authorization_id") or "")
+                == authorization.id
+            ]
             task_id = "crt_" + canonical_fingerprint(
-                {"authorization_id": authorization.id, "direction_id": "product_marketing"}
+                {
+                    "authorization_id": authorization.id,
+                    "direction_id": "product_marketing",
+                    "attempt": len(prior_attempts) + 1,
+                }
             )[:24]
             existing_task = self._store.get_subagent_task(task_id)
             if existing_task is None:
@@ -4027,6 +4044,7 @@ class ContentResearchService:
                         **base_task.metadata,
                         "scope_execution_authorization_id": authorization.id,
                         "execution_revision": authorization.execution_revision,
+                        "scope_execution_attempt": len(prior_attempts) + 1,
                     },
                 )
                 self._store.save_subagent_task(existing_task)
