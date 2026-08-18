@@ -3137,6 +3137,13 @@ class ContentResearchService:
                 local_cache_id=brief.id,
             )
 
+        if action in {
+            "start_formal_research",
+            "retry_formal_research",
+            "resume_formal_research",
+        }:
+            self._require_scope_execution_authority(workflow_run_id=workflow_run_id)
+
         if action == "pause_formal_research":
             result = await self._workflow_runtime.pause_content_research_run(
                 workflow_run_id=workflow_run_id
@@ -3337,6 +3344,7 @@ class ContentResearchService:
         self._require_frozen_product_marketing_dispatch_contract(brief)
         if not self._store.list_scope_contracts(workflow_run_id):
             raise ContentResearchValidationError("scope_confirmation_required")
+        self._require_scope_execution_authority(workflow_run_id=workflow_run_id)
         dispatch = await self._dispatch.enqueue(
             workflow_run_id=workflow_run_id,
             provider=request.provider,
@@ -3357,6 +3365,58 @@ class ContentResearchService:
             source_kind=request.source_kind,
             limit_per_specialist=request.limit,
         )
+
+    def _require_scope_execution_authority(
+        self,
+        *,
+        workflow_run_id: str,
+        execution_authorization: ScopeExecutionAuthorization | None = None,
+    ) -> None:
+        """Fence formal execution behind the persisted coverage decision.
+
+        A confirmed Scope with no coverage evaluation is the one initial
+        collection path and therefore needs no continuation authorization.
+        Once coverage is awaiting a user decision, every execution and
+        publication path must carry the authorization written by
+        ``resolve_coverage``.  The authorization revision intentionally
+        advances the source coverage snapshot by one, because it owns the
+        resulting continuation attempt.
+        """
+        contracts = self._store.list_scope_contracts(workflow_run_id)
+        if not contracts:
+            raise ContentResearchValidationError("scope_confirmation_required")
+        contract = contracts[-1]
+        coverage = self._store.get_coverage_snapshot(
+            workflow_run_id, version=contract.version
+        )
+
+        if execution_authorization is not None:
+            persisted = self._store.get_scope_execution_authorization(
+                execution_authorization.id
+            )
+            if (
+                persisted is None
+                or persisted != execution_authorization
+                or persisted.workflow_run_id != workflow_run_id
+                or persisted.scope_contract_id != contract.id
+                or persisted.scope_contract_version != contract.version
+            ):
+                raise ContentResearchValidationError(
+                    "scope_execution_authorization_invalid"
+                )
+
+        if coverage is None or coverage.state != "awaiting_scope_decision":
+            return
+        if execution_authorization is None:
+            raise ContentResearchValidationError(
+                "scope_execution_authorization_required"
+            )
+        if (
+            execution_authorization.coverage_snapshot_id != coverage.id
+            or execution_authorization.execution_revision
+            != coverage.execution_revision + 1
+        ):
+            raise ContentResearchValidationError("scope_execution_authorization_invalid")
 
     def _require_frozen_product_marketing_dispatch_contract(
         self, brief: ResearchBriefRecord
@@ -3688,6 +3748,7 @@ class ContentResearchService:
             raise ContentResearchNotFoundError(
                 f"Content research workflow not found: {workflow_run_id}"
             )
+        self._require_scope_execution_authority(workflow_run_id=workflow_run_id)
         async with ThreadStore(self._store._db_path) as thread_store:
             if await thread_store.get_thread(brief.thread_id) is None:
                 raise ContentResearchValidationError(
@@ -3732,6 +3793,13 @@ class ContentResearchService:
         workflow_run_id: str,
         request: ContentResearchSourceCollectionRequest,
     ) -> ContentResearchSourceCollectionResponse:
+        """Collect diagnostic source output outside the formal evidence chain.
+
+        This endpoint is intentionally non-authoritative: it records only
+        observation trace events and does not create packets, coverage, or a
+        report. Formal evidence collection continues through the guarded
+        formal-research runtime.
+        """
         brief = self._store.get_brief_by_workflow(workflow_run_id)
         if brief is None:
             raise ContentResearchNotFoundError(
@@ -3979,10 +4047,22 @@ class ContentResearchService:
         if (
             authorization.workflow_run_id != continuation.workflow_run_id
             or authorization.execution_revision != continuation.execution_revision
+            or (
+                continuation.operation == "limited_report"
+                and authorization.state != "authorized_limited_report"
+            )
+            or (
+                continuation.operation == "supplementary_collection"
+                and authorization.state != "authorized_collection"
+            )
         ):
             raise ContentResearchValidationError(
                 "scope execution continuation does not match its authorization"
             )
+        self._require_scope_execution_authority(
+            workflow_run_id=continuation.workflow_run_id,
+            execution_authorization=authorization,
+        )
         brief = self._store.get_brief_by_workflow(continuation.workflow_run_id)
         if brief is None:
             raise ContentResearchNotFoundError(
@@ -4113,6 +4193,10 @@ class ContentResearchService:
         execution_authorization: ScopeExecutionAuthorization | None = None,
         executable_task_ids: set[str] | None = None,
     ) -> None:
+        self._require_scope_execution_authority(
+            workflow_run_id=brief.workflow_run_id,
+            execution_authorization=execution_authorization,
+        )
         tasks = self._store.list_subagent_tasks_for_workflow(brief.workflow_run_id)
         # Failed specialists stay on the same parent Run until the user asks
         # for a retry.  Completed siblings are reused; only the failed work is
@@ -4388,6 +4472,7 @@ class ContentResearchService:
                 report_artifact_ref = await self._publish_report_after_workflow_completion(
                     workflow_run_id=brief.workflow_run_id,
                     thread_id=brief.thread_id,
+                    execution_authorization=execution_authorization,
                 )
                 if report_artifact_ref is not None:
                     complete_report = getattr(
@@ -4646,9 +4731,17 @@ class ContentResearchService:
         return checkpoint
 
     async def _publish_report_after_workflow_completion(
-        self, *, workflow_run_id: str, thread_id: str
+        self,
+        *,
+        workflow_run_id: str,
+        thread_id: str,
+        execution_authorization: ScopeExecutionAuthorization | None = None,
     ) -> dict[str, str] | None:
         """Materialize the report during the dedicated finalization boundary."""
+        self._require_scope_execution_authority(
+            workflow_run_id=workflow_run_id,
+            execution_authorization=execution_authorization,
+        )
         async with WorkflowStore(self._store._db_path) as workflow_store:
             run = await workflow_store.get_run(workflow_run_id)
         if run is None or run.status.value != "finalizing_report":

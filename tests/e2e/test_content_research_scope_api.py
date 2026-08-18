@@ -8,9 +8,10 @@ import httpx
 import pytest
 
 from app.api.routes.router import app
+from app.content_research.api_schemas import ContentResearchSourceCollectionRequest
 from app.content_research.presearch.service import PresearchService
 from app.content_research.scope_contract import CoverageSnapshot, ScopeAuditEvent
-from app.content_research.service import ContentResearchService
+from app.content_research.service import ContentResearchService, ContentResearchValidationError
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
 from app.services.llm.types import LLMResponse, TokenUsage
 from tests.e2e.test_content_research_brief_confirm_api import WORKSPACE_HEADERS, FakeRuntime
@@ -171,6 +172,86 @@ async def _confirmed_scope_with_unmet_season(client: httpx.AsyncClient) -> tuple
         ),
     )
     return workflow_run_id, contract
+
+
+async def _confirm_initial_scope(client: httpx.AsyncClient, workflow_run_id: str) -> dict:
+    prepared = await client.post(
+        f"/content-research/workflows/{workflow_run_id}/actions",
+        json={"action": "prepare_scope", "payload": {"direction_id": "product_marketing"}},
+    )
+    assert prepared.status_code == 200
+    scope = prepared.json()["result"]["scope"]
+    confirmed = await client.post(
+        f"/content-research/workflows/{workflow_run_id}/actions",
+        json={
+            "action": "confirm_scope",
+            "payload": {
+                "scope_draft_id": scope["id"],
+                "structure_hash": scope["structure_hash"],
+                "query_groups": [
+                    {"final_query": group["final_query"]} for group in scope["query_groups"]
+                ],
+            },
+        },
+    )
+    assert confirmed.status_code == 200
+    return confirmed.json()["result"]["scope_contract"]
+
+
+@pytest.mark.asyncio
+async def test_initial_confirmed_scope_can_dispatch_its_first_collection(scope_client):
+    workflow = await _scope_ready_workflow(scope_client)
+    workflow_run_id = workflow["presearch"]["workflow_run_id"]
+    await _confirm_initial_scope(scope_client, workflow_run_id)
+
+    response = await scope_client.post(
+        f"/content-research/workflows/{workflow_run_id}/actions",
+        json={
+            "action": "start_formal_research",
+            "payload": {
+                "provider": "xiaohongshu",
+                "source_kind": "search_result",
+                "limit": 20,
+            },
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["result"]["status"] == "queued"
+
+
+@pytest.mark.asyncio
+async def test_awaiting_scope_decision_rejects_legacy_execution_entrypoints(scope_client):
+    workflow_run_id, _contract = await _confirmed_scope_with_unmet_season(scope_client)
+    formal_payload = {
+        "provider": "xiaohongshu",
+        "source_kind": "search_result",
+        "limit": 20,
+    }
+
+    for action, payload in (
+        ("start_formal_research", formal_payload),
+        ("retry_formal_research", formal_payload),
+        ("resume_formal_research", {}),
+    ):
+        response = await scope_client.post(
+            f"/content-research/workflows/{workflow_run_id}/actions",
+            json={"action": action, "payload": payload},
+        )
+        assert response.status_code == 422, response.text
+        assert "scope_execution_authorization_required" in response.text
+
+    service = app.state.content_research_service
+    with pytest.raises(ContentResearchValidationError, match="scope_execution_authorization_required"):
+        await service.start_formal_research(
+            workflow_run_id=workflow_run_id,
+            request=ContentResearchSourceCollectionRequest(**formal_payload),
+        )
+
+    report = await scope_client.get(
+        f"/content-research/workflows/{workflow_run_id}/lite-report"
+    )
+    assert report.status_code == 404, report.text
 
 
 async def _authorized_continuation_snapshot(

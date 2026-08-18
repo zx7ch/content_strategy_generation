@@ -147,6 +147,7 @@ class LiteReportReader:
                 and item.scope_contract_version == contract.version
                 and item.resolution == "generate_limited_report"
                 and item.state == "authorized_limited_report"
+                and item.execution_revision == snapshot.execution_revision + 1
             ),
             None,
         )
