@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   ContentResearchApiError,
+  confirmContentResearchScope,
   confirmContentResearchSubjectStructure,
   startContentResearchFormalResearch,
   confirmContentResearchBrief,
@@ -12,13 +13,16 @@ import {
   getContentResearchDirectionEvidence,
   getContentResearchLiteReport,
   getContentResearchLiteReportWithRetry,
+  getContentResearchScope,
   getContentResearchWorkflow,
+  prepareContentResearchScope,
   retryContentResearchFormalResearch,
   resumeContentResearchFormalResearch,
   submitContentResearchBrandDecision,
   submitContentResearchContentDecision,
   isContentResearchReportPending,
   retryContentResearchPresearch,
+  resolveContentResearchCoverage,
   saveLLMConfiguration,
 } from "./content-research-api.ts";
 import { setWorkspaceContext } from "./api.ts";
@@ -230,6 +234,99 @@ test("confirmContentResearchBrief posts product structure confirmation with sele
   assert.match(requestBody, /"primary_marketing_goal":"content_seeding"/);
   assert.match(requestBody, /"subject_structure_confirmation":\{"core_object":"徒步短裤","research_intent":"速干","context_modifiers":\["夏季"\]\}/);
   assert.equal(result.workflow_run_id, "run_1");
+});
+
+test("scope actions use the finalized server-owned payload contract", async () => {
+  const requestBodies: string[] = [];
+  globalThis.fetch = (async (_input, init) => {
+    const requestBody = String(init?.body ?? "");
+    requestBodies.push(requestBody);
+    const action = JSON.parse(requestBody).action as string;
+    if (action === "prepare_scope") {
+      return jsonResponse(workflowActionPayload(action, {
+        scope: scopeDraftPayload(),
+      }));
+    }
+    if (action === "confirm_scope") {
+      return jsonResponse(workflowActionPayload(action, {
+        scope_contract: scopeContractPayload(),
+        audit_event: scopeAuditPayload("scope_confirmed"),
+      }));
+    }
+    return jsonResponse(workflowActionPayload(action, {
+      report_mode: "limited",
+      scope_contract: scopeContractPayload(),
+      unmet_constraint_ids: ["season"],
+      audit_event: scopeAuditPayload("coverage_resolved"),
+    }));
+  }) as typeof fetch;
+
+  const draft = await prepareContentResearchScope("run_1", { direction_id: "product_marketing" });
+  await confirmContentResearchScope("run_1", {
+    scope_draft_id: draft.id,
+    structure_hash: draft.structure_hash,
+    query_groups: [
+      { final_query: "白衬衫通勤穿搭" },
+      { final_query: "长袖衬衫" },
+      { final_query: "长袖衬衫 通勤" },
+    ],
+  });
+  await resolveContentResearchCoverage("run_1", {
+    scope_contract_version: 1,
+    resolution: "expand_required_constraint",
+    constraint_id: "season",
+    supplementary_queries: ["夏季 防晒 长袖衬衫"],
+  });
+
+  assert.deepEqual(JSON.parse(requestBodies[0]), {
+    action: "prepare_scope",
+    payload: { direction_id: "product_marketing" },
+  });
+  assert.deepEqual(JSON.parse(requestBodies[1]), {
+    action: "confirm_scope",
+    payload: {
+      scope_draft_id: "scope_draft_1",
+      structure_hash: "structure_hash_1",
+      query_groups: [
+        { final_query: "白衬衫通勤穿搭" },
+        { final_query: "长袖衬衫" },
+        { final_query: "长袖衬衫 通勤" },
+      ],
+    },
+  });
+  assert.deepEqual(JSON.parse(requestBodies[2]), {
+    action: "resolve_coverage",
+    payload: {
+      scope_contract_version: 1,
+      resolution: "expand_required_constraint",
+      constraint_id: "season",
+      supplementary_queries: ["夏季 防晒 长袖衬衫"],
+    },
+  });
+});
+
+test("getContentResearchScope reads the persisted Scope projection and optional version", async () => {
+  const requestUrls: string[] = [];
+  globalThis.fetch = (async (input) => {
+    requestUrls.push(String(input));
+    return jsonResponse({
+      schema_version: "content_research_api_v1",
+      workflow_run_id: "run_1",
+      draft: scopeDraftPayload(),
+      scope_contract: scopeContractPayload(),
+      audit_events: [scopeAuditPayload("scope_suggested"), scopeAuditPayload("scope_confirmed")],
+    });
+  }) as typeof fetch;
+
+  const latest = await getContentResearchScope("run_1");
+  const versioned = await getContentResearchScope("run_1", 1);
+
+  assert.ok(requestUrls[0].endsWith("/content-research/workflows/run_1/scope"));
+  assert.ok(requestUrls[1].endsWith("/content-research/workflows/run_1/scope?version=1"));
+  assert.equal(latest.scope_contract.query_groups[0].suggested_query, "夏季 长袖衬衫 通勤");
+  assert.equal(latest.scope_contract.query_groups[0].final_query, "白衬衫通勤穿搭");
+  assert.equal(latest.scope_contract.query_groups[0].execution_role, "exploratory");
+  assert.equal(versioned.scope_contract.version, 1);
 });
 
 test("formal research dispatch preserves failed specialist state", async () => {
@@ -531,6 +628,68 @@ function workflowPayload() {
     runtime_run: { run_id: "run_1", current_step: "formal_research", status: "running" },
     runtime_steps: [],
     runtime_child_tasks: [],
+  };
+}
+
+function workflowActionPayload(action: string, result: Record<string, unknown>) {
+  return {
+    schema_version: "content_research_workflow_action_response_v1",
+    workflow_run_id: "run_1",
+    action,
+    status: "completed",
+    result,
+    execution_mode: "local",
+    remote_run_id: null,
+    local_cache_id: "rb_1",
+    sync_status: "local_only",
+  };
+}
+
+function scopeDraftPayload() {
+  return {
+    id: "scope_draft_1",
+    workflow_run_id: "run_1",
+    research_plan_id: "plan_1",
+    structure_hash: "structure_hash_1",
+    constraints: [
+      { id: "core_object", label: "核心对象", value: "长袖衬衫", mode: "required", allowed_aliases: [] },
+      { id: "season", label: "季节", value: "夏季", mode: "required", allowed_aliases: [] },
+    ],
+    query_groups: [
+      { suggested_query: "夏季 长袖衬衫 通勤", final_query: "夏季长袖通勤衬衫", targeted_required_terms: ["夏季", "长袖衬衫", "通勤"] },
+      { suggested_query: "长袖衬衫", final_query: "长袖衬衫", targeted_required_terms: ["长袖衬衫"] },
+      { suggested_query: "长袖衬衫 通勤", final_query: "长袖衬衫 通勤", targeted_required_terms: ["长袖衬衫", "通勤"] },
+    ],
+    created_at: "2026-08-18T00:00:00+08:00",
+  };
+}
+
+function scopeContractPayload() {
+  return {
+    id: "scope_contract_1",
+    workflow_run_id: "run_1",
+    research_plan_id: "plan_1",
+    version: 1,
+    schema_version: "content_research_scope_contract_v1",
+    constraints: scopeDraftPayload().constraints,
+    query_groups: [
+      { id: "group_1", suggested_query: "夏季 长袖衬衫 通勤", final_query: "白衬衫通勤穿搭", origin: "user_edited", execution_role: "exploratory" },
+      { id: "group_2", suggested_query: "长袖衬衫", final_query: "长袖衬衫", origin: "system_suggested", execution_role: "coverage" },
+      { id: "group_3", suggested_query: "长袖衬衫 通勤", final_query: "长袖衬衫 通勤", origin: "system_suggested", execution_role: "coverage" },
+    ],
+    created_at: "2026-08-18T00:01:00+08:00",
+  };
+}
+
+function scopeAuditPayload(eventName: string) {
+  return {
+    id: `audit_${eventName}`,
+    workflow_run_id: "run_1",
+    scope_contract_id: "scope_contract_1",
+    scope_contract_version: 1,
+    event_name: eventName,
+    payload: {},
+    created_at: "2026-08-18T00:02:00+08:00",
   };
 }
 

@@ -284,3 +284,191 @@ test("Brief confirmation requires an explicit marketing goal before enabling con
   });
   container.remove();
 });
+
+test("Creator submits only final-query edits for every server-provided Draft group", async () => {
+  const dom = new JSDOM("<!doctype html><html><body></body></html>", { url: "http://localhost" });
+  Object.assign(globalThis, {
+    window: dom.window,
+    document: dom.window.document,
+    HTMLElement: dom.window.HTMLElement,
+    HTMLInputElement: dom.window.HTMLInputElement,
+    HTMLButtonElement: dom.window.HTMLButtonElement,
+    Event: dom.window.Event,
+    IS_REACT_ACT_ENVIRONMENT: true,
+  });
+  Object.defineProperty(globalThis, "navigator", { configurable: true, value: dom.window.navigator });
+  const React = await import("react");
+  const { act } = React;
+  const { createRoot } = await import("react-dom/client");
+  const { default: CreatorPage } = await import("./page.tsx");
+  const { ContentResearchScopeCard } = CreatorPage;
+  const container = document.createElement("div");
+  document.body.append(container);
+  const root = createRoot(container);
+  let submitted: unknown = null;
+
+  await act(async () => {
+    root.render(React.createElement(ContentResearchScopeCard, {
+      draft: scopeDraftFixture(),
+      projection: null,
+      busy: false,
+      onConfirm: (payload: unknown) => { submitted = payload; },
+      onResolve: () => undefined,
+    }));
+  });
+
+  const inputs = [...container.querySelectorAll('input[aria-label^="检索组 "]')] as HTMLInputElement[];
+  assert.equal(inputs.length, 3);
+  assert.equal(inputs[0].value, "夏季长袖通勤衬衫");
+  assert.match(container.textContent ?? "", /系统建议：夏季 长袖衬衫 通勤/);
+  await act(async () => {
+    const valueSetter = Object.getOwnPropertyDescriptor(dom.window.HTMLInputElement.prototype, "value")?.set;
+    valueSetter?.call(inputs[0], "白衬衫通勤穿搭");
+    inputs[0].dispatchEvent(new dom.window.Event("input", { bubbles: true }));
+  });
+  const confirm = [...container.querySelectorAll("button")].find((button) => button.textContent === "确认并开始调研");
+  await act(async () => { confirm?.click(); });
+
+  assert.deepEqual(submitted, {
+    scope_draft_id: "scope_draft_1",
+    structure_hash: "structure_hash_1",
+    query_groups: [
+      { final_query: "白衬衫通勤穿搭" },
+      { final_query: "长袖衬衫" },
+      { final_query: "长袖衬衫 通勤" },
+    ],
+  });
+
+  await act(async () => { root.unmount(); });
+  container.remove();
+});
+
+test("Creator restores exploratory scope and exposes all three pending coverage decisions", async () => {
+  const dom = new JSDOM("<!doctype html><html><body></body></html>", { url: "http://localhost" });
+  Object.assign(globalThis, {
+    window: dom.window,
+    document: dom.window.document,
+    HTMLElement: dom.window.HTMLElement,
+    HTMLInputElement: dom.window.HTMLInputElement,
+    HTMLButtonElement: dom.window.HTMLButtonElement,
+    Event: dom.window.Event,
+    IS_REACT_ACT_ENVIRONMENT: true,
+  });
+  Object.defineProperty(globalThis, "navigator", { configurable: true, value: dom.window.navigator });
+  const React = await import("react");
+  const { act } = React;
+  const { createRoot } = await import("react-dom/client");
+  const { default: CreatorPage } = await import("./page.tsx");
+  const { ContentResearchScopeCard } = CreatorPage;
+  const container = document.createElement("div");
+  document.body.append(container);
+  const root = createRoot(container);
+  const resolutions: unknown[] = [];
+
+  await act(async () => {
+    root.render(React.createElement(ContentResearchScopeCard, {
+      draft: null,
+      projection: scopeProjectionFixture(),
+      busy: false,
+      onConfirm: () => undefined,
+      onResolve: (payload: unknown) => { resolutions.push(payload); },
+    }));
+  });
+
+  assert.match(container.textContent ?? "", /白衬衫通勤穿搭/);
+  assert.match(container.textContent ?? "", /探索补充/);
+  assert.match(container.textContent ?? "", /继续补充夏季样本/);
+  assert.match(container.textContent ?? "", /基于现有证据生成受限报告/);
+  assert.match(container.textContent ?? "", /放宽夏季约束/);
+  assert.doesNotMatch(container.textContent ?? "", /研究结论/);
+
+  const supplementary = container.querySelector('input[aria-label="补充检索词 1"]') as HTMLInputElement;
+  await act(async () => {
+    const valueSetter = Object.getOwnPropertyDescriptor(dom.window.HTMLInputElement.prototype, "value")?.set;
+    valueSetter?.call(supplementary, "夏季 防晒 长袖衬衫");
+    supplementary.dispatchEvent(new dom.window.Event("input", { bubbles: true }));
+  });
+  const buttonNamed = (name: string) =>
+    [...container.querySelectorAll("button")].find((button) => button.textContent === name);
+  await act(async () => {
+    buttonNamed("继续补充夏季样本")?.click();
+    buttonNamed("基于现有证据生成受限报告")?.click();
+    buttonNamed("放宽夏季约束")?.click();
+  });
+
+  assert.deepEqual(resolutions, [
+    {
+      scope_contract_version: 1,
+      resolution: "expand_required_constraint",
+      constraint_id: "season",
+      supplementary_queries: ["夏季 防晒 长袖衬衫"],
+    },
+    { scope_contract_version: 1, resolution: "generate_limited_report" },
+    { scope_contract_version: 1, resolution: "relax_constraint", constraint_id: "season" },
+  ]);
+
+  await act(async () => { root.unmount(); });
+  container.remove();
+});
+
+test("Creator thread restoration reads persisted Scope instead of browser-owned scope state", () => {
+  const source = readFileSync(new URL("./page.tsx", import.meta.url), "utf8");
+
+  assert.match(source, /getContentResearchScope\(runIdForThread\)/);
+  assert.match(source, /scopeProjection/);
+});
+
+function scopeDraftFixture() {
+  return {
+    id: "scope_draft_1",
+    workflow_run_id: "run_1",
+    research_plan_id: "plan_1",
+    structure_hash: "structure_hash_1",
+    constraints: [
+      { id: "core_object", label: "核心对象", value: "长袖衬衫", mode: "required", allowed_aliases: [] },
+      { id: "season", label: "季节", value: "夏季", mode: "required", allowed_aliases: [] },
+    ],
+    query_groups: [
+      { suggested_query: "夏季 长袖衬衫 通勤", final_query: "夏季长袖通勤衬衫", targeted_required_terms: ["夏季", "长袖衬衫", "通勤"] },
+      { suggested_query: "长袖衬衫", final_query: "长袖衬衫", targeted_required_terms: ["长袖衬衫"] },
+      { suggested_query: "长袖衬衫 通勤", final_query: "长袖衬衫 通勤", targeted_required_terms: ["长袖衬衫", "通勤"] },
+    ],
+    created_at: "2026-08-18T00:00:00+08:00",
+  };
+}
+
+function scopeProjectionFixture() {
+  return {
+    schema_version: "content_research_api_v1",
+    workflow_run_id: "run_1",
+    draft: scopeDraftFixture(),
+    scope_contract: {
+      id: "scope_contract_1",
+      workflow_run_id: "run_1",
+      research_plan_id: "plan_1",
+      version: 1,
+      schema_version: "content_research_scope_contract_v1",
+      constraints: scopeDraftFixture().constraints,
+      query_groups: [
+        { id: "group_1", suggested_query: "夏季 长袖衬衫 通勤", final_query: "白衬衫通勤穿搭", origin: "user_edited", execution_role: "exploratory" },
+        { id: "group_2", suggested_query: "长袖衬衫", final_query: "长袖衬衫", origin: "system_suggested", execution_role: "coverage" },
+      ],
+      created_at: "2026-08-18T00:01:00+08:00",
+    },
+    audit_events: [{
+      id: "audit_coverage",
+      workflow_run_id: "run_1",
+      scope_contract_id: "scope_contract_1",
+      scope_contract_version: 1,
+      event_name: "coverage_evaluated",
+      payload: {
+        coverage_snapshot_id: "coverage_1",
+        state: "awaiting_scope_decision",
+        constraint_counts: { season: { matched_candidate_count: 1, independent_author_count: 1, required: true } },
+        unmet_constraint_ids: ["season"],
+        reason_codes: ["required_constraint_coverage_unmet:season"],
+      },
+      created_at: "2026-08-18T00:02:00+08:00",
+    }],
+  };
+}

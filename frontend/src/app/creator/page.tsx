@@ -23,6 +23,7 @@ import {
 import { useBrandContext } from "@/components/providers/BrandProvider";
 import {
   startContentResearchFormalResearch,
+  confirmContentResearchScope,
   confirmContentResearchSubjectStructure,
   repairContentResearchFromPersistedPackets,
   confirmContentResearchBrief,
@@ -34,15 +35,22 @@ import {
   isContentResearchReportPending,
   getContentResearchLiteReport,
   getContentResearchLiteReportWithRetry,
+  getContentResearchScope,
   getContentResearchWorkflow,
+  prepareContentResearchScope,
   retryContentResearchFormalResearch,
   retryContentResearchPresearch,
+  resolveContentResearchCoverage,
   resumeContentResearchFormalResearch,
   startXHSQRLogin,
   type ContentResearchFormalResearchResponse,
   type ContentResearchDirectionEvidence,
   type ContentResearchLiteReportResponse,
   type ContentResearchPresearchResponse,
+  type ContentResearchConfirmScopeRequest,
+  type ContentResearchResolveCoverageRequest,
+  type ContentResearchScopeDraft,
+  type ContentResearchScopeProjection,
   type ContentResearchTrace,
   type ContentResearchWorkflowSummary,
 } from "@/lib/content-research-api";
@@ -2032,7 +2040,186 @@ function ContentResearchContextSidebar({
   );
 }
 
-export default function CreatorPage() {
+interface ContentResearchScopeCardProps {
+  draft: ContentResearchScopeDraft | null;
+  projection: ContentResearchScopeProjection | null;
+  busy: boolean;
+  onConfirm: (payload: ContentResearchConfirmScopeRequest) => void;
+  onResolve: (payload: ContentResearchResolveCoverageRequest) => void;
+}
+
+function pendingCoverageDecision(projection: ContentResearchScopeProjection | null) {
+  if (!projection) return null;
+  const evaluated = [...projection.audit_events].reverse().find((event) => (
+    event.event_name === "coverage_evaluated"
+    && stringField(event.payload, "state") === "awaiting_scope_decision"
+  ));
+  if (!evaluated) return null;
+  const coverageSnapshotId = stringField(evaluated.payload, "coverage_snapshot_id");
+  const resolved = projection.audit_events.some((event) => (
+    event.event_name === "coverage_resolved"
+    && (!coverageSnapshotId || stringField(event.payload, "coverage_snapshot_id") === coverageSnapshotId)
+  ));
+  return resolved ? null : {
+    unmetConstraintIds: arrayField(evaluated.payload, "unmet_constraint_ids"),
+  };
+}
+
+function scopeExecutionRoleLabel(role: string) {
+  if (role === "coverage") return "覆盖检索";
+  if (role === "supplementary") return "补充覆盖";
+  if (role === "exploratory") return "探索补充";
+  return role;
+}
+
+function ContentResearchScopeCard({
+  draft,
+  projection,
+  busy,
+  onConfirm,
+  onResolve,
+}: ContentResearchScopeCardProps) {
+  const [finalQueries, setFinalQueries] = useState<string[]>([]);
+  const [supplementaryQueries, setSupplementaryQueries] = useState(["", ""]);
+  useEffect(() => {
+    setFinalQueries(draft?.query_groups.map((group) => group.final_query) ?? []);
+  }, [draft]);
+
+  const pending = pendingCoverageDecision(projection);
+  const contract = projection?.scope_contract ?? null;
+  const unmetConstraintId = pending?.unmetConstraintIds[0] ?? null;
+  const unmetConstraint = contract?.constraints.find((item) => item.id === unmetConstraintId) ?? null;
+  const unmetLabel = unmetConstraint?.value || unmetConstraint?.label || "必要范围";
+
+  if (draft && !projection) {
+    const valid = finalQueries.length === draft.query_groups.length
+      && finalQueries.every((query) => query.trim().length > 0);
+    return (
+      <div className="flex justify-start">
+        <section className="w-full max-w-[92%] rounded-2xl border border-line bg-[#f0f2f5] px-5 py-4 text-sm text-ink" aria-label="确认检索范围">
+          <p className="text-xs font-semibold uppercase tracking-wider text-quiet">检索范围确认</p>
+          <h2 className="mt-1 text-base font-semibold">确认每组最终检索词</h2>
+          <p className="mt-1 text-xs leading-5 text-quiet">这些检索词会冻结为本轮执行范围。可以编辑最终检索词，范围约束仍由服务端管理。</p>
+          <div className="mt-4 space-y-3">
+            {draft.query_groups.map((group, index) => (
+              <label key={`${draft.id}-${index}`} className="block rounded-xl border border-line bg-white px-3 py-3">
+                <span className="text-xs font-medium text-ink">检索组 {index + 1}</span>
+                <input
+                  aria-label={`检索组 ${index + 1}`}
+                  value={finalQueries[index] ?? ""}
+                  onChange={(event) => setFinalQueries((current) => current.map((query, queryIndex) => (
+                    queryIndex === index ? event.target.value : query
+                  )))}
+                  className="mt-2 w-full rounded-lg border border-line bg-white px-3 py-2 text-sm outline-none focus:border-ink"
+                />
+                {group.suggested_query !== (finalQueries[index] ?? "") && (
+                  <span className="mt-1 block text-[11px] text-quiet">系统建议：{group.suggested_query}</span>
+                )}
+              </label>
+            ))}
+          </div>
+          <div className="mt-4 flex justify-end">
+            <button
+              type="button"
+              disabled={busy || !valid}
+              onClick={() => onConfirm({
+                scope_draft_id: draft.id,
+                structure_hash: draft.structure_hash,
+                query_groups: finalQueries.map((finalQuery) => ({ final_query: finalQuery.trim() })),
+              })}
+              className="rounded-lg bg-ink px-4 py-2 text-xs font-medium text-white disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              {busy ? "确认中…" : "确认并开始调研"}
+            </button>
+          </div>
+        </section>
+      </div>
+    );
+  }
+
+  if (!projection || !contract) return null;
+
+  return (
+    <div className="flex justify-start">
+      <section className="w-full max-w-[92%] rounded-2xl border border-line bg-[#f0f2f5] px-5 py-4 text-sm text-ink" aria-label="已确认检索范围">
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <p className="text-xs font-semibold uppercase tracking-wider text-quiet">已冻结检索范围</p>
+            <h2 className="mt-1 text-base font-semibold">Scope v{contract.version}</h2>
+          </div>
+          <span className="rounded-full bg-white px-2.5 py-1 text-[11px] text-quiet">服务端已保存</span>
+        </div>
+        <div className="mt-3 space-y-2">
+          {contract.query_groups.map((group, index) => (
+            <div key={group.id} className="rounded-xl border border-line bg-white px-3 py-2.5">
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-xs font-medium">检索组 {index + 1}</span>
+                <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] text-quiet">{scopeExecutionRoleLabel(group.execution_role)}</span>
+              </div>
+              <p className="mt-1.5 leading-5">{group.final_query}</p>
+              {group.suggested_query !== group.final_query && (
+                <p className="mt-1 text-[11px] text-quiet">原建议：{group.suggested_query}</p>
+              )}
+            </div>
+          ))}
+        </div>
+
+        {pending && (
+          <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50 px-4 py-4 text-amber-950" aria-label="覆盖不足决策">
+            <p className="text-sm font-semibold">{unmetLabel}覆盖不足，需要你决定下一步</p>
+            <p className="mt-1 text-xs leading-5 text-amber-800">正常报告会保持隐藏，直到你选择补充样本、生成受限报告或放宽约束。</p>
+            <div className="mt-3 grid gap-2 sm:grid-cols-2">
+              {supplementaryQueries.map((query, index) => (
+                <input
+                  key={index}
+                  aria-label={`补充检索词 ${index + 1}`}
+                  value={query}
+                  onChange={(event) => setSupplementaryQueries((current) => current.map((item, queryIndex) => (
+                    queryIndex === index ? event.target.value : item
+                  )))}
+                  placeholder={`补充检索词 ${index + 1}${index === 1 ? "（可选）" : ""}`}
+                  className="rounded-lg border border-amber-200 bg-white px-3 py-2 text-xs text-ink outline-none focus:border-amber-500"
+                />
+              ))}
+            </div>
+            <div className="mt-3 flex flex-wrap gap-2">
+              <button
+                type="button"
+                disabled={busy || !supplementaryQueries.some((query) => query.trim())}
+                onClick={() => onResolve({
+                  scope_contract_version: contract.version,
+                  resolution: "expand_required_constraint",
+                  ...(unmetConstraintId ? { constraint_id: unmetConstraintId } : {}),
+                  supplementary_queries: supplementaryQueries.map((query) => query.trim()).filter(Boolean),
+                })}
+                className="rounded-lg bg-amber-900 px-3 py-2 text-xs font-medium text-white disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                继续补充{unmetLabel}样本
+              </button>
+              <button type="button" disabled={busy} onClick={() => onResolve({ scope_contract_version: contract.version, resolution: "generate_limited_report" })} className="rounded-lg border border-amber-300 bg-white px-3 py-2 text-xs font-medium">
+                基于现有证据生成受限报告
+              </button>
+              <button
+                type="button"
+                disabled={busy || !unmetConstraintId}
+                onClick={() => onResolve({
+                  scope_contract_version: contract.version,
+                  resolution: "relax_constraint",
+                  ...(unmetConstraintId ? { constraint_id: unmetConstraintId } : {}),
+                })}
+                className="rounded-lg border border-amber-300 bg-white px-3 py-2 text-xs font-medium"
+              >
+                放宽{unmetLabel}约束
+              </button>
+            </div>
+          </div>
+        )}
+      </section>
+    </div>
+  );
+}
+
+function CreatorPage() {
   const { selectedBrandId } = useBrandContext();
   const [threads, setThreads] = useState<CreatorThreadSummary[]>([]);
   const [activeThreadId, setActiveThreadId] = useState<string | null>(null);
@@ -2041,6 +2228,9 @@ export default function CreatorPage() {
   const [contentResearchMode, setContentResearchMode] = useState(false);
   const [contentResearchIntent, setContentResearchIntent] = useState<ContentResearchIntentState | null>(null);
   const [contentResearchRun, setContentResearchRun] = useState<ContentResearchRunState | null>(null);
+  const [preparedScope, setPreparedScope] = useState<ContentResearchScopeDraft | null>(null);
+  const [scopeProjection, setScopeProjection] = useState<ContentResearchScopeProjection | null>(null);
+  const [scopeActionBusy, setScopeActionBusy] = useState(false);
   const [traceExpanded, setTraceExpanded] = useState(false);
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
   const [editingText, setEditingText] = useState("");
@@ -2285,6 +2475,9 @@ export default function CreatorPage() {
     setMessages([WELCOME_MESSAGE]);
     setContentResearchIntent(null);
     setContentResearchRun(null);
+    setPreparedScope(null);
+    setScopeProjection(null);
+    setScopeActionBusy(false);
     setTraceExpanded(false);
     setTask(null);
     setStatusLog([]);
@@ -2300,6 +2493,13 @@ export default function CreatorPage() {
         : current
     );
     return trace;
+  }
+
+  async function refreshContentResearchScope(workflowRunId: string) {
+    const projection = await getContentResearchScope(workflowRunId);
+    setScopeProjection(projection);
+    setPreparedScope(null);
+    return projection;
   }
 
   async function restoreInterruptedContentResearchRun(threadId: string): Promise<boolean> {
@@ -2373,6 +2573,12 @@ export default function CreatorPage() {
         )
       ) {
         return report;
+      }
+      try {
+        const projection = await refreshContentResearchScope(workflowRunId);
+        if (pendingCoverageDecision(projection)) return null;
+      } catch {
+        // Scope does not exist before confirmation and can lag collection briefly.
       }
       await new Promise<void>((resolve) => window.setTimeout(resolve, 1000));
     }
@@ -2513,6 +2719,8 @@ export default function CreatorPage() {
       const presearch = await createContentResearchPresearch({ seed_text: subject, user_note: null, thread_id: activeThreadId });
       setContentResearchIntent({ seed: subject, presearch: { ...presearch, competitor_tags: [...new Set([...presearch.competitor_tags, ...competitors])], research_directions: directions.length ? directions : presearch.research_directions } });
       setContentResearchRun(null);
+      setPreparedScope(null);
+      setScopeProjection(null);
       setTraceExpanded(false);
       appendMessage({ role: "assistant", text: "已新建一轮调研 checklist，可以修改主体、竞品或调研方向后重新确认。" });
     } catch {
@@ -2528,6 +2736,8 @@ export default function CreatorPage() {
       removeContentResearchRunForThread(run.summary.brief.thread_id);
       setContentResearchRun(null);
       setContentResearchIntent(null);
+      setPreparedScope(null);
+      setScopeProjection(null);
       setTraceExpanded(false);
       appendMessage({ role: "assistant", text: "已结束本次内容调研，并清除当前线程的调研恢复入口。" });
     } catch (error) {
@@ -2551,17 +2761,73 @@ export default function CreatorPage() {
       reportStatus: "idle",
       reportError: null,
     });
+    setPreparedScope(null);
+    setScopeProjection(null);
     setTraceExpanded(false);
     appendMessage({
       role: "assistant",
-      text: "已确认调研范围，正在开始内容调研。",
+      text: "调研 brief 已确认，请确认本轮最终检索词。",
     });
     try {
       await refreshContentResearchTrace(summary.workflow_run_id);
     } catch {
       appendMessage({ role: "system", text: "调研过程暂时不可用，稍后可在 Trace 中刷新。" });
     }
-    void startContentResearchForRun(summary.workflow_run_id);
+    const directionId = arrayField(summary.brief.payload, "selected_directions")[0]
+      || stringField(summary.directions[0]?.payload, "direction_id");
+    if (!directionId) {
+      appendMessage({ role: "system", text: "无法读取已确认的调研方向，请返回 checklist 后重试。" });
+      return;
+    }
+    try {
+      setPreparedScope(await prepareContentResearchScope(summary.workflow_run_id, { direction_id: directionId }));
+    } catch (error) {
+      appendMessage({
+        role: "system",
+        text: `检索范围准备失败：${error instanceof Error ? error.message : "请稍后重试。"}`,
+      });
+    }
+  }
+
+  async function confirmPreparedContentResearchScope(payload: ContentResearchConfirmScopeRequest) {
+    const run = contentResearchRun;
+    if (!run || scopeActionBusy) return;
+    setScopeActionBusy(true);
+    try {
+      await confirmContentResearchScope(run.workflowRunId, payload);
+      await refreshContentResearchScope(run.workflowRunId);
+      appendMessage({ role: "assistant", text: "检索范围已冻结，正在开始内容调研。" });
+      void startContentResearchForRun(run.workflowRunId);
+    } catch (error) {
+      appendMessage({
+        role: "system",
+        text: `确认检索范围失败：${error instanceof Error ? error.message : "请刷新后重试。"}`,
+      });
+    } finally {
+      setScopeActionBusy(false);
+    }
+  }
+
+  async function resolvePendingContentResearchCoverage(payload: ContentResearchResolveCoverageRequest) {
+    const run = contentResearchRun;
+    if (!run || scopeActionBusy) return;
+    setScopeActionBusy(true);
+    try {
+      await resolveContentResearchCoverage(run.workflowRunId, payload);
+      await refreshContentResearchScope(run.workflowRunId);
+      if (payload.resolution === "generate_limited_report") {
+        await refreshContentResearchReport(run.workflowRunId);
+      } else {
+        void startContentResearchForRun(run.workflowRunId);
+      }
+    } catch (error) {
+      appendMessage({
+        role: "system",
+        text: `覆盖范围决策失败：${error instanceof Error ? error.message : "请稍后重试。"}`,
+      });
+    } finally {
+      setScopeActionBusy(false);
+    }
   }
 
   async function continueModelRecovery() {
@@ -2582,6 +2848,8 @@ export default function CreatorPage() {
       || "本轮调研";
     setContentResearchIntent({ seed, presearch });
     setContentResearchRun(null);
+    setPreparedScope(null);
+    setScopeProjection(null);
     setTraceExpanded(false);
   }
 
@@ -2638,6 +2906,15 @@ export default function CreatorPage() {
           const workflow = await getContentResearchWorkflow(runIdForThread);
           if (loadingThreadRef.current !== threadId || workflow.brief.thread_id !== threadId) return;
           saveContentResearchRunForThread(threadId, runIdForThread);
+          let restoredScopeProjection: ContentResearchScopeProjection | null = null;
+          try {
+            restoredScopeProjection = await getContentResearchScope(runIdForThread);
+          } catch {
+            // Runs created before Scope confirmation have no persisted projection.
+          }
+          if (loadingThreadRef.current !== threadId) return;
+          setScopeProjection(restoredScopeProjection);
+          setPreparedScope(null);
           let trace: ContentResearchTrace | null = null;
           try {
             trace = await getContentResearchTrace(runIdForThread);
@@ -3044,6 +3321,12 @@ export default function CreatorPage() {
               const isUser = message.role === "user";
               const isSystem = message.role === "system";
               const editing = editingMessageId === message.id;
+              const hideReportForPendingScope = Boolean(
+                message.report
+                && message.report.workflow_run_id === scopeProjection?.workflow_run_id
+                && pendingCoverageDecision(scopeProjection),
+              );
+              if (hideReportForPendingScope) return null;
 
               return (
                 <div
@@ -3123,6 +3406,16 @@ export default function CreatorPage() {
                 onConfirmed={(summary) => void handleContentResearchConfirmed(summary)}
                 onPresearchUpdated={(presearch) => setContentResearchIntent((current) => current ? { ...current, presearch } : current)}
                 onError={(message) => appendMessage({ role: "system", text: message })}
+              />
+            )}
+
+            {(preparedScope || scopeProjection) && (
+              <ContentResearchScopeCard
+                draft={preparedScope}
+                projection={scopeProjection}
+                busy={scopeActionBusy}
+                onConfirm={(payload) => void confirmPreparedContentResearchScope(payload)}
+                onResolve={(payload) => void resolvePendingContentResearchCoverage(payload)}
               />
             )}
 
@@ -3406,3 +3699,6 @@ export default function CreatorPage() {
 }
 
 CreatorPage.ContentResearchIntentCard = ContentResearchIntentCard;
+CreatorPage.ContentResearchScopeCard = ContentResearchScopeCard;
+
+export default CreatorPage;

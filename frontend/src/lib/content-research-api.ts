@@ -211,7 +211,7 @@ export interface ContentResearchFormalResearchResponse {
 
 export interface ContentResearchWorkflowActionRequest {
   schema_version?: string;
-  action: "confirm_brief" | "start_formal_research" | "retry_formal_research" | "resume_formal_research" | "end_content_research" | "retry_presearch" | "clarify_subject" | "confirm_subject_structure" | "repair_from_persisted_packets";
+  action: "confirm_brief" | "start_formal_research" | "retry_formal_research" | "resume_formal_research" | "end_content_research" | "retry_presearch" | "clarify_subject" | "confirm_subject_structure" | "repair_from_persisted_packets" | "prepare_scope" | "confirm_scope" | "resolve_coverage";
   payload?: JsonObject;
 }
 
@@ -225,6 +225,104 @@ export interface ContentResearchWorkflowActionResponse<T = JsonObject> {
   remote_run_id?: string | null;
   local_cache_id?: string | null;
   sync_status: string;
+}
+
+export interface ContentResearchScopeConstraint {
+  id: string;
+  label: string;
+  value: string;
+  mode: "required" | "preferred";
+  allowed_aliases: string[];
+}
+
+export interface ContentResearchScopeDraftQueryGroup {
+  suggested_query: string;
+  final_query: string;
+  targeted_required_terms: string[];
+}
+
+export interface ContentResearchScopeDraft {
+  id: string;
+  workflow_run_id: string;
+  research_plan_id: string;
+  structure_hash: string;
+  constraints: ContentResearchScopeConstraint[];
+  query_groups: ContentResearchScopeDraftQueryGroup[];
+  created_at: string;
+}
+
+export type ContentResearchScopeExecutionRole = "coverage" | "supplementary" | "exploratory";
+
+export interface ContentResearchScopeContractQueryGroup {
+  id: string;
+  suggested_query: string;
+  final_query: string;
+  origin: "system_suggested" | "user_edited";
+  execution_role: ContentResearchScopeExecutionRole;
+}
+
+export interface ContentResearchScopeContract {
+  id: string;
+  workflow_run_id: string;
+  research_plan_id: string;
+  version: number;
+  schema_version: string;
+  constraints: ContentResearchScopeConstraint[];
+  query_groups: ContentResearchScopeContractQueryGroup[];
+  created_at: string;
+}
+
+export interface ContentResearchScopeAuditEvent {
+  id: string;
+  workflow_run_id: string;
+  scope_draft_id?: string;
+  scope_contract_id?: string;
+  scope_contract_version?: number;
+  event_name: string;
+  payload: JsonObject;
+  created_at: string;
+}
+
+export interface ContentResearchScopeProjection {
+  schema_version: string;
+  workflow_run_id: string;
+  draft: ContentResearchScopeDraft;
+  scope_contract: ContentResearchScopeContract;
+  audit_events: ContentResearchScopeAuditEvent[];
+}
+
+export interface ContentResearchPrepareScopeRequest {
+  direction_id: string;
+}
+
+export interface ContentResearchConfirmScopeRequest {
+  scope_draft_id: string;
+  structure_hash: string;
+  query_groups: Array<{ final_query: string }>;
+}
+
+export type ContentResearchCoverageResolution =
+  | "expand_required_constraint"
+  | "generate_limited_report"
+  | "relax_constraint";
+
+export interface ContentResearchResolveCoverageRequest {
+  scope_contract_version: number;
+  resolution: ContentResearchCoverageResolution;
+  constraint_id?: string;
+  supplementary_queries?: string[];
+}
+
+export interface ContentResearchConfirmScopeResult {
+  scope_contract: ContentResearchScopeContract;
+  audit_event: ContentResearchScopeAuditEvent;
+}
+
+export interface ContentResearchResolveCoverageResult {
+  report_mode: string;
+  scope_contract: ContentResearchScopeContract;
+  unmet_constraint_ids: string[];
+  audit_event: ContentResearchScopeAuditEvent;
 }
 
 export interface XHSQRLoginResponse {
@@ -433,6 +531,49 @@ export async function confirmContentResearchBriefLegacy(
 
 export async function getContentResearchWorkflow(workflowRunId: string): Promise<ContentResearchWorkflowSummary> {
   return contentResearchFetch(`/content-research/workflows/${encodeURIComponent(workflowRunId)}`);
+}
+
+export async function prepareContentResearchScope(
+  workflowRunId: string,
+  payload: ContentResearchPrepareScopeRequest,
+): Promise<ContentResearchScopeDraft> {
+  const response = await runContentResearchWorkflowAction<{ scope: ContentResearchScopeDraft }>(workflowRunId, {
+    action: "prepare_scope",
+    payload: payload as unknown as JsonObject,
+  });
+  return response.result.scope;
+}
+
+export async function confirmContentResearchScope(
+  workflowRunId: string,
+  payload: ContentResearchConfirmScopeRequest,
+): Promise<ContentResearchConfirmScopeResult> {
+  const response = await runContentResearchWorkflowAction<ContentResearchConfirmScopeResult>(workflowRunId, {
+    action: "confirm_scope",
+    payload: payload as unknown as JsonObject,
+  });
+  return response.result;
+}
+
+export async function resolveContentResearchCoverage(
+  workflowRunId: string,
+  payload: ContentResearchResolveCoverageRequest,
+): Promise<ContentResearchResolveCoverageResult> {
+  const response = await runContentResearchWorkflowAction<ContentResearchResolveCoverageResult>(workflowRunId, {
+    action: "resolve_coverage",
+    payload: payload as unknown as JsonObject,
+  });
+  return response.result;
+}
+
+export async function getContentResearchScope(
+  workflowRunId: string,
+  version?: number,
+): Promise<ContentResearchScopeProjection> {
+  const suffix = version === undefined ? "" : `?version=${encodeURIComponent(String(version))}`;
+  return contentResearchFetch(
+    `/content-research/workflows/${encodeURIComponent(workflowRunId)}/scope${suffix}`,
+  );
 }
 
 export async function getContentResearchTrace(workflowRunId: string): Promise<ContentResearchTrace> {
