@@ -16,7 +16,14 @@ from app.content_research.models import (
     SubagentTaskRecord,
 )
 from app.content_research.persistence_models import StageCheckpointRecord
-from app.content_research.stores.sqlite_store import _dumps, _dumps_any_list, _fmt_dt
+from app.content_research.scope_contract import ScopeExecutionContinuation
+from app.content_research.stores.sqlite_store import (
+    _dumps,
+    _dumps_any_list,
+    _fmt_dt,
+    _loads_any_list,
+    _parse_dt,
+)
 
 
 def _now() -> datetime:
@@ -384,3 +391,142 @@ class AsyncFormalResearchDispatchRepository:
         if row is None:
             raise RuntimeError(f"dispatch job disappeared: {workflow_run_id}")
         return dict(row)
+
+
+class AsyncScopeExecutionContinuationRepository:
+    """Lease/claim boundary for authorization-owned continuation commands."""
+
+    def __init__(self, db_path: str) -> None:
+        self._db_path = db_path
+
+    async def claim_next(
+        self, *, owner: str, lease_seconds: int = 120
+    ) -> ScopeExecutionContinuation | None:
+        now = _now()
+        expires = (now + timedelta(seconds=lease_seconds)).isoformat()
+        token = uuid.uuid4().hex
+        async with aiosqlite.connect(self._db_path) as conn:
+            conn.row_factory = aiosqlite.Row
+            cursor = await conn.execute(
+                """SELECT 1 FROM content_research_scope_execution_continuations
+                   WHERE state='pending'
+                      OR (state='running' AND lease_expires_at IS NOT NULL
+                          AND lease_expires_at < ?)
+                   LIMIT 1""",
+                (now.isoformat(),),
+            )
+            if await cursor.fetchone() is None:
+                return None
+            await conn.execute("BEGIN IMMEDIATE")
+            try:
+                await conn.execute(
+                    """UPDATE content_research_scope_execution_continuations
+                       SET state='pending', lease_owner=NULL, lease_token=NULL,
+                           lease_expires_at=NULL, updated_at=?
+                       WHERE state='running' AND lease_expires_at IS NOT NULL
+                         AND lease_expires_at < ?""",
+                    (now.isoformat(), now.isoformat()),
+                )
+                cursor = await conn.execute(
+                    """SELECT id FROM content_research_scope_execution_continuations
+                       WHERE state='pending' ORDER BY created_at ASC, id ASC LIMIT 1"""
+                )
+                candidate = await cursor.fetchone()
+                if candidate is None:
+                    await conn.commit()
+                    return None
+                continuation_id = str(candidate["id"])
+                result = await conn.execute(
+                    """UPDATE content_research_scope_execution_continuations
+                       SET state='running', attempt_count=attempt_count+1,
+                           lease_owner=?, lease_token=?, lease_expires_at=?, updated_at=?
+                       WHERE id=? AND state='pending'""",
+                    (
+                        owner,
+                        token,
+                        expires,
+                        now.isoformat(),
+                        continuation_id,
+                    ),
+                )
+                if result.rowcount != 1:
+                    await conn.commit()
+                    return None
+                row_cursor = await conn.execute(
+                    """SELECT * FROM content_research_scope_execution_continuations
+                       WHERE id=?""",
+                    (continuation_id,),
+                )
+                row = await row_cursor.fetchone()
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
+        return self._row_to_continuation(row) if row is not None else None
+
+    async def renew(
+        self, *, authorization_id: str, owner: str, token: str, lease_seconds: int = 120
+    ) -> bool:
+        now = _now()
+        async with aiosqlite.connect(self._db_path) as conn:
+            result = await conn.execute(
+                """UPDATE content_research_scope_execution_continuations
+                   SET lease_expires_at=?, updated_at=?
+                   WHERE authorization_id=? AND state='running'
+                     AND lease_owner=? AND lease_token=?""",
+                (
+                    (now + timedelta(seconds=lease_seconds)).isoformat(),
+                    now.isoformat(),
+                    authorization_id,
+                    owner,
+                    token,
+                ),
+            )
+            await conn.commit()
+        return result.rowcount == 1
+
+    async def complete(
+        self,
+        *,
+        authorization_id: str,
+        owner: str,
+        token: str,
+        error: str | None = None,
+    ) -> bool:
+        now = _now().isoformat()
+        async with aiosqlite.connect(self._db_path) as conn:
+            result = await conn.execute(
+                """UPDATE content_research_scope_execution_continuations
+                   SET state=?, last_error=?, lease_owner=NULL, lease_token=NULL,
+                       lease_expires_at=NULL, updated_at=?, completed_at=?
+                   WHERE authorization_id=? AND state='running'
+                     AND lease_owner=? AND lease_token=?""",
+                (
+                    "failed" if error else "completed",
+                    error,
+                    now,
+                    now,
+                    authorization_id,
+                    owner,
+                    token,
+                ),
+            )
+            await conn.commit()
+        return result.rowcount == 1
+
+    @staticmethod
+    def _row_to_continuation(row: aiosqlite.Row) -> ScopeExecutionContinuation:
+        return ScopeExecutionContinuation(
+            id=str(row["id"]),
+            authorization_id=str(row["authorization_id"]),
+            workflow_run_id=str(row["workflow_run_id"]),
+            execution_revision=int(row["execution_revision"]),
+            operation=str(row["operation"]),
+            supplementary_queries=tuple(
+                str(item)
+                for item in _loads_any_list(row["supplementary_queries_json"])
+            ),
+            state=str(row["state"]),
+            created_at=_parse_dt(str(row["created_at"])),
+            lease_token=str(row["lease_token"]) if row["lease_token"] else None,
+        )

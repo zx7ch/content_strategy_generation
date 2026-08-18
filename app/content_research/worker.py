@@ -9,7 +9,10 @@ from collections.abc import Callable
 from dataclasses import replace
 
 from app.content_research.api_schemas import ContentResearchSourceCollectionRequest
-from app.content_research.async_dispatch import AsyncFormalResearchDispatchRepository
+from app.content_research.async_dispatch import (
+    AsyncFormalResearchDispatchRepository,
+    AsyncScopeExecutionContinuationRepository,
+)
 from app.content_research.models import utcnow
 from app.content_research.persistence_models import StageCheckpointRecord
 from app.content_research.service import ContentResearchService
@@ -32,6 +35,7 @@ class ContentResearchDispatchWorker:
     ) -> None:
         self._store = store
         self._dispatch = AsyncFormalResearchDispatchRepository(store._db_path)
+        self._continuations = AsyncScopeExecutionContinuationRepository(store._db_path)
         self._service_factory = service_factory
         self._wake_event = wake_event or asyncio.Event()
         self._recovery_scan_seconds = recovery_scan_seconds
@@ -39,6 +43,11 @@ class ContentResearchDispatchWorker:
         self._owner = f"content-research-worker:{uuid.uuid4().hex}"
 
     async def run_once(self) -> bool:
+        continuation = await self._continuations.claim_next(
+            owner=self._owner, lease_seconds=self._lease_seconds
+        )
+        if continuation is not None:
+            return await self._run_scope_continuation(continuation)
         job = await self._dispatch.claim_next(owner=self._owner, lease_seconds=self._lease_seconds)
         if job is None:
             return False
@@ -105,6 +114,49 @@ class ContentResearchDispatchWorker:
             )
         return True
 
+    async def _run_scope_continuation(self, continuation) -> bool:
+        token = str(continuation.lease_token or "")
+        if not token:
+            raise RuntimeError("claimed scope continuation is missing its lease token")
+        lease_stop = asyncio.Event()
+        lease_lost = asyncio.Event()
+        heartbeat = asyncio.create_task(
+            self._heartbeat_continuation_lease(
+                authorization_id=continuation.authorization_id,
+                token=token,
+                stop_event=lease_stop,
+                lease_lost=lease_lost,
+            )
+        )
+        error: Exception | None = None
+        try:
+            await self._service_factory().execute_scope_continuation(continuation)
+        except Exception as exc:
+            error = exc
+            logger.exception(
+                "content research scope continuation failed",
+                extra={
+                    "workflow_run_id": continuation.workflow_run_id,
+                    "authorization_id": continuation.authorization_id,
+                },
+            )
+        finally:
+            lease_stop.set()
+            await heartbeat
+        if lease_lost.is_set():
+            logger.error(
+                "content research scope continuation lease lost",
+                extra={"authorization_id": continuation.authorization_id},
+            )
+            return True
+        await self._continuations.complete(
+            authorization_id=continuation.authorization_id,
+            owner=self._owner,
+            token=token,
+            error=str(error) if error is not None else None,
+        )
+        return True
+
     async def _heartbeat_lease(
         self,
         *,
@@ -122,6 +174,30 @@ class ContentResearchDispatchWorker:
                 pass
             if not await self._dispatch.renew(
                 workflow_run_id=workflow_run_id,
+                owner=self._owner,
+                token=token,
+                lease_seconds=self._lease_seconds,
+            ):
+                lease_lost.set()
+                return
+
+    async def _heartbeat_continuation_lease(
+        self,
+        *,
+        authorization_id: str,
+        token: str,
+        stop_event: asyncio.Event,
+        lease_lost: asyncio.Event,
+    ) -> None:
+        interval = max(1.0, self._lease_seconds / 3)
+        while True:
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=interval)
+                return
+            except asyncio.TimeoutError:
+                pass
+            if not await self._continuations.renew(
+                authorization_id=authorization_id,
                 owner=self._owner,
                 token=token,
                 lease_seconds=self._lease_seconds,

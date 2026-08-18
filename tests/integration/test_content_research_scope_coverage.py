@@ -12,6 +12,8 @@ from app.content_research.scope_contract import (
     CoverageSnapshot,
     ScopeAuditEvent,
     ScopeConstraint,
+    ScopeExecutionAuthorization,
+    ScopeExecutionContinuation,
     ScopeQueryGroupInput,
     build_scope_contract,
 )
@@ -149,6 +151,104 @@ def test_scope_coverage_persists_exact_counts_reasons_and_corresponding_audits(
     assert coverage_event["reason_codes"] == snapshot.constraint_counts["_summary"][
         "reason_codes"
     ]
+
+
+def test_supplementary_execution_persists_a_new_coverage_revision_with_lineage(
+    tmp_path,
+) -> None:
+    store = SQLiteContentResearchStore(str(tmp_path / "scope-coverage-revision.db"))
+    contract = build_scope_contract(
+        workflow_run_id="run_scope_revision",
+        research_plan_id="rp_scope_revision",
+        version=1,
+        constraints=(
+            ScopeConstraint("core_object", "核心对象", "衬衫", "required"),
+            ScopeConstraint("season", "季节", "夏季", "required"),
+        ),
+        query_groups=(
+            ScopeQueryGroupInput("夏季 衬衫", "夏季 衬衫", ("夏季", "衬衫")),
+        ),
+    )
+    store.save_scope_contract(contract)
+    initial = persist_scope_coverage_evaluation(
+        store=store,
+        contract=contract,
+        candidates=(),
+        query_group_outcomes={},
+        minimum_samples=1,
+        minimum_independent_authors=1,
+    )
+    authorization = ScopeExecutionAuthorization(
+        id="sea_scope_revision",
+        workflow_run_id=contract.workflow_run_id,
+        scope_contract_id=contract.id,
+        scope_contract_version=contract.version,
+        coverage_snapshot_id=initial.id,
+        resolution="expand_required_constraint",
+        execution_revision=2,
+        state="authorized_collection",
+    )
+    continuation = ScopeExecutionContinuation(
+        id="sec_scope_revision",
+        authorization_id=authorization.id,
+        workflow_run_id=contract.workflow_run_id,
+        execution_revision=authorization.execution_revision,
+        operation="supplementary_collection",
+        supplementary_queries=("夏季 防晒 衬衫",),
+        state="pending",
+    )
+    resolution_event = ScopeAuditEvent(
+        id="sae_scope_revision_resolved",
+        workflow_run_id=contract.workflow_run_id,
+        scope_contract_id=contract.id,
+        scope_contract_version=contract.version,
+        event_name="coverage_resolved",
+        payload={
+            "schema_version": "content_research_scope_audit_event_v1",
+            "coverage_snapshot_id": initial.id,
+            "resolution": authorization.resolution,
+        },
+    )
+    store.resolve_coverage_and_authorize_execution_atomically(
+        snapshot=initial,
+        authorization=authorization,
+        continuation=continuation,
+        event=resolution_event,
+    )
+
+    revised = persist_scope_coverage_evaluation(
+        store=store,
+        contract=contract,
+        candidates=(
+            {
+                "canonical_source_id": "note_supplementary",
+                "title": "夏季防晒衬衫",
+                "author_id": "author_supplementary",
+                "retrieval_context": {"query_group_ids": ["qg_supplementary"]},
+            },
+        ),
+        query_group_outcomes={
+            "qg_supplementary": {
+                "status": "completed",
+                "discovered_count": 1,
+                "failure_code": None,
+            }
+        },
+        minimum_samples=1,
+        minimum_independent_authors=1,
+        execution_authorization=authorization,
+        source_snapshot=initial,
+    )
+
+    assert revised.id != initial.id
+    assert revised.execution_authorization_id == authorization.id
+    assert revised.execution_revision == 2
+    assert revised.source_coverage_snapshot_id == initial.id
+    assert revised.state == "satisfied"
+    assert store.get_coverage_snapshot(contract.workflow_run_id, version=1) == revised
+    assert store.get_coverage_snapshot(
+        contract.workflow_run_id, version=1, execution_revision=1
+    ) == initial
 
 
 def test_coverage_snapshot_rolls_back_when_its_audit_cannot_commit(

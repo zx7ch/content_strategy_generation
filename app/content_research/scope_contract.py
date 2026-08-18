@@ -142,6 +142,9 @@ class CoverageSnapshot:
     state: Literal["satisfied", "awaiting_scope_decision"]
     constraint_counts: dict[str, dict[str, object]]
     unmet_constraint_ids: tuple[str, ...]
+    execution_revision: int = 1
+    execution_authorization_id: str | None = None
+    source_coverage_snapshot_id: str | None = None
     created_at: datetime = field(default_factory=utcnow)
 
     def __post_init__(self) -> None:
@@ -155,6 +158,8 @@ class CoverageSnapshot:
             raise ValueError("coverage snapshot identity is required")
         if self.scope_contract_version < 1:
             raise ValueError("coverage snapshot version must be positive")
+        if self.execution_revision < 1:
+            raise ValueError("coverage execution revision must be positive")
         if self.state not in {"satisfied", "awaiting_scope_decision"}:
             raise ValueError("invalid coverage snapshot state")
 
@@ -202,6 +207,42 @@ class ScopeExecutionAuthorization:
         )
         if self.state != expected_state:
             raise ValueError("invalid scope execution authorization state")
+
+
+@dataclass(frozen=True)
+class ScopeExecutionContinuation:
+    """Durable executable command owned by one coverage authorization."""
+
+    id: str
+    authorization_id: str
+    workflow_run_id: str
+    execution_revision: int
+    operation: Literal["limited_report", "supplementary_collection"]
+    supplementary_queries: tuple[str, ...]
+    state: Literal["pending", "running", "completed", "failed"]
+    created_at: datetime = field(default_factory=utcnow)
+    lease_token: str | None = field(default=None, compare=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if not all(
+            (
+                self.id.strip(),
+                self.authorization_id.strip(),
+                self.workflow_run_id.strip(),
+            )
+        ):
+            raise ValueError("scope execution continuation identity is required")
+        if self.execution_revision < 1:
+            raise ValueError("scope execution continuation revision must be positive")
+        if self.operation not in {"limited_report", "supplementary_collection"}:
+            raise ValueError("invalid scope execution continuation operation")
+        if self.state not in {"pending", "running", "completed", "failed"}:
+            raise ValueError("invalid scope execution continuation state")
+        queries = tuple(query.strip() for query in self.supplementary_queries)
+        if any(not query for query in queries) or len(set(queries)) != len(queries):
+            raise ValueError("scope execution continuation queries must be distinct and non-empty")
+        if self.operation == "limited_report" and queries:
+            raise ValueError("limited report continuation does not accept queries")
 
 
 def build_scope_contract(

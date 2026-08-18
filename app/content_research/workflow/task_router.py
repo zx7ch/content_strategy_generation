@@ -190,6 +190,7 @@ class SubagentTaskRouter:
         self, *, task: SubagentTaskRecord, provider: str, limit: int, source_result: SourceOperationResult | None,
     ) -> SubagentExecutionResult:
         input_payload = dict(task.payload.get("input_payload") or {})
+        scope_execution = dict(input_payload.get("scope_execution") or {})
         direction = dict(input_payload.get("direction") or {})
         direction_id = str(direction.get("id") or task.direction_id or "")
         if not direction_id:
@@ -269,6 +270,16 @@ class SubagentTaskRouter:
             comment_policy_id=policy.id,
             run_as_of_at=snapshot.run_as_of_at,
             admission_contract=contract, admission_policy=policy, policy_snapshot=snapshot,
+            execution_authorization_id=str(
+                scope_execution.get("authorization_id") or ""
+            )
+            or None,
+            execution_revision=int(scope_execution.get("execution_revision") or 1),
+            supplementary_queries=tuple(
+                str(item)
+                for item in scope_execution.get("supplementary_queries") or ()
+                if str(item).strip()
+            ),
         )
         status = (
             "failed"

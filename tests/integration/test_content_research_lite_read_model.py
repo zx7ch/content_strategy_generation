@@ -21,6 +21,7 @@ from app.content_research.scope_contract import (
     ScopeAuditEvent,
     ScopeConstraint,
     ScopeExecutionAuthorization,
+    ScopeExecutionContinuation,
     ScopeQueryGroupInput,
     build_scope_contract,
 )
@@ -357,17 +358,27 @@ def _persist_unmet_season_scope(store, workflow_run_id: str, *, authorize_limite
     )
     store.save_coverage_snapshot(snapshot)
     if authorize_limited:
+        authorization = ScopeExecutionAuthorization(
+            id="sea_limited_season",
+            workflow_run_id=workflow_run_id,
+            scope_contract_id=contract.id,
+            scope_contract_version=1,
+            coverage_snapshot_id=snapshot.id,
+            resolution="generate_limited_report",
+            execution_revision=2,
+            state="authorized_limited_report",
+        )
         store.resolve_coverage_and_authorize_execution_atomically(
             snapshot=snapshot,
-            authorization=ScopeExecutionAuthorization(
-                id="sea_limited_season",
+            authorization=authorization,
+            continuation=ScopeExecutionContinuation(
+                id="sec_limited_season",
+                authorization_id=authorization.id,
                 workflow_run_id=workflow_run_id,
-                scope_contract_id=contract.id,
-                scope_contract_version=1,
-                coverage_snapshot_id=snapshot.id,
-                resolution="generate_limited_report",
-                execution_revision=1,
-                state="authorized_limited_report",
+                execution_revision=2,
+                operation="limited_report",
+                supplementary_queries=(),
+                state="pending",
             ),
             event=ScopeAuditEvent(
                 id="sae_limited_season",

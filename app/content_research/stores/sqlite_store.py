@@ -51,6 +51,7 @@ from app.content_research.scope_contract import (
     ScopeDraftAuditEvent,
     ScopeDraftConfirmation,
     ScopeExecutionAuthorization,
+    ScopeExecutionContinuation,
     ScopeQueryGroup,
     ScopeQueryGroupInput,
     build_scope_contract,
@@ -787,14 +788,19 @@ class SQLiteContentResearchStore:
                 )
                 conn.execute(
                     """INSERT INTO content_research_scope_coverage_snapshots
-                       (id, workflow_run_id, scope_contract_id, scope_contract_version, state,
-                        constraint_counts_json, unmet_constraint_ids_json, created_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                       (id, workflow_run_id, scope_contract_id, scope_contract_version,
+                        execution_revision, execution_authorization_id,
+                        source_coverage_snapshot_id, state, constraint_counts_json,
+                        unmet_constraint_ids_json, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         snapshot.id,
                         snapshot.workflow_run_id,
                         snapshot.scope_contract_id,
                         snapshot.scope_contract_version,
+                        snapshot.execution_revision,
+                        snapshot.execution_authorization_id,
+                        snapshot.source_coverage_snapshot_id,
                         snapshot.state,
                         _dumps(snapshot.constraint_counts),
                         _dumps_any_list(list(snapshot.unmet_constraint_ids)),
@@ -827,14 +833,19 @@ class SQLiteContentResearchStore:
                 )
                 conn.execute(
                     """INSERT INTO content_research_scope_coverage_snapshots
-                       (id, workflow_run_id, scope_contract_id, scope_contract_version, state,
-                        constraint_counts_json, unmet_constraint_ids_json, created_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                       (id, workflow_run_id, scope_contract_id, scope_contract_version,
+                        execution_revision, execution_authorization_id,
+                        source_coverage_snapshot_id, state, constraint_counts_json,
+                        unmet_constraint_ids_json, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         snapshot.id,
                         snapshot.workflow_run_id,
                         snapshot.scope_contract_id,
                         snapshot.scope_contract_version,
+                        snapshot.execution_revision,
+                        snapshot.execution_authorization_id,
+                        snapshot.source_coverage_snapshot_id,
                         snapshot.state,
                         _dumps(snapshot.constraint_counts),
                         _dumps_any_list(list(snapshot.unmet_constraint_ids)),
@@ -849,13 +860,34 @@ class SQLiteContentResearchStore:
         return snapshot
 
     def get_coverage_snapshot(
-        self, workflow_run_id: str, *, version: int
+        self,
+        workflow_run_id: str,
+        *,
+        version: int,
+        execution_revision: int | None = None,
     ) -> CoverageSnapshot | None:
         with self._connect() as conn:
+            if execution_revision is None:
+                row = conn.execute(
+                    """SELECT * FROM content_research_scope_coverage_snapshots
+                       WHERE workflow_run_id = ? AND scope_contract_version = ?
+                       ORDER BY execution_revision DESC, created_at DESC, id DESC LIMIT 1""",
+                    (workflow_run_id, version),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    """SELECT * FROM content_research_scope_coverage_snapshots
+                       WHERE workflow_run_id = ? AND scope_contract_version = ?
+                         AND execution_revision = ?""",
+                    (workflow_run_id, version, execution_revision),
+                ).fetchone()
+        return self._row_to_coverage_snapshot(row) if row else None
+
+    def get_coverage_snapshot_by_id(self, snapshot_id: str) -> CoverageSnapshot | None:
+        with self._connect() as conn:
             row = conn.execute(
-                """SELECT * FROM content_research_scope_coverage_snapshots
-                   WHERE workflow_run_id = ? AND scope_contract_version = ?""",
-                (workflow_run_id, version),
+                "SELECT * FROM content_research_scope_coverage_snapshots WHERE id=?",
+                (snapshot_id,),
             ).fetchone()
         return self._row_to_coverage_snapshot(row) if row else None
 
@@ -864,9 +896,10 @@ class SQLiteContentResearchStore:
         *,
         snapshot: CoverageSnapshot,
         authorization: ScopeExecutionAuthorization,
+        continuation: ScopeExecutionContinuation,
         event: ScopeAuditEvent,
         successor_scope_contract: ResearchScopeContract | None = None,
-    ) -> tuple[ResearchScopeContract, ScopeAuditEvent, ScopeExecutionAuthorization, bool]:
+    ) -> tuple[ResearchScopeContract, ScopeAuditEvent, ScopeExecutionAuthorization, ScopeExecutionContinuation, bool]:
         """Persist one coverage decision and its continuation authority together.
 
         The coverage snapshot is the decision's idempotency boundary.  A
@@ -885,6 +918,9 @@ class SQLiteContentResearchStore:
             or authorization.coverage_snapshot_id != snapshot.id
             or authorization.scope_contract_id != result_contract.id
             or authorization.scope_contract_version != result_contract.version
+            or continuation.authorization_id != authorization.id
+            or continuation.workflow_run_id != authorization.workflow_run_id
+            or continuation.execution_revision != authorization.execution_revision
             or event.workflow_run_id != snapshot.workflow_run_id
             or event.scope_contract_id != result_contract.id
             or event.scope_contract_version != result_contract.version
@@ -914,6 +950,16 @@ class SQLiteContentResearchStore:
             ).fetchone()
             if existing_row is not None:
                 existing = self._row_to_scope_execution_authorization(existing_row)
+                continuation_row = conn.execute(
+                    """SELECT * FROM content_research_scope_execution_continuations
+                       WHERE authorization_id = ?""",
+                    (existing.id,),
+                ).fetchone()
+                if continuation_row is None:
+                    raise RuntimeError("coverage authorization references a missing continuation")
+                existing_continuation = self._row_to_scope_execution_continuation(
+                    continuation_row
+                )
                 event_rows = conn.execute(
                     """SELECT * FROM content_research_scope_audit_events
                        WHERE workflow_run_id = ?
@@ -937,6 +983,9 @@ class SQLiteContentResearchStore:
                     existing.resolution != authorization.resolution
                     or existing.scope_contract_id != authorization.scope_contract_id
                     or existing.scope_contract_version != authorization.scope_contract_version
+                    or existing_continuation.operation != continuation.operation
+                    or existing_continuation.supplementary_queries
+                    != continuation.supplementary_queries
                     or existing_event.payload != event.payload
                 ):
                     raise ValueError("coverage snapshot already has a different persisted resolution")
@@ -951,6 +1000,7 @@ class SQLiteContentResearchStore:
                     self._row_to_scope_contract(existing_contract_row),
                     existing_event,
                     existing,
+                    existing_continuation,
                     False,
                 )
 
@@ -964,8 +1014,9 @@ class SQLiteContentResearchStore:
             )
             self._insert_scope_audit_event(conn, event)
             self._insert_scope_execution_authorization(conn, authorization)
+            self._insert_scope_execution_continuation(conn, continuation)
             conn.commit()
-            return result_contract, event, authorization, True
+            return result_contract, event, authorization, continuation, True
         except sqlite3.OperationalError as exc:
             conn.rollback()
             if "locked" in str(exc).lower() or "busy" in str(exc).lower():
@@ -987,6 +1038,61 @@ class SQLiteContentResearchStore:
                 (workflow_run_id,),
             ).fetchall()
         return [self._row_to_scope_execution_authorization(row) for row in rows]
+
+    def get_scope_execution_authorization(
+        self, authorization_id: str
+    ) -> ScopeExecutionAuthorization | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """SELECT * FROM content_research_scope_execution_authorizations
+                   WHERE id=?""",
+                (authorization_id,),
+            ).fetchone()
+        return self._row_to_scope_execution_authorization(row) if row else None
+
+    def save_scope_execution_continuation(
+        self, continuation: ScopeExecutionContinuation
+    ) -> ScopeExecutionContinuation:
+        try:
+            with self._connect() as conn:
+                self._insert_scope_execution_continuation(conn, continuation)
+        except sqlite3.IntegrityError as exc:
+            raise ValueError(
+                f"Scope execution continuation is append-only and already exists: {continuation.id}"
+            ) from exc
+        return continuation
+
+    def list_scope_execution_continuations(
+        self, workflow_run_id: str
+    ) -> list[ScopeExecutionContinuation]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """SELECT * FROM content_research_scope_execution_continuations
+                   WHERE workflow_run_id = ? ORDER BY created_at ASC, id ASC""",
+                (workflow_run_id,),
+            ).fetchall()
+        return [self._row_to_scope_execution_continuation(row) for row in rows]
+
+    def requeue_scope_execution_continuation(
+        self, authorization_id: str
+    ) -> ScopeExecutionContinuation:
+        now = _fmt_dt(datetime.now(timezone.utc))
+        with self._connect() as conn:
+            conn.execute(
+                """UPDATE content_research_scope_execution_continuations
+                   SET state='pending', lease_owner=NULL, lease_token=NULL,
+                       lease_expires_at=NULL, last_error=NULL, updated_at=?
+                   WHERE authorization_id=? AND state='failed'""",
+                (now, authorization_id),
+            )
+            row = conn.execute(
+                """SELECT * FROM content_research_scope_execution_continuations
+                   WHERE authorization_id=?""",
+                (authorization_id,),
+            ).fetchone()
+        if row is None:
+            raise ValueError("scope execution continuation was not found")
+        return self._row_to_scope_execution_continuation(row)
 
     def append_scope_audit_event(self, event: ScopeAuditEvent) -> ScopeAuditEvent:
         _validate_payload("ScopeAuditEvent", event.payload)
@@ -1057,6 +1163,29 @@ class SQLiteContentResearchStore:
                 authorization.execution_revision,
                 authorization.state,
                 _fmt_dt(authorization.created_at),
+            ),
+        )
+
+    @staticmethod
+    def _insert_scope_execution_continuation(
+        conn: sqlite3.Connection, continuation: ScopeExecutionContinuation
+    ) -> None:
+        created_at = _fmt_dt(continuation.created_at)
+        conn.execute(
+            """INSERT INTO content_research_scope_execution_continuations
+               (id, authorization_id, workflow_run_id, execution_revision, operation,
+                supplementary_queries_json, state, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                continuation.id,
+                continuation.authorization_id,
+                continuation.workflow_run_id,
+                continuation.execution_revision,
+                continuation.operation,
+                _dumps_any_list(list(continuation.supplementary_queries)),
+                continuation.state,
+                created_at,
+                created_at,
             ),
         )
 
@@ -1940,6 +2069,9 @@ class SQLiteContentResearchStore:
             unmet_constraint_ids=tuple(
                 str(item) for item in _loads_any_list(row["unmet_constraint_ids_json"])
             ),
+            execution_revision=row["execution_revision"],
+            execution_authorization_id=row["execution_authorization_id"],
+            source_coverage_snapshot_id=row["source_coverage_snapshot_id"],
             created_at=_parse_dt(row["created_at"]),
         )
 
@@ -1955,6 +2087,24 @@ class SQLiteContentResearchStore:
             coverage_snapshot_id=row["coverage_snapshot_id"],
             resolution=row["resolution"],
             execution_revision=row["execution_revision"],
+            state=row["state"],
+            created_at=_parse_dt(row["created_at"]),
+        )
+
+    @staticmethod
+    def _row_to_scope_execution_continuation(
+        row: sqlite3.Row,
+    ) -> ScopeExecutionContinuation:
+        return ScopeExecutionContinuation(
+            id=row["id"],
+            authorization_id=row["authorization_id"],
+            workflow_run_id=row["workflow_run_id"],
+            execution_revision=row["execution_revision"],
+            operation=row["operation"],
+            supplementary_queries=tuple(
+                str(item)
+                for item in _loads_any_list(row["supplementary_queries_json"])
+            ),
             state=row["state"],
             created_at=_parse_dt(row["created_at"]),
         )

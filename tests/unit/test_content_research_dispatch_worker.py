@@ -10,6 +10,7 @@ from app.content_research.api_schemas import ContentResearchFormalResearchRespon
 from app.content_research.async_dispatch import AsyncFormalResearchDispatchRepository
 from app.content_research.async_pipeline_store import AsyncDirectionalPersistenceSession
 from app.content_research.persistence_models import StageCheckpointRecord
+from app.content_research.scope_contract import ScopeExecutionContinuation
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
 from app.content_research.worker import ContentResearchDispatchWorker
 
@@ -30,6 +31,15 @@ class FakeFormalResearchService:
             source_kind=request.source_kind,
             limit_per_specialist=request.limit,
         )
+
+
+class FakeContinuationService(FakeFormalResearchService):
+    def __init__(self) -> None:
+        super().__init__()
+        self.continuations: list[ScopeExecutionContinuation] = []
+
+    async def execute_scope_continuation(self, continuation):
+        self.continuations.append(continuation)
 
 
 @pytest.mark.asyncio
@@ -89,6 +99,33 @@ async def test_completed_dispatch_is_requeued_only_by_explicit_retry(tmp_path):
     assert retried["status"] == "queued"
     assert retried["lease_owner"] is None
     assert retried["last_error"] is None
+
+
+@pytest.mark.asyncio
+async def test_worker_claims_persisted_scope_continuation_with_its_queries(tmp_path):
+    store = SQLiteContentResearchStore(str(tmp_path / "continuation.db"))
+    continuation = ScopeExecutionContinuation(
+        id="sec-worker",
+        authorization_id="sea-worker",
+        workflow_run_id="run-worker",
+        execution_revision=2,
+        operation="supplementary_collection",
+        supplementary_queries=("夏季 防晒 长袖衬衫", "夏季 透气 衬衫"),
+        state="pending",
+    )
+    store.save_scope_execution_continuation(continuation)
+    service = FakeContinuationService()
+    worker = ContentResearchDispatchWorker(store=store, service_factory=lambda: service)
+
+    assert await worker.run_once() is True
+    assert service.calls == []
+    assert len(service.continuations) == 1
+    claimed = service.continuations[0]
+    assert claimed.authorization_id == continuation.authorization_id
+    assert claimed.supplementary_queries == continuation.supplementary_queries
+    assert claimed.state == "running"
+    persisted = store.list_scope_execution_continuations("run-worker")[0]
+    assert persisted.state == "completed"
 
 
 @pytest.mark.asyncio

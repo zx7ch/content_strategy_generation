@@ -116,6 +116,7 @@ from app.content_research.scope_contract import (
     ScopeConstraint,
     ScopeDraftAuditEvent,
     ScopeExecutionAuthorization,
+    ScopeExecutionContinuation,
     ScopeQueryGroupInput,
     build_scope_contract,
     build_scope_draft,
@@ -2817,7 +2818,11 @@ class ContentResearchService:
             report_mode=report_mode,
             details=details,
         )
-        prior_authorizations = self._store.list_scope_execution_authorizations(workflow_run_id)
+        execution_revision = (
+            1
+            if successor_scope_contract is not None
+            else snapshot.execution_revision + 1
+        )
         authorization = ScopeExecutionAuthorization(
             id="sea_"
             + canonical_fingerprint(
@@ -2834,26 +2839,40 @@ class ContentResearchService:
             scope_contract_version=resulting_contract.version,
             coverage_snapshot_id=snapshot.id,
             resolution=request.resolution,
-            execution_revision=1
-            + max(
-                (
-                    item.execution_revision
-                    for item in prior_authorizations
-                    if item.scope_contract_id == resulting_contract.id
-                ),
-                default=0,
-            ),
+            execution_revision=execution_revision,
             state=(
                 "authorized_limited_report"
                 if request.resolution == "generate_limited_report"
                 else "authorized_collection"
             ),
         )
+        continuation = ScopeExecutionContinuation(
+            id="sec_"
+            + canonical_fingerprint(
+                {
+                    "authorization_id": authorization.id,
+                    "execution_revision": authorization.execution_revision,
+                }
+            )[:24],
+            authorization_id=authorization.id,
+            workflow_run_id=workflow_run_id,
+            execution_revision=authorization.execution_revision,
+            operation=(
+                "limited_report"
+                if authorization.resolution == "generate_limited_report"
+                else "supplementary_collection"
+            ),
+            supplementary_queries=tuple(
+                str(query) for query in details.get("supplementary_queries", ())
+            ),
+            state="pending",
+        )
         try:
-            resulting_contract, event, authorization, _created = (
+            resulting_contract, event, authorization, continuation, _created = (
                 self._store.resolve_coverage_and_authorize_execution_atomically(
                     snapshot=snapshot,
                     authorization=authorization,
+                    continuation=continuation,
                     event=event,
                     successor_scope_contract=successor_scope_contract,
                 )
@@ -2863,7 +2882,7 @@ class ContentResearchService:
 
         await self._continue_coverage_execution(
             workflow_run_id=workflow_run_id,
-            authorization=authorization,
+            continuation=continuation,
         )
         return _coverage_resolution_result(
             contract=resulting_contract,
@@ -2876,7 +2895,7 @@ class ContentResearchService:
         self,
         *,
         workflow_run_id: str,
-        authorization: ScopeExecutionAuthorization,
+        continuation: ScopeExecutionContinuation,
     ) -> None:
         """Wake the durable continuation after its authorization is committed.
 
@@ -2884,16 +2903,8 @@ class ContentResearchService:
         the same action reuses that authorization and retries this idempotent
         wake instead of recording another decision.
         """
-        if authorization.resolution == "generate_limited_report":
-            resume = getattr(self._workflow_runtime, "resume_content_research_run", None)
-            if callable(resume):
-                await resume(workflow_run_id=workflow_run_id)
-            return
-        await self._dispatch.enqueue(
-            workflow_run_id=workflow_run_id,
-            provider="xiaohongshu",
-            source_kind="search_result",
-            limit=50,
+        self._store.requeue_scope_execution_continuation(
+            continuation.authorization_id
         )
         if self._dispatch_wake_event is not None:
             self._dispatch_wake_event.set()
@@ -3751,13 +3762,47 @@ class ContentResearchService:
             retryable=result.retryable,
         )
 
-    def _persist_scope_coverage(self, workflow_run_id: str) -> Any | None:
+    def _persist_scope_coverage(
+        self,
+        workflow_run_id: str,
+        *,
+        execution_authorization: ScopeExecutionAuthorization | None = None,
+    ) -> Any | None:
         contracts = self._store.list_scope_contracts(workflow_run_id)
         if not contracts:
             return None
-        scope_contract = contracts[-1]
+        scope_contract = (
+            next(
+                (
+                    contract
+                    for contract in contracts
+                    if execution_authorization is not None
+                    and contract.id == execution_authorization.scope_contract_id
+                ),
+                None,
+            )
+            or contracts[-1]
+        )
+        source_snapshot = (
+            self._store.get_coverage_snapshot_by_id(
+                execution_authorization.coverage_snapshot_id
+            )
+            if execution_authorization is not None
+            else None
+        )
+        if (
+            execution_authorization is not None
+            and execution_authorization.resolution == "generate_limited_report"
+        ):
+            return source_snapshot
         existing = self._store.get_coverage_snapshot(
-            workflow_run_id, version=scope_contract.version
+            workflow_run_id,
+            version=scope_contract.version,
+            execution_revision=(
+                execution_authorization.execution_revision
+                if execution_authorization is not None
+                else 1
+            ),
         )
         if existing is not None:
             return existing
@@ -3801,15 +3846,33 @@ class ContentResearchService:
             for group in scope_contract.query_groups
         }
         final_pages: dict[str, StageCheckpointRecord] = {}
+        execution_task_id = (
+            "crt_"
+            + canonical_fingerprint(
+                {
+                    "authorization_id": execution_authorization.id,
+                    "direction_id": "product_marketing",
+                }
+            )[:24]
+            if execution_authorization is not None
+            else None
+        )
         for checkpoint in self._store.list_typed_records(StageCheckpointRecord):
             group_id = str(checkpoint.payload.get("query_group_id") or "")
             if (
                 checkpoint.workflow_run_id != workflow_run_id
                 or checkpoint.stage_name != "collect_page"
                 or checkpoint.status != "completed"
-                or group_id not in query_group_outcomes
+                or (
+                    group_id not in query_group_outcomes
+                    and checkpoint.subagent_task_id != execution_task_id
+                )
             ):
                 continue
+            query_group_outcomes.setdefault(
+                group_id,
+                {"status": "unknown", "discovered_count": 0, "failure_code": None},
+            )
             current = final_pages.get(group_id)
             if current is None or int(checkpoint.payload.get("page_no") or 0) > int(
                 current.payload.get("page_no") or 0
@@ -3828,6 +3891,117 @@ class ContentResearchService:
             query_group_outcomes=query_group_outcomes,
             minimum_samples=sample_policy.minimum_samples,
             minimum_independent_authors=sample_policy.minimum_independent_authors,
+            execution_authorization=execution_authorization,
+            source_snapshot=source_snapshot,
+        )
+
+    async def execute_scope_continuation(
+        self, continuation: ScopeExecutionContinuation
+    ) -> None:
+        """Execute only the work owned by one persisted authorization command."""
+        authorization = self._store.get_scope_execution_authorization(
+            continuation.authorization_id
+        )
+        if authorization is None:
+            raise ContentResearchValidationError(
+                "scope execution continuation authorization was not found"
+            )
+        if (
+            authorization.workflow_run_id != continuation.workflow_run_id
+            or authorization.execution_revision != continuation.execution_revision
+        ):
+            raise ContentResearchValidationError(
+                "scope execution continuation does not match its authorization"
+            )
+        brief = self._store.get_brief_by_workflow(continuation.workflow_run_id)
+        if brief is None:
+            raise ContentResearchNotFoundError(
+                f"Content research workflow not found: {continuation.workflow_run_id}"
+            )
+        runtime_snapshot = await self._workflow_runtime.get_runtime_snapshot(
+            continuation.workflow_run_id
+        )
+        runtime_status = str(
+            (runtime_snapshot.get("run") or {}).get("status")
+            or runtime_snapshot.get("run_status")
+            or ""
+        )
+        if runtime_status == "waiting_user":
+            restart = getattr(
+                self._workflow_runtime, "restart_formal_research_step", None
+            )
+            if callable(restart):
+                await restart(
+                    workflow_run_id=continuation.workflow_run_id,
+                    child_task_ids=[],
+                )
+        if runtime_status == "succeeded":
+            return
+
+        executable_task_ids: set[str] = set()
+        if continuation.operation == "supplementary_collection":
+            base_task = next(
+                (
+                    task
+                    for task in self._store.list_subagent_tasks_for_workflow(
+                        continuation.workflow_run_id
+                    )
+                    if task.direction_id == "product_marketing"
+                    and (task.payload.get("workflow_child_task_id") or "")
+                ),
+                None,
+            )
+            if base_task is None:
+                raise ContentResearchValidationError(
+                    "supplementary collection requires the initial product marketing task"
+                )
+            task_id = "crt_" + canonical_fingerprint(
+                {"authorization_id": authorization.id, "direction_id": "product_marketing"}
+            )[:24]
+            existing_task = self._store.get_subagent_task(task_id)
+            if existing_task is None:
+                input_payload = dict(base_task.payload.get("input_payload") or {})
+                input_payload["scope_execution"] = {
+                    "authorization_id": authorization.id,
+                    "execution_revision": authorization.execution_revision,
+                    "supplementary_queries": list(
+                        continuation.supplementary_queries
+                    ),
+                }
+                payload = {
+                    **base_task.payload,
+                    "input_payload": input_payload,
+                    "status": "queued",
+                }
+                payload.pop("workflow_child_task_id", None)
+                now = utcnow()
+                existing_task = SubagentTaskRecord(
+                    id=task_id,
+                    workflow_run_id=base_task.workflow_run_id,
+                    thread_id=base_task.thread_id,
+                    schema_version=base_task.schema_version,
+                    status="queued",
+                    plan_id=base_task.plan_id,
+                    direction_id=base_task.direction_id,
+                    created_at=now,
+                    updated_at=now,
+                    payload=payload,
+                    metadata={
+                        **base_task.metadata,
+                        "scope_execution_authorization_id": authorization.id,
+                        "execution_revision": authorization.execution_revision,
+                    },
+                )
+                self._store.save_subagent_task(existing_task)
+            executable_task_ids.add(existing_task.id)
+
+        await self._execute_formal_research(
+            brief=brief,
+            provider="xiaohongshu",
+            source_kind="search_result",
+            limit=50,
+            execution_authorization=authorization,
+            executable_task_ids=executable_task_ids,
         )
 
     async def _execute_formal_research(
@@ -3837,13 +4011,20 @@ class ContentResearchService:
         provider: str,
         source_kind: str,
         limit: int,
+        execution_authorization: ScopeExecutionAuthorization | None = None,
+        executable_task_ids: set[str] | None = None,
     ) -> None:
         tasks = self._store.list_subagent_tasks_for_workflow(brief.workflow_run_id)
         # Failed specialists stay on the same parent Run until the user asks
         # for a retry.  Completed siblings are reused; only the failed work is
         # executed again.
         executable_tasks = [
-            task for task in tasks if task.status in {"queued", "pending", "failed"}
+            task
+            for task in tasks
+            if task.status in {"queued", "pending", "failed"}
+            and (
+                executable_task_ids is None or task.id in executable_task_ids
+            )
         ]
         workflow_traces = self._store.list_traces_for_workflow(brief.workflow_run_id)
         trace_id = workflow_traces[0].id if workflow_traces else None
@@ -3990,7 +4171,10 @@ class ContentResearchService:
                 )
             return
 
-        scope_coverage = self._persist_scope_coverage(brief.workflow_run_id)
+        scope_coverage = self._persist_scope_coverage(
+            brief.workflow_run_id,
+            execution_authorization=execution_authorization,
+        )
         limited_report_authorized = (
             scope_coverage is not None
             and any(

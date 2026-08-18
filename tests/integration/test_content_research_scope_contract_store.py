@@ -13,6 +13,8 @@ from app.content_research.scope_contract import (
     ScopeAuditEvent,
     ScopeConstraint,
     ScopeDraftAuditEvent,
+    ScopeExecutionAuthorization,
+    ScopeExecutionContinuation,
     ScopeQueryGroupInput,
     build_scope_contract,
     build_scope_draft,
@@ -113,6 +115,122 @@ def test_scope_contract_versions_and_scope_audit_events_are_append_only(tmp_path
     assert store.get_coverage_snapshot(v1.workflow_run_id, version=1) == snapshot
     with pytest.raises(ValueError, match="append-only"):
         store.append_scope_audit_event(event)
+
+
+def test_competing_atomic_coverage_resolutions_reconcile_same_and_reject_different(
+    tmp_path,
+) -> None:
+    def run_race(db_name: str, resolutions: tuple[str, str]):
+        db_path = tmp_path / db_name
+        stores = [
+            SQLiteContentResearchStore(str(db_path)),
+            SQLiteContentResearchStore(str(db_path)),
+        ]
+        contract = _contract(version=1)
+        stores[0].save_scope_contract(contract)
+        snapshot = CoverageSnapshot(
+            id=f"scv_{db_name}",
+            workflow_run_id=contract.workflow_run_id,
+            scope_contract_id=contract.id,
+            scope_contract_version=contract.version,
+            state="awaiting_scope_decision",
+            constraint_counts={},
+            unmet_constraint_ids=("season",),
+        )
+        stores[0].save_coverage_snapshot(snapshot)
+        barrier = threading.Barrier(2)
+        results = []
+        errors: list[BaseException] = []
+
+        def resolve(store, resolution):
+            operation = (
+                "limited_report"
+                if resolution == "generate_limited_report"
+                else "supplementary_collection"
+            )
+            authorization = ScopeExecutionAuthorization(
+                id=f"sea_{resolution}",
+                workflow_run_id=contract.workflow_run_id,
+                scope_contract_id=contract.id,
+                scope_contract_version=contract.version,
+                coverage_snapshot_id=snapshot.id,
+                resolution=resolution,
+                execution_revision=2,
+                state=(
+                    "authorized_limited_report"
+                    if resolution == "generate_limited_report"
+                    else "authorized_collection"
+                ),
+            )
+            continuation = ScopeExecutionContinuation(
+                id=f"sec_{resolution}",
+                authorization_id=authorization.id,
+                workflow_run_id=contract.workflow_run_id,
+                execution_revision=2,
+                operation=operation,
+                supplementary_queries=(
+                    ("夏季 防晒 长袖衬衫",)
+                    if resolution == "expand_required_constraint"
+                    else ()
+                ),
+                state="pending",
+            )
+            event = ScopeAuditEvent(
+                id=f"sae_{resolution}",
+                workflow_run_id=contract.workflow_run_id,
+                scope_contract_id=contract.id,
+                scope_contract_version=contract.version,
+                event_name="coverage_resolved",
+                payload={
+                    "schema_version": "content_research_scope_audit_event_v1",
+                    "coverage_snapshot_id": snapshot.id,
+                    "resolution": resolution,
+                },
+            )
+            try:
+                barrier.wait()
+                results.append(
+                    store.resolve_coverage_and_authorize_execution_atomically(
+                        snapshot=snapshot,
+                        authorization=authorization,
+                        continuation=continuation,
+                        event=event,
+                    )
+                )
+            except BaseException as exc:
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=resolve, args=(store, resolution))
+            for store, resolution in zip(stores, resolutions, strict=True)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+        assert all(not thread.is_alive() for thread in threads)
+        return stores[0], results, errors
+
+    same_store, same_results, same_errors = run_race(
+        "same.db",
+        ("generate_limited_report", "generate_limited_report"),
+    )
+    assert same_errors == []
+    assert len(same_results) == 2
+    assert sorted(result[4] for result in same_results) == [False, True]
+    assert len(same_store.list_scope_execution_authorizations("run_scope_1")) == 1
+    assert len(same_store.list_scope_execution_continuations("run_scope_1")) == 1
+
+    different_store, different_results, different_errors = run_race(
+        "different.db",
+        ("generate_limited_report", "expand_required_constraint"),
+    )
+    assert len(different_results) == 1
+    assert len(different_errors) == 1
+    assert isinstance(different_errors[0], ValueError)
+    assert "different persisted resolution" in str(different_errors[0])
+    assert len(different_store.list_scope_execution_authorizations("run_scope_1")) == 1
+    assert len(different_store.list_scope_execution_continuations("run_scope_1")) == 1
 
 
 def test_scope_draft_and_suggestion_audit_event_commit_atomically(tmp_path) -> None:

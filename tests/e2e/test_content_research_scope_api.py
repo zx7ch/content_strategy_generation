@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import replace
 
@@ -51,6 +52,13 @@ class SummerCommuteFakeLLM:
         )
 
 
+class ScopeFakeRuntime(FakeRuntime):
+    async def resume_content_research_run(self, *, workflow_run_id: str) -> dict:
+        raise AssertionError(
+            "resolve_coverage must queue its persisted continuation, not resume inline"
+        )
+
+
 @pytest.fixture()
 async def scope_client(tmp_path):
     original = getattr(app.state, "content_research_service", None)
@@ -60,7 +68,7 @@ async def scope_client(tmp_path):
         presearch=PresearchService(
             SummerCommuteFakeLLM(), first_feedback_timeout_seconds=0.05, hard_cutoff_seconds=0.1
         ),
-        workflow_runtime=FakeRuntime(db_path),
+        workflow_runtime=ScopeFakeRuntime(db_path),
     )
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(
@@ -226,7 +234,45 @@ async def test_generate_limited_report_resolution_preserves_v1_and_exact_season_
     assert store.list_scope_execution_authorizations(workflow_run_id)[0].state == (
         "authorized_limited_report"
     )
+    continuation = store.list_scope_execution_continuations(workflow_run_id)[0]
+    assert continuation.authorization_id == authorization["id"]
+    assert continuation.execution_revision == authorization["execution_revision"] == 2
+    assert continuation.operation == "limited_report"
+    assert continuation.supplementary_queries == ()
+    assert continuation.state == "pending"
     assert [contract.version for contract in store.list_scope_contracts(workflow_run_id)] == [1]
+
+
+@pytest.mark.asyncio
+async def test_limited_continuation_reaches_report_execution_without_source_tasks(
+    scope_client, monkeypatch
+):
+    workflow_run_id, _contract_v1 = await _confirmed_scope_with_unmet_season(
+        scope_client
+    )
+    response = await scope_client.post(
+        f"/content-research/workflows/{workflow_run_id}/actions",
+        json={
+            "action": "resolve_coverage",
+            "payload": {
+                "scope_contract_version": 1,
+                "resolution": "generate_limited_report",
+            },
+        },
+    )
+    assert response.status_code == 200
+    service = app.state.content_research_service
+    continuation = service._store.list_scope_execution_continuations(workflow_run_id)[0]
+    captured = {}
+
+    async def capture_execution(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(service, "_execute_formal_research", capture_execution)
+    await service.execute_scope_continuation(continuation)
+
+    assert captured["executable_task_ids"] == set()
+    assert captured["execution_authorization"].id == continuation.authorization_id
 
 
 @pytest.mark.asyncio
@@ -266,6 +312,60 @@ async def test_expand_required_constraint_retains_v1_and_authorizes_collection(
     authorizations = store.list_scope_execution_authorizations(workflow_run_id)
     assert len(authorizations) == 1
     assert authorizations[0].scope_contract_version == 1
+    assert authorizations[0].execution_revision == 2
+    continuation = store.list_scope_execution_continuations(workflow_run_id)[0]
+    assert continuation.authorization_id == authorizations[0].id
+    assert continuation.operation == "supplementary_collection"
+    assert continuation.supplementary_queries == tuple(supplementary_queries)
+    assert continuation.state == "pending"
+
+
+@pytest.mark.asyncio
+async def test_supplementary_continuation_executes_only_its_authorized_task(
+    scope_client, monkeypatch
+):
+    workflow_run_id, _contract_v1 = await _confirmed_scope_with_unmet_season(
+        scope_client
+    )
+    response = await scope_client.post(
+        f"/content-research/workflows/{workflow_run_id}/actions",
+        json={
+            "action": "resolve_coverage",
+            "payload": {
+                "scope_contract_version": 1,
+                "resolution": "expand_required_constraint",
+                "constraint_id": "season",
+                "supplementary_queries": ["夏季 防晒 长袖衬衫"],
+            },
+        },
+    )
+    assert response.status_code == 200
+    service = app.state.content_research_service
+    continuation = service._store.list_scope_execution_continuations(workflow_run_id)[0]
+    captured = {}
+
+    async def capture_execution(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(service, "_execute_formal_research", capture_execution)
+    await service.execute_scope_continuation(continuation)
+
+    executable_ids = captured["executable_task_ids"]
+    assert len(executable_ids) == 1
+    continuation_task = service._store.get_subagent_task(next(iter(executable_ids)))
+    assert continuation_task is not None
+    assert continuation_task.payload.get("workflow_child_task_id") is None
+    assert continuation_task.payload["input_payload"]["scope_execution"] == {
+        "authorization_id": continuation.authorization_id,
+        "execution_revision": 2,
+        "supplementary_queries": ["夏季 防晒 长袖衬衫"],
+    }
+    initial_task_ids = {
+        task.id
+        for task in service._store.list_subagent_tasks_for_workflow(workflow_run_id)
+        if task.payload.get("workflow_child_task_id")
+    }
+    assert executable_ids.isdisjoint(initial_task_ids)
 
 
 @pytest.mark.asyncio
@@ -365,6 +465,7 @@ async def test_versioned_coverage_resolution_replays_after_lost_response(
     expected_versions = [1, 2] if payload["resolution"] == "relax_constraint" else [1]
     assert [contract.version for contract in store.list_scope_contracts(workflow_run_id)] == expected_versions
     assert len(store.list_scope_execution_authorizations(workflow_run_id)) == 1
+    assert len(store.list_scope_execution_continuations(workflow_run_id)) == 1
     resulting_version = 2 if payload["resolution"] == "relax_constraint" else 1
     assert len(
         [
@@ -412,30 +513,30 @@ async def test_resolve_coverage_rejects_a_different_decision_for_the_same_snapsh
 
 
 @pytest.mark.asyncio
-async def test_limited_resolution_reconciles_a_concurrent_duplicate(scope_client, monkeypatch):
-    """Propagating a concurrent deterministic duplicate must make this test fail."""
+async def test_limited_resolution_reconciles_competing_atomic_calls(scope_client):
+    """Bypassing the atomic resolution operation must make this test fail."""
     workflow_run_id, _contract_v1 = await _confirmed_scope_with_unmet_season(scope_client)
     store = app.state.content_research_service._store
-    append = store.append_scope_audit_event
-
-    def append_after_competing_writer(event):
-        append(event)
-        return append(event)
-
-    monkeypatch.setattr(store, "append_scope_audit_event", append_after_competing_writer)
-    response = await scope_client.post(
-        f"/content-research/workflows/{workflow_run_id}/actions",
-        json={
-            "action": "resolve_coverage",
-            "payload": {
-                "scope_contract_version": 1,
-                "resolution": "generate_limited_report",
-            },
+    request = {
+        "action": "resolve_coverage",
+        "payload": {
+            "scope_contract_version": 1,
+            "resolution": "generate_limited_report",
         },
+    }
+    first, second = await asyncio.gather(
+        scope_client.post(
+            f"/content-research/workflows/{workflow_run_id}/actions", json=request
+        ),
+        scope_client.post(
+            f"/content-research/workflows/{workflow_run_id}/actions", json=request
+        ),
     )
 
-    assert response.status_code == 200
-    assert response.json()["result"]["report_mode"] == "limited"
+    assert first.status_code == second.status_code == 200
+    assert first.json()["result"] == second.json()["result"]
+    assert len(store.list_scope_execution_authorizations(workflow_run_id)) == 1
+    assert len(store.list_scope_execution_continuations(workflow_run_id)) == 1
     assert len(
         [
             event
@@ -443,6 +544,41 @@ async def test_limited_resolution_reconciles_a_concurrent_duplicate(scope_client
             if event.event_name == "coverage_resolved"
         ]
     ) == 1
+
+
+@pytest.mark.asyncio
+async def test_competing_different_atomic_decisions_have_one_winner(scope_client):
+    workflow_run_id, _contract_v1 = await _confirmed_scope_with_unmet_season(scope_client)
+    endpoint = f"/content-research/workflows/{workflow_run_id}/actions"
+    limited, expand = await asyncio.gather(
+        scope_client.post(
+            endpoint,
+            json={
+                "action": "resolve_coverage",
+                "payload": {
+                    "scope_contract_version": 1,
+                    "resolution": "generate_limited_report",
+                },
+            },
+        ),
+        scope_client.post(
+            endpoint,
+            json={
+                "action": "resolve_coverage",
+                "payload": {
+                    "scope_contract_version": 1,
+                    "resolution": "expand_required_constraint",
+                    "constraint_id": "season",
+                    "supplementary_queries": ["夏季 防晒 长袖衬衫"],
+                },
+            },
+        ),
+    )
+
+    assert sorted([limited.status_code, expand.status_code]) == [200, 422]
+    store = app.state.content_research_service._store
+    assert len(store.list_scope_execution_authorizations(workflow_run_id)) == 1
+    assert len(store.list_scope_execution_continuations(workflow_run_id)) == 1
 
 
 @pytest.mark.asyncio

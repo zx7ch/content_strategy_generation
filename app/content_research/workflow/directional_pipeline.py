@@ -46,6 +46,7 @@ from app.content_research.scope_contract import (
     CoverageSnapshot,
     ResearchScopeContract,
     ScopeAuditEvent,
+    ScopeExecutionAuthorization,
 )
 from app.content_research.sources.base import SourceOperationResult
 from app.content_research.sources.canonical_registry import CanonicalSourceRegistry
@@ -191,10 +192,19 @@ def persist_scope_coverage_evaluation(
     query_group_outcomes: Mapping[str, Mapping[str, Any]],
     minimum_samples: int,
     minimum_independent_authors: int,
+    execution_authorization: ScopeExecutionAuthorization | None = None,
+    source_snapshot: CoverageSnapshot | None = None,
 ) -> CoverageSnapshot:
     """Persist candidate Scope projections and their decision-ready aggregate."""
+    execution_revision = (
+        execution_authorization.execution_revision
+        if execution_authorization is not None
+        else 1
+    )
     existing = store.get_coverage_snapshot(
-        contract.workflow_run_id, version=contract.version
+        contract.workflow_run_id,
+        version=contract.version,
+        execution_revision=execution_revision,
     )
     if existing is not None:
         existing_events = store.list_scope_audit_events(
@@ -215,6 +225,9 @@ def persist_scope_coverage_evaluation(
                     payload={
                         "schema_version": "content_research_scope_audit_event_v1",
                         "coverage_snapshot_id": existing.id,
+                        "execution_authorization_id": existing.execution_authorization_id,
+                        "execution_revision": existing.execution_revision,
+                        "source_coverage_snapshot_id": existing.source_coverage_snapshot_id,
                         "state": existing.state,
                         "constraint_counts": existing.constraint_counts,
                         "unmet_constraint_ids": list(existing.unmet_constraint_ids),
@@ -229,7 +242,10 @@ def persist_scope_coverage_evaluation(
         return existing
 
     schema_version = "content_research_scope_audit_event_v1"
-    contract_group_ids = {group.id for group in contract.query_groups}
+    contract_group_ids = {
+        *[group.id for group in contract.query_groups],
+        *[str(group_id) for group_id in query_group_outcomes],
+    }
     existing_event_ids = {
         event.id
         for event in store.list_scope_audit_events(
@@ -239,7 +255,12 @@ def persist_scope_coverage_evaluation(
     for group in contract.query_groups:
         outcome = dict(query_group_outcomes.get(group.id) or {})
         event = ScopeAuditEvent(
-            id=_scope_event_id(contract, "query_group_collected", group.id),
+            id=_scope_event_id(
+                contract,
+                "query_group_collected",
+                group.id,
+                execution_revision=execution_revision,
+            ),
             workflow_run_id=contract.workflow_run_id,
             scope_contract_id=contract.id,
             scope_contract_version=contract.version,
@@ -249,6 +270,10 @@ def persist_scope_coverage_evaluation(
                 "query_group_id": group.id,
                 "final_query": group.final_query,
                 "execution_role": group.execution_role,
+                "execution_authorization_id": (
+                    execution_authorization.id if execution_authorization else None
+                ),
+                "execution_revision": execution_revision,
                 "request_outcome": str(outcome.get("status") or "unknown"),
                 "discovered_count": int(outcome.get("discovered_count") or 0),
                 "failure_code": outcome.get("failure_code"),
@@ -269,7 +294,12 @@ def persist_scope_coverage_evaluation(
         author_id = admission_author_identity(candidate)
         matches.append((candidate_id, author_id, match))
         event = ScopeAuditEvent(
-            id=_scope_event_id(contract, "candidate_scope_evaluated", candidate_id),
+            id=_scope_event_id(
+                contract,
+                "candidate_scope_evaluated",
+                candidate_id,
+                execution_revision=execution_revision,
+            ),
             workflow_run_id=contract.workflow_run_id,
             scope_contract_id=contract.id,
             scope_contract_version=contract.version,
@@ -278,6 +308,10 @@ def persist_scope_coverage_evaluation(
                 "schema_version": schema_version,
                 "candidate_id": candidate_id,
                 "scope_contract_version": match.scope_contract_version,
+                "execution_authorization_id": (
+                    execution_authorization.id if execution_authorization else None
+                ),
+                "execution_revision": execution_revision,
                 "query_group_hits": list(match.query_group_hits),
                 "constraint_matches": {
                     constraint_id: {
@@ -356,6 +390,13 @@ def persist_scope_coverage_evaluation(
         + canonical_fingerprint(
             {
                 "scope_contract_id": contract.id,
+                "execution_authorization_id": (
+                    execution_authorization.id if execution_authorization else None
+                ),
+                "execution_revision": execution_revision,
+                "source_coverage_snapshot_id": (
+                    source_snapshot.id if source_snapshot is not None else None
+                ),
                 "candidate_ids": sorted(candidate_id for candidate_id, _author, _match in matches),
                 "constraint_counts": constraint_counts,
             }
@@ -366,9 +407,21 @@ def persist_scope_coverage_evaluation(
         state="awaiting_scope_decision" if reason_codes else "satisfied",
         constraint_counts=constraint_counts,
         unmet_constraint_ids=tuple(unmet_constraint_ids),
+        execution_revision=execution_revision,
+        execution_authorization_id=(
+            execution_authorization.id if execution_authorization else None
+        ),
+        source_coverage_snapshot_id=(
+            source_snapshot.id if source_snapshot is not None else None
+        ),
     )
     coverage_event = ScopeAuditEvent(
-        id=_scope_event_id(contract, "coverage_evaluated", snapshot.id),
+        id=_scope_event_id(
+            contract,
+            "coverage_evaluated",
+            snapshot.id,
+            execution_revision=execution_revision,
+        ),
         workflow_run_id=contract.workflow_run_id,
         scope_contract_id=contract.id,
         scope_contract_version=contract.version,
@@ -376,6 +429,9 @@ def persist_scope_coverage_evaluation(
         payload={
             "schema_version": schema_version,
             "coverage_snapshot_id": snapshot.id,
+            "execution_authorization_id": snapshot.execution_authorization_id,
+            "execution_revision": snapshot.execution_revision,
+            "source_coverage_snapshot_id": snapshot.source_coverage_snapshot_id,
             "state": snapshot.state,
             "constraint_counts": snapshot.constraint_counts,
             "unmet_constraint_ids": list(snapshot.unmet_constraint_ids),
@@ -387,7 +443,11 @@ def persist_scope_coverage_evaluation(
 
 
 def _scope_event_id(
-    contract: ResearchScopeContract, event_name: str, subject_id: str
+    contract: ResearchScopeContract,
+    event_name: str,
+    subject_id: str,
+    *,
+    execution_revision: int = 1,
 ) -> str:
     return "sae_" + canonical_fingerprint(
         {
@@ -395,6 +455,7 @@ def _scope_event_id(
             "scope_contract_version": contract.version,
             "event_name": event_name,
             "subject_id": subject_id,
+            "execution_revision": execution_revision,
         }
     )[:24]
 
@@ -498,6 +559,43 @@ def _scope_query_groups(
             ),
         )
         for index, group in enumerate(contract.query_groups)
+    )
+
+
+def _scope_supplementary_query_groups(
+    *,
+    contract: ResearchScopeContract,
+    authorization_id: str | None,
+    queries: tuple[str, ...],
+    direction_id: str,
+    template: QueryGroup,
+    candidate_limit: int,
+) -> tuple[QueryGroup, ...]:
+    if not authorization_id:
+        raise ValueError("supplementary query groups require an execution authorization")
+    return tuple(
+        QueryGroup(
+            id="qg_"
+            + canonical_fingerprint(
+                {
+                    "scope_contract_id": contract.id,
+                    "authorization_id": authorization_id,
+                    "query": query,
+                }
+            )[:16],
+            direction_id=direction_id,
+            query=query,
+            priority=index,
+            sort=template.sort,
+            candidate_limit=candidate_limit,
+            time_window=template.time_window,
+            roles=("supplementary",),
+            activation="primary",
+            normalized_identity=canonical_fingerprint(
+                {"authorization_id": authorization_id, "query": query}
+            ),
+        )
+        for index, query in enumerate(queries)
     )
 
 
@@ -773,6 +871,10 @@ class DirectionalExecutionPipeline:
         )
         self._scope_contract: ResearchScopeContract | None = None
         self._scope_query_plan_hash: str | None = None
+        self._scope_query_group_ids: tuple[str, ...] = ()
+        self._active_scope_query_groups: tuple[QueryGroup, ...] = ()
+        self._scope_execution_authorization_id: str | None = None
+        self._scope_execution_revision = 1
         self._scope_audit_event_ids: set[str] = set()
         self._canonical_sources = CanonicalSourceRegistry(store)
         self._checkpoint_started_at: dict[tuple[str, str], datetime] = {}
@@ -854,12 +956,17 @@ class DirectionalExecutionPipeline:
         admission_contract: DirectionContract | None = None,
         admission_policy: SamplePolicy | None = None,
         policy_snapshot: RunPolicySnapshot | None = None,
+        execution_authorization_id: str | None = None,
+        execution_revision: int = 1,
+        supplementary_queries: tuple[str, ...] = (),
     ) -> DirectionEvidenceRun:
         # Direct pipeline diagnostics have no workflow entity; keep them
         # isolated instead of allowing an unscoped persisted record.
         self._workflow_run_id = workflow_run_id or f"local_{subagent_task_id}"
         self._checkpoint_started_at = {}
         self._load_scope_contract(self._workflow_run_id)
+        self._scope_execution_authorization_id = execution_authorization_id
+        self._scope_execution_revision = execution_revision
         frozen_groups = (
             _frozen_query_groups(policy_snapshot, direction_id)
             if policy_snapshot is not None
@@ -876,12 +983,25 @@ class DirectionalExecutionPipeline:
             run_as_of_at=run_as_of_at,
         )
         if self._scope_contract is not None and direction_id == "product_marketing":
-            groups = _scope_query_groups(
-                contract=self._scope_contract,
-                direction_id=direction_id,
-                template=groups[0],
-                candidate_limit=candidate_limit_per_query,
+            groups = (
+                _scope_supplementary_query_groups(
+                    contract=self._scope_contract,
+                    authorization_id=execution_authorization_id,
+                    queries=supplementary_queries,
+                    direction_id=direction_id,
+                    template=groups[0],
+                    candidate_limit=candidate_limit_per_query,
+                )
+                if execution_authorization_id and supplementary_queries
+                else _scope_query_groups(
+                    contract=self._scope_contract,
+                    direction_id=direction_id,
+                    template=groups[0],
+                    candidate_limit=candidate_limit_per_query,
+                )
             )
+            self._scope_query_group_ids = tuple(group.id for group in groups)
+            self._active_scope_query_groups = groups
         fallback_group = (
             None
             if self._scope_contract is not None and direction_id == "product_marketing"
@@ -1547,6 +1667,7 @@ class DirectionalExecutionPipeline:
                     policy_snapshot=snapshot,
                     scope_contract=self._scope_contract,
                     scope_query_plan_hash=self._scope_query_plan_hash,
+                    scope_query_group_ids=self._scope_query_group_ids,
                 )
                 is None
                 for candidate in candidates
@@ -1861,7 +1982,13 @@ class DirectionalExecutionPipeline:
         summaries = {
             str(item.get("query_group_id") or ""): item for item in pagination
         }
-        for group in self._scope_contract.query_groups:
+        groups = self._active_scope_query_groups or _scope_query_groups(
+            contract=self._scope_contract,
+            direction_id="product_marketing",
+            template=QueryGroup("template", "product_marketing", "template", 0),
+            candidate_limit=20,
+        )
+        for group in groups:
             summary = summaries.get(group.id, {})
             pages = self._page_records(
                 subagent_task_id, "collect_page", plan_hash, group.id
@@ -1869,7 +1996,10 @@ class DirectionalExecutionPipeline:
             final_page = pages[-1] if pages else None
             event = ScopeAuditEvent(
                 id=_scope_event_id(
-                    self._scope_contract, "query_group_collected", group.id
+                    self._scope_contract,
+                    "query_group_collected",
+                    group.id,
+                    execution_revision=self._scope_execution_revision,
                 ),
                 workflow_run_id=self._workflow_run_id,
                 scope_contract_id=self._scope_contract.id,
@@ -1878,8 +2008,14 @@ class DirectionalExecutionPipeline:
                 payload={
                     "schema_version": "content_research_scope_audit_event_v1",
                     "query_group_id": group.id,
-                    "final_query": group.final_query,
-                    "execution_role": group.execution_role,
+                    "final_query": group.query,
+                    "execution_role": (
+                        "supplementary"
+                        if self._scope_execution_authorization_id
+                        else "coverage"
+                    ),
+                    "execution_authorization_id": self._scope_execution_authorization_id,
+                    "execution_revision": self._scope_execution_revision,
                     "request_outcome": str(
                         final_page.payload.get("status")
                         if final_page is not None

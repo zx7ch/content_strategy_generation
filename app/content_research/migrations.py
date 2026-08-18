@@ -572,6 +572,57 @@ CREATE INDEX idx_cr_scope_execution_authorization_workflow
 """
 
 
+_V24_SCOPE_EXECUTION_CONTINUATION_SQL = """
+CREATE TABLE content_research_scope_coverage_snapshots_v24 (
+    id TEXT PRIMARY KEY,
+    workflow_run_id TEXT NOT NULL,
+    scope_contract_id TEXT NOT NULL,
+    scope_contract_version INTEGER NOT NULL,
+    execution_revision INTEGER NOT NULL,
+    execution_authorization_id TEXT UNIQUE,
+    source_coverage_snapshot_id TEXT,
+    state TEXT NOT NULL,
+    constraint_counts_json TEXT NOT NULL,
+    unmet_constraint_ids_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(scope_contract_id, execution_revision)
+);
+INSERT INTO content_research_scope_coverage_snapshots_v24
+    (id, workflow_run_id, scope_contract_id, scope_contract_version,
+     execution_revision, execution_authorization_id, source_coverage_snapshot_id,
+     state, constraint_counts_json, unmet_constraint_ids_json, created_at)
+SELECT id, workflow_run_id, scope_contract_id, scope_contract_version,
+       1, NULL, NULL, state, constraint_counts_json, unmet_constraint_ids_json, created_at
+FROM content_research_scope_coverage_snapshots;
+DROP TABLE content_research_scope_coverage_snapshots;
+ALTER TABLE content_research_scope_coverage_snapshots_v24
+    RENAME TO content_research_scope_coverage_snapshots;
+CREATE INDEX idx_cr_scope_coverage_workflow_version
+    ON content_research_scope_coverage_snapshots(
+        workflow_run_id, scope_contract_version, execution_revision
+    );
+CREATE TABLE content_research_scope_execution_continuations (
+    id TEXT PRIMARY KEY,
+    authorization_id TEXT NOT NULL UNIQUE,
+    workflow_run_id TEXT NOT NULL,
+    execution_revision INTEGER NOT NULL,
+    operation TEXT NOT NULL,
+    supplementary_queries_json TEXT NOT NULL,
+    state TEXT NOT NULL,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    lease_owner TEXT,
+    lease_token TEXT,
+    lease_expires_at TEXT,
+    last_error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    completed_at TEXT
+);
+CREATE INDEX idx_cr_scope_execution_continuation_claim
+    ON content_research_scope_execution_continuations(state, created_at, id);
+"""
+
+
 def _apply_0020(conn: sqlite3.Connection) -> None:
     conn.executescript(_V20_SCOPE_COVERAGE_SQL)
 
@@ -586,6 +637,127 @@ def _apply_0022(conn: sqlite3.Connection) -> None:
 
 def _apply_0023(conn: sqlite3.Connection) -> None:
     conn.executescript(_V23_SCOPE_EXECUTION_AUTHORIZATION_SQL)
+
+
+def _apply_0024(conn: sqlite3.Connection) -> None:
+    conn.executescript(_V24_SCOPE_EXECUTION_CONTINUATION_SQL)
+    rows = conn.execute(
+        """SELECT id, workflow_run_id, scope_contract_id, scope_contract_version,
+                  payload_json, created_at
+           FROM content_research_scope_audit_events
+           WHERE event_name = 'coverage_resolved'
+           ORDER BY created_at ASC, id ASC"""
+    ).fetchall()
+    for event_id, workflow_run_id, scope_contract_id, scope_version, raw_payload, created_at in rows:
+        try:
+            payload = json.loads(raw_payload)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        snapshot_id = str(payload.get("coverage_snapshot_id") or "")
+        resolution = str(payload.get("resolution") or "")
+        if not snapshot_id or resolution not in {
+            "expand_required_constraint",
+            "generate_limited_report",
+            "relax_constraint",
+        }:
+            continue
+        existing_authorization = conn.execute(
+            """SELECT id, execution_revision, resolution, scope_contract_id
+               FROM content_research_scope_execution_authorizations
+               WHERE coverage_snapshot_id=?""",
+            (snapshot_id,),
+        ).fetchone()
+        snapshot_row = conn.execute(
+            """SELECT scope_contract_id, execution_revision
+               FROM content_research_scope_coverage_snapshots WHERE id=?""",
+            (snapshot_id,),
+        ).fetchone()
+        if snapshot_row is None:
+            continue
+        execution_revision = (
+            max(int(existing_authorization[1]), int(snapshot_row[1]) + 1)
+            if existing_authorization is not None
+            and str(existing_authorization[3]) == str(snapshot_row[0])
+            else (
+                int(existing_authorization[1])
+                if existing_authorization is not None
+                else (
+                    int(snapshot_row[1]) + 1
+                    if str(snapshot_row[0]) == str(scope_contract_id)
+                    else 1
+                )
+            )
+        )
+        identity = json.dumps(
+            {
+                "coverage_snapshot_id": snapshot_id,
+                "resolution": resolution,
+                "event_id": event_id,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        authorization_id = (
+            str(existing_authorization[0])
+            if existing_authorization is not None
+            else "sea_" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
+        )
+        continuation_id = "sec_" + hashlib.sha256(
+            authorization_id.encode("utf-8")
+        ).hexdigest()[:24]
+        state = (
+            "authorized_limited_report"
+            if resolution == "generate_limited_report"
+            else "authorized_collection"
+        )
+        operation = (
+            "limited_report"
+            if resolution == "generate_limited_report"
+            else "supplementary_collection"
+        )
+        queries = payload.get("supplementary_queries") or []
+        now = created_at or datetime.now(timezone.utc).isoformat()
+        if existing_authorization is None:
+            conn.execute(
+                """INSERT INTO content_research_scope_execution_authorizations
+                   (id, workflow_run_id, scope_contract_id, scope_contract_version,
+                    coverage_snapshot_id, resolution, execution_revision, state, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    authorization_id,
+                    workflow_run_id,
+                    scope_contract_id,
+                    scope_version,
+                    snapshot_id,
+                    resolution,
+                    execution_revision,
+                    state,
+                    now,
+                ),
+            )
+        elif int(existing_authorization[1]) != execution_revision:
+            conn.execute(
+                """UPDATE content_research_scope_execution_authorizations
+                   SET execution_revision=? WHERE id=?""",
+                (execution_revision, authorization_id),
+            )
+        conn.execute(
+            """INSERT INTO content_research_scope_execution_continuations
+               (id, authorization_id, workflow_run_id, execution_revision, operation,
+                supplementary_queries_json, state, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)""",
+            (
+                continuation_id,
+                authorization_id,
+                workflow_run_id,
+                execution_revision,
+                operation,
+                json.dumps(queries, ensure_ascii=False, separators=(",", ":")),
+                now,
+                now,
+            ),
+        )
 
 
 def _apply_0015(conn: sqlite3.Connection) -> None:
@@ -646,6 +818,7 @@ def _expected_checksums(migration_0002_sql: str, legacy_checksum: str) -> dict[s
         "0021": hashlib.sha256(_V21_SCOPE_DRAFT_SQL.encode("utf-8")).hexdigest(),
         "0022": hashlib.sha256(_V22_SCOPE_DRAFT_CONFIRMATION_SQL.encode("utf-8")).hexdigest(),
         "0023": hashlib.sha256(_V23_SCOPE_EXECUTION_AUTHORIZATION_SQL.encode("utf-8")).hexdigest(),
+        "0024": hashlib.sha256(_V24_SCOPE_EXECUTION_CONTINUATION_SQL.encode("utf-8")).hexdigest(),
     }
 
 
@@ -886,6 +1059,13 @@ def apply_content_research_migrations(
                 name="lite_scope_execution_authorizations",
                 checksum=expected_checksums["0023"],
                 apply=lambda: _apply_0023(conn),
+            )
+            _apply_migration(
+                conn,
+                version="0024",
+                name="scope_execution_continuation_lifecycle",
+                checksum=expected_checksums["0024"],
+                apply=lambda: _apply_0024(conn),
             )
         except Exception:
             conn.rollback()

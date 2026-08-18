@@ -138,6 +138,7 @@ def query_relevance_reason(
     policy_snapshot: RunPolicySnapshot,
     scope_contract: ResearchScopeContract | None = None,
     scope_query_plan_hash: str | None = None,
+    scope_query_group_ids: tuple[str, ...] = (),
 ) -> str | None:
     """Return the mandatory relevance reason unless frozen provenance and quote anchors agree."""
     relevance = frozen_query_relevance(contract, policy_snapshot)
@@ -152,7 +153,9 @@ def query_relevance_reason(
         else {}
     )
     if scope_contract is not None:
-        frozen_group_ids = {group.id for group in scope_contract.query_groups}
+        frozen_group_ids = set(scope_query_group_ids) or {
+            group.id for group in scope_contract.query_groups
+        }
     elif persisted_scope_match:
         frozen_group_ids = {
             str(item)
