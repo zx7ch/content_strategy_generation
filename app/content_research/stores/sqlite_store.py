@@ -50,6 +50,7 @@ from app.content_research.scope_contract import (
     ScopeConstraint,
     ScopeDraftAuditEvent,
     ScopeDraftConfirmation,
+    ScopeExecutionAuthorization,
     ScopeQueryGroup,
     ScopeQueryGroupInput,
     build_scope_contract,
@@ -858,6 +859,135 @@ class SQLiteContentResearchStore:
             ).fetchone()
         return self._row_to_coverage_snapshot(row) if row else None
 
+    def resolve_coverage_and_authorize_execution_atomically(
+        self,
+        *,
+        snapshot: CoverageSnapshot,
+        authorization: ScopeExecutionAuthorization,
+        event: ScopeAuditEvent,
+        successor_scope_contract: ResearchScopeContract | None = None,
+    ) -> tuple[ResearchScopeContract, ScopeAuditEvent, ScopeExecutionAuthorization, bool]:
+        """Persist one coverage decision and its continuation authority together.
+
+        The coverage snapshot is the decision's idempotency boundary.  A
+        matching replay returns the original immutable facts; any different
+        decision for that snapshot is rejected before another audit or Scope
+        revision can become visible.
+        """
+        _validate_payload("ScopeAuditEvent", event.payload)
+        result_contract = successor_scope_contract or self.get_scope_contract(
+            snapshot.workflow_run_id, version=snapshot.scope_contract_version
+        )
+        if result_contract is None:
+            raise ValueError("coverage authorization requires a persisted scope contract")
+        if (
+            authorization.workflow_run_id != snapshot.workflow_run_id
+            or authorization.coverage_snapshot_id != snapshot.id
+            or authorization.scope_contract_id != result_contract.id
+            or authorization.scope_contract_version != result_contract.version
+            or event.workflow_run_id != snapshot.workflow_run_id
+            or event.scope_contract_id != result_contract.id
+            or event.scope_contract_version != result_contract.version
+            or event.event_name != "coverage_resolved"
+            or event.payload.get("coverage_snapshot_id") != snapshot.id
+            or event.payload.get("resolution") != authorization.resolution
+        ):
+            raise ValueError("coverage resolution facts must reference the authorized execution")
+
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            snapshot_row = conn.execute(
+                "SELECT * FROM content_research_scope_coverage_snapshots WHERE id = ?",
+                (snapshot.id,),
+            ).fetchone()
+            if snapshot_row is None:
+                raise ValueError("coverage authorization requires a persisted coverage snapshot")
+            persisted_snapshot = self._row_to_coverage_snapshot(snapshot_row)
+            if persisted_snapshot != snapshot:
+                raise ValueError("coverage authorization snapshot does not match persisted coverage")
+
+            existing_row = conn.execute(
+                """SELECT * FROM content_research_scope_execution_authorizations
+                   WHERE coverage_snapshot_id = ?""",
+                (snapshot.id,),
+            ).fetchone()
+            if existing_row is not None:
+                existing = self._row_to_scope_execution_authorization(existing_row)
+                event_rows = conn.execute(
+                    """SELECT * FROM content_research_scope_audit_events
+                       WHERE workflow_run_id = ?
+                         AND event_name = 'coverage_resolved'
+                       ORDER BY created_at ASC, id ASC""",
+                    (snapshot.workflow_run_id,),
+                ).fetchall()
+                existing_event_row = next(
+                    (
+                        row
+                        for row in event_rows
+                        if _loads(row["payload_json"]).get("coverage_snapshot_id")
+                        == snapshot.id
+                    ),
+                    None,
+                )
+                if existing_event_row is None:
+                    raise RuntimeError("coverage authorization references a missing audit event")
+                existing_event = self._row_to_scope_audit_event(existing_event_row)
+                if (
+                    existing.resolution != authorization.resolution
+                    or existing.scope_contract_id != authorization.scope_contract_id
+                    or existing.scope_contract_version != authorization.scope_contract_version
+                    or existing_event.payload != event.payload
+                ):
+                    raise ValueError("coverage snapshot already has a different persisted resolution")
+                existing_contract_row = conn.execute(
+                    "SELECT * FROM content_research_scope_contracts WHERE id = ?",
+                    (existing.scope_contract_id,),
+                ).fetchone()
+                if existing_contract_row is None:
+                    raise RuntimeError("coverage authorization references a missing scope contract")
+                conn.commit()
+                return (
+                    self._row_to_scope_contract(existing_contract_row),
+                    existing_event,
+                    existing,
+                    False,
+                )
+
+            if successor_scope_contract is not None:
+                self._insert_scope_contract(conn, successor_scope_contract)
+            self._assert_scope_contract_reference(
+                conn,
+                workflow_run_id=authorization.workflow_run_id,
+                scope_contract_id=authorization.scope_contract_id,
+                scope_contract_version=authorization.scope_contract_version,
+            )
+            self._insert_scope_audit_event(conn, event)
+            self._insert_scope_execution_authorization(conn, authorization)
+            conn.commit()
+            return result_contract, event, authorization, True
+        except sqlite3.OperationalError as exc:
+            conn.rollback()
+            if "locked" in str(exc).lower() or "busy" in str(exc).lower():
+                raise RetryableLocalPersistenceError("sqlite_write_locked") from exc
+            raise
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def list_scope_execution_authorizations(
+        self, workflow_run_id: str
+    ) -> list[ScopeExecutionAuthorization]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """SELECT * FROM content_research_scope_execution_authorizations
+                   WHERE workflow_run_id = ? ORDER BY created_at ASC, id ASC""",
+                (workflow_run_id,),
+            ).fetchall()
+        return [self._row_to_scope_execution_authorization(row) for row in rows]
+
     def append_scope_audit_event(self, event: ScopeAuditEvent) -> ScopeAuditEvent:
         _validate_payload("ScopeAuditEvent", event.payload)
         try:
@@ -905,6 +1035,28 @@ class SQLiteContentResearchStore:
                 _dumps(event.payload),
                 _dumps(event.metadata or {}),
                 _fmt_dt(event.created_at),
+            ),
+        )
+
+    @staticmethod
+    def _insert_scope_execution_authorization(
+        conn: sqlite3.Connection, authorization: ScopeExecutionAuthorization
+    ) -> None:
+        conn.execute(
+            """INSERT INTO content_research_scope_execution_authorizations
+               (id, workflow_run_id, scope_contract_id, scope_contract_version,
+                coverage_snapshot_id, resolution, execution_revision, state, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                authorization.id,
+                authorization.workflow_run_id,
+                authorization.scope_contract_id,
+                authorization.scope_contract_version,
+                authorization.coverage_snapshot_id,
+                authorization.resolution,
+                authorization.execution_revision,
+                authorization.state,
+                _fmt_dt(authorization.created_at),
             ),
         )
 
@@ -1788,6 +1940,22 @@ class SQLiteContentResearchStore:
             unmet_constraint_ids=tuple(
                 str(item) for item in _loads_any_list(row["unmet_constraint_ids_json"])
             ),
+            created_at=_parse_dt(row["created_at"]),
+        )
+
+    @staticmethod
+    def _row_to_scope_execution_authorization(
+        row: sqlite3.Row,
+    ) -> ScopeExecutionAuthorization:
+        return ScopeExecutionAuthorization(
+            id=row["id"],
+            workflow_run_id=row["workflow_run_id"],
+            scope_contract_id=row["scope_contract_id"],
+            scope_contract_version=row["scope_contract_version"],
+            coverage_snapshot_id=row["coverage_snapshot_id"],
+            resolution=row["resolution"],
+            execution_revision=row["execution_revision"],
+            state=row["state"],
             created_at=_parse_dt(row["created_at"]),
         )
 

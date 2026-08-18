@@ -220,14 +220,20 @@ async def test_generate_limited_report_resolution_preserves_v1_and_exact_season_
     assert result["audit_event"]["event_name"] == "coverage_resolved"
     assert result["audit_event"]["payload"]["resolution"] == "generate_limited_report"
     store = app.state.content_research_service._store
+    authorization = result["execution_authorization"]
+    assert authorization["resolution"] == "generate_limited_report"
+    assert authorization["state"] == "authorized_limited_report"
+    assert store.list_scope_execution_authorizations(workflow_run_id)[0].state == (
+        "authorized_limited_report"
+    )
     assert [contract.version for contract in store.list_scope_contracts(workflow_run_id)] == [1]
 
 
 @pytest.mark.asyncio
-async def test_expand_required_constraint_creates_v2_from_only_user_supplied_queries(
+async def test_expand_required_constraint_retains_v1_and_authorizes_collection(
     scope_client,
 ):
-    """Synthesizing expansion queries or mutating v1 must make this test fail."""
+    """Creating a semantic Scope revision for supplementary collection must fail this test."""
     workflow_run_id, contract_v1 = await _confirmed_scope_with_unmet_season(scope_client)
     supplementary_queries = ["夏季 防晒 长袖衬衫", "夏季 透气 衬衫"]
 
@@ -246,21 +252,20 @@ async def test_expand_required_constraint_creates_v2_from_only_user_supplied_que
 
     assert response.status_code == 200
     result = response.json()["result"]
-    contract_v2 = result["scope_contract"]
-    assert contract_v2["version"] == 2
-    assert [group["final_query"] for group in contract_v2["query_groups"]] == supplementary_queries
-    assert {group["execution_role"] for group in contract_v2["query_groups"]} == {
-        "supplementary"
-    }
+    assert result["scope_contract"] == contract_v1
     assert result["audit_event"]["payload"]["resolution"] == "expand_required_constraint"
     assert result["audit_event"]["payload"]["source_scope_contract_version"] == 1
-    assert result["audit_event"]["payload"]["resulting_scope_contract_version"] == 2
+    assert result["audit_event"]["payload"]["resulting_scope_contract_version"] == 1
+    assert result["execution_authorization"]["state"] == "authorized_collection"
     store = app.state.content_research_service._store
     persisted_v1 = store.get_scope_contract(workflow_run_id, version=1)
     assert persisted_v1 is not None
     assert [group.final_query for group in persisted_v1.query_groups] == [
         group["final_query"] for group in contract_v1["query_groups"]
     ]
+    authorizations = store.list_scope_execution_authorizations(workflow_run_id)
+    assert len(authorizations) == 1
+    assert authorizations[0].scope_contract_version == 1
 
 
 @pytest.mark.asyncio
@@ -292,6 +297,10 @@ async def test_relax_constraint_creates_v2_and_keeps_v1_required(scope_client):
     persisted_v1 = store.get_scope_contract(workflow_run_id, version=1)
     assert persisted_v1 is not None
     assert next(item for item in persisted_v1.constraints if item.id == "season").mode == "required"
+    authorization = store.list_scope_execution_authorizations(workflow_run_id)
+    assert len(authorization) == 1
+    assert authorization[0].scope_contract_version == 2
+    assert authorization[0].state == "authorized_collection"
 
 
 @pytest.mark.asyncio
@@ -353,14 +362,53 @@ async def test_versioned_coverage_resolution_replays_after_lost_response(
     assert replay.status_code == 200
     assert replay.json()["result"] == first.json()["result"]
     store = app.state.content_research_service._store
-    assert [contract.version for contract in store.list_scope_contracts(workflow_run_id)] == [1, 2]
+    expected_versions = [1, 2] if payload["resolution"] == "relax_constraint" else [1]
+    assert [contract.version for contract in store.list_scope_contracts(workflow_run_id)] == expected_versions
+    assert len(store.list_scope_execution_authorizations(workflow_run_id)) == 1
+    resulting_version = 2 if payload["resolution"] == "relax_constraint" else 1
     assert len(
         [
             event
-            for event in store.list_scope_audit_events(workflow_run_id, version=2)
+            for event in store.list_scope_audit_events(
+                workflow_run_id, version=resulting_version
+            )
             if event.event_name == "coverage_resolved"
         ]
     ) == 1
+
+
+@pytest.mark.asyncio
+async def test_resolve_coverage_rejects_a_different_decision_for_the_same_snapshot(scope_client):
+    """Allowing a second decision for one coverage snapshot must fail this test."""
+    workflow_run_id, _contract_v1 = await _confirmed_scope_with_unmet_season(scope_client)
+    endpoint = f"/content-research/workflows/{workflow_run_id}/actions"
+
+    first = await scope_client.post(
+        endpoint,
+        json={
+            "action": "resolve_coverage",
+            "payload": {
+                "scope_contract_version": 1,
+                "resolution": "generate_limited_report",
+            },
+        },
+    )
+    conflicting = await scope_client.post(
+        endpoint,
+        json={
+            "action": "resolve_coverage",
+            "payload": {
+                "scope_contract_version": 1,
+                "resolution": "relax_constraint",
+                "constraint_id": "season",
+            },
+        },
+    )
+
+    assert first.status_code == 200
+    assert conflicting.status_code == 422
+    store = app.state.content_research_service._store
+    assert len(store.list_scope_execution_authorizations(workflow_run_id)) == 1
 
 
 @pytest.mark.asyncio

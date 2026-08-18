@@ -159,6 +159,51 @@ class CoverageSnapshot:
             raise ValueError("invalid coverage snapshot state")
 
 
+@dataclass(frozen=True)
+class ScopeExecutionAuthorization:
+    """Append-only authorization for the execution selected from a coverage decision."""
+
+    id: str
+    workflow_run_id: str
+    scope_contract_id: str
+    scope_contract_version: int
+    coverage_snapshot_id: str
+    resolution: Literal[
+        "expand_required_constraint",
+        "generate_limited_report",
+        "relax_constraint",
+    ]
+    execution_revision: int
+    state: Literal["authorized_collection", "authorized_limited_report"]
+    created_at: datetime = field(default_factory=utcnow)
+
+    def __post_init__(self) -> None:
+        if not all(
+            (
+                self.id.strip(),
+                self.workflow_run_id.strip(),
+                self.scope_contract_id.strip(),
+                self.coverage_snapshot_id.strip(),
+            )
+        ):
+            raise ValueError("scope execution authorization identity is required")
+        if self.scope_contract_version < 1 or self.execution_revision < 1:
+            raise ValueError("scope execution authorization revisions must be positive")
+        if self.resolution not in {
+            "expand_required_constraint",
+            "generate_limited_report",
+            "relax_constraint",
+        }:
+            raise ValueError("invalid scope execution authorization resolution")
+        expected_state = (
+            "authorized_limited_report"
+            if self.resolution == "generate_limited_report"
+            else "authorized_collection"
+        )
+        if self.state != expected_state:
+            raise ValueError("invalid scope execution authorization state")
+
+
 def build_scope_contract(
     *,
     workflow_run_id: str,

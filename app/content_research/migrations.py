@@ -555,6 +555,23 @@ CREATE TABLE content_research_scope_draft_confirmations (
 """
 
 
+_V23_SCOPE_EXECUTION_AUTHORIZATION_SQL = """
+CREATE TABLE content_research_scope_execution_authorizations (
+    id TEXT PRIMARY KEY,
+    workflow_run_id TEXT NOT NULL,
+    scope_contract_id TEXT NOT NULL,
+    scope_contract_version INTEGER NOT NULL,
+    coverage_snapshot_id TEXT NOT NULL UNIQUE,
+    resolution TEXT NOT NULL,
+    execution_revision INTEGER NOT NULL,
+    state TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX idx_cr_scope_execution_authorization_workflow
+    ON content_research_scope_execution_authorizations(workflow_run_id, created_at, id);
+"""
+
+
 def _apply_0020(conn: sqlite3.Connection) -> None:
     conn.executescript(_V20_SCOPE_COVERAGE_SQL)
 
@@ -565,6 +582,10 @@ def _apply_0021(conn: sqlite3.Connection) -> None:
 
 def _apply_0022(conn: sqlite3.Connection) -> None:
     conn.executescript(_V22_SCOPE_DRAFT_CONFIRMATION_SQL)
+
+
+def _apply_0023(conn: sqlite3.Connection) -> None:
+    conn.executescript(_V23_SCOPE_EXECUTION_AUTHORIZATION_SQL)
 
 
 def _apply_0015(conn: sqlite3.Connection) -> None:
@@ -624,6 +645,7 @@ def _expected_checksums(migration_0002_sql: str, legacy_checksum: str) -> dict[s
         "0020": hashlib.sha256(_V20_SCOPE_COVERAGE_SQL.encode("utf-8")).hexdigest(),
         "0021": hashlib.sha256(_V21_SCOPE_DRAFT_SQL.encode("utf-8")).hexdigest(),
         "0022": hashlib.sha256(_V22_SCOPE_DRAFT_CONFIRMATION_SQL.encode("utf-8")).hexdigest(),
+        "0023": hashlib.sha256(_V23_SCOPE_EXECUTION_AUTHORIZATION_SQL.encode("utf-8")).hexdigest(),
     }
 
 
@@ -857,6 +879,13 @@ def apply_content_research_migrations(
                 name="lite_scope_draft_confirmations",
                 checksum=expected_checksums["0022"],
                 apply=lambda: _apply_0022(conn),
+            )
+            _apply_migration(
+                conn,
+                version="0023",
+                name="lite_scope_execution_authorizations",
+                checksum=expected_checksums["0023"],
+                apply=lambda: _apply_0023(conn),
             )
         except Exception:
             conn.rollback()

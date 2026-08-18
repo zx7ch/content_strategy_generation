@@ -43,6 +43,7 @@ from app.content_research.scope_contract import (
     ResearchScopeDraft,
     ScopeAuditEvent,
     ScopeDraftAuditEvent,
+    ScopeExecutionAuthorization,
 )
 
 TypedRecordT = TypeVar("TypedRecordT", bound=CanonicalSourceRecord | DirectionSourceProjectionRecord | DirectionalEvidencePacketRecord | ClaimCandidateRecord | ClaimAdmissionDecisionRecord | DirectionResultDecisionRecord | WeakSignalRecord | CrossDirectionRecord | AggregateClaimRecord | MarketingConclusionCandidateRecord | MarketingConclusionDecisionRecord | StageCheckpointRecord | BudgetLedgerEntryRecord | ReportDraftRecord | ReportFaithfulnessDecisionRecord | ReportPublicationRecord)
@@ -75,6 +76,17 @@ class ContentResearchStore(Protocol):
         self, snapshot: CoverageSnapshot, event: ScopeAuditEvent
     ) -> CoverageSnapshot: ...
     def get_coverage_snapshot(self, workflow_run_id: str, *, version: int) -> CoverageSnapshot | None: ...
+    def resolve_coverage_and_authorize_execution_atomically(
+        self,
+        *,
+        snapshot: CoverageSnapshot,
+        authorization: ScopeExecutionAuthorization,
+        event: ScopeAuditEvent,
+        successor_scope_contract: ResearchScopeContract | None = None,
+    ) -> tuple[ResearchScopeContract, ScopeAuditEvent, ScopeExecutionAuthorization, bool]: ...
+    def list_scope_execution_authorizations(
+        self, workflow_run_id: str
+    ) -> list[ScopeExecutionAuthorization]: ...
     def append_scope_audit_event(self, event: ScopeAuditEvent) -> ScopeAuditEvent: ...
     def list_scope_audit_events(self, workflow_run_id: str, *, version: int) -> list[ScopeAuditEvent]: ...
     def save_run_policy_snapshot(self, snapshot: RunPolicySnapshot) -> RunPolicySnapshot: ...

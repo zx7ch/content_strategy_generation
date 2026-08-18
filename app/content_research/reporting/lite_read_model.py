@@ -136,16 +136,17 @@ class LiteReportReader:
                     "report scope decision is pending collection for the latest contract"
                 )
             return None
-        events = self._store.list_scope_audit_events(
-            workflow_run_id, version=contract.version
-        )
         authorization = next(
             (
-                event
-                for event in reversed(events)
-                if event.event_name == "coverage_resolved"
-                and event.payload.get("coverage_snapshot_id") == snapshot.id
-                and event.payload.get("resolution") == "generate_limited_report"
+                item
+                for item in reversed(
+                    self._store.list_scope_execution_authorizations(workflow_run_id)
+                )
+                if item.coverage_snapshot_id == snapshot.id
+                and item.scope_contract_id == contract.id
+                and item.scope_contract_version == contract.version
+                and item.resolution == "generate_limited_report"
+                and item.state == "authorized_limited_report"
             ),
             None,
         )

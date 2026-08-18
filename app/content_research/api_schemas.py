@@ -341,6 +341,22 @@ class ResolveCoverageRequest(BaseModel):
     supplementary_queries: list[str] = Field(default_factory=list, max_length=2)
 
 
+class ScopeExecutionAuthorizationResponse(BaseModel):
+    id: str
+    workflow_run_id: str
+    scope_contract_id: str
+    scope_contract_version: int
+    coverage_snapshot_id: str
+    resolution: Literal[
+        "expand_required_constraint",
+        "generate_limited_report",
+        "relax_constraint",
+    ]
+    execution_revision: int
+    state: Literal["authorized_collection", "authorized_limited_report"]
+    created_at: datetime
+
+
 class ContentResearchSubjectClarificationRequest(BaseModel):
     clarification_text: str = Field(min_length=1, max_length=2000)
 

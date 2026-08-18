@@ -20,6 +20,7 @@ from app.content_research.scope_contract import (
     CoverageSnapshot,
     ScopeAuditEvent,
     ScopeConstraint,
+    ScopeExecutionAuthorization,
     ScopeQueryGroupInput,
     build_scope_contract,
 )
@@ -356,8 +357,19 @@ def _persist_unmet_season_scope(store, workflow_run_id: str, *, authorize_limite
     )
     store.save_coverage_snapshot(snapshot)
     if authorize_limited:
-        store.append_scope_audit_event(
-            ScopeAuditEvent(
+        store.resolve_coverage_and_authorize_execution_atomically(
+            snapshot=snapshot,
+            authorization=ScopeExecutionAuthorization(
+                id="sea_limited_season",
+                workflow_run_id=workflow_run_id,
+                scope_contract_id=contract.id,
+                scope_contract_version=1,
+                coverage_snapshot_id=snapshot.id,
+                resolution="generate_limited_report",
+                execution_revision=1,
+                state="authorized_limited_report",
+            ),
+            event=ScopeAuditEvent(
                 id="sae_limited_season",
                 workflow_run_id=workflow_run_id,
                 scope_contract_id=contract.id,
@@ -373,7 +385,7 @@ def _persist_unmet_season_scope(store, workflow_run_id: str, *, authorize_limite
                     "unmet_constraint_ids": ["season"],
                     "constraint_counts": snapshot.constraint_counts,
                 },
-            )
+            ),
         )
 
 
@@ -408,6 +420,9 @@ async def test_limited_lite_report_projects_exact_season_limitation_and_audit(tm
     )
 
     assert report["status_strip"]["report_mode"] == "limited"
+    assert persisted["store"].list_scope_execution_authorizations(
+        persisted["run_id"]
+    )[0].state == "authorized_limited_report"
     assert report["frozen_scope"]["scope_contract_version"] == 1
     assert report["frozen_scope"]["unmet_constraint_ids"] == ["season"]
     assert report["frozen_scope"]["constraint_counts"]["season"] == {
