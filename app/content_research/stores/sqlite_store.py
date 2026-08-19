@@ -16,6 +16,7 @@ from app.content_research.evidence.models import (
     EvidenceLineageRecord,
     EvidenceRecord,
 )
+from app.content_research.execution_decision_identity import build_execution_decision_identity
 from app.content_research.models import (
     HumanDecisionRecord,
     ObservationEventRecord,
@@ -131,18 +132,16 @@ def _execution_decision_identity(
     supplementary_queries: tuple[str, ...],
 ) -> tuple[dict[str, object], str]:
     """Return the one canonical identity shared by new and legacy entrypoints."""
-    payload: dict[str, object] = {
-        "coverage_snapshot_id": coverage_snapshot_id,
-        "source_scope_contract_id": source_scope_contract_id,
-        "resulting_scope_contract_id": resulting_scope_contract_id,
-        "constraint_id": constraint_id,
-        "resolution": resolution,
-        "operation": operation,
-        "supplementary_queries": list(supplementary_queries),
-    }
-    fingerprint = hashlib.sha256(
-        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
+    identity, payload, fingerprint = build_execution_decision_identity(
+        coverage_snapshot_id=coverage_snapshot_id,
+        source_scope_contract_id=source_scope_contract_id,
+        resulting_scope_contract_id=resulting_scope_contract_id,
+        resolution=resolution,
+        target_constraint_id=constraint_id or None,
+        supplementary_queries=supplementary_queries,
+    )
+    if identity.operation != operation:
+        raise ValueError("execution decision operation does not match resolution")
     return payload, fingerprint
 
 
