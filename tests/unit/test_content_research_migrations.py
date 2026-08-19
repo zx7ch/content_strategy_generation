@@ -3,7 +3,11 @@ from __future__ import annotations
 import sqlite3
 import threading
 
+import pytest
+
+import app.content_research.migrations as migrations
 from app.content_research.bootstrap import bootstrap_content_research_schema
+from app.content_research.migrations import apply_content_research_migrations
 from app.content_research.scope_contract import (
     CoverageSnapshot,
     ScopeAuditEvent,
@@ -166,3 +170,40 @@ def test_migration_backfills_historical_limited_report_authority_and_continuatio
     assert replay[2] == authorization
     assert replay[3] == continuation
     assert replay[4] is False
+
+
+def test_execution_unit_backfill_rolls_back_then_retries(tmp_path, monkeypatch) -> None:
+    """A post-backfill failure must leave neither 0025 schema nor ledger state behind."""
+    db_path = str(tmp_path / "execution-unit-backfill-retry.db")
+    bootstrap_content_research_schema(db_path)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("DELETE FROM content_research_schema_migrations WHERE version IN ('0025', '0026')")
+        conn.execute("DROP TABLE content_research_execution_facts")
+        conn.execute("DROP TABLE content_research_scope_execution_attempts")
+        conn.execute("DROP TABLE content_research_scope_execution_units")
+        conn.execute("ALTER TABLE content_research_scope_execution_authorizations DROP COLUMN execution_unit_id")
+        conn.execute("ALTER TABLE content_research_scope_execution_continuations DROP COLUMN execution_unit_id")
+
+    original = migrations._apply_0025
+
+    def fail_after_backfill(conn):
+        original(conn)
+        raise RuntimeError("injected 0025 backfill failure")
+
+    monkeypatch.setattr(migrations, "_apply_0025", fail_after_backfill)
+    with pytest.raises(RuntimeError, match="injected 0025"):
+        apply_content_research_migrations(db_path, bootstrap_content_research_schema)
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='content_research_scope_execution_units'"
+        ).fetchone() is None
+        assert conn.execute(
+            "SELECT 1 FROM content_research_schema_migrations WHERE version='0025'"
+        ).fetchone() is None
+
+    monkeypatch.setattr(migrations, "_apply_0025", original)
+    apply_content_research_migrations(db_path, bootstrap_content_research_schema)
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute(
+            "SELECT 1 FROM content_research_schema_migrations WHERE version='0026'"
+        ).fetchone() is not None
