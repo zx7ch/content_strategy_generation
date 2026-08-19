@@ -125,6 +125,7 @@ def _execution_decision_identity(
     coverage_snapshot_id: str,
     source_scope_contract_id: str,
     resulting_scope_contract_id: str,
+    constraint_id: str = "",
     resolution: str,
     operation: str,
     supplementary_queries: tuple[str, ...],
@@ -134,6 +135,7 @@ def _execution_decision_identity(
         "coverage_snapshot_id": coverage_snapshot_id,
         "source_scope_contract_id": source_scope_contract_id,
         "resulting_scope_contract_id": resulting_scope_contract_id,
+        "constraint_id": constraint_id,
         "resolution": resolution,
         "operation": operation,
         "supplementary_queries": list(supplementary_queries),
@@ -1110,6 +1112,7 @@ class SQLiteContentResearchStore:
             resulting_scope_contract_id=str(
                 decision.get("resulting_scope_contract_id") or snapshot.scope_contract_id
             ),
+            constraint_id=str(decision.get("constraint_id") or ""),
             resolution=resolution,
             operation=operation,
             supplementary_queries=queries,
@@ -1618,6 +1621,7 @@ class SQLiteContentResearchStore:
                 coverage_snapshot_id=snapshot.id,
                 source_scope_contract_id=snapshot.scope_contract_id,
                 resulting_scope_contract_id=authorization.scope_contract_id,
+                constraint_id=str(event.payload.get("constraint_id") or ""),
                 resolution=authorization.resolution,
                 operation=continuation.operation,
                 supplementary_queries=continuation.supplementary_queries,
