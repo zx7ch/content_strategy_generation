@@ -207,3 +207,47 @@ def test_execution_unit_backfill_rolls_back_then_retries(tmp_path, monkeypatch) 
         assert conn.execute(
             "SELECT 1 FROM content_research_schema_migrations WHERE version='0026'"
         ).fetchone() is not None
+
+
+def test_execution_unit_repair_rolls_back_seeded_legacy_alias_then_retries(tmp_path, monkeypatch) -> None:
+    """0026 must atomically repair existing aliases, not merely write its ledger row."""
+    db_path = str(tmp_path / "execution-unit-repair-retry.db")
+    bootstrap_content_research_schema(db_path)
+    with sqlite3.connect(db_path) as conn:
+        now = "2026-08-19T00:00:00+00:00"
+        conn.execute(
+            "INSERT INTO content_research_scope_contracts VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("rsc_source", "run-repair", "rp-repair", 1, "v", "[]", "[]", now),
+        )
+        conn.execute(
+            "INSERT INTO content_research_scope_coverage_snapshots VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("scv-repair", "run-repair", "rsc_source", 1, 1, None, None, "awaiting_scope_decision", "{}", "[]", now),
+        )
+        conn.execute(
+            "INSERT INTO content_research_scope_execution_units VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("seu_legacy", "legacy-fingerprint", "run-repair", "rsc_source", "scv-repair", "generate_limited_report", "limited_report", "pending", now),
+        )
+        conn.execute(
+            "INSERT INTO content_research_scope_execution_authorizations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("sea-repair", "run-repair", "rsc_source", 1, "scv-repair", "generate_limited_report", 2, "authorized_limited_report", now, "seu_legacy"),
+        )
+        conn.execute(
+            "INSERT INTO content_research_scope_execution_continuations (id, authorization_id, workflow_run_id, execution_revision, operation, supplementary_queries_json, state, created_at, updated_at, execution_unit_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("sec-repair", "sea-repair", "run-repair", 2, "limited_report", "[]", "pending", now, now, "seu_legacy"),
+        )
+        conn.execute("DELETE FROM content_research_schema_migrations WHERE version='0026'")
+
+    original = migrations._apply_0026
+    def fail_after_repair(conn):
+        original(conn)
+        raise RuntimeError("injected 0026 repair failure")
+    monkeypatch.setattr(migrations, "_apply_0026", fail_after_repair)
+    with pytest.raises(RuntimeError, match="injected 0026"):
+        apply_content_research_migrations(db_path, bootstrap_content_research_schema)
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("SELECT decision_fingerprint FROM content_research_scope_execution_units").fetchone()[0] == "legacy-fingerprint"
+        assert conn.execute("SELECT 1 FROM content_research_schema_migrations WHERE version='0026'").fetchone() is None
+    monkeypatch.setattr(migrations, "_apply_0026", original)
+    apply_content_research_migrations(db_path, bootstrap_content_research_schema)
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("SELECT decision_fingerprint FROM content_research_scope_execution_units").fetchone()[0] != "legacy-fingerprint"
