@@ -61,6 +61,7 @@ from app.content_research.scope_contract import (
     ScopeQueryGroup,
     ScopeQueryGroupInput,
     build_scope_contract,
+    thaw_execution_payload,
 )
 
 
@@ -1203,8 +1204,10 @@ class SQLiteContentResearchStore:
             if row is None:
                 conn.commit()
                 return None
-            if row["state"] == "running" and row["lease_expires_at"] <= _fmt_dt(now):
-                if row["provider_state"] == "requested":
+            if row["state"] == "failed" or (
+                row["state"] == "running" and row["lease_expires_at"] <= _fmt_dt(now)
+            ):
+                if row["state"] == "running" and row["provider_state"] == "requested":
                     conn.execute(
                         """UPDATE content_research_scope_execution_attempts
                            SET state='outcome_unknown', lease_owner=NULL, lease_token=NULL,
@@ -1619,24 +1622,30 @@ class SQLiteContentResearchStore:
                 operation=continuation.operation,
                 state="pending",
             )
+            existing_unit_row = conn.execute(
+                "SELECT * FROM content_research_scope_execution_units WHERE coverage_snapshot_id=?",
+                (snapshot.id,),
+            ).fetchone()
+            if existing_unit_row is not None:
+                if str(existing_unit_row["decision_fingerprint"]) != decision_fingerprint:
+                    raise ValueError("coverage snapshot already has a different persisted decision")
+                unit = self._row_to_scope_execution_unit(existing_unit_row)
             authorization = replace(authorization, execution_unit_id=unit.id)
             continuation = replace(continuation, execution_unit_id=unit.id)
             self._insert_scope_audit_event(conn, event)
-            self._insert_scope_execution_unit(conn, unit, decision_fingerprint=decision_fingerprint)
-            self._insert_scope_execution_attempt(
-                conn,
-                ScopeExecutionAttempt(execution_unit_id=unit.id, attempt_no=0, state="pending"),
-            )
-            self._insert_execution_fact(
-                conn,
-                ExecutionFact(
-                    execution_unit_id=unit.id,
-                    attempt_no=0,
-                    sequence_no=1,
-                    kind="decision_accepted",
-                    payload={"decision": decision_payload},
-                ),
-            )
+            if existing_unit_row is None:
+                self._insert_scope_execution_unit(conn, unit, decision_fingerprint=decision_fingerprint)
+                self._insert_scope_execution_attempt(
+                    conn,
+                    ScopeExecutionAttempt(execution_unit_id=unit.id, attempt_no=0, state="pending"),
+                )
+                self._insert_execution_fact(
+                    conn,
+                    ExecutionFact(
+                        execution_unit_id=unit.id, attempt_no=0, sequence_no=1,
+                        kind="decision_accepted", payload={"decision": decision_payload},
+                    ),
+                )
             self._insert_scope_execution_authorization(conn, authorization)
             self._insert_scope_execution_continuation(conn, continuation)
             conn.commit()
@@ -1827,7 +1836,7 @@ class SQLiteContentResearchStore:
                 fact.attempt_no,
                 fact.sequence_no,
                 fact.kind,
-                _dumps(dict(fact.payload)),
+                _dumps(thaw_execution_payload(fact.payload)),
                 _fmt_dt(fact.created_at),
             ),
         )

@@ -348,6 +348,7 @@ class ResolveCoverageRequest(BaseModel):
 
 class ScopeExecutionAuthorizationResponse(BaseModel):
     id: str
+    execution_unit_id: str | None = None
     workflow_run_id: str
     scope_contract_id: str
     scope_contract_version: int

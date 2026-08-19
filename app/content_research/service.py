@@ -5624,6 +5624,7 @@ def _scope_execution_authorization_payload(
 ) -> dict[str, Any]:
     return {
         "id": authorization.id,
+        "execution_unit_id": authorization.execution_unit_id,
         "workflow_run_id": authorization.workflow_run_id,
         "scope_contract_id": authorization.scope_contract_id,
         "scope_contract_version": authorization.scope_contract_version,

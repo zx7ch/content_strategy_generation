@@ -344,7 +344,23 @@ class ExecutionFact:
             "outcome_unknown",
         }:
             raise ValueError("invalid execution fact kind")
-        object.__setattr__(self, "payload", MappingProxyType(dict(self.payload)))
+        object.__setattr__(self, "payload", _freeze_execution_payload(self.payload))
+
+
+def _freeze_execution_payload(value: object) -> object:
+    if isinstance(value, Mapping):
+        return MappingProxyType({str(key): _freeze_execution_payload(item) for key, item in value.items()})
+    if isinstance(value, list | tuple):
+        return tuple(_freeze_execution_payload(item) for item in value)
+    return value
+
+
+def thaw_execution_payload(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {key: thaw_execution_payload(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [thaw_execution_payload(item) for item in value]
+    return value
 
 
 def build_scope_contract(

@@ -827,7 +827,7 @@ def _apply_0025(conn: sqlite3.Connection) -> None:
                   authorization.coverage_snapshot_id, authorization.resolution,
                   authorization.created_at, continuation.operation, continuation.state,
                   continuation.lease_owner, continuation.lease_token,
-                  continuation.lease_expires_at
+                  continuation.lease_expires_at, continuation.supplementary_queries_json
            FROM content_research_scope_execution_authorizations AS authorization
            LEFT JOIN content_research_scope_execution_continuations AS continuation
              ON continuation.authorization_id=authorization.id
@@ -846,19 +846,21 @@ def _apply_0025(conn: sqlite3.Connection) -> None:
             lease_owner,
             lease_token,
             lease_expires_at,
+            supplementary_queries_json,
         ) = row
         operation = operation or (
             "limited_report"
             if resolution == "generate_limited_report"
             else "supplementary_collection"
         )
-        unit_id = (
-            "seu_"
-            + hashlib.sha256(f"legacy-authorization:{authorization_id}".encode()).hexdigest()[:24]
+        queries = json.loads(supplementary_queries_json or "[]")
+        identity = json.dumps(
+            {"coverage_snapshot_id": coverage_snapshot_id, "scope_contract_id": scope_contract_id,
+             "resolution": resolution, "operation": operation, "supplementary_queries": queries},
+            ensure_ascii=False, sort_keys=True, separators=(",", ":"),
         )
-        decision_fingerprint = hashlib.sha256(
-            f"legacy-authorization:{authorization_id}".encode()
-        ).hexdigest()
+        decision_fingerprint = hashlib.sha256(identity.encode()).hexdigest()
+        unit_id = "seu_" + decision_fingerprint[:24]
         state = continuation_state or "pending"
         now = created_at or datetime.now(timezone.utc).isoformat()
         conn.execute(
