@@ -123,7 +123,8 @@ def _dumps_any_list(value: list[Any]) -> str:
 def _execution_decision_identity(
     *,
     coverage_snapshot_id: str,
-    scope_contract_id: str,
+    source_scope_contract_id: str,
+    resulting_scope_contract_id: str,
     resolution: str,
     operation: str,
     supplementary_queries: tuple[str, ...],
@@ -131,7 +132,8 @@ def _execution_decision_identity(
     """Return the one canonical identity shared by new and legacy entrypoints."""
     payload: dict[str, object] = {
         "coverage_snapshot_id": coverage_snapshot_id,
-        "scope_contract_id": scope_contract_id,
+        "source_scope_contract_id": source_scope_contract_id,
+        "resulting_scope_contract_id": resulting_scope_contract_id,
         "resolution": resolution,
         "operation": operation,
         "supplementary_queries": list(supplementary_queries),
@@ -1104,15 +1106,21 @@ class SQLiteContentResearchStore:
 
         decision_payload, fingerprint = _execution_decision_identity(
             coverage_snapshot_id=snapshot.id,
-            scope_contract_id=snapshot.scope_contract_id,
+            source_scope_contract_id=snapshot.scope_contract_id,
+            resulting_scope_contract_id=str(
+                decision.get("resulting_scope_contract_id") or snapshot.scope_contract_id
+            ),
             resolution=resolution,
             operation=operation,
             supplementary_queries=queries,
         )
+        resulting_scope_contract_id = str(
+            decision.get("resulting_scope_contract_id") or snapshot.scope_contract_id
+        )
         unit = ScopeExecutionUnit(
             id="seu_" + fingerprint[:24],
             workflow_run_id=snapshot.workflow_run_id,
-            scope_contract_id=snapshot.scope_contract_id,
+            scope_contract_id=resulting_scope_contract_id,
             coverage_snapshot_id=snapshot.id,
             resolution=resolution,
             operation=operation,
@@ -1608,7 +1616,8 @@ class SQLiteContentResearchStore:
             )
             decision_payload, decision_fingerprint = _execution_decision_identity(
                 coverage_snapshot_id=snapshot.id,
-                scope_contract_id=authorization.scope_contract_id,
+                source_scope_contract_id=snapshot.scope_contract_id,
+                resulting_scope_contract_id=authorization.scope_contract_id,
                 resolution=authorization.resolution,
                 operation=continuation.operation,
                 supplementary_queries=continuation.supplementary_queries,

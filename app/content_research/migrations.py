@@ -827,10 +827,13 @@ def _apply_0025(conn: sqlite3.Connection) -> None:
                   authorization.coverage_snapshot_id, authorization.resolution,
                   authorization.created_at, continuation.operation, continuation.state,
                   continuation.lease_owner, continuation.lease_token,
-                  continuation.lease_expires_at, continuation.supplementary_queries_json
+                  continuation.lease_expires_at, continuation.supplementary_queries_json,
+                  snapshot.scope_contract_id
            FROM content_research_scope_execution_authorizations AS authorization
            LEFT JOIN content_research_scope_execution_continuations AS continuation
              ON continuation.authorization_id=authorization.id
+           LEFT JOIN content_research_scope_coverage_snapshots AS snapshot
+             ON snapshot.id=authorization.coverage_snapshot_id
            ORDER BY authorization.created_at ASC, authorization.id ASC"""
     ).fetchall()
     for row in rows:
@@ -847,6 +850,7 @@ def _apply_0025(conn: sqlite3.Connection) -> None:
             lease_token,
             lease_expires_at,
             supplementary_queries_json,
+            source_scope_contract_id,
         ) = row
         operation = operation or (
             "limited_report"
@@ -855,7 +859,9 @@ def _apply_0025(conn: sqlite3.Connection) -> None:
         )
         queries = json.loads(supplementary_queries_json or "[]")
         identity = json.dumps(
-            {"coverage_snapshot_id": coverage_snapshot_id, "scope_contract_id": scope_contract_id,
+            {"coverage_snapshot_id": coverage_snapshot_id,
+             "source_scope_contract_id": source_scope_contract_id,
+             "resulting_scope_contract_id": scope_contract_id,
              "resolution": resolution, "operation": operation, "supplementary_queries": queries},
             ensure_ascii=False, sort_keys=True, separators=(",", ":"),
         )
@@ -921,6 +927,34 @@ def _apply_0025(conn: sqlite3.Connection) -> None:
         )
 
 
+def _apply_0026(conn: sqlite3.Connection) -> None:
+    """Repair pre-canonical 0025 aliases without changing their stable unit IDs."""
+    rows = conn.execute(
+        """SELECT unit.id, authorization.coverage_snapshot_id, snapshot.scope_contract_id,
+                  authorization.scope_contract_id, authorization.resolution, continuation.operation,
+                  continuation.supplementary_queries_json
+           FROM content_research_scope_execution_units AS unit
+           JOIN content_research_scope_execution_authorizations AS authorization
+             ON authorization.execution_unit_id=unit.id
+           JOIN content_research_scope_coverage_snapshots AS snapshot
+             ON snapshot.id=authorization.coverage_snapshot_id
+           LEFT JOIN content_research_scope_execution_continuations AS continuation
+             ON continuation.authorization_id=authorization.id"""
+    ).fetchall()
+    for unit_id, snapshot_id, source_scope_id, resulting_scope_id, resolution, operation, raw_queries in rows:
+        identity = json.dumps(
+            {"coverage_snapshot_id": snapshot_id, "source_scope_contract_id": source_scope_id,
+             "resulting_scope_contract_id": resulting_scope_id, "resolution": resolution,
+             "operation": operation or ("limited_report" if resolution == "generate_limited_report" else "supplementary_collection"),
+             "supplementary_queries": json.loads(raw_queries or "[]")},
+            ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        )
+        conn.execute(
+            "UPDATE content_research_scope_execution_units SET decision_fingerprint=? WHERE id=?",
+            (hashlib.sha256(identity.encode()).hexdigest(), unit_id),
+        )
+
+
 def _apply_0015(conn: sqlite3.Connection) -> None:
     conn.execute(_V15_LLM_CONFIGURATION_SQL)
 
@@ -981,6 +1015,7 @@ def _expected_checksums(migration_0002_sql: str, legacy_checksum: str) -> dict[s
         "0023": hashlib.sha256(_V23_SCOPE_EXECUTION_AUTHORIZATION_SQL.encode("utf-8")).hexdigest(),
         "0024": hashlib.sha256(_V24_SCOPE_EXECUTION_CONTINUATION_SQL.encode("utf-8")).hexdigest(),
         "0025": hashlib.sha256(_V25_EXECUTION_UNITS_SQL.encode("utf-8")).hexdigest(),
+        "0026": _checksum("execution_unit_alias_canonical_repair_v1"),
     }
 
 
@@ -1235,6 +1270,13 @@ def apply_content_research_migrations(
                 name="scope_execution_units_and_facts",
                 checksum=expected_checksums["0025"],
                 apply=lambda: _apply_0025(conn),
+            )
+            _apply_migration(
+                conn,
+                version="0026",
+                name="execution_unit_alias_canonical_repair",
+                checksum=expected_checksums["0026"],
+                apply=lambda: _apply_0026(conn),
             )
         except Exception:
             conn.rollback()
