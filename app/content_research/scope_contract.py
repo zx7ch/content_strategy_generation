@@ -6,8 +6,10 @@ import hashlib
 import json
 import re
 import unicodedata
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
+from types import MappingProxyType
 from typing import Literal
 
 from app.content_research.models import utcnow
@@ -325,7 +327,7 @@ class ExecutionFact:
     attempt_no: int
     sequence_no: int
     kind: ExecutionFactKind
-    payload: dict[str, object]
+    payload: Mapping[str, object]
     created_at: datetime = field(default_factory=utcnow)
 
     def __post_init__(self) -> None:
@@ -342,6 +344,7 @@ class ExecutionFact:
             "outcome_unknown",
         }:
             raise ValueError("invalid execution fact kind")
+        object.__setattr__(self, "payload", MappingProxyType(dict(self.payload)))
 
 
 def build_scope_contract(

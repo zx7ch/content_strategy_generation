@@ -313,8 +313,8 @@ def test_competing_execution_unit_decisions_reconcile_exact_replays_and_reject_c
         )
 
 
-def test_execution_trace_rejects_duplicate_attempt_sequence_numbers(tmp_path) -> None:
-    """Dropping the fact sequence uniqueness constraint must make duplicate facts visible."""
+def test_execution_trace_sequences_are_transition_owned_and_contiguous(tmp_path) -> None:
+    """Allowing callers to choose a fact sequence must make this audit trace forgeable."""
     store = SQLiteContentResearchStore(str(tmp_path / "execution-fact-sequence.db"))
     contract = _contract(version=1)
     store.save_scope_contract(contract)
@@ -333,21 +333,141 @@ def test_execution_trace_rejects_duplicate_attempt_sequence_numbers(tmp_path) ->
         decision={"resolution": "generate_limited_report", "operation": "limited_report"},
     )
 
-    store.append_execution_fact(
-        execution_unit_id=unit.id,
-        attempt_no=0,
-        sequence_no=2,
-        kind="attempt_claimed",
-        payload={"owner": "worker-a"},
-    )
-    with pytest.raises(ValueError, match="append-only"):
+    with pytest.raises(RuntimeError, match="allocated by execution-unit transitions"):
         store.append_execution_fact(
             execution_unit_id=unit.id,
             attempt_no=0,
-            sequence_no=2,
+            sequence_no=99,
             kind="attempt_claimed",
             payload={"owner": "worker-a"},
         )
+    claim = store.claim_execution_unit(execution_unit_id=unit.id, owner="worker-a")
+    assert claim is not None
+    assert store.record_provider_request(
+        execution_unit_id=unit.id,
+        attempt_no=claim.attempt_no,
+        lease_token=str(claim.lease_token),
+        payload={"request": "provider"},
+    )
+    facts = store.execution_trace(unit.id)
+    assert [fact.sequence_no for fact in facts] == [1, 2, 3]
+    with pytest.raises(TypeError):
+        facts[-1].payload["forged"] = True  # type: ignore[index]
+
+
+def test_legacy_authorization_and_execution_unit_resolvers_share_exact_replay_identity(
+    tmp_path,
+) -> None:
+    """Adding a legacy-only value to an identity must fail this cross-seam replay."""
+    store = SQLiteContentResearchStore(str(tmp_path / "execution-unit-alias.db"))
+    contract = _contract(version=1)
+    store.save_scope_contract(contract)
+    snapshot = CoverageSnapshot(
+        id="scv_execution_unit_alias",
+        workflow_run_id=contract.workflow_run_id,
+        scope_contract_id=contract.id,
+        scope_contract_version=contract.version,
+        state="awaiting_scope_decision",
+        constraint_counts={},
+        unmet_constraint_ids=("season",),
+    )
+    store.save_coverage_snapshot(snapshot)
+    authorization = ScopeExecutionAuthorization(
+        id="sea_execution_unit_alias",
+        workflow_run_id=contract.workflow_run_id,
+        scope_contract_id=contract.id,
+        scope_contract_version=contract.version,
+        coverage_snapshot_id=snapshot.id,
+        resolution="expand_required_constraint",
+        execution_revision=2,
+        state="authorized_collection",
+    )
+    continuation = ScopeExecutionContinuation(
+        id="sec_execution_unit_alias",
+        authorization_id=authorization.id,
+        workflow_run_id=contract.workflow_run_id,
+        execution_revision=2,
+        operation="supplementary_collection",
+        supplementary_queries=("夏季 防晒 长袖衬衫",),
+        state="pending",
+    )
+    event = ScopeAuditEvent(
+        id="sae_execution_unit_alias",
+        workflow_run_id=contract.workflow_run_id,
+        scope_contract_id=contract.id,
+        scope_contract_version=contract.version,
+        event_name="coverage_resolved",
+        payload={
+            "schema_version": "content_research_scope_audit_event_v1",
+            "coverage_snapshot_id": snapshot.id,
+            "resolution": "expand_required_constraint",
+        },
+    )
+    _, _, persisted_authorization, _, _ = store.resolve_coverage_and_authorize_execution_atomically(
+        snapshot=snapshot,
+        authorization=authorization,
+        continuation=continuation,
+        event=event,
+    )
+
+    unit, created = store.resolve_coverage_to_execution_unit_atomically(
+        snapshot=snapshot,
+        decision={
+            "resolution": "expand_required_constraint",
+            "operation": "supplementary_collection",
+            "supplementary_queries": ("夏季 防晒 长袖衬衫",),
+        },
+    )
+
+    assert created is False
+    assert unit.id == persisted_authorization.execution_unit_id
+
+
+def test_expired_lease_is_reclaimed_and_stale_token_cannot_write_or_complete(tmp_path) -> None:
+    """Removing the live-expiry predicate must make stale A mutate B's unit."""
+    store = SQLiteContentResearchStore(str(tmp_path / "execution-unit-lease.db"))
+    contract = _contract(version=1)
+    store.save_scope_contract(contract)
+    snapshot = CoverageSnapshot(
+        id="scv_execution_unit_lease",
+        workflow_run_id=contract.workflow_run_id,
+        scope_contract_id=contract.id,
+        scope_contract_version=contract.version,
+        state="awaiting_scope_decision",
+        constraint_counts={},
+        unmet_constraint_ids=("season",),
+    )
+    store.save_coverage_snapshot(snapshot)
+    unit, _ = store.resolve_coverage_to_execution_unit_atomically(
+        snapshot=snapshot,
+        decision={"resolution": "generate_limited_report", "operation": "limited_report"},
+    )
+    claim_a = store.claim_execution_unit(execution_unit_id=unit.id, owner="A", lease_seconds=0)
+    assert claim_a is not None
+    claim_b = store.claim_execution_unit(execution_unit_id=unit.id, owner="B", lease_seconds=120)
+    assert claim_b is not None
+    assert claim_b.attempt_no == claim_a.attempt_no + 1
+    assert not store.record_provider_request(
+        execution_unit_id=unit.id,
+        attempt_no=claim_a.attempt_no,
+        lease_token=str(claim_a.lease_token),
+        payload={"request": "stale"},
+    )
+    assert not store.complete_execution_unit(
+        execution_unit_id=unit.id,
+        attempt_no=claim_a.attempt_no,
+        owner="A",
+        lease_token=str(claim_a.lease_token),
+        state="completed",
+    )
+    assert store.complete_execution_unit(
+        execution_unit_id=unit.id,
+        attempt_no=claim_b.attempt_no,
+        owner="B",
+        lease_token=str(claim_b.lease_token),
+        state="outcome_unknown",
+    )
+    assert [fact.kind for fact in store.execution_trace(unit.id)][-1] == "outcome_unknown"
 
 
 def test_scope_draft_and_suggestion_audit_event_commit_atomically(tmp_path) -> None:

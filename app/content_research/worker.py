@@ -12,6 +12,7 @@ from app.content_research.api_schemas import ContentResearchSourceCollectionRequ
 from app.content_research.async_dispatch import (
     AsyncFormalResearchDispatchRepository,
     AsyncScopeExecutionContinuationRepository,
+    AsyncScopeExecutionUnitRepository,
 )
 from app.content_research.models import utcnow
 from app.content_research.persistence_models import StageCheckpointRecord
@@ -36,6 +37,7 @@ class ContentResearchDispatchWorker:
         self._store = store
         self._dispatch = AsyncFormalResearchDispatchRepository(store._db_path)
         self._continuations = AsyncScopeExecutionContinuationRepository(store._db_path)
+        self._execution_units = AsyncScopeExecutionUnitRepository(store._db_path)
         self._service_factory = service_factory
         self._wake_event = wake_event or asyncio.Event()
         self._recovery_scan_seconds = recovery_scan_seconds
@@ -47,7 +49,22 @@ class ContentResearchDispatchWorker:
             owner=self._owner, lease_seconds=self._lease_seconds
         )
         if continuation is not None:
-            return await self._run_scope_continuation(continuation)
+            unit_claim = None
+            if continuation.execution_unit_id:
+                unit_claim = await self._execution_units.claim_execution_unit(
+                    execution_unit_id=continuation.execution_unit_id,
+                    owner=self._owner,
+                    lease_seconds=self._lease_seconds,
+                )
+                if unit_claim is None:
+                    await self._continuations.complete(
+                        authorization_id=continuation.authorization_id,
+                        owner=self._owner,
+                        token=str(continuation.lease_token or ""),
+                        error="execution unit was not claimable",
+                    )
+                    return True
+            return await self._run_scope_continuation(continuation, unit_claim=unit_claim)
         job = await self._dispatch.claim_next(owner=self._owner, lease_seconds=self._lease_seconds)
         if job is None:
             return False
@@ -114,7 +131,7 @@ class ContentResearchDispatchWorker:
             )
         return True
 
-    async def _run_scope_continuation(self, continuation) -> bool:
+    async def _run_scope_continuation(self, continuation, *, unit_claim=None) -> bool:
         token = str(continuation.lease_token or "")
         if not token:
             raise RuntimeError("claimed scope continuation is missing its lease token")
@@ -128,6 +145,19 @@ class ContentResearchDispatchWorker:
                 lease_lost=lease_lost,
             )
         )
+        unit_heartbeat = None
+        unit_lease_lost = asyncio.Event()
+        if unit_claim is not None:
+            unit_token = str(unit_claim.lease_token or "")
+            unit_heartbeat = asyncio.create_task(
+                self._heartbeat_execution_unit_lease(
+                    execution_unit_id=unit_claim.execution_unit_id,
+                    attempt_no=unit_claim.attempt_no,
+                    token=unit_token,
+                    stop_event=lease_stop,
+                    lease_lost=unit_lease_lost,
+                )
+            )
         error: Exception | None = None
         try:
             await self._service_factory().execute_scope_continuation(continuation)
@@ -143,7 +173,9 @@ class ContentResearchDispatchWorker:
         finally:
             lease_stop.set()
             await heartbeat
-        if lease_lost.is_set():
+            if unit_heartbeat is not None:
+                await unit_heartbeat
+        if lease_lost.is_set() or unit_lease_lost.is_set():
             logger.error(
                 "content research scope continuation lease lost",
                 extra={"authorization_id": continuation.authorization_id},
@@ -155,6 +187,14 @@ class ContentResearchDispatchWorker:
             token=token,
             error=str(error) if error is not None else None,
         )
+        if unit_claim is not None:
+            await self._execution_units.complete_execution_unit(
+                execution_unit_id=unit_claim.execution_unit_id,
+                attempt_no=unit_claim.attempt_no,
+                owner=self._owner,
+                lease_token=str(unit_claim.lease_token or ""),
+                state="failed" if error is not None else "completed",
+            )
         return True
 
     async def _heartbeat_lease(
@@ -200,6 +240,32 @@ class ContentResearchDispatchWorker:
                 authorization_id=authorization_id,
                 owner=self._owner,
                 token=token,
+                lease_seconds=self._lease_seconds,
+            ):
+                lease_lost.set()
+                return
+
+    async def _heartbeat_execution_unit_lease(
+        self,
+        *,
+        execution_unit_id: str,
+        attempt_no: int,
+        token: str,
+        stop_event: asyncio.Event,
+        lease_lost: asyncio.Event,
+    ) -> None:
+        interval = max(1.0, self._lease_seconds / 3)
+        while True:
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=interval)
+                return
+            except asyncio.TimeoutError:
+                pass
+            if not await self._execution_units.renew_execution_unit_lease(
+                execution_unit_id=execution_unit_id,
+                attempt_no=attempt_no,
+                owner=self._owner,
+                lease_token=token,
                 lease_seconds=self._lease_seconds,
             ):
                 lease_lost.set()

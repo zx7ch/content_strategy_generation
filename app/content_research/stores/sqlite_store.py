@@ -119,6 +119,28 @@ def _dumps_any_list(value: list[Any]) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
 
 
+def _execution_decision_identity(
+    *,
+    coverage_snapshot_id: str,
+    scope_contract_id: str,
+    resolution: str,
+    operation: str,
+    supplementary_queries: tuple[str, ...],
+) -> tuple[dict[str, object], str]:
+    """Return the one canonical identity shared by new and legacy entrypoints."""
+    payload: dict[str, object] = {
+        "coverage_snapshot_id": coverage_snapshot_id,
+        "scope_contract_id": scope_contract_id,
+        "resolution": resolution,
+        "operation": operation,
+        "supplementary_queries": list(supplementary_queries),
+    }
+    fingerprint = hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return payload, fingerprint
+
+
 def _validate_payload(record_type: str, payload: dict[str, Any]) -> None:
     if not payload.get("schema_version"):
         raise ValueError(f"{record_type} payload must include schema_version")
@@ -1079,18 +1101,13 @@ class SQLiteContentResearchStore:
         if operation == "limited_report" and queries:
             raise ValueError("limited report execution unit does not accept queries")
 
-        decision_payload = {
-            "coverage_snapshot_id": snapshot.id,
-            "scope_contract_id": snapshot.scope_contract_id,
-            "resolution": resolution,
-            "operation": operation,
-            "supplementary_queries": list(queries),
-        }
-        fingerprint = hashlib.sha256(
-            json.dumps(
-                decision_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-            ).encode("utf-8")
-        ).hexdigest()
+        decision_payload, fingerprint = _execution_decision_identity(
+            coverage_snapshot_id=snapshot.id,
+            scope_contract_id=snapshot.scope_contract_id,
+            resolution=resolution,
+            operation=operation,
+            supplementary_queries=queries,
+        )
         unit = ScopeExecutionUnit(
             id="seu_" + fingerprint[:24],
             workflow_run_id=snapshot.workflow_run_id,
@@ -1157,19 +1174,7 @@ class SQLiteContentResearchStore:
         kind: str,
         payload: dict[str, object],
     ) -> ExecutionFact:
-        fact = ExecutionFact(
-            execution_unit_id=execution_unit_id,
-            attempt_no=attempt_no,
-            sequence_no=sequence_no,
-            kind=kind,  # type: ignore[arg-type]
-            payload=payload,
-        )
-        try:
-            with self._connect() as conn:
-                self._insert_execution_fact(conn, fact)
-        except sqlite3.IntegrityError as exc:
-            raise ValueError("execution fact is append-only and already exists") from exc
-        return fact
+        raise RuntimeError("execution facts are allocated by execution-unit transitions")
 
     def execution_trace(self, execution_unit_id: str) -> list[ExecutionFact]:
         with self._connect() as conn:
@@ -1195,7 +1200,50 @@ class SQLiteContentResearchStore:
                    WHERE execution_unit_id=? ORDER BY attempt_no DESC LIMIT 1""",
                 (execution_unit_id,),
             ).fetchone()
-            if row is None or row["state"] != "pending":
+            if row is None:
+                conn.commit()
+                return None
+            if row["state"] == "running" and row["lease_expires_at"] <= _fmt_dt(now):
+                if row["provider_state"] == "requested":
+                    conn.execute(
+                        """UPDATE content_research_scope_execution_attempts
+                           SET state='outcome_unknown', lease_owner=NULL, lease_token=NULL,
+                               lease_expires_at=NULL
+                           WHERE execution_unit_id=? AND attempt_no=?""",
+                        (execution_unit_id, row["attempt_no"]),
+                    )
+                    conn.execute(
+                        "UPDATE content_research_scope_execution_units SET state='outcome_unknown' WHERE id=?",
+                        (execution_unit_id,),
+                    )
+                    self._append_execution_fact_in_transaction(
+                        conn,
+                        execution_unit_id=execution_unit_id,
+                        attempt_no=int(row["attempt_no"]),
+                        kind="outcome_unknown",
+                        payload={"reason": "lease_expired_after_provider_request"},
+                    )
+                    conn.commit()
+                    return None
+                conn.execute(
+                    """UPDATE content_research_scope_execution_attempts
+                       SET state='failed', lease_owner=NULL, lease_token=NULL, lease_expires_at=NULL
+                       WHERE execution_unit_id=? AND attempt_no=?""",
+                    (execution_unit_id, row["attempt_no"]),
+                )
+                attempt_no = int(row["attempt_no"]) + 1
+                self._insert_scope_execution_attempt(
+                    conn,
+                    ScopeExecutionAttempt(
+                        execution_unit_id=execution_unit_id, attempt_no=attempt_no, state="pending"
+                    ),
+                )
+                row = conn.execute(
+                    """SELECT * FROM content_research_scope_execution_attempts
+                       WHERE execution_unit_id=? AND attempt_no=?""",
+                    (execution_unit_id, attempt_no),
+                ).fetchone()
+            if row["state"] != "pending":
                 conn.commit()
                 return None
             attempt_no = int(row["attempt_no"])
@@ -1253,13 +1301,14 @@ class SQLiteContentResearchStore:
                 """UPDATE content_research_scope_execution_attempts
                    SET lease_expires_at=?
                    WHERE execution_unit_id=? AND attempt_no=? AND state='running'
-                     AND lease_owner=? AND lease_token=?""",
+                     AND lease_owner=? AND lease_token=? AND lease_expires_at > ?""",
                 (
                     _fmt_dt(now + timedelta(seconds=lease_seconds)),
                     execution_unit_id,
                     attempt_no,
                     owner,
                     lease_token,
+                    _fmt_dt(now),
                 ),
             )
         return result.rowcount == 1
@@ -1317,8 +1366,8 @@ class SQLiteContentResearchStore:
                 """UPDATE content_research_scope_execution_attempts
                    SET state=?, lease_owner=NULL, lease_token=NULL, lease_expires_at=NULL
                    WHERE execution_unit_id=? AND attempt_no=? AND state='running'
-                     AND lease_owner=? AND lease_token=?""",
-                (state, execution_unit_id, attempt_no, owner, lease_token),
+                     AND lease_owner=? AND lease_token=? AND lease_expires_at > ?""",
+                (state, execution_unit_id, attempt_no, owner, lease_token, _fmt_dt(datetime.now(timezone.utc))),
             )
             if result.rowcount != 1:
                 self._append_execution_fact_in_transaction(
@@ -1334,6 +1383,14 @@ class SQLiteContentResearchStore:
                 "UPDATE content_research_scope_execution_units SET state=? WHERE id=?",
                 (state, execution_unit_id),
             )
+            if state == "outcome_unknown":
+                self._append_execution_fact_in_transaction(
+                    conn,
+                    execution_unit_id=execution_unit_id,
+                    attempt_no=attempt_no,
+                    kind="outcome_unknown",
+                    payload={"reason": "worker_reported_unknown_outcome"},
+                )
             conn.commit()
             return True
         except Exception:
@@ -1359,8 +1416,14 @@ class SQLiteContentResearchStore:
                 """UPDATE content_research_scope_execution_attempts
                    SET provider_state=?
                    WHERE execution_unit_id=? AND attempt_no=? AND state='running'
-                     AND lease_token=?""",
-                (provider_state, execution_unit_id, attempt_no, lease_token),
+                     AND lease_token=? AND lease_expires_at > ?""",
+                (
+                    provider_state,
+                    execution_unit_id,
+                    attempt_no,
+                    lease_token,
+                    _fmt_dt(datetime.now(timezone.utc)),
+                ),
             )
             if result.rowcount != 1:
                 self._append_execution_fact_in_transaction(
@@ -1540,19 +1603,13 @@ class SQLiteContentResearchStore:
                 scope_contract_id=authorization.scope_contract_id,
                 scope_contract_version=authorization.scope_contract_version,
             )
-            decision_payload = {
-                "coverage_snapshot_id": snapshot.id,
-                "scope_contract_id": authorization.scope_contract_id,
-                "resolution": authorization.resolution,
-                "operation": continuation.operation,
-                "supplementary_queries": list(continuation.supplementary_queries),
-                "authorization_id": authorization.id,
-            }
-            decision_fingerprint = hashlib.sha256(
-                json.dumps(
-                    decision_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-                ).encode("utf-8")
-            ).hexdigest()
+            decision_payload, decision_fingerprint = _execution_decision_identity(
+                coverage_snapshot_id=snapshot.id,
+                scope_contract_id=authorization.scope_contract_id,
+                resolution=authorization.resolution,
+                operation=continuation.operation,
+                supplementary_queries=continuation.supplementary_queries,
+            )
             unit = ScopeExecutionUnit(
                 id="seu_" + decision_fingerprint[:24],
                 workflow_run_id=authorization.workflow_run_id,
@@ -1770,7 +1827,7 @@ class SQLiteContentResearchStore:
                 fact.attempt_no,
                 fact.sequence_no,
                 fact.kind,
-                _dumps(fact.payload),
+                _dumps(dict(fact.payload)),
                 _fmt_dt(fact.created_at),
             ),
         )

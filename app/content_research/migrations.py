@@ -817,7 +817,11 @@ ALTER TABLE content_research_scope_execution_continuations
 
 def _apply_0025(conn: sqlite3.Connection) -> None:
     """Backfill legacy authorization rows as aliases without changing Scope meaning."""
-    conn.executescript(_V25_EXECUTION_UNITS_SQL)
+    # Do not use sqlite3.executescript here: it commits any active transaction
+    # before executing, which would strand schema changes if backfill fails.
+    for statement in _V25_EXECUTION_UNITS_SQL.split(";"):
+        if statement.strip():
+            conn.execute(statement)
     rows = conn.execute(
         """SELECT authorization.id, authorization.workflow_run_id, authorization.scope_contract_id,
                   authorization.coverage_snapshot_id, authorization.resolution,
