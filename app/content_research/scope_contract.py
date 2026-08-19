@@ -244,11 +244,12 @@ class ScopeExecutionContinuation:
             raise ValueError("invalid scope execution continuation operation")
         if self.state not in {"pending", "running", "completed", "failed"}:
             raise ValueError("invalid scope execution continuation state")
-        queries = tuple(query.strip() for query in self.supplementary_queries)
+        queries = tuple(" ".join(query.split()) for query in self.supplementary_queries)
         if any(not query for query in queries) or len(set(queries)) != len(queries):
             raise ValueError("scope execution continuation queries must be distinct and non-empty")
         if self.operation == "limited_report" and queries:
             raise ValueError("limited report continuation does not accept queries")
+        object.__setattr__(self, "supplementary_queries", queries)
 
 
 ExecutionUnitState = Literal["pending", "running", "completed", "failed", "outcome_unknown"]
@@ -275,6 +276,10 @@ class ScopeExecutionUnit:
     resolution: Literal["expand_required_constraint", "generate_limited_report", "relax_constraint"]
     operation: Literal["limited_report", "supplementary_collection"]
     state: ExecutionUnitState
+    identity_schema: str = "execution_decision_identity_v1"
+    identity_json: str = ""
+    identity_state: Literal["canonical", "legacy_identity_incomplete"] = "canonical"
+    legacy_authorization_id: str | None = None
     created_at: datetime = field(default_factory=utcnow)
 
     def __post_init__(self) -> None:
@@ -297,6 +302,20 @@ class ScopeExecutionUnit:
             raise ValueError("invalid scope execution unit operation")
         if self.state not in {"pending", "running", "completed", "failed", "outcome_unknown"}:
             raise ValueError("invalid scope execution unit state")
+        if self.identity_schema != "execution_decision_identity_v1":
+            raise ValueError("invalid scope execution unit identity schema")
+        if self.identity_state not in {"canonical", "legacy_identity_incomplete"}:
+            raise ValueError("invalid scope execution unit identity state")
+        if self.identity_state == "canonical" and not self.identity_json:
+            raise ValueError("canonical scope execution unit identity is required")
+
+    @property
+    def recovery_state(self) -> Literal["replayable", "manual_recovery_required"]:
+        return (
+            "replayable"
+            if self.identity_state == "canonical"
+            else "manual_recovery_required"
+        )
 
 
 @dataclass(frozen=True)

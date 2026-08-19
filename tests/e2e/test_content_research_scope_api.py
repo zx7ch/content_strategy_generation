@@ -283,6 +283,7 @@ async def test_relax_successor_requires_its_persisted_continuation_authority(sco
             "action": "resolve_coverage",
             "payload": {
                 "scope_contract_version": 1,
+                "coverage_snapshot_id": "scv_api_unmet_season",
                 "resolution": "relax_constraint",
                 "constraint_id": "season",
             },
@@ -322,6 +323,7 @@ async def test_scope_continuation_rejects_forged_command_and_completed_replay(sc
             "action": "resolve_coverage",
             "payload": {
                 "scope_contract_version": 1,
+                "coverage_snapshot_id": "scv_api_unmet_season",
                 "resolution": "expand_required_constraint",
                 "constraint_id": "season",
                 "supplementary_queries": ["夏季 防晒 长袖衬衫"],
@@ -401,6 +403,7 @@ async def _authorized_continuation_snapshot(
             "action": "resolve_coverage",
             "payload": {
                 "scope_contract_version": contract["version"],
+                "coverage_snapshot_id": "scv_api_unmet_season",
                 "resolution": "expand_required_constraint",
                 "constraint_id": "season",
                 "supplementary_queries": ["夏季 防晒 长袖衬衫"],
@@ -467,6 +470,7 @@ async def test_generate_limited_report_resolution_preserves_v1_and_exact_season_
             "action": "resolve_coverage",
             "payload": {
                 "scope_contract_version": 1,
+                "coverage_snapshot_id": "scv_api_unmet_season",
                 "resolution": "generate_limited_report",
             },
         },
@@ -506,6 +510,7 @@ async def test_limited_continuation_reaches_report_execution_without_source_task
             "action": "resolve_coverage",
             "payload": {
                 "scope_contract_version": 1,
+                "coverage_snapshot_id": "scv_api_unmet_season",
                 "resolution": "generate_limited_report",
             },
         },
@@ -539,6 +544,7 @@ async def test_expand_required_constraint_retains_v1_and_authorizes_collection(
             "action": "resolve_coverage",
             "payload": {
                 "scope_contract_version": 1,
+                "coverage_snapshot_id": "scv_api_unmet_season",
                 "resolution": "expand_required_constraint",
                 "constraint_id": "season",
                 "supplementary_queries": supplementary_queries,
@@ -581,6 +587,7 @@ async def test_supplementary_continuation_executes_only_its_authorized_task(
             "action": "resolve_coverage",
             "payload": {
                 "scope_contract_version": 1,
+                "coverage_snapshot_id": "scv_api_unmet_season",
                 "resolution": "expand_required_constraint",
                 "constraint_id": "season",
                 "supplementary_queries": ["夏季 防晒 长袖衬衫"],
@@ -627,6 +634,7 @@ async def test_relax_constraint_creates_v2_and_keeps_v1_required(scope_client):
             "action": "resolve_coverage",
             "payload": {
                 "scope_contract_version": 1,
+                "coverage_snapshot_id": "scv_api_unmet_season",
                 "resolution": "relax_constraint",
                 "constraint_id": "season",
             },
@@ -697,6 +705,7 @@ async def test_versioned_coverage_resolution_replays_after_lost_response(scope_c
     """Removing persisted-command replay must make this test fail."""
     workflow_run_id, _contract_v1 = await _confirmed_scope_with_unmet_season(scope_client)
     endpoint = f"/content-research/workflows/{workflow_run_id}/actions"
+    payload = {**payload, "coverage_snapshot_id": "scv_api_unmet_season"}
 
     first = await scope_client.post(
         endpoint, json={"action": "resolve_coverage", "payload": payload}
@@ -708,6 +717,7 @@ async def test_versioned_coverage_resolution_replays_after_lost_response(scope_c
     assert first.status_code == 200
     assert replay.status_code == 200
     assert replay.json()["result"] == first.json()["result"]
+    assert replay.json()["result"]["execution_unit"]["recovery_state"] == "replayable"
     store = app.state.content_research_service._store
     expected_versions = [1, 2] if payload["resolution"] == "relax_constraint" else [1]
     assert [
@@ -742,6 +752,7 @@ async def test_resolve_coverage_rejects_a_different_decision_for_the_same_snapsh
             "action": "resolve_coverage",
             "payload": {
                 "scope_contract_version": 1,
+                "coverage_snapshot_id": "scv_api_unmet_season",
                 "resolution": "generate_limited_report",
             },
         },
@@ -752,6 +763,7 @@ async def test_resolve_coverage_rejects_a_different_decision_for_the_same_snapsh
             "action": "resolve_coverage",
             "payload": {
                 "scope_contract_version": 1,
+                "coverage_snapshot_id": "scv_api_unmet_season",
                 "resolution": "relax_constraint",
                 "constraint_id": "season",
             },
@@ -773,6 +785,7 @@ async def test_limited_resolution_reconciles_competing_atomic_calls(scope_client
         "action": "resolve_coverage",
         "payload": {
             "scope_contract_version": 1,
+            "coverage_snapshot_id": "scv_api_unmet_season",
             "resolution": "generate_limited_report",
         },
     }
@@ -808,6 +821,7 @@ async def test_competing_different_atomic_decisions_have_one_winner(scope_client
                 "action": "resolve_coverage",
                 "payload": {
                     "scope_contract_version": 1,
+                    "coverage_snapshot_id": "scv_api_unmet_season",
                     "resolution": "generate_limited_report",
                 },
             },
@@ -818,6 +832,7 @@ async def test_competing_different_atomic_decisions_have_one_winner(scope_client
                 "action": "resolve_coverage",
                 "payload": {
                     "scope_contract_version": 1,
+                    "coverage_snapshot_id": "scv_api_unmet_season",
                     "resolution": "expand_required_constraint",
                     "constraint_id": "season",
                     "supplementary_queries": ["夏季 防晒 长袖衬衫"],

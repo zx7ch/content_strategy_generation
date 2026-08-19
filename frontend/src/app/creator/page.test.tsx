@@ -399,12 +399,13 @@ test("Creator restores exploratory scope and exposes all three pending coverage 
   assert.deepEqual(resolutions, [
     {
       scope_contract_version: 1,
+      coverage_snapshot_id: "coverage_1",
       resolution: "expand_required_constraint",
       constraint_id: "season",
       supplementary_queries: ["夏季 防晒 长袖衬衫"],
     },
-    { scope_contract_version: 1, resolution: "generate_limited_report" },
-    { scope_contract_version: 1, resolution: "relax_constraint", constraint_id: "season" },
+    { scope_contract_version: 1, coverage_snapshot_id: "coverage_1", resolution: "generate_limited_report" },
+    { scope_contract_version: 1, coverage_snapshot_id: "coverage_1", resolution: "relax_constraint", constraint_id: "season" },
   ]);
 
   await act(async () => { root.unmount(); });
@@ -425,8 +426,8 @@ function scopeDraftFixture() {
     research_plan_id: "plan_1",
     structure_hash: "structure_hash_1",
     constraints: [
-      { id: "core_object", label: "核心对象", value: "长袖衬衫", mode: "required", allowed_aliases: [] },
-      { id: "season", label: "季节", value: "夏季", mode: "required", allowed_aliases: [] },
+      { id: "core_object", label: "核心对象", value: "长袖衬衫", mode: "required" as const, allowed_aliases: [] },
+      { id: "season", label: "季节", value: "夏季", mode: "required" as const, allowed_aliases: [] },
     ],
     query_groups: [
       { suggested_query: "夏季 长袖衬衫 通勤", final_query: "夏季长袖通勤衬衫", targeted_required_terms: ["夏季", "长袖衬衫", "通勤"] },
@@ -450,8 +451,8 @@ function scopeProjectionFixture() {
       schema_version: "content_research_scope_contract_v1",
       constraints: scopeDraftFixture().constraints,
       query_groups: [
-        { id: "group_1", suggested_query: "夏季 长袖衬衫 通勤", final_query: "白衬衫通勤穿搭", origin: "user_edited", execution_role: "exploratory" },
-        { id: "group_2", suggested_query: "长袖衬衫", final_query: "长袖衬衫", origin: "system_suggested", execution_role: "coverage" },
+        { id: "group_1", suggested_query: "夏季 长袖衬衫 通勤", final_query: "白衬衫通勤穿搭", origin: "user_edited" as const, execution_role: "exploratory" as const },
+        { id: "group_2", suggested_query: "长袖衬衫", final_query: "长袖衬衫", origin: "system_suggested" as const, execution_role: "coverage" as const },
       ],
       created_at: "2026-08-18T00:01:00+08:00",
     },

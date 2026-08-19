@@ -273,6 +273,7 @@ test("scope actions use the finalized server-owned payload contract", async () =
   });
   await resolveContentResearchCoverage("run_1", {
     scope_contract_version: 1,
+    coverage_snapshot_id: "coverage_1",
     resolution: "expand_required_constraint",
     constraint_id: "season",
     supplementary_queries: ["夏季 防晒 长袖衬衫"],
@@ -298,6 +299,7 @@ test("scope actions use the finalized server-owned payload contract", async () =
     action: "resolve_coverage",
     payload: {
       scope_contract_version: 1,
+      coverage_snapshot_id: "coverage_1",
       resolution: "expand_required_constraint",
       constraint_id: "season",
       supplementary_queries: ["夏季 防晒 长袖衬衫"],

@@ -337,6 +337,7 @@ class ResolveCoverageRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
     scope_contract_version: int = Field(ge=1)
+    coverage_snapshot_id: str = Field(min_length=1)
     resolution: Literal[
         "expand_required_constraint",
         "generate_limited_report",

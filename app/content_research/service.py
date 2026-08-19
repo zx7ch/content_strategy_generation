@@ -117,6 +117,7 @@ from app.content_research.scope_contract import (
     ScopeDraftAuditEvent,
     ScopeExecutionAuthorization,
     ScopeExecutionContinuation,
+    ScopeExecutionUnit,
     ScopeQueryGroupInput,
     build_scope_contract,
     build_scope_draft,
@@ -2827,10 +2828,16 @@ class ContentResearchService:
             raise ContentResearchValidationError(
                 "Coverage resolution Scope Contract version was not found"
             )
-        snapshot = self._store.get_coverage_snapshot(workflow_run_id, version=contract.version)
-        if snapshot is None or snapshot.state != "awaiting_scope_decision":
+        snapshot = self._store.get_coverage_snapshot_by_id(request.coverage_snapshot_id)
+        if (
+            snapshot is None
+            or snapshot.workflow_run_id != workflow_run_id
+            or snapshot.scope_contract_id != contract.id
+            or snapshot.scope_contract_version != contract.version
+            or snapshot.state != "awaiting_scope_decision"
+        ):
             raise ContentResearchValidationError(
-                "Coverage resolution requires persisted unmet coverage"
+                "Coverage resolution requires the explicit persisted unmet coverage snapshot"
             )
         successor_scope_contract = None
         resulting_contract = contract
@@ -2855,7 +2862,9 @@ class ContentResearchService:
                 )
             if request.resolution == "expand_required_constraint":
                 queries = tuple(
-                    query.strip() for query in request.supplementary_queries if query.strip()
+                    " ".join(query.split())
+                    for query in request.supplementary_queries
+                    if query.strip()
                 )
                 if not 1 <= len(queries) <= 2 or len(set(queries)) != len(queries):
                     raise ContentResearchValidationError(
@@ -2990,6 +2999,11 @@ class ContentResearchService:
             snapshot=snapshot,
             event=event,
             authorization=authorization,
+            execution_unit=(
+                self._store.get_scope_execution_unit(authorization.execution_unit_id)
+                if authorization.execution_unit_id
+                else None
+            ),
         )
 
     async def _continue_coverage_execution(
@@ -4065,14 +4079,15 @@ class ContentResearchService:
             ),
             None,
         )
-        immutable_command = lambda item: (
-            item.id,
-            item.authorization_id,
-            item.workflow_run_id,
-            item.execution_revision,
-            item.operation,
-            item.supplementary_queries,
-        )
+        def immutable_command(item: ScopeExecutionContinuation) -> tuple[object, ...]:
+            return (
+                item.id,
+                item.authorization_id,
+                item.workflow_run_id,
+                item.execution_revision,
+                item.operation,
+                item.supplementary_queries,
+            )
         if (
             persisted_continuation is None
             or immutable_command(persisted_continuation) != immutable_command(continuation)
@@ -5788,6 +5803,7 @@ def _coverage_resolution_result(
     snapshot: Any,
     event: ScopeAuditEvent,
     authorization: ScopeExecutionAuthorization,
+    execution_unit: ScopeExecutionUnit | None,
 ) -> dict[str, Any]:
     return {
         "report_mode": str(event.payload.get("report_mode") or "withheld"),
@@ -5795,6 +5811,15 @@ def _coverage_resolution_result(
         "unmet_constraint_ids": list(snapshot.unmet_constraint_ids),
         "audit_event": _scope_audit_payload(event),
         "execution_authorization": _scope_execution_authorization_payload(authorization),
+        "execution_unit": (
+            {
+                "id": execution_unit.id,
+                "state": execution_unit.state,
+                "recovery_state": execution_unit.recovery_state,
+            }
+            if execution_unit is not None
+            else None
+        ),
     }
 
 

@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import sqlite3
 import threading
+from dataclasses import replace
 
 import pytest
 
+from app.content_research.execution_decision_identity import build_execution_decision_identity
 from app.content_research.models import ResearchBriefRecord
 from app.content_research.scope_contract import (
     CoverageSnapshot,
@@ -176,11 +178,16 @@ def test_competing_atomic_coverage_resolutions_reconcile_same_and_reject_differe
                 scope_contract_id=contract.id,
                 scope_contract_version=contract.version,
                 event_name="coverage_resolved",
-                payload={
-                    "schema_version": "content_research_scope_audit_event_v1",
-                    "coverage_snapshot_id": snapshot.id,
-                    "resolution": resolution,
-                },
+                    payload={
+                        "schema_version": "content_research_scope_audit_event_v1",
+                        "coverage_snapshot_id": snapshot.id,
+                        "resolution": resolution,
+                        "constraint_id": (
+                            "season"
+                            if resolution == "expand_required_constraint"
+                            else ""
+                        ),
+                    },
             )
             try:
                 barrier.wait()
@@ -223,7 +230,7 @@ def test_competing_atomic_coverage_resolutions_reconcile_same_and_reject_differe
     assert len(different_results) == 1
     assert len(different_errors) == 1
     assert isinstance(different_errors[0], ValueError)
-    assert "different persisted resolution" in str(different_errors[0])
+    assert "coverage_decision_already_resolved" in str(different_errors[0])
     assert len(different_store.list_scope_execution_authorizations("run_scope_1")) == 1
     assert len(different_store.list_scope_execution_continuations("run_scope_1")) == 1
 
@@ -246,6 +253,7 @@ def test_coverage_decision_replay_uses_one_execution_unit_and_one_decision_fact(
     decision = {
         "resolution": "expand_required_constraint",
         "operation": "supplementary_collection",
+        "constraint_id": "season",
         "supplementary_queries": ("夏季 防晒 长袖衬衫",),
     }
 
@@ -260,6 +268,25 @@ def test_coverage_decision_replay_uses_one_execution_unit_and_one_decision_fact(
     assert created is True
     assert replay_created is False
     assert [fact.kind for fact in store.execution_trace(unit.id)] == ["decision_accepted"]
+    expected = build_execution_decision_identity(
+        coverage_snapshot_id=snapshot.id,
+        source_scope_contract_id=contract.id,
+        resulting_scope_contract_id=contract.id,
+        resolution="expand_required_constraint",
+        target_constraint_id="season",
+        supplementary_queries=("夏季 防晒 长袖衬衫",),
+    )
+    with sqlite3.connect(store._db_path) as conn:
+        identity_schema, identity_json, identity_state = conn.execute(
+            "SELECT identity_schema, identity_json, identity_state "
+            "FROM content_research_scope_execution_units WHERE id=?",
+            (unit.id,),
+        ).fetchone()
+    assert identity_schema == "execution_decision_identity_v1"
+    assert identity_json == expected.canonical_json
+    assert identity_state == "canonical"
+    assert unit.identity_json == expected.canonical_json
+    assert unit.recovery_state == "replayable"
 
 
 def test_competing_execution_unit_decisions_reconcile_exact_replays_and_reject_conflicts(
@@ -302,14 +329,85 @@ def test_competing_execution_unit_decisions_reconcile_exact_replays_and_reject_c
     assert len({item[0].id for item in results}) == 1
     assert sorted(item[1] for item in results) == [False, True]
 
-    with pytest.raises(ValueError, match="different persisted decision"):
+    with pytest.raises(ValueError, match="coverage_decision_already_resolved"):
         stores[0].resolve_coverage_to_execution_unit_atomically(
             snapshot=snapshot,
             decision={
                 "resolution": "expand_required_constraint",
                 "operation": "supplementary_collection",
+                "constraint_id": "season",
                 "supplementary_queries": ("夏季 长袖衬衫",),
             },
+        )
+
+
+@pytest.mark.parametrize(
+    ("first_decision", "conflicting_decision"),
+    [
+        (
+            {
+                "resolution": "expand_required_constraint",
+                "constraint_id": "season",
+                "supplementary_queries": ("夏季 长袖衬衫",),
+            },
+            {
+                "resolution": "expand_required_constraint",
+                "constraint_id": "scenario",
+                "supplementary_queries": ("夏季 长袖衬衫",),
+            },
+        ),
+        (
+            {
+                "resolution": "expand_required_constraint",
+                "constraint_id": "season",
+                "supplementary_queries": ("夏季 长袖衬衫",),
+            },
+            {
+                "resolution": "expand_required_constraint",
+                "constraint_id": "season",
+                "supplementary_queries": ("夏季 防晒 长袖衬衫",),
+            },
+        ),
+    ],
+)
+def test_execution_decision_compatibility_matrix_replays_exact_identity_and_rejects_conflicts(
+    tmp_path, first_decision, conflicting_decision
+) -> None:
+    """Target and normalized query changes must be visible without permitting a second decision."""
+    store = SQLiteContentResearchStore(str(tmp_path / "execution-unit-matrix.db"))
+    contract = _contract(version=1)
+    store.save_scope_contract(contract)
+    snapshot = CoverageSnapshot(
+        id="scv_execution_unit_matrix",
+        workflow_run_id=contract.workflow_run_id,
+        scope_contract_id=contract.id,
+        scope_contract_version=contract.version,
+        state="awaiting_scope_decision",
+        constraint_counts={},
+        unmet_constraint_ids=("season", "scenario"),
+    )
+    store.save_coverage_snapshot(snapshot)
+
+    unit, created = store.resolve_coverage_to_execution_unit_atomically(
+        snapshot=snapshot, decision=first_decision
+    )
+    replay, replay_created = store.resolve_coverage_to_execution_unit_atomically(
+        snapshot=snapshot,
+        decision={
+            **first_decision,
+            "supplementary_queries": tuple(
+                f"  {query.replace(' ', '   ')}  "
+                for query in first_decision["supplementary_queries"]
+            ),
+        },
+    )
+
+    assert created is True
+    assert replay_created is False
+    assert replay.id == unit.id
+    with pytest.raises(ValueError, match="coverage_decision_already_resolved"):
+        store.resolve_coverage_to_execution_unit_atomically(
+            snapshot=snapshot, decision=conflicting_decision
         )
 
 
@@ -401,6 +499,7 @@ def test_legacy_authorization_and_execution_unit_resolvers_share_exact_replay_id
             "schema_version": "content_research_scope_audit_event_v1",
             "coverage_snapshot_id": snapshot.id,
             "resolution": "expand_required_constraint",
+            "constraint_id": "season",
         },
     )
     _, _, persisted_authorization, _, _ = store.resolve_coverage_and_authorize_execution_atomically(
@@ -410,11 +509,25 @@ def test_legacy_authorization_and_execution_unit_resolvers_share_exact_replay_id
         event=event,
     )
 
+    normalized_replay = store.resolve_coverage_and_authorize_execution_atomically(
+        snapshot=snapshot,
+        authorization=replace(authorization, id="sea_execution_unit_alias_replay"),
+        continuation=replace(
+            continuation,
+            id="sec_execution_unit_alias_replay",
+            authorization_id="sea_execution_unit_alias_replay",
+            supplementary_queries=("  夏季   防晒 长袖衬衫  ",),
+        ),
+        event=event,
+    )
+    assert normalized_replay[4] is False
+
     unit, created = store.resolve_coverage_to_execution_unit_atomically(
         snapshot=snapshot,
         decision={
             "resolution": "expand_required_constraint",
             "operation": "supplementary_collection",
+            "constraint_id": "season",
             "supplementary_queries": ("夏季 防晒 长袖衬衫",),
         },
     )

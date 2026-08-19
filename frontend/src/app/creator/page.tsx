@@ -2056,11 +2056,13 @@ function pendingCoverageDecision(projection: ContentResearchScopeProjection | nu
   ));
   if (!evaluated) return null;
   const coverageSnapshotId = stringField(evaluated.payload, "coverage_snapshot_id");
+  if (!coverageSnapshotId) return null;
   const resolved = projection.audit_events.some((event) => (
     event.event_name === "coverage_resolved"
-    && (!coverageSnapshotId || stringField(event.payload, "coverage_snapshot_id") === coverageSnapshotId)
+    && stringField(event.payload, "coverage_snapshot_id") === coverageSnapshotId
   ));
   return resolved ? null : {
+    coverageSnapshotId,
     unmetConstraintIds: arrayField(evaluated.payload, "unmet_constraint_ids"),
   };
 }
@@ -2188,6 +2190,7 @@ function ContentResearchScopeCard({
                 disabled={busy || !supplementaryQueries.some((query) => query.trim())}
                 onClick={() => onResolve({
                   scope_contract_version: contract.version,
+                  coverage_snapshot_id: pending.coverageSnapshotId,
                   resolution: "expand_required_constraint",
                   ...(unmetConstraintId ? { constraint_id: unmetConstraintId } : {}),
                   supplementary_queries: supplementaryQueries.map((query) => query.trim()).filter(Boolean),
@@ -2196,7 +2199,7 @@ function ContentResearchScopeCard({
               >
                 继续补充{unmetLabel}样本
               </button>
-              <button type="button" disabled={busy} onClick={() => onResolve({ scope_contract_version: contract.version, resolution: "generate_limited_report" })} className="rounded-lg border border-amber-300 bg-white px-3 py-2 text-xs font-medium">
+              <button type="button" disabled={busy} onClick={() => onResolve({ scope_contract_version: contract.version, coverage_snapshot_id: pending.coverageSnapshotId, resolution: "generate_limited_report" })} className="rounded-lg border border-amber-300 bg-white px-3 py-2 text-xs font-medium">
                 基于现有证据生成受限报告
               </button>
               <button
@@ -2204,6 +2207,7 @@ function ContentResearchScopeCard({
                 disabled={busy || !unmetConstraintId}
                 onClick={() => onResolve({
                   scope_contract_version: contract.version,
+                  coverage_snapshot_id: pending.coverageSnapshotId,
                   resolution: "relax_constraint",
                   ...(unmetConstraintId ? { constraint_id: unmetConstraintId } : {}),
                 })}

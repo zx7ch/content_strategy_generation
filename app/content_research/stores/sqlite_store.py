@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import sqlite3
 import uuid
@@ -130,9 +129,9 @@ def _execution_decision_identity(
     resolution: str,
     operation: str,
     supplementary_queries: tuple[str, ...],
-) -> tuple[dict[str, object], str]:
+) -> Any:
     """Return the one canonical identity shared by new and legacy entrypoints."""
-    identity, payload, fingerprint = build_execution_decision_identity(
+    result = build_execution_decision_identity(
         coverage_snapshot_id=coverage_snapshot_id,
         source_scope_contract_id=source_scope_contract_id,
         resulting_scope_contract_id=resulting_scope_contract_id,
@@ -140,9 +139,9 @@ def _execution_decision_identity(
         target_constraint_id=constraint_id or None,
         supplementary_queries=supplementary_queries,
     )
-    if identity.operation != operation:
+    if result.identity.operation != operation:
         raise ValueError("execution decision operation does not match resolution")
-    return payload, fingerprint
+    return result
 
 
 def _validate_payload(record_type: str, payload: dict[str, Any]) -> None:
@@ -1092,20 +1091,21 @@ class SQLiteContentResearchStore:
         to execution units.
         """
         resolution = str(decision.get("resolution") or "")
-        operation = str(decision.get("operation") or "")
-        queries = tuple(str(item).strip() for item in decision.get("supplementary_queries", ()))
+        operation = (
+            "limited_report"
+            if resolution == "generate_limited_report"
+            else "supplementary_collection"
+        )
+        requested_operation = str(decision.get("operation") or operation)
+        queries = tuple(str(item) for item in decision.get("supplementary_queries", ()))
         if resolution not in {
             "expand_required_constraint",
             "generate_limited_report",
             "relax_constraint",
-        } or operation not in {"limited_report", "supplementary_collection"}:
+        } or requested_operation != operation:
             raise ValueError("execution unit decision is invalid")
-        if any(not query for query in queries) or len(set(queries)) != len(queries):
-            raise ValueError("execution unit queries must be distinct and non-empty")
-        if operation == "limited_report" and queries:
-            raise ValueError("limited report execution unit does not accept queries")
-
-        decision_payload, fingerprint = _execution_decision_identity(
+        target_constraint_id = str(decision.get("constraint_id") or "")
+        decision_identity = _execution_decision_identity(
             coverage_snapshot_id=snapshot.id,
             source_scope_contract_id=snapshot.scope_contract_id,
             resulting_scope_contract_id=str(
@@ -1120,13 +1120,16 @@ class SQLiteContentResearchStore:
             decision.get("resulting_scope_contract_id") or snapshot.scope_contract_id
         )
         unit = ScopeExecutionUnit(
-            id="seu_" + fingerprint[:24],
+            id=decision_identity.execution_unit_id,
             workflow_run_id=snapshot.workflow_run_id,
             scope_contract_id=resulting_scope_contract_id,
             coverage_snapshot_id=snapshot.id,
             resolution=resolution,
             operation=operation,
             state="pending",
+            identity_schema=decision_identity.identity.schema,
+            identity_json=decision_identity.canonical_json,
+            identity_state="canonical",
         )
         conn = self._connect()
         try:
@@ -1136,6 +1139,20 @@ class SQLiteContentResearchStore:
             ).fetchone()
             if snapshot_row is None or self._row_to_coverage_snapshot(snapshot_row) != snapshot:
                 raise ValueError("execution unit requires the persisted coverage snapshot")
+            source_contract_row = conn.execute(
+                "SELECT * FROM content_research_scope_contracts WHERE id=?",
+                (snapshot.scope_contract_id,),
+            ).fetchone()
+            if source_contract_row is None:
+                raise ValueError("execution unit requires the persisted source scope")
+            source_contract = self._row_to_scope_contract(source_contract_row)
+            if resolution != "generate_limited_report" and not any(
+                item.id == target_constraint_id
+                and item.mode == "required"
+                and item.id in snapshot.unmet_constraint_ids
+                for item in source_contract.constraints
+            ):
+                raise ValueError("target constraint must be an unmet required constraint")
             existing_row = conn.execute(
                 """SELECT * FROM content_research_scope_execution_units
                    WHERE coverage_snapshot_id=?""",
@@ -1143,12 +1160,18 @@ class SQLiteContentResearchStore:
             ).fetchone()
             if existing_row is not None:
                 existing = self._row_to_scope_execution_unit(existing_row)
+                if existing.identity_state != "canonical":
+                    raise ValueError("coverage_decision_legacy_identity_incomplete")
                 existing_fingerprint = str(existing_row["decision_fingerprint"])
-                if existing_fingerprint != fingerprint:
-                    raise ValueError("coverage snapshot already has a different persisted decision")
+                if existing_fingerprint != decision_identity.decision_fingerprint:
+                    raise ValueError("coverage_decision_already_resolved")
                 conn.commit()
                 return existing, False
-            self._insert_scope_execution_unit(conn, unit, decision_fingerprint=fingerprint)
+            self._insert_scope_execution_unit(
+                conn,
+                unit,
+                decision_fingerprint=decision_identity.decision_fingerprint,
+            )
             self._insert_scope_execution_attempt(
                 conn,
                 ScopeExecutionAttempt(execution_unit_id=unit.id, attempt_no=0, state="pending"),
@@ -1160,7 +1183,7 @@ class SQLiteContentResearchStore:
                     attempt_no=0,
                     sequence_no=1,
                     kind="decision_accepted",
-                    payload={"decision": decision_payload},
+                    payload={"decision": decision_identity.payload},
                 ),
             )
             conn.commit()
@@ -1175,6 +1198,14 @@ class SQLiteContentResearchStore:
             raise
         finally:
             conn.close()
+
+    def get_scope_execution_unit(self, execution_unit_id: str) -> ScopeExecutionUnit | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM content_research_scope_execution_units WHERE id=?",
+                (execution_unit_id,),
+            ).fetchone()
+        return self._row_to_scope_execution_unit(row) if row else None
 
     def append_execution_fact(
         self,
@@ -1532,6 +1563,15 @@ class SQLiteContentResearchStore:
             or event.payload.get("resolution") != authorization.resolution
         ):
             raise ValueError("coverage resolution facts must reference the authorized execution")
+        decision_identity = _execution_decision_identity(
+            coverage_snapshot_id=snapshot.id,
+            source_scope_contract_id=snapshot.scope_contract_id,
+            resulting_scope_contract_id=authorization.scope_contract_id,
+            constraint_id=str(event.payload.get("constraint_id") or ""),
+            resolution=authorization.resolution,
+            operation=continuation.operation,
+            supplementary_queries=continuation.supplementary_queries,
+        )
 
         conn = self._connect()
         try:
@@ -1581,18 +1621,20 @@ class SQLiteContentResearchStore:
                 if existing_event_row is None:
                     raise RuntimeError("coverage authorization references a missing audit event")
                 existing_event = self._row_to_scope_audit_event(existing_event_row)
+                existing_unit_row = conn.execute(
+                    """SELECT * FROM content_research_scope_execution_units
+                       WHERE coverage_snapshot_id=?""",
+                    (snapshot.id,),
+                ).fetchone()
+                if existing_unit_row is None:
+                    raise RuntimeError("coverage authorization references a missing execution unit")
+                if str(existing_unit_row["identity_state"]) != "canonical":
+                    raise ValueError("coverage_decision_legacy_identity_incomplete")
                 if (
-                    existing.resolution != authorization.resolution
-                    or existing.scope_contract_id != authorization.scope_contract_id
-                    or existing.scope_contract_version != authorization.scope_contract_version
-                    or existing_continuation.operation != continuation.operation
-                    or existing_continuation.supplementary_queries
-                    != continuation.supplementary_queries
-                    or existing_event.payload != event.payload
+                    str(existing_unit_row["decision_fingerprint"])
+                    != decision_identity.decision_fingerprint
                 ):
-                    raise ValueError(
-                        "coverage snapshot already has a different persisted resolution"
-                    )
+                    raise ValueError("coverage_decision_already_resolved")
                 existing_contract_row = conn.execute(
                     "SELECT * FROM content_research_scope_contracts WHERE id = ?",
                     (existing.scope_contract_id,),
@@ -1616,37 +1658,41 @@ class SQLiteContentResearchStore:
                 scope_contract_id=authorization.scope_contract_id,
                 scope_contract_version=authorization.scope_contract_version,
             )
-            decision_payload, decision_fingerprint = _execution_decision_identity(
-                coverage_snapshot_id=snapshot.id,
-                source_scope_contract_id=snapshot.scope_contract_id,
-                resulting_scope_contract_id=authorization.scope_contract_id,
-                constraint_id=str(event.payload.get("constraint_id") or ""),
-                resolution=authorization.resolution,
-                operation=continuation.operation,
-                supplementary_queries=continuation.supplementary_queries,
-            )
             unit = ScopeExecutionUnit(
-                id="seu_" + decision_fingerprint[:24],
+                id=decision_identity.execution_unit_id,
                 workflow_run_id=authorization.workflow_run_id,
                 scope_contract_id=authorization.scope_contract_id,
                 coverage_snapshot_id=snapshot.id,
                 resolution=authorization.resolution,
                 operation=continuation.operation,
                 state="pending",
+                identity_schema=decision_identity.identity.schema,
+                identity_json=decision_identity.canonical_json,
+                identity_state="canonical",
             )
             existing_unit_row = conn.execute(
                 "SELECT * FROM content_research_scope_execution_units WHERE coverage_snapshot_id=?",
                 (snapshot.id,),
             ).fetchone()
             if existing_unit_row is not None:
-                if str(existing_unit_row["decision_fingerprint"]) != decision_fingerprint:
-                    raise ValueError("coverage snapshot already has a different persisted decision")
+                if str(existing_unit_row["identity_state"]) != "canonical":
+                    raise ValueError("coverage_decision_legacy_identity_incomplete")
+                if (
+                    str(existing_unit_row["decision_fingerprint"])
+                    != decision_identity.decision_fingerprint
+                ):
+                    raise ValueError("coverage_decision_already_resolved")
                 unit = self._row_to_scope_execution_unit(existing_unit_row)
             authorization = replace(authorization, execution_unit_id=unit.id)
             continuation = replace(continuation, execution_unit_id=unit.id)
             self._insert_scope_audit_event(conn, event)
             if existing_unit_row is None:
-                self._insert_scope_execution_unit(conn, unit, decision_fingerprint=decision_fingerprint)
+                self._insert_scope_execution_unit(
+                    conn,
+                    unit,
+                    decision_fingerprint=decision_identity.decision_fingerprint,
+                    legacy_authorization_id=authorization.id,
+                )
                 self._insert_scope_execution_attempt(
                     conn,
                     ScopeExecutionAttempt(execution_unit_id=unit.id, attempt_no=0, state="pending"),
@@ -1655,7 +1701,7 @@ class SQLiteContentResearchStore:
                     conn,
                     ExecutionFact(
                         execution_unit_id=unit.id, attempt_no=0, sequence_no=1,
-                        kind="decision_accepted", payload={"decision": decision_payload},
+                        kind="decision_accepted", payload={"decision": decision_identity.payload},
                     ),
                 )
             self._insert_scope_execution_authorization(conn, authorization)
@@ -1797,12 +1843,14 @@ class SQLiteContentResearchStore:
         unit: ScopeExecutionUnit,
         *,
         decision_fingerprint: str,
+        legacy_authorization_id: str | None = None,
     ) -> None:
         conn.execute(
             """INSERT INTO content_research_scope_execution_units
                (id, decision_fingerprint, workflow_run_id, scope_contract_id,
-                coverage_snapshot_id, resolution, operation, state, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                coverage_snapshot_id, resolution, operation, state, created_at,
+                identity_schema, identity_json, identity_state, legacy_authorization_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 unit.id,
                 decision_fingerprint,
@@ -1813,6 +1861,10 @@ class SQLiteContentResearchStore:
                 unit.operation,
                 unit.state,
                 _fmt_dt(unit.created_at),
+                unit.identity_schema,
+                unit.identity_json,
+                unit.identity_state,
+                legacy_authorization_id or unit.legacy_authorization_id,
             ),
         )
 
@@ -3179,6 +3231,10 @@ class SQLiteContentResearchStore:
             resolution=row["resolution"],
             operation=row["operation"],
             state=row["state"],
+            identity_schema=row["identity_schema"],
+            identity_json=row["identity_json"],
+            identity_state=row["identity_state"],
+            legacy_authorization_id=row["legacy_authorization_id"],
             created_at=_parse_dt(row["created_at"]),
         )
 

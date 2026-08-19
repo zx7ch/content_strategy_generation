@@ -88,7 +88,7 @@ async def _confirmed_scope_awaiting_coverage(
     client: httpx.AsyncClient,
     worker: ContentResearchDispatchWorker,
     db_path: str,
-) -> tuple[str, dict]:
+) -> tuple[str, dict, str]:
     thread_store = ThreadStore(db_path)
     await thread_store.connect()
     thread = await thread_store.create_thread(title="authorized continuation")
@@ -154,7 +154,7 @@ async def _confirmed_scope_awaiting_coverage(
     assert snapshot.state == "awaiting_scope_decision"
     assert "core_object" in snapshot.unmet_constraint_ids
     await thread_store.close()
-    return workflow_run_id, contract
+    return workflow_run_id, contract, snapshot.id
 
 
 @pytest.mark.asyncio
@@ -180,7 +180,7 @@ async def test_authorized_collection_continuations_run_through_worker_and_pipeli
     continuation_harness, resolution, payload, expected_scope_version
 ):
     client, service, worker, adapter, db_path = continuation_harness
-    workflow_run_id, original_scope = await _confirmed_scope_awaiting_coverage(
+    workflow_run_id, original_scope, coverage_snapshot_id = await _confirmed_scope_awaiting_coverage(
         client, worker, db_path
     )
     resolved = await client.post(
@@ -189,6 +189,7 @@ async def test_authorized_collection_continuations_run_through_worker_and_pipeli
             "action": "resolve_coverage",
             "payload": {
                 "scope_contract_version": 1,
+                "coverage_snapshot_id": coverage_snapshot_id,
                 "resolution": resolution,
                 **payload,
             },
@@ -223,13 +224,17 @@ async def test_limited_continuation_replays_then_publishes_through_real_worker(
     continuation_harness,
 ):
     client, service, worker, _adapter, db_path = continuation_harness
-    workflow_run_id, _scope = await _confirmed_scope_awaiting_coverage(
+    workflow_run_id, _scope, coverage_snapshot_id = await _confirmed_scope_awaiting_coverage(
         client, worker, db_path
     )
     endpoint = f"/content-research/workflows/{workflow_run_id}/actions"
     request = {
         "action": "resolve_coverage",
-        "payload": {"scope_contract_version": 1, "resolution": "generate_limited_report"},
+        "payload": {
+            "scope_contract_version": 1,
+            "coverage_snapshot_id": coverage_snapshot_id,
+            "resolution": "generate_limited_report",
+        },
     }
     first = await client.post(endpoint, json=request)
     replay = await client.post(endpoint, json=request)
@@ -251,7 +256,7 @@ async def test_failed_expand_replay_uses_a_new_worker_attempt_and_reaches_covera
     continuation_harness,
 ):
     client, service, worker, adapter, db_path = continuation_harness
-    workflow_run_id, original_scope = await _confirmed_scope_awaiting_coverage(
+    workflow_run_id, original_scope, coverage_snapshot_id = await _confirmed_scope_awaiting_coverage(
         client, worker, db_path
     )
     adapter.calls.clear()
@@ -262,6 +267,7 @@ async def test_failed_expand_replay_uses_a_new_worker_attempt_and_reaches_covera
         "action": "resolve_coverage",
         "payload": {
             "scope_contract_version": 1,
+            "coverage_snapshot_id": coverage_snapshot_id,
             "resolution": "expand_required_constraint",
             "constraint_id": "core_object",
             "supplementary_queries": ["长袖衬衫 防晒"],

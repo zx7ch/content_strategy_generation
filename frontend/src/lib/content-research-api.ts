@@ -308,6 +308,7 @@ export type ContentResearchCoverageResolution =
 
 export interface ContentResearchResolveCoverageRequest {
   scope_contract_version: number;
+  coverage_snapshot_id: string;
   resolution: ContentResearchCoverageResolution;
   constraint_id?: string;
   supplementary_queries?: string[];
@@ -323,6 +324,11 @@ export interface ContentResearchResolveCoverageResult {
   scope_contract: ContentResearchScopeContract;
   unmet_constraint_ids: string[];
   audit_event: ContentResearchScopeAuditEvent;
+  execution_unit: {
+    id: string;
+    state: string;
+    recovery_state: "replayable" | "manual_recovery_required";
+  };
 }
 
 export interface XHSQRLoginResponse {

@@ -14,7 +14,10 @@ import sqlite3
 from collections.abc import Callable
 from datetime import datetime, timezone
 
-from app.content_research.execution_decision_identity import build_execution_decision_identity
+from app.content_research.execution_decision_identity import (
+    LegacyDecisionInput,
+    build_legacy_execution_decision_identity,
+)
 
 _TYPED_TABLES = (
     "content_research_canonical_sources",
@@ -817,6 +820,180 @@ ALTER TABLE content_research_scope_execution_continuations
 """
 
 
+def _ensure_execution_identity_columns(conn: sqlite3.Connection) -> None:
+    """Make both fresh 0025 and pre-identity 0025 tables safe for reconciliation."""
+    _add_columns(
+        conn,
+        {
+            "content_research_scope_execution_units": (
+                "identity_schema TEXT NOT NULL DEFAULT 'execution_decision_identity_v1'",
+                "identity_json TEXT NOT NULL DEFAULT '{}'",
+                "identity_state TEXT NOT NULL DEFAULT 'legacy_identity_incomplete'",
+                "legacy_authorization_id TEXT",
+            )
+        },
+    )
+    conn.execute(
+        """CREATE UNIQUE INDEX IF NOT EXISTS idx_cr_execution_unit_canonical_fingerprint
+           ON content_research_scope_execution_units(decision_fingerprint)
+           WHERE identity_state='canonical'"""
+    )
+    conn.execute(
+        """CREATE UNIQUE INDEX IF NOT EXISTS idx_cr_execution_unit_legacy_authorization
+           ON content_research_scope_execution_units(legacy_authorization_id)
+           WHERE legacy_authorization_id IS NOT NULL"""
+    )
+
+
+def _remove_legacy_global_fingerprint_uniqueness(conn: sqlite3.Connection) -> None:
+    """Rebuild the execution tables so only canonical fingerprints are unique."""
+    table_sql_row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' "
+        "AND name='content_research_scope_execution_units'"
+    ).fetchone()
+    if table_sql_row is None or "decision_fingerprint TEXT NOT NULL UNIQUE" not in str(
+        table_sql_row[0]
+    ):
+        return
+
+    units = conn.execute(
+        """SELECT id, decision_fingerprint, workflow_run_id, scope_contract_id,
+                  coverage_snapshot_id, resolution, operation, state, created_at,
+                  identity_schema, identity_json, identity_state, legacy_authorization_id
+           FROM content_research_scope_execution_units"""
+    ).fetchall()
+    attempts = conn.execute(
+        """SELECT execution_unit_id, attempt_no, state, lease_owner, lease_token,
+                  lease_expires_at, provider_state, created_at
+           FROM content_research_scope_execution_attempts"""
+    ).fetchall()
+    facts = conn.execute(
+        """SELECT execution_unit_id, attempt_no, sequence_no, kind, payload_json, created_at
+           FROM content_research_execution_facts"""
+    ).fetchall()
+
+    conn.execute("DROP TABLE content_research_execution_facts")
+    conn.execute("DROP TABLE content_research_scope_execution_attempts")
+    conn.execute("DROP TABLE content_research_scope_execution_units")
+    conn.execute(
+        """CREATE TABLE content_research_scope_execution_units (
+               id TEXT PRIMARY KEY,
+               decision_fingerprint TEXT NOT NULL,
+               workflow_run_id TEXT NOT NULL,
+               scope_contract_id TEXT NOT NULL,
+               coverage_snapshot_id TEXT NOT NULL UNIQUE,
+               resolution TEXT NOT NULL,
+               operation TEXT NOT NULL,
+               state TEXT NOT NULL,
+               created_at TEXT NOT NULL,
+               identity_schema TEXT NOT NULL,
+               identity_json TEXT NOT NULL,
+               identity_state TEXT NOT NULL,
+               legacy_authorization_id TEXT
+           )"""
+    )
+    conn.execute(
+        """CREATE INDEX idx_cr_execution_unit_workflow_scope
+           ON content_research_scope_execution_units(workflow_run_id, scope_contract_id)"""
+    )
+    conn.execute(
+        """CREATE UNIQUE INDEX idx_cr_execution_unit_canonical_fingerprint
+           ON content_research_scope_execution_units(decision_fingerprint)
+           WHERE identity_state='canonical'"""
+    )
+    conn.execute(
+        """CREATE UNIQUE INDEX idx_cr_execution_unit_legacy_authorization
+           ON content_research_scope_execution_units(legacy_authorization_id)
+           WHERE legacy_authorization_id IS NOT NULL"""
+    )
+    conn.executemany(
+        "INSERT INTO content_research_scope_execution_units VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        units,
+    )
+
+    conn.execute(
+        """CREATE TABLE content_research_scope_execution_attempts (
+               execution_unit_id TEXT NOT NULL,
+               attempt_no INTEGER NOT NULL,
+               state TEXT NOT NULL,
+               lease_owner TEXT,
+               lease_token TEXT,
+               lease_expires_at TEXT,
+               provider_state TEXT,
+               created_at TEXT NOT NULL,
+               PRIMARY KEY(execution_unit_id, attempt_no),
+               FOREIGN KEY(execution_unit_id) REFERENCES content_research_scope_execution_units(id)
+           )"""
+    )
+    conn.execute(
+        """CREATE INDEX idx_cr_execution_attempt_unit_attempt
+           ON content_research_scope_execution_attempts(execution_unit_id, attempt_no)"""
+    )
+    conn.executemany(
+        "INSERT INTO content_research_scope_execution_attempts VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        attempts,
+    )
+
+    conn.execute(
+        """CREATE TABLE content_research_execution_facts (
+               execution_unit_id TEXT NOT NULL,
+               attempt_no INTEGER NOT NULL,
+               sequence_no INTEGER NOT NULL,
+               kind TEXT NOT NULL,
+               payload_json TEXT NOT NULL,
+               created_at TEXT NOT NULL,
+               PRIMARY KEY(execution_unit_id, attempt_no, sequence_no),
+               FOREIGN KEY(execution_unit_id, attempt_no)
+                   REFERENCES content_research_scope_execution_attempts(execution_unit_id, attempt_no)
+           )"""
+    )
+    conn.execute(
+        """CREATE INDEX idx_cr_execution_fact_unit_attempt_sequence
+           ON content_research_execution_facts(execution_unit_id, attempt_no, sequence_no)"""
+    )
+    conn.executemany(
+        "INSERT INTO content_research_execution_facts VALUES (?, ?, ?, ?, ?, ?)",
+        facts,
+    )
+
+
+def _legacy_decision_from_row(row: sqlite3.Row | tuple[object, ...]):
+    (
+        authorization_id,
+        _workflow_run_id,
+        resulting_scope_contract_id,
+        coverage_snapshot_id,
+        resolution,
+        _created_at,
+        operation,
+        _continuation_state,
+        _lease_owner,
+        _lease_token,
+        _lease_expires_at,
+        supplementary_queries_json,
+        source_scope_contract_id,
+        target_constraint_id,
+    ) = row
+    operation = operation or (
+        "limited_report"
+        if resolution == "generate_limited_report"
+        else "supplementary_collection"
+    )
+    queries = tuple(json.loads(supplementary_queries_json or "[]"))
+    return build_legacy_execution_decision_identity(
+        LegacyDecisionInput(
+            legacy_authorization_id=str(authorization_id),
+            coverage_snapshot_id=str(coverage_snapshot_id),
+            source_scope_contract_id=str(source_scope_contract_id),
+            resulting_scope_contract_id=str(resulting_scope_contract_id),
+            resolution=str(resolution),
+            operation=str(operation),
+            target_constraint_id=(str(target_constraint_id) if target_constraint_id else None),
+            supplementary_queries=queries,
+        )
+    )
+
+
 def _apply_0025(conn: sqlite3.Connection) -> None:
     """Backfill legacy authorization rows as aliases without changing Scope meaning."""
     # Do not use sqlite3.executescript here: it commits any active transaction
@@ -824,6 +1001,7 @@ def _apply_0025(conn: sqlite3.Connection) -> None:
     for statement in _V25_EXECUTION_UNITS_SQL.split(";"):
         if statement.strip():
             conn.execute(statement)
+    _ensure_execution_identity_columns(conn)
     rows = conn.execute(
         """SELECT authorization.id, authorization.workflow_run_id, authorization.scope_contract_id,
                   authorization.coverage_snapshot_id, authorization.resolution,
@@ -835,6 +1013,7 @@ def _apply_0025(conn: sqlite3.Connection) -> None:
                      FROM content_research_scope_audit_events AS event
                     WHERE event.event_name='coverage_resolved'
                       AND json_extract(event.payload_json, '$.coverage_snapshot_id')=authorization.coverage_snapshot_id
+                    ORDER BY event.created_at ASC, event.id ASC
                     LIMIT 1)
            FROM content_research_scope_execution_authorizations AS authorization
            LEFT JOIN content_research_scope_execution_continuations AS continuation
@@ -860,35 +1039,32 @@ def _apply_0025(conn: sqlite3.Connection) -> None:
             source_scope_contract_id,
             target_constraint_id,
         ) = row
-        operation = operation or (
-            "limited_report"
-            if resolution == "generate_limited_report"
-            else "supplementary_collection"
-        )
-        queries = json.loads(supplementary_queries_json or "[]")
-        _, _identity_json, decision_fingerprint = build_execution_decision_identity(
-            coverage_snapshot_id=coverage_snapshot_id, source_scope_contract_id=source_scope_contract_id,
-            resulting_scope_contract_id=scope_contract_id, resolution=resolution,
-            target_constraint_id=target_constraint_id, supplementary_queries=tuple(queries),
-        )
-        unit_id = "seu_" + decision_fingerprint[:24]
+        legacy_identity = _legacy_decision_from_row(row)
+        unit_id = legacy_identity.execution_unit_id
         state = continuation_state or "pending"
         now = created_at or datetime.now(timezone.utc).isoformat()
         conn.execute(
             """INSERT OR IGNORE INTO content_research_scope_execution_units
                (id, decision_fingerprint, workflow_run_id, scope_contract_id,
-                coverage_snapshot_id, resolution, operation, state, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                coverage_snapshot_id, resolution, operation, state, created_at,
+                identity_schema, identity_json, identity_state, legacy_authorization_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 unit_id,
-                decision_fingerprint,
+                legacy_identity.decision_fingerprint,
                 workflow_run_id,
                 scope_contract_id,
                 coverage_snapshot_id,
                 resolution,
-                operation,
+                "limited_report"
+                if resolution == "generate_limited_report"
+                else "supplementary_collection",
                 state if state in {"pending", "running", "completed", "failed"} else "failed",
                 now,
+                legacy_identity.identity_schema,
+                legacy_identity.identity_json,
+                legacy_identity.identity_state,
+                authorization_id,
             ),
         )
         conn.execute(
@@ -934,10 +1110,20 @@ def _apply_0025(conn: sqlite3.Connection) -> None:
 
 def _apply_0026(conn: sqlite3.Connection) -> None:
     """Repair pre-canonical 0025 aliases without changing their stable unit IDs."""
+    _ensure_execution_identity_columns(conn)
     rows = conn.execute(
-        """SELECT unit.id, authorization.coverage_snapshot_id, snapshot.scope_contract_id,
-                  authorization.scope_contract_id, authorization.resolution, continuation.operation,
-                  continuation.supplementary_queries_json
+        """SELECT unit.id, authorization.id, authorization.workflow_run_id,
+                  authorization.scope_contract_id, authorization.coverage_snapshot_id,
+                  authorization.resolution, authorization.created_at,
+                  continuation.operation, continuation.state, continuation.lease_owner,
+                  continuation.lease_token, continuation.lease_expires_at,
+                  continuation.supplementary_queries_json, snapshot.scope_contract_id,
+                  (SELECT json_extract(event.payload_json, '$.constraint_id')
+                     FROM content_research_scope_audit_events AS event
+                    WHERE event.event_name='coverage_resolved'
+                      AND json_extract(event.payload_json, '$.coverage_snapshot_id')=authorization.coverage_snapshot_id
+                    ORDER BY event.created_at ASC, event.id ASC
+                    LIMIT 1)
            FROM content_research_scope_execution_units AS unit
            JOIN content_research_scope_execution_authorizations AS authorization
              ON authorization.execution_unit_id=unit.id
@@ -946,18 +1132,24 @@ def _apply_0026(conn: sqlite3.Connection) -> None:
            LEFT JOIN content_research_scope_execution_continuations AS continuation
              ON continuation.authorization_id=authorization.id"""
     ).fetchall()
-    for unit_id, snapshot_id, source_scope_id, resulting_scope_id, resolution, operation, raw_queries in rows:
-        identity = json.dumps(
-            {"coverage_snapshot_id": snapshot_id, "source_scope_contract_id": source_scope_id,
-             "resulting_scope_contract_id": resulting_scope_id, "resolution": resolution,
-             "operation": operation or ("limited_report" if resolution == "generate_limited_report" else "supplementary_collection"),
-             "supplementary_queries": json.loads(raw_queries or "[]")},
-            ensure_ascii=False, sort_keys=True, separators=(",", ":"),
-        )
+    for row in rows:
+        unit_id = str(row[0])
+        legacy_identity = _legacy_decision_from_row(row[1:])
         conn.execute(
-            "UPDATE content_research_scope_execution_units SET decision_fingerprint=? WHERE id=?",
-            (hashlib.sha256(identity.encode()).hexdigest(), unit_id),
+            """UPDATE content_research_scope_execution_units
+               SET decision_fingerprint=?, identity_schema=?, identity_json=?,
+                   identity_state=?, legacy_authorization_id=?
+               WHERE id=?""",
+            (
+                legacy_identity.decision_fingerprint,
+                legacy_identity.identity_schema,
+                legacy_identity.identity_json,
+                legacy_identity.identity_state,
+                row[1],
+                unit_id,
+            ),
         )
+    _remove_legacy_global_fingerprint_uniqueness(conn)
 
 
 def _apply_0015(conn: sqlite3.Connection) -> None:
@@ -1021,6 +1213,7 @@ def _expected_checksums(migration_0002_sql: str, legacy_checksum: str) -> dict[s
         "0024": hashlib.sha256(_V24_SCOPE_EXECUTION_CONTINUATION_SQL.encode("utf-8")).hexdigest(),
         "0025": hashlib.sha256(_V25_EXECUTION_UNITS_SQL.encode("utf-8")).hexdigest(),
         "0026": _checksum("execution_unit_alias_canonical_repair_v1"),
+        "0027": _checksum("execution_decision_identity_contract_v1"),
     }
 
 
@@ -1281,6 +1474,13 @@ def apply_content_research_migrations(
                 version="0026",
                 name="execution_unit_alias_canonical_repair",
                 checksum=expected_checksums["0026"],
+                apply=lambda: _apply_0026(conn),
+            )
+            _apply_migration(
+                conn,
+                version="0027",
+                name="execution_decision_identity_contract",
+                checksum=expected_checksums["0027"],
                 apply=lambda: _apply_0026(conn),
             )
         except Exception:

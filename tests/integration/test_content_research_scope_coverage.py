@@ -207,6 +207,7 @@ def test_supplementary_execution_persists_a_new_coverage_revision_with_lineage(
             "schema_version": "content_research_scope_audit_event_v1",
             "coverage_snapshot_id": initial.id,
             "resolution": authorization.resolution,
+            "constraint_id": "season",
         },
     )
     store.resolve_coverage_and_authorize_execution_atomically(
