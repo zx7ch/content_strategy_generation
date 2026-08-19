@@ -111,10 +111,13 @@ from app.content_research.reporting.publication_materializer import ReportPublic
 from app.content_research.reporting.read_model import PublishedReportNotFoundError
 from app.content_research.runtime import canonical_fingerprint
 from app.content_research.scope_contract import (
+    ExecutionContext,
+    ExecutionLeaseFencedError,
     ResearchScopeDraft,
     ScopeAuditEvent,
     ScopeConstraint,
     ScopeDraftAuditEvent,
+    ScopeExecutionAttempt,
     ScopeExecutionAuthorization,
     ScopeExecutionContinuation,
     ScopeExecutionUnit,
@@ -3380,6 +3383,18 @@ class ContentResearchService:
             limit_per_specialist=request.limit,
         )
 
+    def _require_live_execution_context(
+        self,
+        context: ExecutionContext | None,
+        operation: str,
+    ) -> None:
+        if context is None:
+            return
+        if not self._store.execution_context_is_live(context, operation=operation):
+            raise ExecutionLeaseFencedError(
+                f"execution attempt lease was fenced before {operation}"
+            )
+
     def _require_scope_execution_authority(
         self,
         *,
@@ -3400,9 +3415,7 @@ class ContentResearchService:
         if not contracts:
             raise ContentResearchValidationError("scope_confirmation_required")
         contract = contracts[-1]
-        coverage = self._store.get_coverage_snapshot(
-            workflow_run_id, version=contract.version
-        )
+        coverage = self._store.get_coverage_snapshot(workflow_run_id, version=contract.version)
         has_persisted_continuation_authority = any(
             item.scope_contract_id == contract.id
             and item.scope_contract_version == contract.version
@@ -3410,9 +3423,7 @@ class ContentResearchService:
         )
 
         if execution_authorization is not None:
-            persisted = self._store.get_scope_execution_authorization(
-                execution_authorization.id
-            )
+            persisted = self._store.get_scope_execution_authorization(execution_authorization.id)
             if (
                 persisted is None
                 or persisted != execution_authorization
@@ -3420,26 +3431,19 @@ class ContentResearchService:
                 or persisted.scope_contract_id != contract.id
                 or persisted.scope_contract_version != contract.version
             ):
-                raise ContentResearchValidationError(
-                    "scope_execution_authorization_invalid"
-                )
+                raise ContentResearchValidationError("scope_execution_authorization_invalid")
 
         if coverage is None:
             if execution_authorization is None and has_persisted_continuation_authority:
-                raise ContentResearchValidationError(
-                    "scope_execution_authorization_required"
-                )
+                raise ContentResearchValidationError("scope_execution_authorization_required")
             return
         if coverage.state != "awaiting_scope_decision":
             return
         if execution_authorization is None:
-            raise ContentResearchValidationError(
-                "scope_execution_authorization_required"
-            )
+            raise ContentResearchValidationError("scope_execution_authorization_required")
         if (
             execution_authorization.coverage_snapshot_id != coverage.id
-            or execution_authorization.execution_revision
-            != coverage.execution_revision + 1
+            or execution_authorization.execution_revision != coverage.execution_revision + 1
         ):
             raise ContentResearchValidationError("scope_execution_authorization_invalid")
 
@@ -3938,7 +3942,9 @@ class ContentResearchService:
         workflow_run_id: str,
         *,
         execution_authorization: ScopeExecutionAuthorization | None = None,
+        execution_context: ExecutionContext | None = None,
     ) -> Any | None:
+        self._require_live_execution_context(execution_context, "coverage_evaluation")
         contracts = self._store.list_scope_contracts(workflow_run_id)
         if not contracts:
             return None
@@ -4060,10 +4066,73 @@ class ContentResearchService:
             minimum_independent_authors=sample_policy.minimum_independent_authors,
             execution_authorization=execution_authorization,
             source_snapshot=source_snapshot,
+            execution_context=execution_context,
         )
 
-    async def execute_scope_continuation(self, continuation: ScopeExecutionContinuation) -> None:
+    async def execute_execution_unit(
+        self,
+        claim: ScopeExecutionAttempt,
+        continuation: ScopeExecutionContinuation,
+    ) -> str:
+        """Execute one continuation only through its exact live attempt lease."""
+        unit = self._store.get_scope_execution_unit(claim.execution_unit_id)
+        if (
+            unit is None
+            or continuation.execution_unit_id != unit.id
+            or claim.state != "running"
+            or not claim.lease_token
+        ):
+            raise ContentResearchValidationError(
+                "execution unit requires a running claimed attempt lease"
+            )
+        context = ExecutionContext(
+            execution_unit_id=unit.id,
+            attempt_no=claim.attempt_no,
+            lease_token=claim.lease_token,
+            scope_contract_id=unit.scope_contract_id,
+        )
+        self._require_live_execution_context(context, "execute_execution_unit")
+        await self.execute_scope_continuation(
+            continuation,
+            execution_context=context,
+        )
+        authorization = self._store.get_scope_execution_authorization(continuation.authorization_id)
+        if authorization is None:
+            raise ContentResearchValidationError(
+                "execution unit authorization disappeared before completion"
+            )
+        if continuation.operation == "supplementary_collection":
+            terminal = self._store.get_coverage_snapshot(
+                continuation.workflow_run_id,
+                version=authorization.scope_contract_version,
+                execution_revision=authorization.execution_revision,
+            )
+            if terminal is None:
+                raise ContentResearchValidationError(
+                    "execution unit supplementary collection has no terminal Coverage"
+                )
+        else:
+            runtime = await self._workflow_runtime.get_runtime_snapshot(
+                continuation.workflow_run_id
+            )
+            runtime_status = str(
+                (runtime.get("run") or {}).get("status") or runtime.get("run_status") or ""
+            )
+            if runtime_status != "succeeded":
+                raise ContentResearchValidationError(
+                    "execution unit limited report has no terminal publication"
+                )
+        self._require_live_execution_context(context, "execution_terminal_postcondition")
+        return "completed"
+
+    async def execute_scope_continuation(
+        self,
+        continuation: ScopeExecutionContinuation,
+        *,
+        execution_context: ExecutionContext | None = None,
+    ) -> None:
         """Execute only the work owned by one persisted authorization command."""
+        self._require_live_execution_context(execution_context, "scope_continuation_start")
         authorization = self._store.get_scope_execution_authorization(continuation.authorization_id)
         if authorization is None:
             raise ContentResearchValidationError(
@@ -4079,6 +4148,7 @@ class ContentResearchService:
             ),
             None,
         )
+
         def immutable_command(item: ScopeExecutionContinuation) -> tuple[object, ...]:
             return (
                 item.id,
@@ -4088,10 +4158,10 @@ class ContentResearchService:
                 item.operation,
                 item.supplementary_queries,
             )
-        if (
-            persisted_continuation is None
-            or immutable_command(persisted_continuation) != immutable_command(continuation)
-        ):
+
+        if persisted_continuation is None or immutable_command(
+            persisted_continuation
+        ) != immutable_command(continuation):
             raise ContentResearchValidationError(
                 "scope execution continuation does not match its persisted command"
             )
@@ -4145,6 +4215,7 @@ class ContentResearchService:
         ):
             restart = getattr(self._workflow_runtime, "restart_formal_research_step", None)
             if callable(restart):
+                self._require_live_execution_context(execution_context, "restart_formal_research")
                 await restart(
                     workflow_run_id=continuation.workflow_run_id,
                     child_task_ids=[],
@@ -4194,6 +4265,7 @@ class ContentResearchService:
             )
             existing_task = self._store.get_subagent_task(task_id)
             if existing_task is None:
+                self._require_live_execution_context(execution_context, "create_continuation_task")
                 input_payload = dict(base_task.payload.get("input_payload") or {})
                 input_payload["scope_execution"] = {
                     "authorization_id": authorization.id,
@@ -4223,6 +4295,14 @@ class ContentResearchService:
                         "scope_execution_authorization_id": authorization.id,
                         "execution_revision": authorization.execution_revision,
                         "scope_execution_attempt": len(prior_attempts) + 1,
+                        "execution_unit_id": (
+                            execution_context.execution_unit_id
+                            if execution_context is not None
+                            else authorization.execution_unit_id
+                        ),
+                        "execution_attempt_no": (
+                            execution_context.attempt_no if execution_context is not None else None
+                        ),
                     },
                 )
                 self._store.save_subagent_task(existing_task)
@@ -4235,6 +4315,7 @@ class ContentResearchService:
             limit=50,
             execution_authorization=authorization,
             executable_task_ids=executable_task_ids,
+            execution_context=execution_context,
         )
 
     async def _execute_formal_research(
@@ -4246,7 +4327,9 @@ class ContentResearchService:
         limit: int,
         execution_authorization: ScopeExecutionAuthorization | None = None,
         executable_task_ids: set[str] | None = None,
+        execution_context: ExecutionContext | None = None,
     ) -> None:
+        self._require_live_execution_context(execution_context, "formal_research_start")
         self._require_scope_execution_authority(
             workflow_run_id=brief.workflow_run_id,
             execution_authorization=execution_authorization,
@@ -4273,6 +4356,7 @@ class ContentResearchService:
                     limit=limit,
                     # Each specialist owns its own query and source result.
                     source_result=None,
+                    execution_context=execution_context,
                 )
                 for task in executable_tasks
             )
@@ -4433,6 +4517,7 @@ class ContentResearchService:
         scope_coverage = self._persist_scope_coverage(
             brief.workflow_run_id,
             execution_authorization=execution_authorization,
+            execution_context=execution_context,
         )
         limited_report_authorized = scope_coverage is not None and any(
             authorization.coverage_snapshot_id == scope_coverage.id
@@ -4461,6 +4546,7 @@ class ContentResearchService:
             raise ContentResearchValidationError(
                 f"Formal governance requires a research plan: {brief.workflow_run_id}"
             )
+        self._require_live_execution_context(execution_context, "governance")
         governance = self._cross_direction_governance.execute(
             workflow_run_id=brief.workflow_run_id,
             research_plan_id=plans[-1].id,
@@ -4511,6 +4597,7 @@ class ContentResearchService:
                 return
 
         if complete is not None:
+            self._require_live_execution_context(execution_context, "workflow_completion")
             artifact_refs = _unique_artifact_refs(
                 [ref for outcome in outcomes for ref in outcome["artifact_refs"]] + governance_refs
             )
@@ -4520,6 +4607,7 @@ class ContentResearchService:
                 artifact_refs=artifact_refs,
             )
             try:
+                self._require_live_execution_context(execution_context, "report_publication")
                 # The report artifact is produced while finalizing_report.  It
                 # is not publicly readable until complete_report_publication
                 # commits the workflow's succeeded state.

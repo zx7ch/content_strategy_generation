@@ -44,6 +44,8 @@ from app.content_research.persistence_models import (
 from app.content_research.runtime import canonical_fingerprint
 from app.content_research.scope_contract import (
     CoverageSnapshot,
+    ExecutionContext,
+    ExecutionLeaseFencedError,
     ResearchScopeContract,
     ScopeAuditEvent,
     ScopeExecutionAuthorization,
@@ -194,12 +196,11 @@ def persist_scope_coverage_evaluation(
     minimum_independent_authors: int,
     execution_authorization: ScopeExecutionAuthorization | None = None,
     source_snapshot: CoverageSnapshot | None = None,
+    execution_context: ExecutionContext | None = None,
 ) -> CoverageSnapshot:
     """Persist candidate Scope projections and their decision-ready aggregate."""
     execution_revision = (
-        execution_authorization.execution_revision
-        if execution_authorization is not None
-        else 1
+        execution_authorization.execution_revision if execution_authorization is not None else 1
     )
     existing = store.get_coverage_snapshot(
         contract.workflow_run_id,
@@ -232,9 +233,7 @@ def persist_scope_coverage_evaluation(
                         "constraint_counts": existing.constraint_counts,
                         "unmet_constraint_ids": list(existing.unmet_constraint_ids),
                         "reason_codes": list(
-                            existing.constraint_counts.get("_summary", {}).get(
-                                "reason_codes", ()
-                            )
+                            existing.constraint_counts.get("_summary", {}).get("reason_codes", ())
                         ),
                     },
                 )
@@ -346,9 +345,7 @@ def persist_scope_coverage_evaluation(
         }
         if constraint.mode == "required" and len(matching) < minimum_samples:
             unmet_constraint_ids.append(constraint.id)
-            reason_codes.append(
-                f"required_constraint_coverage_unmet:{constraint.id}"
-            )
+            reason_codes.append(f"required_constraint_coverage_unmet:{constraint.id}")
 
     query_group_counts: dict[str, dict[str, int]] = {}
     for group_id in sorted(contract_group_ids):
@@ -411,9 +408,7 @@ def persist_scope_coverage_evaluation(
         execution_authorization_id=(
             execution_authorization.id if execution_authorization else None
         ),
-        source_coverage_snapshot_id=(
-            source_snapshot.id if source_snapshot is not None else None
-        ),
+        source_coverage_snapshot_id=(source_snapshot.id if source_snapshot is not None else None),
     )
     coverage_event = ScopeAuditEvent(
         id=_scope_event_id(
@@ -438,7 +433,14 @@ def persist_scope_coverage_evaluation(
             "reason_codes": reason_codes,
         },
     )
-    store.save_coverage_snapshot_with_audit_event(snapshot, coverage_event)
+    if execution_context is None:
+        store.save_coverage_snapshot_with_audit_event(snapshot, coverage_event)
+    else:
+        store.save_coverage_snapshot_with_audit_event(
+            snapshot,
+            coverage_event,
+            execution_context=execution_context,
+        )
     return snapshot
 
 
@@ -449,15 +451,18 @@ def _scope_event_id(
     *,
     execution_revision: int = 1,
 ) -> str:
-    return "sae_" + canonical_fingerprint(
-        {
-            "scope_contract_id": contract.id,
-            "scope_contract_version": contract.version,
-            "event_name": event_name,
-            "subject_id": subject_id,
-            "execution_revision": execution_revision,
-        }
-    )[:24]
+    return (
+        "sae_"
+        + canonical_fingerprint(
+            {
+                "scope_contract_id": contract.id,
+                "scope_contract_version": contract.version,
+                "event_name": event_name,
+                "subject_id": subject_id,
+                "execution_revision": execution_revision,
+            }
+        )[:24]
+    )
 
 
 def evaluate_direction_coverage(
@@ -864,7 +869,13 @@ def build_packet(
 class DirectionalExecutionPipeline:
     """Persist the collect/selection/packet safe boundaries for one direction."""
 
-    def __init__(self, store: ContentResearchStore, *, scope_store: Any | None = None) -> None:
+    def __init__(
+        self,
+        store: ContentResearchStore,
+        *,
+        scope_store: Any | None = None,
+        execution_context: ExecutionContext | None = None,
+    ) -> None:
         self._store = store
         self._scope_store = scope_store or (
             store if hasattr(store, "list_scope_contracts") else None
@@ -878,16 +889,26 @@ class DirectionalExecutionPipeline:
         self._scope_audit_event_ids: set[str] = set()
         self._canonical_sources = CanonicalSourceRegistry(store)
         self._checkpoint_started_at: dict[tuple[str, str], datetime] = {}
+        self._execution_context = execution_context
 
     @classmethod
     async def open_async(
-        cls, db_path: str, *, workflow_run_id: str
+        cls,
+        db_path: str,
+        *,
+        workflow_run_id: str,
+        execution_context: ExecutionContext | None = None,
     ) -> DirectionalExecutionPipeline:
         from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
 
         return cls(
-            await AsyncDirectionalPersistenceSession.open(db_path, workflow_run_id=workflow_run_id),
+            await AsyncDirectionalPersistenceSession.open(
+                db_path,
+                workflow_run_id=workflow_run_id,
+                execution_context=execution_context,
+            ),
             scope_store=SQLiteContentResearchStore(db_path),
+            execution_context=execution_context,
         )  # type: ignore[arg-type]
 
     async def _flush(self) -> None:
@@ -959,10 +980,13 @@ class DirectionalExecutionPipeline:
         execution_authorization_id: str | None = None,
         execution_revision: int = 1,
         supplementary_queries: tuple[str, ...] = (),
+        execution_context: ExecutionContext | None = None,
     ) -> DirectionEvidenceRun:
         # Direct pipeline diagnostics have no workflow entity; keep them
         # isolated instead of allowing an unscoped persisted record.
         self._workflow_run_id = workflow_run_id or f"local_{subagent_task_id}"
+        if execution_context != self._execution_context:
+            raise ValueError("directional pipeline execution context changed")
         self._checkpoint_started_at = {}
         self._load_scope_contract(self._workflow_run_id)
         self._scope_execution_authorization_id = execution_authorization_id
@@ -1168,6 +1192,12 @@ class DirectionalExecutionPipeline:
                 try:
                     detail_result = await collect_detail(candidate)
                 except Exception:
+                    self._record_provider_outcome(
+                        operation="detail",
+                        operation_fingerprint=operation_fingerprint,
+                        provider_state="outcome_unknown",
+                        payload={"reason": "provider_call_interrupted"},
+                    )
                     self._terminal_operation(
                         subagent_task_id,
                         "detail",
@@ -1177,7 +1207,11 @@ class DirectionalExecutionPipeline:
                         recovery_action="确认外部调用结果后再恢复；系统不会自动重放。",
                     )
                     await self._flush()
-                    raise
+                    if self._execution_context is None:
+                        raise
+                    raise OperationOutcomeUnknownError(
+                        operation="detail", operation_fingerprint=operation_fingerprint
+                    )
                 if isinstance(detail_result, SourceOperationResult):
                     detail = (
                         dict(detail_result.items[0])
@@ -1478,6 +1512,7 @@ class DirectionalExecutionPipeline:
                         admission_contract=admission_contract,
                         admission_policy=admission_policy,
                         policy_snapshot=policy_snapshot,
+                        execution_context=execution_context,
                     )
         await self._flush()
         return DirectionEvidenceRun(
@@ -1620,9 +1655,7 @@ class DirectionalExecutionPipeline:
                 match = evaluate_scope_match(
                     source={
                         **dict(packet.payload.get("field_projection") or {}),
-                        "retrieval_context": dict(
-                            packet.payload.get("retrieval_context") or {}
-                        ),
+                        "retrieval_context": dict(packet.payload.get("retrieval_context") or {}),
                     },
                     contract=self._scope_contract,
                 )
@@ -1764,8 +1797,7 @@ class DirectionalExecutionPipeline:
                     self._store.get_typed_record(type(candidate), candidate.id) is None
                 )
                 event_missing = (
-                    scope_event is not None
-                    and scope_event.id not in self._scope_audit_event_ids
+                    scope_event is not None and scope_event.id not in self._scope_audit_event_ids
                 )
                 save_with_audit = getattr(
                     self._store, "save_claim_candidate_with_scope_audit_event", None
@@ -1889,6 +1921,12 @@ class DirectionalExecutionPipeline:
                 try:
                     result = _discover_page(await discover(replace(group, cursor=cursor)))
                 except Exception:
+                    self._record_provider_outcome(
+                        operation="discover",
+                        operation_fingerprint=operation_fingerprint,
+                        provider_state="outcome_unknown",
+                        payload={"reason": "provider_call_interrupted"},
+                    )
                     self._terminal_operation(
                         subagent_task_id,
                         "discover",
@@ -1898,7 +1936,11 @@ class DirectionalExecutionPipeline:
                         recovery_action="确认外部调用结果后再恢复；系统不会自动重放。",
                     )
                     await self._flush()
-                    raise
+                    if self._execution_context is None:
+                        raise
+                    raise OperationOutcomeUnknownError(
+                        operation="discover", operation_fingerprint=operation_fingerprint
+                    )
                 remaining = max(group.candidate_limit - len(group_candidates), 0)
                 page_items = [
                     {
@@ -1979,9 +2021,7 @@ class DirectionalExecutionPipeline:
     ) -> None:
         if self._scope_store is None or self._scope_contract is None:
             return
-        summaries = {
-            str(item.get("query_group_id") or ""): item for item in pagination
-        }
+        summaries = {str(item.get("query_group_id") or ""): item for item in pagination}
         groups = self._active_scope_query_groups or _scope_query_groups(
             contract=self._scope_contract,
             direction_id="product_marketing",
@@ -1990,9 +2030,7 @@ class DirectionalExecutionPipeline:
         )
         for group in groups:
             summary = summaries.get(group.id, {})
-            pages = self._page_records(
-                subagent_task_id, "collect_page", plan_hash, group.id
-            )
+            pages = self._page_records(subagent_task_id, "collect_page", plan_hash, group.id)
             final_page = pages[-1] if pages else None
             event = ScopeAuditEvent(
                 id=_scope_event_id(
@@ -2010,9 +2048,7 @@ class DirectionalExecutionPipeline:
                     "query_group_id": group.id,
                     "final_query": group.query,
                     "execution_role": (
-                        "supplementary"
-                        if self._scope_execution_authorization_id
-                        else "coverage"
+                        "supplementary" if self._scope_execution_authorization_id else "coverage"
                     ),
                     "execution_authorization_id": self._scope_execution_authorization_id,
                     "execution_revision": self._scope_execution_revision,
@@ -2023,9 +2059,7 @@ class DirectionalExecutionPipeline:
                     ),
                     "discovered_count": int(summary.get("actual_count") or 0),
                     "failure_code": (
-                        final_page.payload.get("failure_reason")
-                        if final_page is not None
-                        else None
+                        final_page.payload.get("failure_reason") if final_page is not None else None
                     ),
                 },
             )
@@ -2116,6 +2150,12 @@ class DirectionalExecutionPipeline:
                         }
                     )
                 except Exception:
+                    self._record_provider_outcome(
+                        operation="comments",
+                        operation_fingerprint=operation_fingerprint,
+                        provider_state="outcome_unknown",
+                        payload={"reason": "provider_call_interrupted"},
+                    )
                     self._terminal_operation(
                         subagent_task_id,
                         "comments",
@@ -2125,7 +2165,11 @@ class DirectionalExecutionPipeline:
                         recovery_action="确认外部调用结果后再恢复；系统不会自动重放。",
                     )
                     await self._flush()
-                    raise
+                    if self._execution_context is None:
+                        raise
+                    raise OperationOutcomeUnknownError(
+                        operation="comments", operation_fingerprint=operation_fingerprint
+                    )
                 page_items = [
                     _manifest_value(item) for item in result.items if isinstance(item, dict)
                 ]
@@ -2521,6 +2565,22 @@ class DirectionalExecutionPipeline:
         self._save_operation_checkpoint(
             task_id, operation, operation_fingerprint, "running", request=request
         )
+        if self._execution_context is not None:
+            assert self._scope_store is not None
+            recorded = self._scope_store.record_provider_request(
+                execution_unit_id=self._execution_context.execution_unit_id,
+                attempt_no=self._execution_context.attempt_no,
+                lease_token=self._execution_context.lease_token,
+                payload={
+                    "operation": operation,
+                    "operation_fingerprint": operation_fingerprint,
+                    "request": _safe_operation_request(request),
+                },
+            )
+            if not recorded:
+                raise ExecutionLeaseFencedError(
+                    f"execution attempt lease was fenced before provider {operation}"
+                )
         return operation_fingerprint
 
     def _complete_operation(
@@ -2548,6 +2608,19 @@ class DirectionalExecutionPipeline:
     ) -> None:
         outcome = _safe_operation_outcome(result)
         failure_code = result.failure_reason
+        provider_state = (
+            "succeeded"
+            if result.status in {"completed", "empty", "partial_completed"}
+            else "retryable_failed"
+            if result.retryable
+            else "terminal_failed"
+        )
+        self._record_provider_outcome(
+            operation=operation,
+            operation_fingerprint=operation_fingerprint,
+            provider_state=provider_state,
+            payload=outcome,
+        )
         if result.status in {"completed", "empty", "partial_completed"}:
             self._complete_operation(task_id, operation, operation_fingerprint, completion=outcome)
             return
@@ -2563,6 +2636,33 @@ class DirectionalExecutionPipeline:
             recovery_action=_recovery_action(failure_code, result.retryable),
             outcome=outcome,
         )
+
+    def _record_provider_outcome(
+        self,
+        *,
+        operation: str,
+        operation_fingerprint: str,
+        provider_state: str,
+        payload: Mapping[str, Any],
+    ) -> None:
+        if self._execution_context is None:
+            return
+        assert self._scope_store is not None
+        recorded = self._scope_store.record_provider_outcome(
+            execution_unit_id=self._execution_context.execution_unit_id,
+            attempt_no=self._execution_context.attempt_no,
+            lease_token=self._execution_context.lease_token,
+            provider_state=provider_state,
+            payload={
+                "operation": operation,
+                "operation_fingerprint": operation_fingerprint,
+                **dict(payload),
+            },
+        )
+        if not recorded:
+            raise ExecutionLeaseFencedError(
+                f"execution attempt lease was fenced after provider {operation}"
+            )
 
     def _terminal_operation(
         self,

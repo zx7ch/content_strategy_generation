@@ -47,7 +47,9 @@ from app.content_research.persistence_models import (
 )
 from app.content_research.scope_contract import (
     CoverageSnapshot,
+    ExecutionContext,
     ExecutionFact,
+    ExecutionLeaseFencedError,
     ResearchScopeContract,
     ResearchScopeDraft,
     ScopeAuditEvent,
@@ -1001,7 +1003,11 @@ class SQLiteContentResearchStore:
         return snapshot
 
     def save_coverage_snapshot_with_audit_event(
-        self, snapshot: CoverageSnapshot, event: ScopeAuditEvent
+        self,
+        snapshot: CoverageSnapshot,
+        event: ScopeAuditEvent,
+        *,
+        execution_context: ExecutionContext | None = None,
     ) -> CoverageSnapshot:
         _validate_payload("ScopeAuditEvent", event.payload)
         if (
@@ -1013,7 +1019,24 @@ class SQLiteContentResearchStore:
         ):
             raise ValueError("coverage audit event must reference the snapshot being saved")
         try:
-            with self._connect() as conn:
+            conn = self._connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                if (
+                    execution_context is not None
+                    and not self._execution_context_is_live_in_transaction(conn, execution_context)
+                ):
+                    self._append_execution_fact_in_transaction(
+                        conn,
+                        execution_unit_id=execution_context.execution_unit_id,
+                        attempt_no=execution_context.attempt_no,
+                        kind="lease_fenced",
+                        payload={"operation": "coverage_persistence"},
+                    )
+                    conn.commit()
+                    raise ExecutionLeaseFencedError(
+                        "execution attempt lease was fenced before Coverage persistence"
+                    )
                 self._assert_scope_contract_reference(
                     conn,
                     workflow_run_id=snapshot.workflow_run_id,
@@ -1042,6 +1065,20 @@ class SQLiteContentResearchStore:
                     ),
                 )
                 self._insert_scope_audit_event(conn, event)
+                if execution_context is not None:
+                    self._append_execution_fact_in_transaction(
+                        conn,
+                        execution_unit_id=execution_context.execution_unit_id,
+                        attempt_no=execution_context.attempt_no,
+                        kind="coverage_persisted",
+                        payload={"coverage_snapshot_id": snapshot.id},
+                    )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
         except sqlite3.IntegrityError as exc:
             raise ValueError(
                 f"Coverage snapshot or audit event is append-only and already exists: {snapshot.id}"
@@ -1098,11 +1135,15 @@ class SQLiteContentResearchStore:
         )
         requested_operation = str(decision.get("operation") or operation)
         queries = tuple(str(item) for item in decision.get("supplementary_queries", ()))
-        if resolution not in {
-            "expand_required_constraint",
-            "generate_limited_report",
-            "relax_constraint",
-        } or requested_operation != operation:
+        if (
+            resolution
+            not in {
+                "expand_required_constraint",
+                "generate_limited_report",
+                "relax_constraint",
+            }
+            or requested_operation != operation
+        ):
             raise ValueError("execution unit decision is invalid")
         target_constraint_id = str(decision.get("constraint_id") or "")
         decision_identity = _execution_decision_identity(
@@ -1257,6 +1298,20 @@ class SQLiteContentResearchStore:
             if row["state"] == "failed" or (
                 row["state"] == "running" and row["lease_expires_at"] <= _fmt_dt(now)
             ):
+                if row["state"] == "failed" and row["provider_state"] in {
+                    "terminal_failed",
+                    "outcome_unknown",
+                }:
+                    conn.commit()
+                    return None
+                if row["state"] == "running":
+                    self._append_execution_fact_in_transaction(
+                        conn,
+                        execution_unit_id=execution_unit_id,
+                        attempt_no=int(row["attempt_no"]),
+                        kind="lease_fenced",
+                        payload={"operation": "lease_expired_takeover"},
+                    )
                 if row["state"] == "running" and row["provider_state"] == "requested":
                     conn.execute(
                         """UPDATE content_research_scope_execution_attempts
@@ -1366,6 +1421,68 @@ class SQLiteContentResearchStore:
             )
         return result.rowcount == 1
 
+    def execution_context_is_live(self, context: ExecutionContext, *, operation: str) -> bool:
+        """Validate the exact latest attempt and durably explain a rejected write."""
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            live = self._execution_context_is_live_in_transaction(conn, context)
+            if not live:
+                self._append_execution_fact_in_transaction(
+                    conn,
+                    execution_unit_id=context.execution_unit_id,
+                    attempt_no=context.attempt_no,
+                    kind="lease_fenced",
+                    payload={"operation": operation},
+                )
+            conn.commit()
+            return live
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def get_scope_execution_attempt(
+        self, execution_unit_id: str, attempt_no: int
+    ) -> ScopeExecutionAttempt | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """SELECT * FROM content_research_scope_execution_attempts
+                   WHERE execution_unit_id=? AND attempt_no=?""",
+                (execution_unit_id, attempt_no),
+            ).fetchone()
+        return self._row_to_scope_execution_attempt(row) if row else None
+
+    @staticmethod
+    def _execution_context_is_live_in_transaction(
+        conn: sqlite3.Connection, context: ExecutionContext
+    ) -> bool:
+        row = conn.execute(
+            """SELECT attempt_no FROM content_research_scope_execution_attempts
+               WHERE execution_unit_id=? ORDER BY attempt_no DESC LIMIT 1""",
+            (context.execution_unit_id,),
+        ).fetchone()
+        if row is None or int(row["attempt_no"]) != context.attempt_no:
+            return False
+        live = conn.execute(
+            """SELECT 1 FROM content_research_scope_execution_attempts AS attempt
+               JOIN content_research_scope_execution_units AS unit
+                 ON unit.id=attempt.execution_unit_id
+               WHERE attempt.execution_unit_id=? AND attempt.attempt_no=?
+                 AND attempt.state='running' AND unit.state='running'
+                 AND attempt.lease_token=? AND attempt.lease_expires_at > ?
+                 AND unit.scope_contract_id=?""",
+            (
+                context.execution_unit_id,
+                context.attempt_no,
+                context.lease_token,
+                _fmt_dt(datetime.now(timezone.utc)),
+                context.scope_contract_id,
+            ),
+        ).fetchone()
+        return live is not None
+
     def record_provider_request(
         self,
         *,
@@ -1374,13 +1491,18 @@ class SQLiteContentResearchStore:
         lease_token: str,
         payload: dict[str, object],
     ) -> bool:
+        correlated_payload = {
+            **payload,
+            "execution_unit_id": execution_unit_id,
+            "attempt_no": attempt_no,
+        }
         return self._record_execution_provider_fact(
             execution_unit_id=execution_unit_id,
             attempt_no=attempt_no,
             lease_token=lease_token,
             kind="provider_request_recorded",
             provider_state="requested",
-            payload=payload,
+            payload=correlated_payload,
         )
 
     def record_provider_outcome(
@@ -1392,13 +1514,30 @@ class SQLiteContentResearchStore:
         provider_state: str,
         payload: dict[str, object],
     ) -> bool:
+        provider_state = {
+            "completed": "succeeded",
+            "failed": "terminal_failed",
+        }.get(provider_state, provider_state)
+        if provider_state not in {
+            "succeeded",
+            "retryable_failed",
+            "terminal_failed",
+            "outcome_unknown",
+        }:
+            raise ValueError("invalid provider outcome state")
+        correlated_payload = {
+            **payload,
+            "execution_unit_id": execution_unit_id,
+            "attempt_no": attempt_no,
+            "provider_state": provider_state,
+        }
         return self._record_execution_provider_fact(
             execution_unit_id=execution_unit_id,
             attempt_no=attempt_no,
             lease_token=lease_token,
             kind="provider_outcome_recorded",
             provider_state=provider_state,
-            payload=payload,
+            payload=correlated_payload,
         )
 
     def complete_execution_unit(
@@ -1420,7 +1559,14 @@ class SQLiteContentResearchStore:
                    SET state=?, lease_owner=NULL, lease_token=NULL, lease_expires_at=NULL
                    WHERE execution_unit_id=? AND attempt_no=? AND state='running'
                      AND lease_owner=? AND lease_token=? AND lease_expires_at > ?""",
-                (state, execution_unit_id, attempt_no, owner, lease_token, _fmt_dt(datetime.now(timezone.utc))),
+                (
+                    state,
+                    execution_unit_id,
+                    attempt_no,
+                    owner,
+                    lease_token,
+                    _fmt_dt(datetime.now(timezone.utc)),
+                ),
             )
             if result.rowcount != 1:
                 self._append_execution_fact_in_transaction(
@@ -1709,8 +1855,11 @@ class SQLiteContentResearchStore:
                 self._insert_execution_fact(
                     conn,
                     ExecutionFact(
-                        execution_unit_id=unit.id, attempt_no=0, sequence_no=1,
-                        kind="decision_accepted", payload={"decision": decision_identity.payload},
+                        execution_unit_id=unit.id,
+                        attempt_no=0,
+                        sequence_no=1,
+                        kind="decision_accepted",
+                        payload={"decision": decision_identity.payload},
                     ),
                 )
             self._insert_scope_execution_authorization(conn, authorization)
@@ -1782,7 +1931,21 @@ class SQLiteContentResearchStore:
                 """UPDATE content_research_scope_execution_continuations
                    SET state='pending', lease_owner=NULL, lease_token=NULL,
                        lease_expires_at=NULL, last_error=NULL, updated_at=?
-                   WHERE authorization_id=? AND state='failed'""",
+                   WHERE authorization_id=? AND state='failed'
+                     AND (
+                       execution_unit_id IS NULL
+                       OR EXISTS (
+                         SELECT 1 FROM content_research_scope_execution_attempts AS attempt
+                         WHERE attempt.execution_unit_id =
+                           content_research_scope_execution_continuations.execution_unit_id
+                           AND attempt.attempt_no = (
+                             SELECT MAX(latest.attempt_no)
+                             FROM content_research_scope_execution_attempts AS latest
+                             WHERE latest.execution_unit_id = attempt.execution_unit_id
+                           )
+                           AND attempt.provider_state='retryable_failed'
+                       )
+                     )""",
                 (now, authorization_id),
             )
             row = conn.execute(

@@ -10,7 +10,15 @@ from app.content_research.api_schemas import ContentResearchFormalResearchRespon
 from app.content_research.async_dispatch import AsyncFormalResearchDispatchRepository
 from app.content_research.async_pipeline_store import AsyncDirectionalPersistenceSession
 from app.content_research.persistence_models import StageCheckpointRecord
-from app.content_research.scope_contract import ScopeExecutionContinuation
+from app.content_research.scope_contract import (
+    CoverageSnapshot,
+    ScopeAuditEvent,
+    ScopeConstraint,
+    ScopeExecutionAuthorization,
+    ScopeExecutionContinuation,
+    ScopeQueryGroupInput,
+    build_scope_contract,
+)
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
 from app.content_research.worker import ContentResearchDispatchWorker
 
@@ -46,6 +54,78 @@ class FailingContinuationService(FakeContinuationService):
     async def execute_scope_continuation(self, continuation):
         await super().execute_scope_continuation(continuation)
         raise RuntimeError("authorized supplementary collection failed")
+
+
+class ExecutionUnitContinuationService(FakeFormalResearchService):
+    def __init__(self) -> None:
+        super().__init__()
+        self.executions = []
+
+    async def execute_execution_unit(self, claim, continuation):
+        self.executions.append((claim, continuation))
+        return "completed"
+
+
+def _save_execution_unit_continuation(store: SQLiteContentResearchStore):
+    contract = build_scope_contract(
+        workflow_run_id="run-execution-context",
+        research_plan_id="plan-execution-context",
+        version=1,
+        constraints=(ScopeConstraint("core_object", "core", "shirt", "required"),),
+        query_groups=(ScopeQueryGroupInput("shirt", "shirt"),),
+    )
+    store.save_scope_contract(contract)
+    snapshot = CoverageSnapshot(
+        id="coverage-execution-context",
+        workflow_run_id=contract.workflow_run_id,
+        scope_contract_id=contract.id,
+        scope_contract_version=contract.version,
+        state="awaiting_scope_decision",
+        constraint_counts={},
+        unmet_constraint_ids=("core_object",),
+    )
+    store.save_coverage_snapshot(snapshot)
+    authorization = ScopeExecutionAuthorization(
+        id="authorization-execution-context",
+        workflow_run_id=contract.workflow_run_id,
+        scope_contract_id=contract.id,
+        scope_contract_version=contract.version,
+        coverage_snapshot_id=snapshot.id,
+        resolution="expand_required_constraint",
+        execution_revision=2,
+        state="authorized_collection",
+    )
+    continuation = ScopeExecutionContinuation(
+        id="continuation-execution-context",
+        authorization_id=authorization.id,
+        workflow_run_id=contract.workflow_run_id,
+        execution_revision=2,
+        operation="supplementary_collection",
+        supplementary_queries=("shirt sunscreen",),
+        state="pending",
+    )
+    event = ScopeAuditEvent(
+        id="coverage-resolution-execution-context",
+        workflow_run_id=contract.workflow_run_id,
+        scope_contract_id=contract.id,
+        scope_contract_version=contract.version,
+        event_name="coverage_resolved",
+        payload={
+            "schema_version": "content_research_scope_audit_event_v1",
+            "coverage_snapshot_id": snapshot.id,
+            "resolution": "expand_required_constraint",
+            "constraint_id": "core_object",
+        },
+    )
+    _, _, persisted_authorization, persisted_continuation, _ = (
+        store.resolve_coverage_and_authorize_execution_atomically(
+            snapshot=snapshot,
+            authorization=authorization,
+            continuation=continuation,
+            event=event,
+        )
+    )
+    return persisted_authorization, persisted_continuation
 
 
 @pytest.mark.asyncio
@@ -99,7 +179,10 @@ async def test_completed_dispatch_is_requeued_only_by_explicit_retry(tmp_path):
     )
     assert normal["status"] == "completed"
     retried = await dispatch.enqueue(
-        workflow_run_id="run-retry", provider="xiaohongshu", source_kind="search_result", limit=12,
+        workflow_run_id="run-retry",
+        provider="xiaohongshu",
+        source_kind="search_result",
+        limit=12,
         retry_completed=True,
     )
     assert retried["status"] == "queued"
@@ -132,6 +215,26 @@ async def test_worker_claims_persisted_scope_continuation_with_its_queries(tmp_p
     assert claimed.state == "running"
     persisted = store.list_scope_execution_continuations("run-worker")[0]
     assert persisted.state == "completed"
+
+
+@pytest.mark.asyncio
+async def test_worker_passes_the_claimed_execution_attempt_to_the_service(tmp_path):
+    """Dropping the attempt claim must fail before an authorized continuation can execute."""
+    store = SQLiteContentResearchStore(str(tmp_path / "execution-context.db"))
+    authorization, continuation = _save_execution_unit_continuation(store)
+    service = ExecutionUnitContinuationService()
+    worker = ContentResearchDispatchWorker(store=store, service_factory=lambda: service)
+
+    assert await worker.run_once() is True
+
+    assert len(service.executions) == 1
+    claim, executed = service.executions[0]
+    assert claim.execution_unit_id == authorization.execution_unit_id
+    assert claim.attempt_no == 0
+    assert claim.state == "running"
+    assert claim.lease_owner
+    assert claim.lease_token
+    assert executed.authorization_id == continuation.authorization_id
 
 
 @pytest.mark.asyncio
@@ -213,7 +316,10 @@ async def test_event_wakeup_dispatches_without_waiting_for_recovery_scan(tmp_pat
         # not determine the latency of an interactive confirmation.
         await asyncio.sleep(0.02)
         await dispatch.enqueue(
-            workflow_run_id="run-event", provider="xiaohongshu", source_kind="search_result", limit=9
+            workflow_run_id="run-event",
+            provider="xiaohongshu",
+            source_kind="search_result",
+            limit=9,
         )
         wake_event.set()
 
@@ -267,9 +373,7 @@ async def test_async_pipeline_session_replaces_superseded_checkpoint_on_same_run
     )
     store.save_stage_checkpoint(original)
 
-    session = await AsyncDirectionalPersistenceSession.open(
-        db_path, workflow_run_id="run-recovery"
-    )
+    session = await AsyncDirectionalPersistenceSession.open(db_path, workflow_run_id="run-recovery")
     replacement = StageCheckpointRecord(
         id=original.id,
         schema_version=original.schema_version,
@@ -304,18 +408,10 @@ async def test_stale_async_session_cannot_overwrite_recovered_checkpoint(tmp_pat
         status="superseded",
     )
     store.save_stage_checkpoint(original)
-    first = await AsyncDirectionalPersistenceSession.open(
-        db_path, workflow_run_id="run-recovery"
-    )
-    stale = await AsyncDirectionalPersistenceSession.open(
-        db_path, workflow_run_id="run-recovery"
-    )
-    first.save_stage_checkpoint(
-        replace(original, status="completed", payload={"attempt": 1})
-    )
-    stale.save_stage_checkpoint(
-        replace(original, status="completed", payload={"attempt": 2})
-    )
+    first = await AsyncDirectionalPersistenceSession.open(db_path, workflow_run_id="run-recovery")
+    stale = await AsyncDirectionalPersistenceSession.open(db_path, workflow_run_id="run-recovery")
+    first.save_stage_checkpoint(replace(original, status="completed", payload={"attempt": 1}))
+    stale.save_stage_checkpoint(replace(original, status="completed", payload={"attempt": 2}))
 
     await first.flush()
     with pytest.raises(RuntimeError, match="immutable persistence conflict"):
@@ -324,6 +420,4 @@ async def test_stale_async_session_cannot_overwrite_recovered_checkpoint(tmp_pat
     reloaded = await AsyncDirectionalPersistenceSession.open(
         db_path, workflow_run_id="run-recovery"
     )
-    assert reloaded.get_typed_record(
-        StageCheckpointRecord, original.id
-    ).payload == {"attempt": 1}
+    assert reloaded.get_typed_record(StageCheckpointRecord, original.id).payload == {"attempt": 1}

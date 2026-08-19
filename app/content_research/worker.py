@@ -159,10 +159,22 @@ class ContentResearchDispatchWorker:
                 )
             )
         error: Exception | None = None
+        terminal_state = "completed"
         try:
-            await self._service_factory().execute_scope_continuation(continuation)
+            service = self._service_factory()
+            if unit_claim is not None:
+                terminal_state = await service.execute_execution_unit(unit_claim, continuation)
+            else:
+                await service.execute_scope_continuation(continuation)
         except Exception as exc:
             error = exc
+            terminal_state = "failed"
+            if unit_claim is not None:
+                attempt = self._store.get_scope_execution_attempt(
+                    unit_claim.execution_unit_id, unit_claim.attempt_no
+                )
+                if attempt is not None and attempt.provider_state == "outcome_unknown":
+                    terminal_state = "outcome_unknown"
             logger.exception(
                 "content research scope continuation failed",
                 extra={
@@ -181,20 +193,22 @@ class ContentResearchDispatchWorker:
                 extra={"authorization_id": continuation.authorization_id},
             )
             return True
+        if unit_claim is not None:
+            completed = await self._execution_units.complete_execution_unit(
+                execution_unit_id=unit_claim.execution_unit_id,
+                attempt_no=unit_claim.attempt_no,
+                owner=self._owner,
+                lease_token=str(unit_claim.lease_token or ""),
+                state=terminal_state,
+            )
+            if not completed:
+                return True
         await self._continuations.complete(
             authorization_id=continuation.authorization_id,
             owner=self._owner,
             token=token,
             error=str(error) if error is not None else None,
         )
-        if unit_claim is not None:
-            await self._execution_units.complete_execution_unit(
-                execution_unit_id=unit_claim.execution_unit_id,
-                attempt_no=unit_claim.attempt_no,
-                owner=self._owner,
-                lease_token=str(unit_claim.lease_token or ""),
-                state="failed" if error is not None else "completed",
-            )
         return True
 
     async def _heartbeat_lease(

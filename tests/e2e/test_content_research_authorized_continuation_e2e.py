@@ -27,9 +27,14 @@ class RecordingCapableFakeAdapter(CapableFakeAdapter):
     def __init__(self) -> None:
         super().__init__()
         self.discover_queries: list[str] = []
+        self.discover_contexts: list[dict] = []
+        self.discover_exception: Exception | None = None
 
     async def discover_candidates(self, request):
         self.discover_queries.append(request.query)
+        self.discover_contexts.append(dict(request.context))
+        if self.discover_exception is not None:
+            raise self.discover_exception
         return await super().discover_candidates(request)
 
 
@@ -75,9 +80,7 @@ async def _wait_for_workflow_status(
     client: httpx.AsyncClient, workflow_run_id: str, status: str
 ) -> dict:
     for _ in range(100):
-        summary = (
-            await client.get(f"/content-research/workflows/{workflow_run_id}")
-        ).json()
+        summary = (await client.get(f"/content-research/workflows/{workflow_run_id}")).json()
         if summary["runtime_run"]["status"] == status:
             return summary
         await asyncio.sleep(0.01)
@@ -129,8 +132,7 @@ async def _confirmed_scope_awaiting_coverage(
                 "scope_draft_id": draft["id"],
                 "structure_hash": draft["structure_hash"],
                 "query_groups": [
-                    {"final_query": group["final_query"]}
-                    for group in draft["query_groups"]
+                    {"final_query": group["final_query"]} for group in draft["query_groups"]
                 ],
             },
         },
@@ -180,9 +182,11 @@ async def test_authorized_collection_continuations_run_through_worker_and_pipeli
     continuation_harness, resolution, payload, expected_scope_version
 ):
     client, service, worker, adapter, db_path = continuation_harness
-    workflow_run_id, original_scope, coverage_snapshot_id = await _confirmed_scope_awaiting_coverage(
-        client, worker, db_path
-    )
+    (
+        workflow_run_id,
+        original_scope,
+        coverage_snapshot_id,
+    ) = await _confirmed_scope_awaiting_coverage(client, worker, db_path)
     resolved = await client.post(
         f"/content-research/workflows/{workflow_run_id}/actions",
         json={
@@ -216,7 +220,9 @@ async def test_authorized_collection_continuations_run_through_worker_and_pipeli
     assert continuation_snapshot.execution_authorization_id == authorization["id"]
     assert continuation_snapshot.scope_contract_version == expected_scope_version
     assert continuation_snapshot.source_coverage_snapshot_id
-    assert service._store.list_scope_execution_continuations(workflow_run_id)[0].state == "completed"
+    assert (
+        service._store.list_scope_execution_continuations(workflow_run_id)[0].state == "completed"
+    )
 
 
 @pytest.mark.asyncio
@@ -244,7 +250,9 @@ async def test_limited_continuation_replays_then_publishes_through_real_worker(
     assert len(service._store.list_scope_execution_authorizations(workflow_run_id)) == 1
     assert await worker.run_once()
     await _wait_for_workflow_status(client, workflow_run_id, "succeeded")
-    assert service._store.list_scope_execution_continuations(workflow_run_id)[0].state == "completed"
+    assert (
+        service._store.list_scope_execution_continuations(workflow_run_id)[0].state == "completed"
+    )
     assert authorization["state"] == "authorized_limited_report"
     report = await client.get(f"/content-research/workflows/{workflow_run_id}/lite-report")
     assert report.status_code == 200, report.text
@@ -256,9 +264,11 @@ async def test_failed_expand_replay_uses_a_new_worker_attempt_and_reaches_covera
     continuation_harness,
 ):
     client, service, worker, adapter, db_path = continuation_harness
-    workflow_run_id, original_scope, coverage_snapshot_id = await _confirmed_scope_awaiting_coverage(
-        client, worker, db_path
-    )
+    (
+        workflow_run_id,
+        original_scope,
+        coverage_snapshot_id,
+    ) = await _confirmed_scope_awaiting_coverage(client, worker, db_path)
     adapter.calls.clear()
     adapter.discover_queries.clear()
     adapter.discover_failure_reason = "timeout"
@@ -305,3 +315,165 @@ async def test_failed_expand_replay_uses_a_new_worker_attempt_and_reaches_covera
     assert snapshot is not None
     assert snapshot.execution_authorization_id == authorization["id"]
     assert [scope.version for scope in service._store.list_scope_contracts(workflow_run_id)] == [1]
+    execution_unit_id = authorization["execution_unit_id"]
+    with service._store._connect() as conn:
+        attempts = conn.execute(
+            """SELECT attempt_no, state, provider_state
+               FROM content_research_scope_execution_attempts
+               WHERE execution_unit_id=? ORDER BY attempt_no""",
+            (execution_unit_id,),
+        ).fetchall()
+    assert [tuple(row) for row in attempts] == [
+        (0, "failed", "retryable_failed"),
+        (1, "completed", "succeeded"),
+    ]
+    provider_facts = [
+        fact
+        for fact in service._store.execution_trace(execution_unit_id)
+        if fact.kind in {"provider_request_recorded", "provider_outcome_recorded"}
+    ]
+    assert {fact.attempt_no for fact in provider_facts} == {0, 1}
+    continuation_contexts = [
+        context
+        for context in adapter.discover_contexts
+        if context.get("execution_unit_id") == execution_unit_id
+    ]
+    assert [context["attempt_no"] for context in continuation_contexts] == [0, 1]
+
+
+@pytest.mark.asyncio
+async def test_unknown_provider_outcome_is_durable_and_exact_replay_does_not_call_again(
+    continuation_harness,
+):
+    """Replaying a request whose external outcome is unknown must never duplicate that call."""
+    client, service, worker, adapter, db_path = continuation_harness
+    workflow_run_id, _scope, coverage_snapshot_id = await _confirmed_scope_awaiting_coverage(
+        client, worker, db_path
+    )
+    adapter.discover_queries.clear()
+    adapter.discover_exception = ConnectionError("connection dropped after request send")
+    endpoint = f"/content-research/workflows/{workflow_run_id}/actions"
+    request = {
+        "action": "resolve_coverage",
+        "payload": {
+            "scope_contract_version": 1,
+            "coverage_snapshot_id": coverage_snapshot_id,
+            "resolution": "expand_required_constraint",
+            "constraint_id": "core_object",
+            "supplementary_queries": ["长袖衬衫 防晒"],
+        },
+    }
+
+    first = await client.post(endpoint, json=request)
+    assert first.status_code == 200, first.text
+    unit = first.json()["result"]["execution_unit"]
+    assert await worker.run_once()
+    assert len(adapter.discover_queries) == 1
+
+    durable_unit = service._store.get_scope_execution_unit(unit["id"])
+    assert durable_unit is not None
+    assert durable_unit.state == "outcome_unknown"
+    assert [fact.kind for fact in service._store.execution_trace(unit["id"])][-3:] == [
+        "provider_request_recorded",
+        "provider_outcome_recorded",
+        "outcome_unknown",
+    ]
+
+    replay = await client.post(endpoint, json=request)
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["result"]["execution_unit"] == {
+        "id": unit["id"],
+        "state": "outcome_unknown",
+        "recovery_state": "outcome_unknown",
+    }
+    assert await worker.run_once() is False
+    assert len(adapter.discover_queries) == 1
+
+
+@pytest.mark.asyncio
+async def test_terminal_provider_failure_is_not_requeued_by_exact_replay(
+    continuation_harness,
+):
+    client, service, worker, adapter, db_path = continuation_harness
+    workflow_run_id, _scope, coverage_snapshot_id = await _confirmed_scope_awaiting_coverage(
+        client, worker, db_path
+    )
+    adapter.discover_queries.clear()
+    adapter.discover_failure_reason = "provider_access_rejected"
+    endpoint = f"/content-research/workflows/{workflow_run_id}/actions"
+    request = {
+        "action": "resolve_coverage",
+        "payload": {
+            "scope_contract_version": 1,
+            "coverage_snapshot_id": coverage_snapshot_id,
+            "resolution": "expand_required_constraint",
+            "constraint_id": "core_object",
+            "supplementary_queries": ["长袖衬衫 防晒"],
+        },
+    }
+
+    first = await client.post(endpoint, json=request)
+    assert first.status_code == 200, first.text
+    unit_id = first.json()["result"]["execution_unit"]["id"]
+    assert await worker.run_once()
+    assert len(adapter.discover_queries) == 1
+    attempt = service._store.get_scope_execution_attempt(unit_id, 0)
+    assert attempt is not None
+    assert (attempt.state, attempt.provider_state) == ("failed", "terminal_failed")
+
+    replay = await client.post(endpoint, json=request)
+    assert replay.status_code == 200, replay.text
+    assert await worker.run_once() is False
+    assert len(adapter.discover_queries) == 1
+
+
+@pytest.mark.asyncio
+async def test_stale_execution_claim_is_fenced_before_any_continuation_artifact(
+    continuation_harness,
+):
+    """A superseded worker claim must fail before task recovery or task creation writes."""
+    client, service, worker, adapter, db_path = continuation_harness
+    workflow_run_id, _scope, coverage_snapshot_id = await _confirmed_scope_awaiting_coverage(
+        client, worker, db_path
+    )
+    adapter.discover_queries.clear()
+    response = await client.post(
+        f"/content-research/workflows/{workflow_run_id}/actions",
+        json={
+            "action": "resolve_coverage",
+            "payload": {
+                "scope_contract_version": 1,
+                "coverage_snapshot_id": coverage_snapshot_id,
+                "resolution": "expand_required_constraint",
+                "constraint_id": "core_object",
+                "supplementary_queries": ["长袖衬衫 防晒"],
+            },
+        },
+    )
+    assert response.status_code == 200, response.text
+    authorization = response.json()["result"]["execution_authorization"]
+    unit_id = authorization["execution_unit_id"]
+    continuation = service._store.list_scope_execution_continuations(workflow_run_id)[0]
+    claim_a = service._store.claim_execution_unit(
+        execution_unit_id=unit_id, owner="worker-a", lease_seconds=0
+    )
+    assert claim_a is not None
+    claim_b = service._store.claim_execution_unit(
+        execution_unit_id=unit_id, owner="worker-b", lease_seconds=120
+    )
+    assert claim_b is not None
+    task_ids_before = {
+        task.id for task in service._store.list_subagent_tasks_for_workflow(workflow_run_id)
+    }
+
+    with pytest.raises(Exception, match="lease"):
+        await service.execute_execution_unit(claim_a, continuation)
+
+    assert {
+        task.id for task in service._store.list_subagent_tasks_for_workflow(workflow_run_id)
+    } == task_ids_before
+    assert adapter.discover_queries == []
+    assert any(
+        fact.attempt_no == claim_a.attempt_no and fact.kind == "lease_fenced"
+        for fact in service._store.execution_trace(unit_id)
+    )

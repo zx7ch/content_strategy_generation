@@ -310,12 +310,14 @@ class ScopeExecutionUnit:
             raise ValueError("canonical scope execution unit identity is required")
 
     @property
-    def recovery_state(self) -> Literal["replayable", "manual_recovery_required"]:
-        return (
-            "replayable"
-            if self.identity_state == "canonical"
-            else "manual_recovery_required"
-        )
+    def recovery_state(
+        self,
+    ) -> Literal["replayable", "outcome_unknown", "manual_recovery_required"]:
+        if self.identity_state != "canonical":
+            return "manual_recovery_required"
+        if self.state == "outcome_unknown":
+            return "outcome_unknown"
+        return "replayable"
 
 
 @dataclass(frozen=True)
@@ -336,6 +338,29 @@ class ScopeExecutionAttempt:
             raise ValueError("scope execution attempt identity is required")
         if self.state not in {"pending", "running", "completed", "failed", "outcome_unknown"}:
             raise ValueError("invalid scope execution attempt state")
+
+
+@dataclass(frozen=True)
+class ExecutionContext:
+    """Immutable authority carried by one worker attempt through every write."""
+
+    execution_unit_id: str
+    attempt_no: int
+    lease_token: str = field(repr=False)
+    scope_contract_id: str
+
+    def __post_init__(self) -> None:
+        if (
+            not self.execution_unit_id.strip()
+            or self.attempt_no < 0
+            or not self.lease_token.strip()
+            or not self.scope_contract_id.strip()
+        ):
+            raise ValueError("execution context identity is required")
+
+
+class ExecutionLeaseFencedError(RuntimeError):
+    """Raised when an execution attempt no longer owns its live lease."""
 
 
 @dataclass(frozen=True)
@@ -368,7 +393,9 @@ class ExecutionFact:
 
 def _freeze_execution_payload(value: object) -> object:
     if isinstance(value, Mapping):
-        return MappingProxyType({str(key): _freeze_execution_payload(item) for key, item in value.items()})
+        return MappingProxyType(
+            {str(key): _freeze_execution_payload(item) for key, item in value.items()}
+        )
     if isinstance(value, list | tuple):
         return tuple(_freeze_execution_payload(item) for item in value)
     return value

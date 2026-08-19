@@ -15,6 +15,7 @@ from app.content_research.models import (
     TraceRecord,
     utcnow,
 )
+from app.content_research.scope_contract import ExecutionContext, ExecutionLeaseFencedError
 from app.content_research.sources import SourceAdapterRegistry
 from app.content_research.sources.base import (
     CollectCommentsRequest,
@@ -29,6 +30,15 @@ from app.content_research.workflow.directional_pipeline import (
     OperationOutcomeUnknownError,
     QueryGroup,
 )
+
+
+def _provider_execution_context(context: ExecutionContext | None) -> dict[str, object]:
+    if context is None:
+        return {}
+    return {
+        "execution_unit_id": context.execution_unit_id,
+        "attempt_no": context.attempt_no,
+    }
 
 
 class SubagentTaskRouter:
@@ -107,15 +117,24 @@ class SubagentTaskRouter:
         source_kind: str = "search_result",
         limit: int = 10,
         source_result: SourceOperationResult | None = None,
+        execution_context: ExecutionContext | None = None,
     ) -> SubagentTaskRecord:
         if self._store is None:
             raise ValueError("SubagentTaskRouter requires a store to execute tasks")
+        self._require_live_execution(execution_context, "subagent_task_started")
         agent_name = "DirectionalExecutionPipeline"
         trace = self._ensure_trace(task, trace_id)
         sequence_no = self._next_observation_sequence(trace.id)
         started = replace(task, status="running", updated_at=utcnow())
         self._store.save_subagent_task(started)
-        self._append_event(trace, sequence_no, "task_started", "subagent_task_started", started, {"agent_name": agent_name})
+        self._append_event(
+            trace,
+            sequence_no,
+            "task_started",
+            "subagent_task_started",
+            started,
+            {"agent_name": agent_name},
+        )
         sequence_no += 1
         self._append_event(
             trace,
@@ -129,9 +148,14 @@ class SubagentTaskRouter:
 
         try:
             result = await self._execute_direction_pipeline(
-                task=started, provider=provider, limit=limit, source_result=source_result,
+                task=started,
+                provider=provider,
+                limit=limit,
+                source_result=source_result,
+                execution_context=execution_context,
             )
         except OperationOutcomeUnknownError as exc:
+            self._require_live_execution(execution_context, "subagent_outcome_unknown")
             pending = self._terminal_task(
                 started,
                 status="outcome_unknown",
@@ -139,7 +163,12 @@ class SubagentTaskRouter:
                     status="outcome_unknown",
                     findings=[],
                     evidence_records=[],
-                    missing_evidence=[{"reason": "collection_outcome_pending_confirmation", "operation": exc.operation}],
+                    missing_evidence=[
+                        {
+                            "reason": "collection_outcome_pending_confirmation",
+                            "operation": exc.operation,
+                        }
+                    ],
                     failure_reason="collection_outcome_pending_confirmation",
                     metadata={
                         "recovery_action": "confirm_collection_outcome_before_retry",
@@ -153,10 +182,15 @@ class SubagentTaskRouter:
                 "task_pending_confirmation",
                 "subagent_task_outcome_unknown",
                 pending,
-                {"error_message": str(exc), "recoverable": True, "recovery_action": "confirm_collection_outcome_before_retry"},
+                {
+                    "error_message": str(exc),
+                    "recoverable": True,
+                    "recovery_action": "confirm_collection_outcome_before_retry",
+                },
             )
             return pending
         except Exception as exc:
+            self._require_live_execution(execution_context, "subagent_failed")
             failed = self._terminal_task(started, status="failed", result=None, error=str(exc))
             self._append_event(
                 trace,
@@ -168,13 +202,20 @@ class SubagentTaskRouter:
             )
             return failed
 
+        self._require_live_execution(execution_context, "subagent_terminal")
         sequence_no = self._append_result_events(trace, sequence_no, started, result)
         terminal = self._terminal_task(started, status=result.status, result=result)
-        terminal_event = "subagent_task_completed" if result.status in {"completed", "partial_completed"} else "subagent_task_failed"
+        terminal_event = (
+            "subagent_task_completed"
+            if result.status in {"completed", "partial_completed"}
+            else "subagent_task_failed"
+        )
         self._append_event(
             trace,
             sequence_no,
-            "task_completed" if result.status in {"completed", "partial_completed"} else "task_failed",
+            "task_completed"
+            if result.status in {"completed", "partial_completed"}
+            else "task_failed",
             terminal_event,
             terminal,
             {
@@ -187,7 +228,13 @@ class SubagentTaskRouter:
         return terminal
 
     async def _execute_direction_pipeline(
-        self, *, task: SubagentTaskRecord, provider: str, limit: int, source_result: SourceOperationResult | None,
+        self,
+        *,
+        task: SubagentTaskRecord,
+        provider: str,
+        limit: int,
+        source_result: SourceOperationResult | None,
+        execution_context: ExecutionContext | None = None,
     ) -> SubagentExecutionResult:
         input_payload = dict(task.payload.get("input_payload") or {})
         scope_execution = dict(input_payload.get("scope_execution") or {})
@@ -198,7 +245,9 @@ class SubagentTaskRouter:
         snapshot = self._store.get_run_policy_snapshot_for_workflow(task.workflow_run_id)
         if snapshot is None:
             raise ValueError("direction task requires run policy snapshot")
-        contracts = {item.direction_id: item for item in self._store.list_direction_contracts(snapshot.id)}
+        contracts = {
+            item.direction_id: item for item in self._store.list_direction_contracts(snapshot.id)
+        }
         contract = contracts.get(direction_id)
         if contract is None:
             raise ValueError(f"direction contract not found: {direction_id}")
@@ -211,16 +260,31 @@ class SubagentTaskRouter:
             if source_result is not None:
                 result = source_result
             else:
-                result = await adapter.discover_candidates(DiscoverCandidatesRequest(
-                    workflow_run_id=task.workflow_run_id, query=group.query, limit=min(limit, group.candidate_limit), sort=group.sort, cursor=group.cursor,
-                    context={"subagent_task_id": task.id, "direction_id": direction_id, "query_group_id": group.id},
-                ))
+                result = await adapter.discover_candidates(
+                    DiscoverCandidatesRequest(
+                        workflow_run_id=task.workflow_run_id,
+                        query=group.query,
+                        limit=min(limit, group.candidate_limit),
+                        sort=group.sort,
+                        cursor=group.cursor,
+                        context={
+                            "subagent_task_id": task.id,
+                            "direction_id": direction_id,
+                            "query_group_id": group.id,
+                            **_provider_execution_context(execution_context),
+                        },
+                    )
+                )
             return SourceOperationResult(
                 provider=result.provider,
                 operation=result.operation,
                 source_kind=result.source_kind,
                 status=result.status,
-                items=[{**item, "query_priority": group.priority} for item in result.items if isinstance(item, dict)],
+                items=[
+                    {**item, "query_priority": group.priority}
+                    for item in result.items
+                    if isinstance(item, dict)
+                ],
                 failure_reason=result.failure_reason,
                 cookie_status=result.cookie_status,
                 next_cursor=result.next_cursor,
@@ -231,37 +295,65 @@ class SubagentTaskRouter:
             )
 
         async def collect_detail(candidate: dict[str, Any]) -> SourceOperationResult:
-            return await adapter.collect_note_detail(CollectNoteDetailRequest(
-                workflow_run_id=task.workflow_run_id,
-                note_id=str(candidate.get("canonical_id") or ""), note_url=str(candidate.get("source_url") or ""),
-                required_fields=contract.required_note_fields,
-                context={"subagent_task_id": task.id, "direction_id": direction_id},
-            ))
+            return await adapter.collect_note_detail(
+                CollectNoteDetailRequest(
+                    workflow_run_id=task.workflow_run_id,
+                    note_id=str(candidate.get("canonical_id") or ""),
+                    note_url=str(candidate.get("source_url") or ""),
+                    required_fields=contract.required_note_fields,
+                    context={
+                        "subagent_task_id": task.id,
+                        "direction_id": direction_id,
+                        **_provider_execution_context(execution_context),
+                    },
+                )
+            )
 
         async def collect_comments(candidate: dict[str, Any]) -> SourceOperationResult:
-            return await adapter.collect_comments(CollectCommentsRequest(
-                workflow_run_id=task.workflow_run_id,
-                parent_note_id=str(candidate.get("canonical_id") or ""),
-                note_url=str(candidate.get("source_url") or ""),
-                limit=int(candidate.get("_collection_limit") or policy.comment_limit),
-                cursor=candidate.get("_collection_cursor"),
-                top_level_only=bool(candidate.get("_collection_top_level_only", policy.comment_top_level_only)),
-                reply_depth_limit=int(candidate.get("_collection_reply_depth_limit", policy.comment_reply_depth_limit)),
-                context={"subagent_task_id": task.id, "direction_id": direction_id, "sample_policy_id": policy.id},
-            ))
+            return await adapter.collect_comments(
+                CollectCommentsRequest(
+                    workflow_run_id=task.workflow_run_id,
+                    parent_note_id=str(candidate.get("canonical_id") or ""),
+                    note_url=str(candidate.get("source_url") or ""),
+                    limit=int(candidate.get("_collection_limit") or policy.comment_limit),
+                    cursor=candidate.get("_collection_cursor"),
+                    top_level_only=bool(
+                        candidate.get("_collection_top_level_only", policy.comment_top_level_only)
+                    ),
+                    reply_depth_limit=int(
+                        candidate.get(
+                            "_collection_reply_depth_limit", policy.comment_reply_depth_limit
+                        )
+                    ),
+                    context={
+                        "subagent_task_id": task.id,
+                        "direction_id": direction_id,
+                        "sample_policy_id": policy.id,
+                        **_provider_execution_context(execution_context),
+                    },
+                )
+            )
 
         run = await (
             await DirectionalExecutionPipeline.open_async(
-                self._store._db_path, workflow_run_id=task.workflow_run_id
+                self._store._db_path,
+                workflow_run_id=task.workflow_run_id,
+                execution_context=execution_context,
             )
         ).execute(
-            workflow_run_id=task.workflow_run_id, subagent_task_id=task.id, direction_id=direction_id,
+            workflow_run_id=task.workflow_run_id,
+            subagent_task_id=task.id,
+            direction_id=direction_id,
             subject=str(input_payload.get("confirmed_subject") or ""),
             questions=[str(item) for item in direction.get("questions") or []],
             competitors=[str(item) for item in input_payload.get("competitors") or []],
-            author_cap=policy.author_cap, minimum_samples=policy.minimum_samples,
-            minimum_independent_authors=policy.minimum_independent_authors, detail_fetch_cap=policy.detail_fetch_cap, snapshot_id=snapshot.id,
-            discover=discover, collect_detail=collect_detail,
+            author_cap=policy.author_cap,
+            minimum_samples=policy.minimum_samples,
+            minimum_independent_authors=policy.minimum_independent_authors,
+            detail_fetch_cap=policy.detail_fetch_cap,
+            snapshot_id=snapshot.id,
+            discover=discover,
+            collect_detail=collect_detail,
             collect_comments=collect_comments if contract.required_comment_fields else None,
             required_comment_fields=contract.required_comment_fields,
             comment_limit=policy.comment_limit,
@@ -269,27 +361,32 @@ class SubagentTaskRouter:
             comment_reply_depth_limit=policy.comment_reply_depth_limit,
             comment_policy_id=policy.id,
             run_as_of_at=snapshot.run_as_of_at,
-            admission_contract=contract, admission_policy=policy, policy_snapshot=snapshot,
-            execution_authorization_id=str(
-                scope_execution.get("authorization_id") or ""
-            )
-            or None,
+            admission_contract=contract,
+            admission_policy=policy,
+            policy_snapshot=snapshot,
+            execution_authorization_id=str(scope_execution.get("authorization_id") or "") or None,
             execution_revision=int(scope_execution.get("execution_revision") or 1),
             supplementary_queries=tuple(
                 str(item)
                 for item in scope_execution.get("supplementary_queries") or ()
                 if str(item).strip()
             ),
+            execution_context=execution_context,
         )
         status = (
             "failed"
             if run.blocking_failure_code
-            else "completed" if run.selection.status == "complete" else "partial_completed"
+            else "completed"
+            if run.selection.status == "complete"
+            else "partial_completed"
         )
         return SubagentExecutionResult(
             status=status,
-            findings=[], evidence_records=[],
-            missing_evidence=[] if run.selection.status == "complete" else [{"reason": run.selection.status}],
+            findings=[],
+            evidence_records=[],
+            missing_evidence=[]
+            if run.selection.status == "complete"
+            else [{"reason": run.selection.status}],
             failure_reason=run.blocking_failure_code,
             metadata={
                 "direction_id": direction_id,
@@ -298,6 +395,15 @@ class SubagentTaskRouter:
                 "blocking_failure_code": run.blocking_failure_code,
             },
         )
+
+    def _require_live_execution(self, context: ExecutionContext | None, operation: str) -> None:
+        if context is None:
+            return
+        assert self._store is not None
+        if not self._store.execution_context_is_live(context, operation=operation):
+            raise ExecutionLeaseFencedError(
+                f"execution attempt lease was fenced before {operation}"
+            )
 
     def _ensure_trace(self, task: SubagentTaskRecord, trace_id: str | None) -> TraceRecord:
         assert self._store is not None
@@ -441,8 +547,20 @@ class SubagentTaskRouter:
         subject = str(input_payload.get("confirmed_subject") or "").strip()
         question = str(input_payload.get("custom_research_question") or "").strip()
         label = str(direction.get("label") or "").strip()
-        questions = [str(item).strip() for item in direction.get("questions") or [] if str(item).strip()]
-        competitors = [str(item).strip() for item in input_payload.get("competitors") or [] if str(item).strip()]
+        questions = [
+            str(item).strip() for item in direction.get("questions") or [] if str(item).strip()
+        ]
+        competitors = [
+            str(item).strip()
+            for item in input_payload.get("competitors") or []
+            if str(item).strip()
+        ]
         direction_focus = " ".join(questions[:2]) or label
-        competitor_focus = " ".join(competitors[:2]) if str(direction.get("id") or "") == "competitor_discovery" else ""
-        return " ".join(item for item in [subject, question, label, direction_focus, competitor_focus] if item).strip()
+        competitor_focus = (
+            " ".join(competitors[:2])
+            if str(direction.get("id") or "") == "competitor_discovery"
+            else ""
+        )
+        return " ".join(
+            item for item in [subject, question, label, direction_focus, competitor_focus] if item
+        ).strip()

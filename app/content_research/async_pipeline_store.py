@@ -8,6 +8,7 @@ boundaries.  Provider-operation facts are flushed before and after calls.
 from __future__ import annotations
 
 from collections import defaultdict
+from datetime import datetime, timezone
 from typing import TypeVar
 
 import aiosqlite
@@ -17,7 +18,11 @@ from app.content_research.persistence_models import (
     StageCheckpointRecord,
     TypedPersistenceRecord,
 )
-from app.content_research.scope_contract import ScopeAuditEvent
+from app.content_research.scope_contract import (
+    ExecutionContext,
+    ExecutionLeaseFencedError,
+    ScopeAuditEvent,
+)
 from app.content_research.stores.sqlite_store import (
     _TYPED_RECORD_TABLES,
     _dumps,
@@ -32,18 +37,25 @@ T = TypeVar("T", bound=TypedPersistenceRecord)
 class AsyncDirectionalPersistenceSession:
     """In-memory typed-record view backed by asynchronous, explicit flushes."""
 
-    def __init__(self, db_path: str) -> None:
+    def __init__(self, db_path: str, *, execution_context: ExecutionContext | None = None) -> None:
         self._db_path = db_path
-        self._records: dict[type[TypedPersistenceRecord], dict[str, TypedPersistenceRecord]] = defaultdict(dict)
+        self._execution_context = execution_context
+        self._records: dict[type[TypedPersistenceRecord], dict[str, TypedPersistenceRecord]] = (
+            defaultdict(dict)
+        )
         self._pending: list[TypedPersistenceRecord] = []
         self._pending_scope_events: list[ScopeAuditEvent] = []
         self._scope_event_ids: set[str] = set()
 
     @classmethod
     async def open(
-        cls, db_path: str, *, workflow_run_id: str | None = None
+        cls,
+        db_path: str,
+        *,
+        workflow_run_id: str | None = None,
+        execution_context: ExecutionContext | None = None,
     ) -> AsyncDirectionalPersistenceSession:
-        session = cls(db_path)
+        session = cls(db_path, execution_context=execution_context)
         async with aiosqlite.connect(db_path) as conn:
             conn.row_factory = aiosqlite.Row
             for record_type, (table, fields) in _TYPED_RECORD_TABLES.items():
@@ -53,7 +65,9 @@ class AsyncDirectionalPersistenceSession:
                         (workflow_run_id,),
                     )
                 else:
-                    cursor = await conn.execute(f"SELECT * FROM {table} ORDER BY created_at ASC, id ASC")
+                    cursor = await conn.execute(
+                        f"SELECT * FROM {table} ORDER BY created_at ASC, id ASC"
+                    )
                 for row in await cursor.fetchall():
                     session._records[record_type][str(row["id"])] = session._row_to_record(
                         row, record_type, fields
@@ -63,9 +77,7 @@ class AsyncDirectionalPersistenceSession:
                 + (" WHERE workflow_run_id=?" if workflow_run_id is not None else ""),
                 (workflow_run_id,) if workflow_run_id is not None else (),
             )
-            session._scope_event_ids = {
-                str(row["id"]) for row in await cursor.fetchall()
-            }
+            session._scope_event_ids = {str(row["id"]) for row in await cursor.fetchall()}
         return session
 
     def get_typed_record(self, record_type: type[T], record_id: str) -> T | None:
@@ -140,25 +152,80 @@ class AsyncDirectionalPersistenceSession:
         pending, self._pending = self._pending, []
         pending_scope_events, self._pending_scope_events = self._pending_scope_events, []
         async with aiosqlite.connect(self._db_path) as conn:
+            conn.row_factory = aiosqlite.Row
             await conn.execute("BEGIN IMMEDIATE")
             try:
+                if self._execution_context is not None:
+                    context = self._execution_context
+                    cursor = await conn.execute(
+                        """SELECT 1 FROM content_research_scope_execution_attempts AS attempt
+                           JOIN content_research_scope_execution_units AS unit
+                             ON unit.id=attempt.execution_unit_id
+                           WHERE attempt.execution_unit_id=? AND attempt.attempt_no=?
+                             AND attempt.attempt_no=(
+                               SELECT MAX(latest.attempt_no)
+                               FROM content_research_scope_execution_attempts AS latest
+                               WHERE latest.execution_unit_id=attempt.execution_unit_id
+                             )
+                             AND attempt.state='running' AND unit.state='running'
+                             AND attempt.lease_token=? AND attempt.lease_expires_at > ?
+                             AND unit.scope_contract_id=?""",
+                        (
+                            context.execution_unit_id,
+                            context.attempt_no,
+                            context.lease_token,
+                            _fmt_dt(datetime.now(timezone.utc)),
+                            context.scope_contract_id,
+                        ),
+                    )
+                    if await cursor.fetchone() is None:
+                        sequence_cursor = await conn.execute(
+                            """SELECT COALESCE(MAX(sequence_no), 0) + 1
+                               FROM content_research_execution_facts
+                               WHERE execution_unit_id=? AND attempt_no=?""",
+                            (context.execution_unit_id, context.attempt_no),
+                        )
+                        sequence_no = int((await sequence_cursor.fetchone())[0])
+                        await conn.execute(
+                            """INSERT INTO content_research_execution_facts
+                               (execution_unit_id, attempt_no, sequence_no, kind,
+                                payload_json, created_at)
+                               VALUES (?, ?, ?, 'lease_fenced', ?, ?)""",
+                            (
+                                context.execution_unit_id,
+                                context.attempt_no,
+                                sequence_no,
+                                _dumps({"operation": "directional_persistence_flush"}),
+                                _fmt_dt(datetime.now(timezone.utc)),
+                            ),
+                        )
+                        await conn.commit()
+                        raise ExecutionLeaseFencedError(
+                            "execution attempt lease was fenced before directional persistence"
+                        )
                 for record in pending:
                     table, fields = _TYPED_RECORD_TABLES[type(record)]
                     values = [getattr(record, field) for field in fields]
                     values = [
-                        _fmt_dt(value) if field in {"started_at", "finished_at"} and value else value
+                        _fmt_dt(value)
+                        if field in {"started_at", "finished_at"} and value
+                        else value
                         for field, value in zip(fields, values, strict=True)
                     ]
-                    columns = ("id", "schema_version", *fields, "payload_json", "metadata_json", "created_at")
+                    columns = (
+                        "id",
+                        "schema_version",
+                        *fields,
+                        "payload_json",
+                        "metadata_json",
+                        "created_at",
+                    )
                     if isinstance(record, StageCheckpointRecord):
                         updates = ", ".join(
-                            f"{column}=excluded.{column}"
-                            for column in columns
-                            if column != "id"
+                            f"{column}=excluded.{column}" for column in columns if column != "id"
                         )
                         conflict_clause = (
-                            f"DO UPDATE SET {updates} "
-                            f"WHERE {table}.status='superseded'"
+                            f"DO UPDATE SET {updates} WHERE {table}.status='superseded'"
                         )
                     else:
                         conflict_clause = "DO NOTHING"
@@ -211,7 +278,9 @@ class AsyncDirectionalPersistenceSession:
         row: aiosqlite.Row, record_type: type[TypedPersistenceRecord], fields: tuple[str, ...]
     ) -> TypedPersistenceRecord:
         values = {
-            field: _parse_dt(row[field]) if field in {"started_at", "finished_at"} and row[field] else row[field]
+            field: _parse_dt(row[field])
+            if field in {"started_at", "finished_at"} and row[field]
+            else row[field]
             for field in fields
         }
         return record_type(
