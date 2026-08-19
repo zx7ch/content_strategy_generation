@@ -220,6 +220,7 @@ class ContentResearchSourceCollectionRequest(BaseModel):
 
 class ContentResearchSourceCollectionResponse(BaseModel):
     schema_version: str = CONTENT_RESEARCH_API_SCHEMA_VERSION
+    execution_authority: Literal["diagnostic_only"] = "diagnostic_only"
     workflow_run_id: str
     provider: str
     source_kind: str

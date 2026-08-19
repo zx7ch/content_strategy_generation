@@ -1297,6 +1297,7 @@ async def collect_content_research_sources(
     payload: ContentResearchSourceCollectionRequest,
     request: Request,
 ) -> ContentResearchSourceCollectionResponse:
+    """Return diagnostic-only source data outside formal evidence execution."""
     service = _get_content_research_service(request)
     try:
         return await service.collect_sources(workflow_run_id=workflow_run_id, request=payload)

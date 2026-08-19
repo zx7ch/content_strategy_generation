@@ -38,3 +38,22 @@ pytest tests/e2e/test_content_research_scope_api.py tests/e2e/test_content_resea
 The existing source-collection API coverage already verifies that direct
 collection leaves the runtime running and formal subagent task queued; Task 3
 keeps that route deliberately outside the formal evidence chain.
+
+## Fix round 1
+
+- A successor Scope with no coverage snapshot is no longer treated as initial
+  when a persisted continuation authorization owns that Scope. Legacy formal
+  actions require the authorization in that state.
+- `execute_scope_continuation` now reloads the continuation by authorization,
+  compares its immutable command fields before use, and rejects completed or
+  failed command replays.
+- The public source-collection response explicitly declares
+  `execution_authority: diagnostic_only`; regression coverage proves it writes
+  no directional evidence packets, Coverage snapshots, or report publications.
+
+Focused verification after this fix round:
+
+```text
+pytest tests/e2e/test_content_research_scope_api.py tests/e2e/test_content_research_report_publication_timeline_api.py tests/unit/test_content_research_dispatch_worker.py -q
+40 passed in 3.73s
+```

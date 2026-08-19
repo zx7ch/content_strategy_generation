@@ -9,9 +9,16 @@ import pytest
 
 from app.api.routes.router import app
 from app.content_research.api_schemas import ContentResearchSourceCollectionRequest
+from app.content_research.async_dispatch import AsyncScopeExecutionContinuationRepository
+from app.content_research.persistence_models import (
+    DirectionalEvidencePacketRecord,
+    ReportPublicationRecord,
+)
 from app.content_research.presearch.service import PresearchService
 from app.content_research.scope_contract import CoverageSnapshot, ScopeAuditEvent
 from app.content_research.service import ContentResearchService, ContentResearchValidationError
+from app.content_research.sources import SourceAdapterRegistry
+from app.content_research.sources.base import SourceOperationResult
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
 from app.services.llm.types import LLMResponse, TokenUsage
 from tests.e2e.test_content_research_brief_confirm_api import WORKSPACE_HEADERS, FakeRuntime
@@ -60,6 +67,18 @@ class ScopeFakeRuntime(FakeRuntime):
         )
 
 
+class ScopeDiagnosticSourceAdapter:
+    async def discover_candidates(self, request):
+        return SourceOperationResult(
+            provider="xiaohongshu",
+            operation="discover_candidates",
+            source_kind="search_result",
+            status="completed",
+            items=[],
+            metadata={"request_query": request.query},
+        )
+
+
 @pytest.fixture()
 async def scope_client(tmp_path):
     original = getattr(app.state, "content_research_service", None)
@@ -70,6 +89,7 @@ async def scope_client(tmp_path):
             SummerCommuteFakeLLM(), first_feedback_timeout_seconds=0.05, hard_cutoff_seconds=0.1
         ),
         workflow_runtime=ScopeFakeRuntime(db_path),
+        source_registry=SourceAdapterRegistry({"xiaohongshu": ScopeDiagnosticSourceAdapter()}),
     )
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(
@@ -252,6 +272,117 @@ async def test_awaiting_scope_decision_rejects_legacy_execution_entrypoints(scop
         f"/content-research/workflows/{workflow_run_id}/lite-report"
     )
     assert report.status_code == 404, report.text
+
+
+@pytest.mark.asyncio
+async def test_relax_successor_requires_its_persisted_continuation_authority(scope_client, monkeypatch):
+    workflow_run_id, _contract = await _confirmed_scope_with_unmet_season(scope_client)
+    resolution = await scope_client.post(
+        f"/content-research/workflows/{workflow_run_id}/actions",
+        json={
+            "action": "resolve_coverage",
+            "payload": {
+                "scope_contract_version": 1,
+                "resolution": "relax_constraint",
+                "constraint_id": "season",
+            },
+        },
+    )
+    assert resolution.status_code == 200
+    assert resolution.json()["result"]["scope_contract"]["version"] == 2
+
+    legacy = await scope_client.post(
+        f"/content-research/workflows/{workflow_run_id}/actions",
+        json={
+            "action": "start_formal_research",
+            "payload": {"provider": "xiaohongshu", "source_kind": "search_result", "limit": 20},
+        },
+    )
+    assert legacy.status_code == 422, legacy.text
+    assert "scope_execution_authorization_required" in legacy.text
+
+    service = app.state.content_research_service
+    captured = {}
+
+    async def capture_execution(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(service, "_execute_formal_research", capture_execution)
+    continuation = service._store.list_scope_execution_continuations(workflow_run_id)[0]
+    await service.execute_scope_continuation(continuation)
+    assert captured["execution_authorization"].id == continuation.authorization_id
+
+
+@pytest.mark.asyncio
+async def test_scope_continuation_rejects_forged_command_and_completed_replay(scope_client):
+    workflow_run_id, _contract = await _confirmed_scope_with_unmet_season(scope_client)
+    resolution = await scope_client.post(
+        f"/content-research/workflows/{workflow_run_id}/actions",
+        json={
+            "action": "resolve_coverage",
+            "payload": {
+                "scope_contract_version": 1,
+                "resolution": "expand_required_constraint",
+                "constraint_id": "season",
+                "supplementary_queries": ["夏季 防晒 长袖衬衫"],
+            },
+        },
+    )
+    assert resolution.status_code == 200
+    service = app.state.content_research_service
+    persisted = service._store.list_scope_execution_continuations(workflow_run_id)[0]
+    forged = replace(persisted, supplementary_queries=("伪造检索词",))
+
+    with pytest.raises(ContentResearchValidationError, match="persisted command"):
+        await service.execute_scope_continuation(forged)
+
+    repository = AsyncScopeExecutionContinuationRepository(service._store._db_path)
+    claimed = await repository.claim_next(owner="scope-test")
+    assert claimed is not None
+    assert await repository.complete(
+        authorization_id=claimed.authorization_id,
+        owner="scope-test",
+        token=str(claimed.lease_token),
+    )
+    completed = service._store.list_scope_execution_continuations(workflow_run_id)[0]
+    with pytest.raises(ContentResearchValidationError, match="not claimable"):
+        await service.execute_scope_continuation(completed)
+
+
+@pytest.mark.asyncio
+async def test_direct_source_collection_is_diagnostic_only(scope_client):
+    workflow_run_id, contract = await _confirmed_scope_with_unmet_season(scope_client)
+    store = app.state.content_research_service._store
+    coverage_before = store.get_coverage_snapshot(workflow_run_id, version=contract["version"])
+    packet_ids_before = {
+        item.id
+        for item in store.list_typed_records(DirectionalEvidencePacketRecord)
+        if item.workflow_run_id == workflow_run_id
+    }
+    publication_ids_before = {
+        item.id
+        for item in store.list_typed_records(ReportPublicationRecord)
+        if item.workflow_run_id == workflow_run_id
+    }
+
+    response = await scope_client.post(
+        f"/content-research/workflows/{workflow_run_id}/source-collections",
+        json={"query": "夏季 长袖衬衫", "limit": 5},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["execution_authority"] == "diagnostic_only"
+    assert store.get_coverage_snapshot(workflow_run_id, version=contract["version"]) == coverage_before
+    assert {
+        item.id
+        for item in store.list_typed_records(DirectionalEvidencePacketRecord)
+        if item.workflow_run_id == workflow_run_id
+    } == packet_ids_before
+    assert {
+        item.id
+        for item in store.list_typed_records(ReportPublicationRecord)
+        if item.workflow_run_id == workflow_run_id
+    } == publication_ids_before
 
 
 async def _authorized_continuation_snapshot(

@@ -3389,6 +3389,11 @@ class ContentResearchService:
         coverage = self._store.get_coverage_snapshot(
             workflow_run_id, version=contract.version
         )
+        has_persisted_continuation_authority = any(
+            item.scope_contract_id == contract.id
+            and item.scope_contract_version == contract.version
+            for item in self._store.list_scope_execution_authorizations(workflow_run_id)
+        )
 
         if execution_authorization is not None:
             persisted = self._store.get_scope_execution_authorization(
@@ -3405,7 +3410,13 @@ class ContentResearchService:
                     "scope_execution_authorization_invalid"
                 )
 
-        if coverage is None or coverage.state != "awaiting_scope_decision":
+        if coverage is None:
+            if execution_authorization is None and has_persisted_continuation_authority:
+                raise ContentResearchValidationError(
+                    "scope_execution_authorization_required"
+                )
+            return
+        if coverage.state != "awaiting_scope_decision":
             return
         if execution_authorization is None:
             raise ContentResearchValidationError(
@@ -4044,6 +4055,34 @@ class ContentResearchService:
             raise ContentResearchValidationError(
                 "scope execution continuation authorization was not found"
             )
+        persisted_continuation = next(
+            (
+                item
+                for item in self._store.list_scope_execution_continuations(
+                    authorization.workflow_run_id
+                )
+                if item.authorization_id == authorization.id
+            ),
+            None,
+        )
+        immutable_command = lambda item: (
+            item.id,
+            item.authorization_id,
+            item.workflow_run_id,
+            item.execution_revision,
+            item.operation,
+            item.supplementary_queries,
+        )
+        if (
+            persisted_continuation is None
+            or immutable_command(persisted_continuation) != immutable_command(continuation)
+        ):
+            raise ContentResearchValidationError(
+                "scope execution continuation does not match its persisted command"
+            )
+        if persisted_continuation.state in {"completed", "failed"}:
+            raise ContentResearchValidationError("scope execution continuation is not claimable")
+        continuation = persisted_continuation
         if (
             authorization.workflow_run_id != continuation.workflow_run_id
             or authorization.execution_revision != continuation.execution_revision
