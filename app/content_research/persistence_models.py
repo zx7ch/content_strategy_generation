@@ -8,6 +8,8 @@ from typing import Any
 
 from app.content_research.models import utcnow
 
+EXECUTION_FACT_SCHEMA_VERSION = "content_research_execution_fact_v1"
+
 
 def _required(*values: str) -> None:
     if not all(values):

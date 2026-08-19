@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -16,8 +17,13 @@ from app.content_research.models import (
     SubagentTaskRecord,
 )
 from app.content_research.persistence_models import StageCheckpointRecord
-from app.content_research.scope_contract import ScopeExecutionContinuation
+from app.content_research.scope_contract import (
+    ExecutionFact,
+    ScopeExecutionAttempt,
+    ScopeExecutionContinuation,
+)
 from app.content_research.stores.sqlite_store import (
+    SQLiteContentResearchStore,
     _dumps,
     _dumps_any_list,
     _fmt_dt,
@@ -36,9 +42,7 @@ class AsyncFormalResearchDispatchRepository:
     def __init__(self, db_path: str) -> None:
         self._db_path = db_path
 
-    async def persist_brief(
-        self, conn: aiosqlite.Connection, brief: ResearchBriefRecord
-    ) -> None:
+    async def persist_brief(self, conn: aiosqlite.Connection, brief: ResearchBriefRecord) -> None:
         """Persist one brief inside a transaction owned by the caller."""
         await conn.execute(
             """INSERT INTO content_research_briefs
@@ -107,7 +111,12 @@ class AsyncFormalResearchDispatchRepository:
         )
 
     async def enqueue(
-        self, *, workflow_run_id: str, provider: str, source_kind: str, limit: int,
+        self,
+        *,
+        workflow_run_id: str,
+        provider: str,
+        source_kind: str,
+        limit: int,
         retry_completed: bool = False,
     ) -> dict[str, Any]:
         now = _now().isoformat()
@@ -129,7 +138,15 @@ class AsyncFormalResearchDispatchRepository:
                          lease_token=CASE WHEN content_research_dispatch_jobs.status = 'failed' OR (content_research_dispatch_jobs.status = 'completed' AND ?) THEN NULL ELSE content_research_dispatch_jobs.lease_token END,
                          last_error=CASE WHEN content_research_dispatch_jobs.status = 'failed' OR (content_research_dispatch_jobs.status = 'completed' AND ?) THEN NULL ELSE content_research_dispatch_jobs.last_error END,
                          updated_at=excluded.updated_at""",
-                    (workflow_run_id, provider, source_kind, limit, now, now, *([retry_completed] * 8)),
+                    (
+                        workflow_run_id,
+                        provider,
+                        source_kind,
+                        limit,
+                        now,
+                        now,
+                        *([retry_completed] * 8),
+                    ),
                 )
                 row = await self._fetch_job(conn, workflow_run_id)
                 await conn.commit()
@@ -523,10 +540,110 @@ class AsyncScopeExecutionContinuationRepository:
             execution_revision=int(row["execution_revision"]),
             operation=str(row["operation"]),
             supplementary_queries=tuple(
-                str(item)
-                for item in _loads_any_list(row["supplementary_queries_json"])
+                str(item) for item in _loads_any_list(row["supplementary_queries_json"])
             ),
             state=str(row["state"]),
             created_at=_parse_dt(str(row["created_at"])),
             lease_token=str(row["lease_token"]) if row["lease_token"] else None,
+            execution_unit_id=(
+                str(row["execution_unit_id"])
+                if "execution_unit_id" in row.keys() and row["execution_unit_id"]
+                else None
+            ),
+        )
+
+
+class AsyncScopeExecutionUnitRepository:
+    """Async façade for the execution-unit lease and trace seam.
+
+    Continuation repository methods remain available as compatibility aliases
+    while callers migrate to the stable execution-unit identity.
+    """
+
+    def __init__(self, db_path: str) -> None:
+        self._db_path = db_path
+
+    async def claim_execution_unit(
+        self, *, execution_unit_id: str, owner: str, lease_seconds: int = 120
+    ) -> ScopeExecutionAttempt | None:
+        return await asyncio.to_thread(
+            SQLiteContentResearchStore(self._db_path).claim_execution_unit,
+            execution_unit_id=execution_unit_id,
+            owner=owner,
+            lease_seconds=lease_seconds,
+        )
+
+    async def renew_execution_unit_lease(
+        self,
+        *,
+        execution_unit_id: str,
+        attempt_no: int,
+        owner: str,
+        lease_token: str,
+        lease_seconds: int = 120,
+    ) -> bool:
+        return await asyncio.to_thread(
+            SQLiteContentResearchStore(self._db_path).renew_execution_unit_lease,
+            execution_unit_id=execution_unit_id,
+            attempt_no=attempt_no,
+            owner=owner,
+            lease_token=lease_token,
+            lease_seconds=lease_seconds,
+        )
+
+    async def record_provider_request(
+        self,
+        *,
+        execution_unit_id: str,
+        attempt_no: int,
+        lease_token: str,
+        payload: dict[str, object],
+    ) -> bool:
+        return await asyncio.to_thread(
+            SQLiteContentResearchStore(self._db_path).record_provider_request,
+            execution_unit_id=execution_unit_id,
+            attempt_no=attempt_no,
+            lease_token=lease_token,
+            payload=payload,
+        )
+
+    async def record_provider_outcome(
+        self,
+        *,
+        execution_unit_id: str,
+        attempt_no: int,
+        lease_token: str,
+        provider_state: str,
+        payload: dict[str, object],
+    ) -> bool:
+        return await asyncio.to_thread(
+            SQLiteContentResearchStore(self._db_path).record_provider_outcome,
+            execution_unit_id=execution_unit_id,
+            attempt_no=attempt_no,
+            lease_token=lease_token,
+            provider_state=provider_state,
+            payload=payload,
+        )
+
+    async def complete_execution_unit(
+        self,
+        *,
+        execution_unit_id: str,
+        attempt_no: int,
+        owner: str,
+        lease_token: str,
+        state: str,
+    ) -> bool:
+        return await asyncio.to_thread(
+            SQLiteContentResearchStore(self._db_path).complete_execution_unit,
+            execution_unit_id=execution_unit_id,
+            attempt_no=attempt_no,
+            owner=owner,
+            lease_token=lease_token,
+            state=state,
+        )
+
+    async def execution_trace(self, execution_unit_id: str) -> list[ExecutionFact]:
+        return await asyncio.to_thread(
+            SQLiteContentResearchStore(self._db_path).execution_trace, execution_unit_id
         )

@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
-from datetime import datetime, timezone
+import uuid
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from typing import Any, TypeVar
 
 from app.content_research.bootstrap import bootstrap_content_research_schema
@@ -44,14 +47,17 @@ from app.content_research.persistence_models import (
 )
 from app.content_research.scope_contract import (
     CoverageSnapshot,
+    ExecutionFact,
     ResearchScopeContract,
     ResearchScopeDraft,
     ScopeAuditEvent,
     ScopeConstraint,
     ScopeDraftAuditEvent,
     ScopeDraftConfirmation,
+    ScopeExecutionAttempt,
     ScopeExecutionAuthorization,
     ScopeExecutionContinuation,
+    ScopeExecutionUnit,
     ScopeQueryGroup,
     ScopeQueryGroupInput,
     build_scope_contract,
@@ -121,22 +127,128 @@ def _validate_payload(record_type: str, payload: dict[str, Any]) -> None:
 _TypedRecordT = TypeVar("_TypedRecordT", bound=TypedPersistenceRecord)
 
 _TYPED_RECORD_TABLES: dict[type[TypedPersistenceRecord], tuple[str, tuple[str, ...]]] = {
-    CanonicalSourceRecord: ("content_research_canonical_sources", ("platform", "platform_source_kind", "platform_source_id", "canonical_url")),
-    DirectionSourceProjectionRecord: ("content_research_direction_source_projections", ("workflow_run_id", "research_direction_id", "canonical_source_id", "evidence_packet_id")),
-    DirectionalEvidencePacketRecord: ("content_research_directional_evidence_packets", ("workflow_run_id", "research_direction_id", "canonical_source_id", "field_projection_hash")),
-    ClaimCandidateRecord: ("content_research_claim_candidates", ("workflow_run_id", "research_direction_id", "evidence_packet_id", "statement", "intent_id", "claim_type", "requested_state")),
-    ClaimAdmissionDecisionRecord: ("content_research_claim_admission_decisions", ("research_direction_id", "claim_candidate_id", "decision", "policy_snapshot_id")),
-    DirectionResultDecisionRecord: ("content_research_direction_result_decisions", ("research_direction_id", "policy_snapshot_id")),
+    CanonicalSourceRecord: (
+        "content_research_canonical_sources",
+        ("platform", "platform_source_kind", "platform_source_id", "canonical_url"),
+    ),
+    DirectionSourceProjectionRecord: (
+        "content_research_direction_source_projections",
+        ("workflow_run_id", "research_direction_id", "canonical_source_id", "evidence_packet_id"),
+    ),
+    DirectionalEvidencePacketRecord: (
+        "content_research_directional_evidence_packets",
+        (
+            "workflow_run_id",
+            "research_direction_id",
+            "canonical_source_id",
+            "field_projection_hash",
+        ),
+    ),
+    ClaimCandidateRecord: (
+        "content_research_claim_candidates",
+        (
+            "workflow_run_id",
+            "research_direction_id",
+            "evidence_packet_id",
+            "statement",
+            "intent_id",
+            "claim_type",
+            "requested_state",
+        ),
+    ),
+    ClaimAdmissionDecisionRecord: (
+        "content_research_claim_admission_decisions",
+        ("research_direction_id", "claim_candidate_id", "decision", "policy_snapshot_id"),
+    ),
+    DirectionResultDecisionRecord: (
+        "content_research_direction_result_decisions",
+        ("research_direction_id", "policy_snapshot_id"),
+    ),
     WeakSignalRecord: ("content_research_weak_signals", ("admission_decision_id",)),
-    CrossDirectionRecord: ("content_research_cross_direction_records", ("research_plan_id", "record_type")),
-    AggregateClaimRecord: ("content_research_aggregate_claims", ("research_plan_id", "aggregate_type")),
-    MarketingConclusionCandidateRecord: ("content_research_marketing_conclusion_candidates", ("workflow_run_id", "research_plan_id", "track")),
-    MarketingConclusionDecisionRecord: ("content_research_marketing_conclusion_decisions", ("workflow_run_id", "research_plan_id", "candidate_id", "track", "state")),
-    StageCheckpointRecord: ("content_research_stage_checkpoints", ("workflow_run_id", "subagent_task_id", "stage_name", "input_fingerprint", "status", "retry_count", "started_at", "finished_at")),
-    BudgetLedgerEntryRecord: ("content_research_budget_ledger_entries", ("research_plan_id", "research_direction_id", "idempotency_key", "reservation_status", "reserved_amount", "consumed_amount", "stage_checkpoint_id")),
-    ReportDraftRecord: ("content_research_report_drafts", ("workflow_run_id", "research_plan_id", "governed_snapshot_id", "governed_snapshot_version", "input_fingerprint", "policy_version", "algorithm_version", "previous_version_id")),
-    ReportFaithfulnessDecisionRecord: ("content_research_report_faithfulness_decisions", ("workflow_run_id", "research_plan_id", "governed_snapshot_id", "governed_snapshot_version", "input_fingerprint", "policy_version", "algorithm_version", "report_draft_id", "previous_version_id")),
-    ReportPublicationRecord: ("content_research_report_publications", ("workflow_run_id", "research_plan_id", "governed_snapshot_id", "governed_snapshot_version", "input_fingerprint", "policy_version", "algorithm_version", "report_draft_id", "faithfulness_decision_id", "publication_state", "previous_version_id")),
+    CrossDirectionRecord: (
+        "content_research_cross_direction_records",
+        ("research_plan_id", "record_type"),
+    ),
+    AggregateClaimRecord: (
+        "content_research_aggregate_claims",
+        ("research_plan_id", "aggregate_type"),
+    ),
+    MarketingConclusionCandidateRecord: (
+        "content_research_marketing_conclusion_candidates",
+        ("workflow_run_id", "research_plan_id", "track"),
+    ),
+    MarketingConclusionDecisionRecord: (
+        "content_research_marketing_conclusion_decisions",
+        ("workflow_run_id", "research_plan_id", "candidate_id", "track", "state"),
+    ),
+    StageCheckpointRecord: (
+        "content_research_stage_checkpoints",
+        (
+            "workflow_run_id",
+            "subagent_task_id",
+            "stage_name",
+            "input_fingerprint",
+            "status",
+            "retry_count",
+            "started_at",
+            "finished_at",
+        ),
+    ),
+    BudgetLedgerEntryRecord: (
+        "content_research_budget_ledger_entries",
+        (
+            "research_plan_id",
+            "research_direction_id",
+            "idempotency_key",
+            "reservation_status",
+            "reserved_amount",
+            "consumed_amount",
+            "stage_checkpoint_id",
+        ),
+    ),
+    ReportDraftRecord: (
+        "content_research_report_drafts",
+        (
+            "workflow_run_id",
+            "research_plan_id",
+            "governed_snapshot_id",
+            "governed_snapshot_version",
+            "input_fingerprint",
+            "policy_version",
+            "algorithm_version",
+            "previous_version_id",
+        ),
+    ),
+    ReportFaithfulnessDecisionRecord: (
+        "content_research_report_faithfulness_decisions",
+        (
+            "workflow_run_id",
+            "research_plan_id",
+            "governed_snapshot_id",
+            "governed_snapshot_version",
+            "input_fingerprint",
+            "policy_version",
+            "algorithm_version",
+            "report_draft_id",
+            "previous_version_id",
+        ),
+    ),
+    ReportPublicationRecord: (
+        "content_research_report_publications",
+        (
+            "workflow_run_id",
+            "research_plan_id",
+            "governed_snapshot_id",
+            "governed_snapshot_version",
+            "input_fingerprint",
+            "policy_version",
+            "algorithm_version",
+            "report_draft_id",
+            "faithfulness_decision_id",
+            "publication_state",
+            "previous_version_id",
+        ),
+    ),
 }
 
 
@@ -220,10 +332,29 @@ class SQLiteContentResearchStore:
 
     def delete_workflow(self, workflow_run_id: str) -> None:
         with self._connect() as conn:
-            evidence_ids = [row[0] for row in conn.execute("SELECT id FROM content_research_evidence_records WHERE workflow_run_id = ?", (workflow_run_id,))]
+            evidence_ids = [
+                row[0]
+                for row in conn.execute(
+                    "SELECT id FROM content_research_evidence_records WHERE workflow_run_id = ?",
+                    (workflow_run_id,),
+                )
+            ]
             for evidence_id in evidence_ids:
-                conn.execute("DELETE FROM content_research_evidence_lineage WHERE evidence_record_id = ?", (evidence_id,))
-            for table in ("content_research_evidence_records", "content_research_human_decisions", "content_research_observation_events", "content_research_traces", "content_research_result_snapshots", "content_research_subagent_tasks", "content_research_directions", "content_research_plans", "content_research_briefs"):
+                conn.execute(
+                    "DELETE FROM content_research_evidence_lineage WHERE evidence_record_id = ?",
+                    (evidence_id,),
+                )
+            for table in (
+                "content_research_evidence_records",
+                "content_research_human_decisions",
+                "content_research_observation_events",
+                "content_research_traces",
+                "content_research_result_snapshots",
+                "content_research_subagent_tasks",
+                "content_research_directions",
+                "content_research_plans",
+                "content_research_briefs",
+            ):
                 conn.execute(f"DELETE FROM {table} WHERE workflow_run_id = ?", (workflow_run_id,))
 
     def save_plan(self, plan: ResearchPlanRecord) -> ResearchPlanRecord:
@@ -442,7 +573,9 @@ class SQLiteContentResearchStore:
                     ),
                 )
         except sqlite3.IntegrityError as exc:
-            raise ValueError(f"Observation event is append-only and already exists: {event.id}") from exc
+            raise ValueError(
+                f"Observation event is append-only and already exists: {event.id}"
+            ) from exc
         return event
 
     def list_observation_events(self, trace_id: str) -> list[ObservationEventRecord]:
@@ -460,13 +593,21 @@ class SQLiteContentResearchStore:
         if event.workflow_run_id != draft.workflow_run_id or event.scope_draft_id != draft.id:
             raise ValueError("scope draft audit event must reference the draft being saved")
         constraints = [
-            {"id": item.id, "label": item.label, "value": item.value, "mode": item.mode,
-             "allowed_aliases": list(item.allowed_aliases)}
+            {
+                "id": item.id,
+                "label": item.label,
+                "value": item.value,
+                "mode": item.mode,
+                "allowed_aliases": list(item.allowed_aliases),
+            }
             for item in draft.constraints
         ]
         groups = [
-            {"suggested_query": item.suggested_query, "final_query": item.final_query,
-             "targeted_required_terms": list(item.targeted_required_terms)}
+            {
+                "suggested_query": item.suggested_query,
+                "final_query": item.final_query,
+                "targeted_required_terms": list(item.targeted_required_terms),
+            }
             for item in draft.query_groups
         ]
         try:
@@ -475,18 +616,33 @@ class SQLiteContentResearchStore:
                     """INSERT INTO content_research_scope_drafts
                        (id, workflow_run_id, research_plan_id, structure_hash, constraints_json,
                         query_groups_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                    (draft.id, draft.workflow_run_id, draft.research_plan_id, draft.structure_hash,
-                     _dumps_any_list(constraints), _dumps_any_list(groups), _fmt_dt(draft.created_at)),
+                    (
+                        draft.id,
+                        draft.workflow_run_id,
+                        draft.research_plan_id,
+                        draft.structure_hash,
+                        _dumps_any_list(constraints),
+                        _dumps_any_list(groups),
+                        _fmt_dt(draft.created_at),
+                    ),
                 )
                 conn.execute(
                     """INSERT INTO content_research_scope_draft_audit_events
                        (id, workflow_run_id, scope_draft_id, event_name, payload_json, created_at)
                        VALUES (?, ?, ?, ?, ?, ?)""",
-                    (event.id, event.workflow_run_id, event.scope_draft_id, event.event_name,
-                     _dumps(event.payload), _fmt_dt(event.created_at)),
+                    (
+                        event.id,
+                        event.workflow_run_id,
+                        event.scope_draft_id,
+                        event.event_name,
+                        _dumps(event.payload),
+                        _fmt_dt(event.created_at),
+                    ),
                 )
         except sqlite3.IntegrityError as exc:
-            raise ValueError(f"Scope draft or audit event is append-only and already exists: {draft.id}") from exc
+            raise ValueError(
+                f"Scope draft or audit event is append-only and already exists: {draft.id}"
+            ) from exc
         return draft
 
     def get_scope_draft(self, scope_draft_id: str) -> ResearchScopeDraft | None:
@@ -546,9 +702,7 @@ class SQLiteContentResearchStore:
                 else ""
             )
             if draft.structure_hash != current_structure_hash:
-                raise ValueError(
-                    "Scope draft structure hash does not match the current brief"
-                )
+                raise ValueError("Scope draft structure hash does not match the current brief")
             confirmation = conn.execute(
                 """SELECT scope_contract_id FROM content_research_scope_draft_confirmations
                    WHERE scope_draft_id = ?""",
@@ -560,7 +714,9 @@ class SQLiteContentResearchStore:
                     (confirmation["scope_contract_id"],),
                 ).fetchone()
                 if contract_row is None:
-                    raise RuntimeError("scope draft confirmation references a missing scope contract")
+                    raise RuntimeError(
+                        "scope draft confirmation references a missing scope contract"
+                    )
                 event_row = conn.execute(
                     """SELECT * FROM content_research_scope_audit_events
                        WHERE workflow_run_id = ? AND scope_contract_id = ?
@@ -582,7 +738,9 @@ class SQLiteContentResearchStore:
                 )
 
             if len(final_queries) != len(draft.query_groups):
-                raise ValueError("scope confirmation final query count must match the persisted draft")
+                raise ValueError(
+                    "scope confirmation final query count must match the persisted draft"
+                )
             version_row = conn.execute(
                 """SELECT COALESCE(MAX(version), 0) + 1 AS next_version
                    FROM content_research_scope_contracts
@@ -596,9 +754,7 @@ class SQLiteContentResearchStore:
                     final_query=final_query,
                     targeted_required_terms=proposal.targeted_required_terms,
                 )
-                for proposal, final_query in zip(
-                    draft.query_groups, final_queries, strict=True
-                )
+                for proposal, final_query in zip(draft.query_groups, final_queries, strict=True)
             )
             contract = build_scope_contract(
                 workflow_run_id=draft.workflow_run_id,
@@ -687,7 +843,9 @@ class SQLiteContentResearchStore:
             with self._connect() as conn:
                 self._insert_scope_contract(conn, contract)
         except sqlite3.IntegrityError as exc:
-            raise ValueError(f"Scope contract is append-only and already exists: {contract.id}") from exc
+            raise ValueError(
+                f"Scope contract is append-only and already exists: {contract.id}"
+            ) from exc
         return contract
 
     def save_scope_contract_with_audit_event(
@@ -711,7 +869,9 @@ class SQLiteContentResearchStore:
                 )
                 self._insert_scope_audit_event(conn, event)
         except sqlite3.IntegrityError as exc:
-            raise ValueError(f"Scope contract or audit event is append-only and already exists: {contract.id}") from exc
+            raise ValueError(
+                f"Scope contract or audit event is append-only and already exists: {contract.id}"
+            ) from exc
         return contract
 
     @staticmethod
@@ -738,7 +898,9 @@ class SQLiteContentResearchStore:
         ]
         return _dumps_any_list(constraints), _dumps_any_list(groups)
 
-    def _insert_scope_contract(self, conn: sqlite3.Connection, contract: ResearchScopeContract) -> None:
+    def _insert_scope_contract(
+        self, conn: sqlite3.Connection, contract: ResearchScopeContract
+    ) -> None:
         constraints_json, query_groups_json = self._scope_contract_payload(contract)
         conn.execute(
             """INSERT INTO content_research_scope_contracts
@@ -808,7 +970,9 @@ class SQLiteContentResearchStore:
                     ),
                 )
         except sqlite3.IntegrityError as exc:
-            raise ValueError(f"Coverage snapshot is append-only and already exists: {snapshot.id}") from exc
+            raise ValueError(
+                f"Coverage snapshot is append-only and already exists: {snapshot.id}"
+            ) from exc
         return snapshot
 
     def save_coverage_snapshot_with_audit_event(
@@ -891,6 +1055,363 @@ class SQLiteContentResearchStore:
             ).fetchone()
         return self._row_to_coverage_snapshot(row) if row else None
 
+    def resolve_coverage_to_execution_unit_atomically(
+        self, *, snapshot: CoverageSnapshot, decision: dict[str, Any]
+    ) -> tuple[ScopeExecutionUnit, bool]:
+        """Create one executable unit for an exact decision, or return its replay.
+
+        This narrow seam is intentionally independent of legacy authorization
+        rows.  The existing authorization/continuation transaction calls the
+        same durable tables as a compatibility bridge until all readers move
+        to execution units.
+        """
+        resolution = str(decision.get("resolution") or "")
+        operation = str(decision.get("operation") or "")
+        queries = tuple(str(item).strip() for item in decision.get("supplementary_queries", ()))
+        if resolution not in {
+            "expand_required_constraint",
+            "generate_limited_report",
+            "relax_constraint",
+        } or operation not in {"limited_report", "supplementary_collection"}:
+            raise ValueError("execution unit decision is invalid")
+        if any(not query for query in queries) or len(set(queries)) != len(queries):
+            raise ValueError("execution unit queries must be distinct and non-empty")
+        if operation == "limited_report" and queries:
+            raise ValueError("limited report execution unit does not accept queries")
+
+        decision_payload = {
+            "coverage_snapshot_id": snapshot.id,
+            "scope_contract_id": snapshot.scope_contract_id,
+            "resolution": resolution,
+            "operation": operation,
+            "supplementary_queries": list(queries),
+        }
+        fingerprint = hashlib.sha256(
+            json.dumps(
+                decision_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+        ).hexdigest()
+        unit = ScopeExecutionUnit(
+            id="seu_" + fingerprint[:24],
+            workflow_run_id=snapshot.workflow_run_id,
+            scope_contract_id=snapshot.scope_contract_id,
+            coverage_snapshot_id=snapshot.id,
+            resolution=resolution,
+            operation=operation,
+            state="pending",
+        )
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            snapshot_row = conn.execute(
+                "SELECT * FROM content_research_scope_coverage_snapshots WHERE id=?", (snapshot.id,)
+            ).fetchone()
+            if snapshot_row is None or self._row_to_coverage_snapshot(snapshot_row) != snapshot:
+                raise ValueError("execution unit requires the persisted coverage snapshot")
+            existing_row = conn.execute(
+                """SELECT * FROM content_research_scope_execution_units
+                   WHERE coverage_snapshot_id=?""",
+                (snapshot.id,),
+            ).fetchone()
+            if existing_row is not None:
+                existing = self._row_to_scope_execution_unit(existing_row)
+                existing_fingerprint = str(existing_row["decision_fingerprint"])
+                if existing_fingerprint != fingerprint:
+                    raise ValueError("coverage snapshot already has a different persisted decision")
+                conn.commit()
+                return existing, False
+            self._insert_scope_execution_unit(conn, unit, decision_fingerprint=fingerprint)
+            self._insert_scope_execution_attempt(
+                conn,
+                ScopeExecutionAttempt(execution_unit_id=unit.id, attempt_no=0, state="pending"),
+            )
+            self._insert_execution_fact(
+                conn,
+                ExecutionFact(
+                    execution_unit_id=unit.id,
+                    attempt_no=0,
+                    sequence_no=1,
+                    kind="decision_accepted",
+                    payload={"decision": decision_payload},
+                ),
+            )
+            conn.commit()
+            return unit, True
+        except sqlite3.OperationalError as exc:
+            conn.rollback()
+            if "locked" in str(exc).lower() or "busy" in str(exc).lower():
+                raise RetryableLocalPersistenceError("sqlite_write_locked") from exc
+            raise
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def append_execution_fact(
+        self,
+        *,
+        execution_unit_id: str,
+        attempt_no: int,
+        sequence_no: int,
+        kind: str,
+        payload: dict[str, object],
+    ) -> ExecutionFact:
+        fact = ExecutionFact(
+            execution_unit_id=execution_unit_id,
+            attempt_no=attempt_no,
+            sequence_no=sequence_no,
+            kind=kind,  # type: ignore[arg-type]
+            payload=payload,
+        )
+        try:
+            with self._connect() as conn:
+                self._insert_execution_fact(conn, fact)
+        except sqlite3.IntegrityError as exc:
+            raise ValueError("execution fact is append-only and already exists") from exc
+        return fact
+
+    def execution_trace(self, execution_unit_id: str) -> list[ExecutionFact]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """SELECT * FROM content_research_execution_facts
+                   WHERE execution_unit_id=?
+                   ORDER BY attempt_no ASC, sequence_no ASC""",
+                (execution_unit_id,),
+            ).fetchall()
+        return [self._row_to_execution_fact(row) for row in rows]
+
+    def claim_execution_unit(
+        self, *, execution_unit_id: str, owner: str, lease_seconds: int = 120
+    ) -> ScopeExecutionAttempt | None:
+        """Claim the unit's pending attempt; legacy continuations remain aliases."""
+        now = datetime.now(timezone.utc)
+        token = uuid.uuid4().hex
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                """SELECT * FROM content_research_scope_execution_attempts
+                   WHERE execution_unit_id=? ORDER BY attempt_no DESC LIMIT 1""",
+                (execution_unit_id,),
+            ).fetchone()
+            if row is None or row["state"] != "pending":
+                conn.commit()
+                return None
+            attempt_no = int(row["attempt_no"])
+            updated = conn.execute(
+                """UPDATE content_research_scope_execution_attempts
+                   SET state='running', lease_owner=?, lease_token=?, lease_expires_at=?
+                   WHERE execution_unit_id=? AND attempt_no=? AND state='pending'""",
+                (
+                    owner,
+                    token,
+                    _fmt_dt(now + timedelta(seconds=lease_seconds)),
+                    execution_unit_id,
+                    attempt_no,
+                ),
+            )
+            if updated.rowcount != 1:
+                conn.commit()
+                return None
+            conn.execute(
+                "UPDATE content_research_scope_execution_units SET state='running' WHERE id=?",
+                (execution_unit_id,),
+            )
+            self._append_execution_fact_in_transaction(
+                conn,
+                execution_unit_id=execution_unit_id,
+                attempt_no=attempt_no,
+                kind="attempt_claimed",
+                payload={"owner": owner},
+            )
+            claimed = conn.execute(
+                """SELECT * FROM content_research_scope_execution_attempts
+                   WHERE execution_unit_id=? AND attempt_no=?""",
+                (execution_unit_id, attempt_no),
+            ).fetchone()
+            conn.commit()
+            return self._row_to_scope_execution_attempt(claimed) if claimed else None
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def renew_execution_unit_lease(
+        self,
+        *,
+        execution_unit_id: str,
+        attempt_no: int,
+        owner: str,
+        lease_token: str,
+        lease_seconds: int = 120,
+    ) -> bool:
+        now = datetime.now(timezone.utc)
+        with self._connect() as conn:
+            result = conn.execute(
+                """UPDATE content_research_scope_execution_attempts
+                   SET lease_expires_at=?
+                   WHERE execution_unit_id=? AND attempt_no=? AND state='running'
+                     AND lease_owner=? AND lease_token=?""",
+                (
+                    _fmt_dt(now + timedelta(seconds=lease_seconds)),
+                    execution_unit_id,
+                    attempt_no,
+                    owner,
+                    lease_token,
+                ),
+            )
+        return result.rowcount == 1
+
+    def record_provider_request(
+        self,
+        *,
+        execution_unit_id: str,
+        attempt_no: int,
+        lease_token: str,
+        payload: dict[str, object],
+    ) -> bool:
+        return self._record_execution_provider_fact(
+            execution_unit_id=execution_unit_id,
+            attempt_no=attempt_no,
+            lease_token=lease_token,
+            kind="provider_request_recorded",
+            provider_state="requested",
+            payload=payload,
+        )
+
+    def record_provider_outcome(
+        self,
+        *,
+        execution_unit_id: str,
+        attempt_no: int,
+        lease_token: str,
+        provider_state: str,
+        payload: dict[str, object],
+    ) -> bool:
+        return self._record_execution_provider_fact(
+            execution_unit_id=execution_unit_id,
+            attempt_no=attempt_no,
+            lease_token=lease_token,
+            kind="provider_outcome_recorded",
+            provider_state=provider_state,
+            payload=payload,
+        )
+
+    def complete_execution_unit(
+        self,
+        *,
+        execution_unit_id: str,
+        attempt_no: int,
+        owner: str,
+        lease_token: str,
+        state: str,
+    ) -> bool:
+        if state not in {"completed", "failed", "outcome_unknown"}:
+            raise ValueError("invalid execution unit terminal state")
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            result = conn.execute(
+                """UPDATE content_research_scope_execution_attempts
+                   SET state=?, lease_owner=NULL, lease_token=NULL, lease_expires_at=NULL
+                   WHERE execution_unit_id=? AND attempt_no=? AND state='running'
+                     AND lease_owner=? AND lease_token=?""",
+                (state, execution_unit_id, attempt_no, owner, lease_token),
+            )
+            if result.rowcount != 1:
+                self._append_execution_fact_in_transaction(
+                    conn,
+                    execution_unit_id=execution_unit_id,
+                    attempt_no=attempt_no,
+                    kind="lease_fenced",
+                    payload={"operation": "complete_execution_unit"},
+                )
+                conn.commit()
+                return False
+            conn.execute(
+                "UPDATE content_research_scope_execution_units SET state=? WHERE id=?",
+                (state, execution_unit_id),
+            )
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def _record_execution_provider_fact(
+        self,
+        *,
+        execution_unit_id: str,
+        attempt_no: int,
+        lease_token: str,
+        kind: str,
+        provider_state: str,
+        payload: dict[str, object],
+    ) -> bool:
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            result = conn.execute(
+                """UPDATE content_research_scope_execution_attempts
+                   SET provider_state=?
+                   WHERE execution_unit_id=? AND attempt_no=? AND state='running'
+                     AND lease_token=?""",
+                (provider_state, execution_unit_id, attempt_no, lease_token),
+            )
+            if result.rowcount != 1:
+                self._append_execution_fact_in_transaction(
+                    conn,
+                    execution_unit_id=execution_unit_id,
+                    attempt_no=attempt_no,
+                    kind="lease_fenced",
+                    payload={"operation": kind},
+                )
+                conn.commit()
+                return False
+            self._append_execution_fact_in_transaction(
+                conn,
+                execution_unit_id=execution_unit_id,
+                attempt_no=attempt_no,
+                kind=kind,
+                payload=payload,
+            )
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def _append_execution_fact_in_transaction(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        execution_unit_id: str,
+        attempt_no: int,
+        kind: str,
+        payload: dict[str, object],
+    ) -> None:
+        row = conn.execute(
+            """SELECT COALESCE(MAX(sequence_no), 0) FROM content_research_execution_facts
+               WHERE execution_unit_id=? AND attempt_no=?""",
+            (execution_unit_id, attempt_no),
+        ).fetchone()
+        self._insert_execution_fact(
+            conn,
+            ExecutionFact(
+                execution_unit_id=execution_unit_id,
+                attempt_no=attempt_no,
+                sequence_no=int(row[0]) + 1,
+                kind=kind,  # type: ignore[arg-type]
+                payload=payload,
+            ),
+        )
+
     def resolve_coverage_and_authorize_execution_atomically(
         self,
         *,
@@ -899,7 +1420,13 @@ class SQLiteContentResearchStore:
         continuation: ScopeExecutionContinuation,
         event: ScopeAuditEvent,
         successor_scope_contract: ResearchScopeContract | None = None,
-    ) -> tuple[ResearchScopeContract, ScopeAuditEvent, ScopeExecutionAuthorization, ScopeExecutionContinuation, bool]:
+    ) -> tuple[
+        ResearchScopeContract,
+        ScopeAuditEvent,
+        ScopeExecutionAuthorization,
+        ScopeExecutionContinuation,
+        bool,
+    ]:
         """Persist one coverage decision and its continuation authority together.
 
         The coverage snapshot is the decision's idempotency boundary.  A
@@ -941,7 +1468,9 @@ class SQLiteContentResearchStore:
                 raise ValueError("coverage authorization requires a persisted coverage snapshot")
             persisted_snapshot = self._row_to_coverage_snapshot(snapshot_row)
             if persisted_snapshot != snapshot:
-                raise ValueError("coverage authorization snapshot does not match persisted coverage")
+                raise ValueError(
+                    "coverage authorization snapshot does not match persisted coverage"
+                )
 
             existing_row = conn.execute(
                 """SELECT * FROM content_research_scope_execution_authorizations
@@ -957,9 +1486,7 @@ class SQLiteContentResearchStore:
                 ).fetchone()
                 if continuation_row is None:
                     raise RuntimeError("coverage authorization references a missing continuation")
-                existing_continuation = self._row_to_scope_execution_continuation(
-                    continuation_row
-                )
+                existing_continuation = self._row_to_scope_execution_continuation(continuation_row)
                 event_rows = conn.execute(
                     """SELECT * FROM content_research_scope_audit_events
                        WHERE workflow_run_id = ?
@@ -971,8 +1498,7 @@ class SQLiteContentResearchStore:
                     (
                         row
                         for row in event_rows
-                        if _loads(row["payload_json"]).get("coverage_snapshot_id")
-                        == snapshot.id
+                        if _loads(row["payload_json"]).get("coverage_snapshot_id") == snapshot.id
                     ),
                     None,
                 )
@@ -988,7 +1514,9 @@ class SQLiteContentResearchStore:
                     != continuation.supplementary_queries
                     or existing_event.payload != event.payload
                 ):
-                    raise ValueError("coverage snapshot already has a different persisted resolution")
+                    raise ValueError(
+                        "coverage snapshot already has a different persisted resolution"
+                    )
                 existing_contract_row = conn.execute(
                     "SELECT * FROM content_research_scope_contracts WHERE id = ?",
                     (existing.scope_contract_id,),
@@ -1012,7 +1540,46 @@ class SQLiteContentResearchStore:
                 scope_contract_id=authorization.scope_contract_id,
                 scope_contract_version=authorization.scope_contract_version,
             )
+            decision_payload = {
+                "coverage_snapshot_id": snapshot.id,
+                "scope_contract_id": authorization.scope_contract_id,
+                "resolution": authorization.resolution,
+                "operation": continuation.operation,
+                "supplementary_queries": list(continuation.supplementary_queries),
+                "authorization_id": authorization.id,
+            }
+            decision_fingerprint = hashlib.sha256(
+                json.dumps(
+                    decision_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                ).encode("utf-8")
+            ).hexdigest()
+            unit = ScopeExecutionUnit(
+                id="seu_" + decision_fingerprint[:24],
+                workflow_run_id=authorization.workflow_run_id,
+                scope_contract_id=authorization.scope_contract_id,
+                coverage_snapshot_id=snapshot.id,
+                resolution=authorization.resolution,
+                operation=continuation.operation,
+                state="pending",
+            )
+            authorization = replace(authorization, execution_unit_id=unit.id)
+            continuation = replace(continuation, execution_unit_id=unit.id)
             self._insert_scope_audit_event(conn, event)
+            self._insert_scope_execution_unit(conn, unit, decision_fingerprint=decision_fingerprint)
+            self._insert_scope_execution_attempt(
+                conn,
+                ScopeExecutionAttempt(execution_unit_id=unit.id, attempt_no=0, state="pending"),
+            )
+            self._insert_execution_fact(
+                conn,
+                ExecutionFact(
+                    execution_unit_id=unit.id,
+                    attempt_no=0,
+                    sequence_no=1,
+                    kind="decision_accepted",
+                    payload={"decision": decision_payload},
+                ),
+            )
             self._insert_scope_execution_authorization(conn, authorization)
             self._insert_scope_execution_continuation(conn, continuation)
             conn.commit()
@@ -1106,7 +1673,9 @@ class SQLiteContentResearchStore:
                 )
                 self._insert_scope_audit_event(conn, event)
         except sqlite3.IntegrityError as exc:
-            raise ValueError(f"Scope audit event is append-only and already exists: {event.id}") from exc
+            raise ValueError(
+                f"Scope audit event is append-only and already exists: {event.id}"
+            ) from exc
         return event
 
     @staticmethod
@@ -1145,14 +1714,77 @@ class SQLiteContentResearchStore:
         )
 
     @staticmethod
+    def _insert_scope_execution_unit(
+        conn: sqlite3.Connection,
+        unit: ScopeExecutionUnit,
+        *,
+        decision_fingerprint: str,
+    ) -> None:
+        conn.execute(
+            """INSERT INTO content_research_scope_execution_units
+               (id, decision_fingerprint, workflow_run_id, scope_contract_id,
+                coverage_snapshot_id, resolution, operation, state, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                unit.id,
+                decision_fingerprint,
+                unit.workflow_run_id,
+                unit.scope_contract_id,
+                unit.coverage_snapshot_id,
+                unit.resolution,
+                unit.operation,
+                unit.state,
+                _fmt_dt(unit.created_at),
+            ),
+        )
+
+    @staticmethod
+    def _insert_scope_execution_attempt(
+        conn: sqlite3.Connection, attempt: ScopeExecutionAttempt
+    ) -> None:
+        conn.execute(
+            """INSERT INTO content_research_scope_execution_attempts
+               (execution_unit_id, attempt_no, state, lease_owner, lease_token,
+                lease_expires_at, provider_state, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                attempt.execution_unit_id,
+                attempt.attempt_no,
+                attempt.state,
+                attempt.lease_owner,
+                attempt.lease_token,
+                _fmt_dt(attempt.lease_expires_at) if attempt.lease_expires_at else None,
+                attempt.provider_state,
+                _fmt_dt(attempt.created_at),
+            ),
+        )
+
+    @staticmethod
+    def _insert_execution_fact(conn: sqlite3.Connection, fact: ExecutionFact) -> None:
+        conn.execute(
+            """INSERT INTO content_research_execution_facts
+               (execution_unit_id, attempt_no, sequence_no, kind, payload_json, created_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (
+                fact.execution_unit_id,
+                fact.attempt_no,
+                fact.sequence_no,
+                fact.kind,
+                _dumps(fact.payload),
+                _fmt_dt(fact.created_at),
+            ),
+        )
+
+    @staticmethod
     def _insert_scope_execution_authorization(
         conn: sqlite3.Connection, authorization: ScopeExecutionAuthorization
     ) -> None:
         conn.execute(
             """INSERT INTO content_research_scope_execution_authorizations
                (id, workflow_run_id, scope_contract_id, scope_contract_version,
-                coverage_snapshot_id, resolution, execution_revision, state, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                coverage_snapshot_id, resolution, execution_revision, state, created_at,
+                execution_unit_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 authorization.id,
                 authorization.workflow_run_id,
@@ -1163,6 +1795,7 @@ class SQLiteContentResearchStore:
                 authorization.execution_revision,
                 authorization.state,
                 _fmt_dt(authorization.created_at),
+                authorization.execution_unit_id,
             ),
         )
 
@@ -1174,8 +1807,8 @@ class SQLiteContentResearchStore:
         conn.execute(
             """INSERT INTO content_research_scope_execution_continuations
                (id, authorization_id, workflow_run_id, execution_revision, operation,
-                supplementary_queries_json, state, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                supplementary_queries_json, state, created_at, updated_at, execution_unit_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 continuation.id,
                 continuation.authorization_id,
@@ -1186,6 +1819,7 @@ class SQLiteContentResearchStore:
                 continuation.state,
                 created_at,
                 created_at,
+                continuation.execution_unit_id,
             ),
         )
 
@@ -1353,7 +1987,9 @@ class SQLiteContentResearchStore:
                     ),
                 )
         except sqlite3.IntegrityError as exc:
-            raise ValueError(f"Evidence lineage is append-only and already exists: {lineage.id}") from exc
+            raise ValueError(
+                f"Evidence lineage is append-only and already exists: {lineage.id}"
+            ) from exc
         return lineage
 
     def list_evidence_lineage(self, evidence_record_id: str) -> list[EvidenceLineageRecord]:
@@ -1364,7 +2000,9 @@ class SQLiteContentResearchStore:
             ).fetchall()
         return [self._row_to_evidence_lineage(row) for row in rows]
 
-    def save_result_snapshot(self, snapshot: ResearchResultSnapshotRecord) -> ResearchResultSnapshotRecord:
+    def save_result_snapshot(
+        self, snapshot: ResearchResultSnapshotRecord
+    ) -> ResearchResultSnapshotRecord:
         if not snapshot.schema_version:
             raise ValueError("ResearchResultSnapshot must include schema_version")
         try:
@@ -1413,7 +2051,9 @@ class SQLiteContentResearchStore:
                     ),
                 )
         except sqlite3.IntegrityError as exc:
-            raise ValueError(f"Research result snapshot is immutable and already exists: {snapshot.id}") from exc
+            raise ValueError(
+                f"Research result snapshot is immutable and already exists: {snapshot.id}"
+            ) from exc
         return snapshot
 
     def get_result_snapshot(self, snapshot_id: str) -> ResearchResultSnapshotRecord | None:
@@ -1424,7 +2064,9 @@ class SQLiteContentResearchStore:
             ).fetchone()
         return self._row_to_result_snapshot(row) if row else None
 
-    def list_result_snapshots_for_workflow(self, workflow_run_id: str) -> list[ResearchResultSnapshotRecord]:
+    def list_result_snapshots_for_workflow(
+        self, workflow_run_id: str
+    ) -> list[ResearchResultSnapshotRecord]:
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT * FROM content_research_result_snapshots WHERE workflow_run_id = ? ORDER BY created_at ASC",
@@ -1466,7 +2108,9 @@ class SQLiteContentResearchStore:
                     ),
                 )
         except sqlite3.IntegrityError as exc:
-            raise ValueError(f"Human decision is append-only and already exists: {decision.id}") from exc
+            raise ValueError(
+                f"Human decision is append-only and already exists: {decision.id}"
+            ) from exc
         return decision
 
     def get_human_decision_by_request(
@@ -1494,7 +2138,9 @@ class SQLiteContentResearchStore:
             ).fetchall()
         return [self._row_to_human_decision(row) for row in rows]
 
-    def list_current_human_decisions_for_workflow(self, workflow_run_id: str) -> list[HumanDecisionRecord]:
+    def list_current_human_decisions_for_workflow(
+        self, workflow_run_id: str
+    ) -> list[HumanDecisionRecord]:
         current: dict[tuple[str, str], HumanDecisionRecord] = {}
         for decision in self.list_human_decisions_for_workflow(workflow_run_id):
             current[(decision.target_type, decision.target_id)] = decision
@@ -1502,43 +2148,130 @@ class SQLiteContentResearchStore:
 
     def save_run_policy_snapshot(self, snapshot: RunPolicySnapshot) -> RunPolicySnapshot:
         with self._connect() as conn:
-            existing = conn.execute("SELECT effective_policy_hash FROM content_research_run_policy_snapshots WHERE id = ?", (snapshot.id,)).fetchone()
+            existing = conn.execute(
+                "SELECT effective_policy_hash FROM content_research_run_policy_snapshots WHERE id = ?",
+                (snapshot.id,),
+            ).fetchone()
             if existing is not None:
                 if existing[0] != snapshot.effective_policy_hash:
                     raise ValueError(f"RunPolicySnapshot is append-only: {snapshot.id}")
                 return snapshot
-            conn.execute("INSERT INTO content_research_run_policy_snapshots VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (snapshot.id, snapshot.workflow_run_id, snapshot.research_brief_id, snapshot.research_plan_id, snapshot.schema_version, _dumps(snapshot.effective_policy), snapshot.effective_policy_hash, _fmt_dt(snapshot.run_as_of_at), _dumps(snapshot.base_policy_ids_and_versions), _dumps(snapshot.requested_overrides), _dumps(snapshot.validation_result), _fmt_dt(snapshot.created_at), _dumps(snapshot.metadata)))
+            conn.execute(
+                "INSERT INTO content_research_run_policy_snapshots VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    snapshot.id,
+                    snapshot.workflow_run_id,
+                    snapshot.research_brief_id,
+                    snapshot.research_plan_id,
+                    snapshot.schema_version,
+                    _dumps(snapshot.effective_policy),
+                    snapshot.effective_policy_hash,
+                    _fmt_dt(snapshot.run_as_of_at),
+                    _dumps(snapshot.base_policy_ids_and_versions),
+                    _dumps(snapshot.requested_overrides),
+                    _dumps(snapshot.validation_result),
+                    _fmt_dt(snapshot.created_at),
+                    _dumps(snapshot.metadata),
+                ),
+            )
         return snapshot
 
     def get_run_policy_snapshot(self, snapshot_id: str) -> RunPolicySnapshot | None:
         with self._connect() as conn:
-            row = conn.execute("SELECT * FROM content_research_run_policy_snapshots WHERE id = ?", (snapshot_id,)).fetchone()
+            row = conn.execute(
+                "SELECT * FROM content_research_run_policy_snapshots WHERE id = ?", (snapshot_id,)
+            ).fetchone()
         return self._row_to_snapshot(row) if row else None
 
-    def get_run_policy_snapshot_for_workflow(self, workflow_run_id: str) -> RunPolicySnapshot | None:
+    def get_run_policy_snapshot_for_workflow(
+        self, workflow_run_id: str
+    ) -> RunPolicySnapshot | None:
         with self._connect() as conn:
-            row = conn.execute("SELECT * FROM content_research_run_policy_snapshots WHERE workflow_run_id = ?", (workflow_run_id,)).fetchone()
+            row = conn.execute(
+                "SELECT * FROM content_research_run_policy_snapshots WHERE workflow_run_id = ?",
+                (workflow_run_id,),
+            ).fetchone()
         return self._row_to_snapshot(row) if row else None
 
     def save_sample_policy(self, policy: SamplePolicy) -> SamplePolicy:
         with self._connect() as conn:
-            conn.execute("INSERT INTO content_research_sample_policies VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING", (policy.id, policy.schema_version, policy.direction_id, policy.minimum_samples, policy.minimum_independent_authors, policy.author_cap, _dumps(policy.metadata)))
+            conn.execute(
+                "INSERT INTO content_research_sample_policies VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING",
+                (
+                    policy.id,
+                    policy.schema_version,
+                    policy.direction_id,
+                    policy.minimum_samples,
+                    policy.minimum_independent_authors,
+                    policy.author_cap,
+                    _dumps(policy.metadata),
+                ),
+            )
         return policy
 
     def get_sample_policy(self, sample_policy_id: str) -> SamplePolicy | None:
         with self._connect() as conn:
-            row = conn.execute("SELECT * FROM content_research_sample_policies WHERE id = ?", (sample_policy_id,)).fetchone()
-        return SamplePolicy(id=row["id"], schema_version=row["schema_version"], direction_id=row["direction_id"], minimum_samples=row["minimum_samples"], minimum_independent_authors=row["minimum_independent_authors"], author_cap=row["author_cap"], metadata=_loads(row["metadata_json"])) if row else None
+            row = conn.execute(
+                "SELECT * FROM content_research_sample_policies WHERE id = ?", (sample_policy_id,)
+            ).fetchone()
+        return (
+            SamplePolicy(
+                id=row["id"],
+                schema_version=row["schema_version"],
+                direction_id=row["direction_id"],
+                minimum_samples=row["minimum_samples"],
+                minimum_independent_authors=row["minimum_independent_authors"],
+                author_cap=row["author_cap"],
+                metadata=_loads(row["metadata_json"]),
+            )
+            if row
+            else None
+        )
 
     def save_direction_contract(self, contract: DirectionContract) -> DirectionContract:
         with self._connect() as conn:
-            conn.execute("INSERT INTO content_research_direction_contracts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING", (contract.id, contract.snapshot_id, contract.direction_id, contract.schema_version, contract.sample_policy_id, _dumps_any_list(list(contract.required_note_fields)), _dumps_any_list(list(contract.optional_note_fields)), _dumps_any_list(list(contract.required_comment_fields)), _dumps_any_list(list(contract.claim_rules)), contract.analysis_schema_version, contract.resume_contract_version, _dumps(contract.metadata)))
+            conn.execute(
+                "INSERT INTO content_research_direction_contracts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING",
+                (
+                    contract.id,
+                    contract.snapshot_id,
+                    contract.direction_id,
+                    contract.schema_version,
+                    contract.sample_policy_id,
+                    _dumps_any_list(list(contract.required_note_fields)),
+                    _dumps_any_list(list(contract.optional_note_fields)),
+                    _dumps_any_list(list(contract.required_comment_fields)),
+                    _dumps_any_list(list(contract.claim_rules)),
+                    contract.analysis_schema_version,
+                    contract.resume_contract_version,
+                    _dumps(contract.metadata),
+                ),
+            )
         return contract
 
     def list_direction_contracts(self, snapshot_id: str) -> list[DirectionContract]:
         with self._connect() as conn:
-            rows = conn.execute("SELECT * FROM content_research_direction_contracts WHERE snapshot_id = ? ORDER BY direction_id", (snapshot_id,)).fetchall()
-        return [DirectionContract(id=row["id"], snapshot_id=row["snapshot_id"], direction_id=row["direction_id"], schema_version=row["schema_version"], sample_policy_id=row["sample_policy_id"], required_note_fields=tuple(_loads_any_list(row["required_note_fields_json"])), optional_note_fields=tuple(_loads_any_list(row["optional_note_fields_json"])), required_comment_fields=tuple(_loads_any_list(row["required_comment_fields_json"])), claim_rules=tuple(_loads_any_list(row["claim_rules_json"])), analysis_schema_version=row["analysis_schema_version"], resume_contract_version=row["resume_contract_version"], metadata=_loads(row["metadata_json"])) for row in rows]
+            rows = conn.execute(
+                "SELECT * FROM content_research_direction_contracts WHERE snapshot_id = ? ORDER BY direction_id",
+                (snapshot_id,),
+            ).fetchall()
+        return [
+            DirectionContract(
+                id=row["id"],
+                snapshot_id=row["snapshot_id"],
+                direction_id=row["direction_id"],
+                schema_version=row["schema_version"],
+                sample_policy_id=row["sample_policy_id"],
+                required_note_fields=tuple(_loads_any_list(row["required_note_fields_json"])),
+                optional_note_fields=tuple(_loads_any_list(row["optional_note_fields_json"])),
+                required_comment_fields=tuple(_loads_any_list(row["required_comment_fields_json"])),
+                claim_rules=tuple(_loads_any_list(row["claim_rules_json"])),
+                analysis_schema_version=row["analysis_schema_version"],
+                resume_contract_version=row["resume_contract_version"],
+                metadata=_loads(row["metadata_json"]),
+            )
+            for row in rows
+        ]
 
     def _save_typed_record(
         self,
@@ -1642,40 +2375,108 @@ class SQLiteContentResearchStore:
         fields: tuple[str, ...],
     ) -> TypedPersistenceRecord:
         values = {
-            field: _parse_dt(row[field]) if field in {"started_at", "finished_at"} and row[field] else row[field]
+            field: _parse_dt(row[field])
+            if field in {"started_at", "finished_at"} and row[field]
+            else row[field]
             for field in fields
         }
         return record_type(
-            id=row["id"], schema_version=row["schema_version"], payload=_loads(row["payload_json"]),
-            metadata=_loads(row["metadata_json"]), created_at=_parse_dt(row["created_at"]),
+            id=row["id"],
+            schema_version=row["schema_version"],
+            payload=_loads(row["payload_json"]),
+            metadata=_loads(row["metadata_json"]),
+            created_at=_parse_dt(row["created_at"]),
             **values,
         )
 
     def save_canonical_source(self, source: CanonicalSourceRecord) -> CanonicalSourceRecord:
-        return self._save_typed_record("content_research_canonical_sources", source, {"platform": source.platform, "platform_source_kind": source.platform_source_kind, "platform_source_id": source.platform_source_id, "canonical_url": source.canonical_url})  # type: ignore[return-value]
+        return self._save_typed_record(
+            "content_research_canonical_sources",
+            source,
+            {
+                "platform": source.platform,
+                "platform_source_kind": source.platform_source_kind,
+                "platform_source_id": source.platform_source_id,
+                "canonical_url": source.canonical_url,
+            },
+        )  # type: ignore[return-value]
 
     def resolve_canonical_source(self, source: CanonicalSourceRecord) -> CanonicalSourceRecord:
         with self._connect() as conn:
             conn.execute(
                 "INSERT INTO content_research_canonical_sources (id, schema_version, platform, platform_source_kind, platform_source_id, canonical_url, payload_json, metadata_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(platform, platform_source_kind, platform_source_id) DO NOTHING",
-                (source.id, source.schema_version, source.platform, source.platform_source_kind, source.platform_source_id, source.canonical_url, _dumps(source.payload), _dumps(source.metadata), _fmt_dt(source.created_at)),
+                (
+                    source.id,
+                    source.schema_version,
+                    source.platform,
+                    source.platform_source_kind,
+                    source.platform_source_id,
+                    source.canonical_url,
+                    _dumps(source.payload),
+                    _dumps(source.metadata),
+                    _fmt_dt(source.created_at),
+                ),
             )
-            row = conn.execute("SELECT * FROM content_research_canonical_sources WHERE platform = ? AND platform_source_kind = ? AND platform_source_id = ?", (source.platform, source.platform_source_kind, source.platform_source_id)).fetchone()
-        return self._row_to_typed_record(row, CanonicalSourceRecord, ("platform", "platform_source_kind", "platform_source_id", "canonical_url"))  # type: ignore[return-value]
+            row = conn.execute(
+                "SELECT * FROM content_research_canonical_sources WHERE platform = ? AND platform_source_kind = ? AND platform_source_id = ?",
+                (source.platform, source.platform_source_kind, source.platform_source_id),
+            ).fetchone()
+        return self._row_to_typed_record(
+            row,
+            CanonicalSourceRecord,
+            ("platform", "platform_source_kind", "platform_source_id", "canonical_url"),
+        )  # type: ignore[return-value]
 
     def get_canonical_source(self, source_id: str) -> CanonicalSourceRecord | None:
-        return self._get_typed_record("content_research_canonical_sources", source_id, CanonicalSourceRecord, ("platform", "platform_source_kind", "platform_source_id", "canonical_url"))  # type: ignore[return-value]
+        return self._get_typed_record(
+            "content_research_canonical_sources",
+            source_id,
+            CanonicalSourceRecord,
+            ("platform", "platform_source_kind", "platform_source_id", "canonical_url"),
+        )  # type: ignore[return-value]
 
-    def save_direction_source_projection(self, record: DirectionSourceProjectionRecord) -> DirectionSourceProjectionRecord:
-        self._require_typed_parent("content_research_canonical_sources", record.canonical_source_id, "canonical source")
-        self._require_typed_parent("content_research_directional_evidence_packets", record.evidence_packet_id, "evidence packet")
-        return self._save_typed_record("content_research_direction_source_projections", record, {"workflow_run_id": record.workflow_run_id, "research_direction_id": record.research_direction_id, "canonical_source_id": record.canonical_source_id, "evidence_packet_id": record.evidence_packet_id})  # type: ignore[return-value]
+    def save_direction_source_projection(
+        self, record: DirectionSourceProjectionRecord
+    ) -> DirectionSourceProjectionRecord:
+        self._require_typed_parent(
+            "content_research_canonical_sources", record.canonical_source_id, "canonical source"
+        )
+        self._require_typed_parent(
+            "content_research_directional_evidence_packets",
+            record.evidence_packet_id,
+            "evidence packet",
+        )
+        return self._save_typed_record(
+            "content_research_direction_source_projections",
+            record,
+            {
+                "workflow_run_id": record.workflow_run_id,
+                "research_direction_id": record.research_direction_id,
+                "canonical_source_id": record.canonical_source_id,
+                "evidence_packet_id": record.evidence_packet_id,
+            },
+        )  # type: ignore[return-value]
 
-    def save_directional_evidence_packet(self, record: DirectionalEvidencePacketRecord) -> DirectionalEvidencePacketRecord:
-        self._require_typed_parent("content_research_canonical_sources", record.canonical_source_id, "canonical source")
-        return self._save_typed_record("content_research_directional_evidence_packets", record, {"workflow_run_id": record.workflow_run_id, "research_direction_id": record.research_direction_id, "canonical_source_id": record.canonical_source_id, "field_projection_hash": record.field_projection_hash})  # type: ignore[return-value]
+    def save_directional_evidence_packet(
+        self, record: DirectionalEvidencePacketRecord
+    ) -> DirectionalEvidencePacketRecord:
+        self._require_typed_parent(
+            "content_research_canonical_sources", record.canonical_source_id, "canonical source"
+        )
+        return self._save_typed_record(
+            "content_research_directional_evidence_packets",
+            record,
+            {
+                "workflow_run_id": record.workflow_run_id,
+                "research_direction_id": record.research_direction_id,
+                "canonical_source_id": record.canonical_source_id,
+                "field_projection_hash": record.field_projection_hash,
+            },
+        )  # type: ignore[return-value]
 
-    def list_direction_source_projections(self, workflow_run_id: str, research_direction_id: str, *, offset: int = 0, limit: int = 50) -> list[DirectionSourceProjectionRecord]:
+    def list_direction_source_projections(
+        self, workflow_run_id: str, research_direction_id: str, *, offset: int = 0, limit: int = 50
+    ) -> list[DirectionSourceProjectionRecord]:
         if offset < 0 or limit < 1:
             raise ValueError("offset must be non-negative and limit must be positive")
         with self._connect() as conn:
@@ -1683,7 +2484,19 @@ class SQLiteContentResearchStore:
                 "SELECT * FROM content_research_direction_source_projections WHERE workflow_run_id = ? AND research_direction_id = ? ORDER BY created_at ASC, id ASC LIMIT ? OFFSET ?",
                 (workflow_run_id, research_direction_id, limit, offset),
             ).fetchall()
-        return [self._row_to_typed_record(row, DirectionSourceProjectionRecord, ("workflow_run_id", "research_direction_id", "canonical_source_id", "evidence_packet_id")) for row in rows]  # type: ignore[return-value]
+        return [
+            self._row_to_typed_record(
+                row,
+                DirectionSourceProjectionRecord,
+                (
+                    "workflow_run_id",
+                    "research_direction_id",
+                    "canonical_source_id",
+                    "evidence_packet_id",
+                ),
+            )
+            for row in rows
+        ]  # type: ignore[return-value]
 
     def count_run_independent_sources(self, workflow_run_id: str) -> int:
         """Count the complete canonical union without exposing paginated projections."""
@@ -1694,7 +2507,9 @@ class SQLiteContentResearchStore:
             ).fetchone()
         return int(row[0] if row else 0)
 
-    def list_directional_evidence_packets(self, workflow_run_id: str, research_direction_id: str, *, offset: int = 0, limit: int = 50) -> list[DirectionalEvidencePacketRecord]:
+    def list_directional_evidence_packets(
+        self, workflow_run_id: str, research_direction_id: str, *, offset: int = 0, limit: int = 50
+    ) -> list[DirectionalEvidencePacketRecord]:
         if offset < 0 or limit < 1:
             raise ValueError("offset must be non-negative and limit must be positive")
         with self._connect() as conn:
@@ -1702,15 +2517,44 @@ class SQLiteContentResearchStore:
                 "SELECT * FROM content_research_directional_evidence_packets WHERE workflow_run_id = ? AND research_direction_id = ? ORDER BY created_at ASC, id ASC LIMIT ? OFFSET ?",
                 (workflow_run_id, research_direction_id, limit, offset),
             ).fetchall()
-        return [self._row_to_typed_record(row, DirectionalEvidencePacketRecord, ("workflow_run_id", "research_direction_id", "canonical_source_id", "field_projection_hash")) for row in rows]  # type: ignore[return-value]
+        return [
+            self._row_to_typed_record(
+                row,
+                DirectionalEvidencePacketRecord,
+                (
+                    "workflow_run_id",
+                    "research_direction_id",
+                    "canonical_source_id",
+                    "field_projection_hash",
+                ),
+            )
+            for row in rows
+        ]  # type: ignore[return-value]
 
     def save_claim_candidate(self, record: ClaimCandidateRecord) -> ClaimCandidateRecord:
-        self._require_typed_parent("content_research_directional_evidence_packets", record.evidence_packet_id, "evidence packet")
+        self._require_typed_parent(
+            "content_research_directional_evidence_packets",
+            record.evidence_packet_id,
+            "evidence packet",
+        )
         packet = self.get_typed_record(DirectionalEvidencePacketRecord, record.evidence_packet_id)
         assert packet is not None
         from app.content_research.admission.candidates import validate_candidate_packet
+
         validate_candidate_packet(record, packet)
-        return self._save_typed_record("content_research_claim_candidates", record, {"workflow_run_id": record.workflow_run_id, "research_direction_id": record.research_direction_id, "evidence_packet_id": record.evidence_packet_id, "statement": record.statement, "intent_id": record.intent_id, "claim_type": record.claim_type, "requested_state": record.requested_state})  # type: ignore[return-value]
+        return self._save_typed_record(
+            "content_research_claim_candidates",
+            record,
+            {
+                "workflow_run_id": record.workflow_run_id,
+                "research_direction_id": record.research_direction_id,
+                "evidence_packet_id": record.evidence_packet_id,
+                "statement": record.statement,
+                "intent_id": record.intent_id,
+                "claim_type": record.claim_type,
+                "requested_state": record.requested_state,
+            },
+        )  # type: ignore[return-value]
 
     def save_claim_candidate_with_scope_audit_event(
         self, record: ClaimCandidateRecord, event: ScopeAuditEvent
@@ -1745,9 +2589,7 @@ class SQLiteContentResearchStore:
                     scope_contract_id=event.scope_contract_id,
                     scope_contract_version=event.scope_contract_version,
                 )
-                self._insert_typed_record(
-                    conn, "content_research_claim_candidates", record, values
-                )
+                self._insert_typed_record(conn, "content_research_claim_candidates", record, values)
                 self._insert_scope_audit_event(conn, event)
         except sqlite3.IntegrityError as exc:
             raise ValueError(
@@ -1755,64 +2597,145 @@ class SQLiteContentResearchStore:
             ) from exc
         return record
 
-    def list_claim_candidates(self, workflow_run_id: str, research_direction_id: str) -> list[ClaimCandidateRecord]:
+    def list_claim_candidates(
+        self, workflow_run_id: str, research_direction_id: str
+    ) -> list[ClaimCandidateRecord]:
         with self._connect() as conn:
-            rows = conn.execute("SELECT * FROM content_research_claim_candidates WHERE workflow_run_id = ? AND research_direction_id = ? ORDER BY created_at ASC, id ASC", (workflow_run_id, research_direction_id)).fetchall()
-        fields = ("workflow_run_id", "research_direction_id", "evidence_packet_id", "statement", "intent_id", "claim_type", "requested_state")
+            rows = conn.execute(
+                "SELECT * FROM content_research_claim_candidates WHERE workflow_run_id = ? AND research_direction_id = ? ORDER BY created_at ASC, id ASC",
+                (workflow_run_id, research_direction_id),
+            ).fetchall()
+        fields = (
+            "workflow_run_id",
+            "research_direction_id",
+            "evidence_packet_id",
+            "statement",
+            "intent_id",
+            "claim_type",
+            "requested_state",
+        )
         return [self._row_to_typed_record(row, ClaimCandidateRecord, fields) for row in rows]  # type: ignore[return-value]
 
-    def save_claim_admission_decision(self, record: ClaimAdmissionDecisionRecord) -> ClaimAdmissionDecisionRecord:
-        self._require_typed_parent("content_research_claim_candidates", record.claim_candidate_id, "claim candidate")
-        self._require_typed_parent("content_research_run_policy_snapshots", record.policy_snapshot_id, "policy snapshot")
-        return self._save_typed_record("content_research_claim_admission_decisions", record, {"research_direction_id": record.research_direction_id, "claim_candidate_id": record.claim_candidate_id, "decision": record.decision, "policy_snapshot_id": record.policy_snapshot_id})  # type: ignore[return-value]
+    def save_claim_admission_decision(
+        self, record: ClaimAdmissionDecisionRecord
+    ) -> ClaimAdmissionDecisionRecord:
+        self._require_typed_parent(
+            "content_research_claim_candidates", record.claim_candidate_id, "claim candidate"
+        )
+        self._require_typed_parent(
+            "content_research_run_policy_snapshots", record.policy_snapshot_id, "policy snapshot"
+        )
+        return self._save_typed_record(
+            "content_research_claim_admission_decisions",
+            record,
+            {
+                "research_direction_id": record.research_direction_id,
+                "claim_candidate_id": record.claim_candidate_id,
+                "decision": record.decision,
+                "policy_snapshot_id": record.policy_snapshot_id,
+            },
+        )  # type: ignore[return-value]
 
-    def save_direction_result_decision(self, record: DirectionResultDecisionRecord) -> DirectionResultDecisionRecord:
-        self._require_typed_parent("content_research_run_policy_snapshots", record.policy_snapshot_id, "policy snapshot")
-        return self._save_typed_record("content_research_direction_result_decisions", record, {"research_direction_id": record.research_direction_id, "policy_snapshot_id": record.policy_snapshot_id})  # type: ignore[return-value]
+    def save_direction_result_decision(
+        self, record: DirectionResultDecisionRecord
+    ) -> DirectionResultDecisionRecord:
+        self._require_typed_parent(
+            "content_research_run_policy_snapshots", record.policy_snapshot_id, "policy snapshot"
+        )
+        return self._save_typed_record(
+            "content_research_direction_result_decisions",
+            record,
+            {
+                "research_direction_id": record.research_direction_id,
+                "policy_snapshot_id": record.policy_snapshot_id,
+            },
+        )  # type: ignore[return-value]
 
     def save_weak_signal(self, record: WeakSignalRecord) -> WeakSignalRecord:
-        self._require_typed_parent("content_research_claim_admission_decisions", record.admission_decision_id, "admission decision")
-        return self._save_typed_record("content_research_weak_signals", record, {"admission_decision_id": record.admission_decision_id})  # type: ignore[return-value]
+        self._require_typed_parent(
+            "content_research_claim_admission_decisions",
+            record.admission_decision_id,
+            "admission decision",
+        )
+        return self._save_typed_record(
+            "content_research_weak_signals",
+            record,
+            {"admission_decision_id": record.admission_decision_id},
+        )  # type: ignore[return-value]
 
     def save_cross_direction_record(self, record: CrossDirectionRecord) -> CrossDirectionRecord:
-        return self._save_typed_record("content_research_cross_direction_records", record, {"research_plan_id": record.research_plan_id, "record_type": record.record_type})  # type: ignore[return-value]
+        return self._save_typed_record(
+            "content_research_cross_direction_records",
+            record,
+            {"research_plan_id": record.research_plan_id, "record_type": record.record_type},
+        )  # type: ignore[return-value]
 
     def save_aggregate_claim(self, record: AggregateClaimRecord) -> AggregateClaimRecord:
-        return self._save_typed_record("content_research_aggregate_claims", record, {"research_plan_id": record.research_plan_id, "aggregate_type": record.aggregate_type})  # type: ignore[return-value]
+        return self._save_typed_record(
+            "content_research_aggregate_claims",
+            record,
+            {"research_plan_id": record.research_plan_id, "aggregate_type": record.aggregate_type},
+        )  # type: ignore[return-value]
 
-    def save_marketing_conclusion_candidate(self, record: MarketingConclusionCandidateRecord) -> MarketingConclusionCandidateRecord:
+    def save_marketing_conclusion_candidate(
+        self, record: MarketingConclusionCandidateRecord
+    ) -> MarketingConclusionCandidateRecord:
         return self._save_typed_record(
             "content_research_marketing_conclusion_candidates",
             record,
-            {"workflow_run_id": record.workflow_run_id, "research_plan_id": record.research_plan_id, "track": record.track},
+            {
+                "workflow_run_id": record.workflow_run_id,
+                "research_plan_id": record.research_plan_id,
+                "track": record.track,
+            },
         )  # type: ignore[return-value]
 
-    def list_marketing_conclusion_candidates(self, workflow_run_id: str, research_plan_id: str) -> list[MarketingConclusionCandidateRecord]:
+    def list_marketing_conclusion_candidates(
+        self, workflow_run_id: str, research_plan_id: str
+    ) -> list[MarketingConclusionCandidateRecord]:
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT * FROM content_research_marketing_conclusion_candidates WHERE workflow_run_id = ? AND research_plan_id = ? ORDER BY created_at ASC, id ASC",
                 (workflow_run_id, research_plan_id),
             ).fetchall()
         return [
-            self._row_to_typed_record(row, MarketingConclusionCandidateRecord, ("workflow_run_id", "research_plan_id", "track"))
+            self._row_to_typed_record(
+                row,
+                MarketingConclusionCandidateRecord,
+                ("workflow_run_id", "research_plan_id", "track"),
+            )
             for row in rows
         ]  # type: ignore[return-value]
 
-    def save_marketing_conclusion_decision(self, record: MarketingConclusionDecisionRecord) -> MarketingConclusionDecisionRecord:
+    def save_marketing_conclusion_decision(
+        self, record: MarketingConclusionDecisionRecord
+    ) -> MarketingConclusionDecisionRecord:
         return self._save_typed_record(
             "content_research_marketing_conclusion_decisions",
             record,
-            {"workflow_run_id": record.workflow_run_id, "research_plan_id": record.research_plan_id, "candidate_id": record.candidate_id, "track": record.track, "state": record.state},
+            {
+                "workflow_run_id": record.workflow_run_id,
+                "research_plan_id": record.research_plan_id,
+                "candidate_id": record.candidate_id,
+                "track": record.track,
+                "state": record.state,
+            },
         )  # type: ignore[return-value]
 
-    def list_marketing_conclusion_decisions(self, workflow_run_id: str, research_plan_id: str) -> list[MarketingConclusionDecisionRecord]:
+    def list_marketing_conclusion_decisions(
+        self, workflow_run_id: str, research_plan_id: str
+    ) -> list[MarketingConclusionDecisionRecord]:
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT * FROM content_research_marketing_conclusion_decisions WHERE workflow_run_id = ? AND research_plan_id = ? ORDER BY created_at ASC, id ASC",
                 (workflow_run_id, research_plan_id),
             ).fetchall()
         return [
-            self._row_to_typed_record(row, MarketingConclusionDecisionRecord, ("workflow_run_id", "research_plan_id", "candidate_id", "track", "state"))
+            self._row_to_typed_record(
+                row,
+                MarketingConclusionDecisionRecord,
+                ("workflow_run_id", "research_plan_id", "candidate_id", "track", "state"),
+            )
             for row in rows
         ]  # type: ignore[return-value]
 
@@ -1848,39 +2771,123 @@ class SQLiteContentResearchStore:
 
     def save_budget_ledger_entry(self, record: BudgetLedgerEntryRecord) -> BudgetLedgerEntryRecord:
         if record.stage_checkpoint_id:
-            self._require_typed_parent("content_research_stage_checkpoints", record.stage_checkpoint_id, "stage checkpoint")
-        return self._save_typed_record("content_research_budget_ledger_entries", record, {"research_plan_id": record.research_plan_id, "research_direction_id": record.research_direction_id, "idempotency_key": record.idempotency_key, "reservation_status": record.reservation_status, "reserved_amount": record.reserved_amount, "consumed_amount": record.consumed_amount, "stage_checkpoint_id": record.stage_checkpoint_id})  # type: ignore[return-value]
+            self._require_typed_parent(
+                "content_research_stage_checkpoints", record.stage_checkpoint_id, "stage checkpoint"
+            )
+        return self._save_typed_record(
+            "content_research_budget_ledger_entries",
+            record,
+            {
+                "research_plan_id": record.research_plan_id,
+                "research_direction_id": record.research_direction_id,
+                "idempotency_key": record.idempotency_key,
+                "reservation_status": record.reservation_status,
+                "reserved_amount": record.reserved_amount,
+                "consumed_amount": record.consumed_amount,
+                "stage_checkpoint_id": record.stage_checkpoint_id,
+            },
+        )  # type: ignore[return-value]
 
     def save_report_draft(self, record: ReportDraftRecord) -> ReportDraftRecord:
-        self._require_result_snapshot(record.governed_snapshot_id, record.workflow_run_id, record.research_plan_id, record.governed_snapshot_version)
+        self._require_result_snapshot(
+            record.governed_snapshot_id,
+            record.workflow_run_id,
+            record.research_plan_id,
+            record.governed_snapshot_version,
+        )
         return self._save_typed_record(
             "content_research_report_drafts",
             record,
-            {"workflow_run_id": record.workflow_run_id, "research_plan_id": record.research_plan_id, "governed_snapshot_id": record.governed_snapshot_id, "governed_snapshot_version": record.governed_snapshot_version, "input_fingerprint": record.input_fingerprint, "policy_version": record.policy_version, "algorithm_version": record.algorithm_version, "previous_version_id": record.previous_version_id},
+            {
+                "workflow_run_id": record.workflow_run_id,
+                "research_plan_id": record.research_plan_id,
+                "governed_snapshot_id": record.governed_snapshot_id,
+                "governed_snapshot_version": record.governed_snapshot_version,
+                "input_fingerprint": record.input_fingerprint,
+                "policy_version": record.policy_version,
+                "algorithm_version": record.algorithm_version,
+                "previous_version_id": record.previous_version_id,
+            },
         )  # type: ignore[return-value]
 
-    def save_report_faithfulness_decision(self, record: ReportFaithfulnessDecisionRecord) -> ReportFaithfulnessDecisionRecord:
-        self._require_result_snapshot(record.governed_snapshot_id, record.workflow_run_id, record.research_plan_id, record.governed_snapshot_version)
-        self._require_typed_parent("content_research_report_drafts", record.report_draft_id, "report draft")
+    def save_report_faithfulness_decision(
+        self, record: ReportFaithfulnessDecisionRecord
+    ) -> ReportFaithfulnessDecisionRecord:
+        self._require_result_snapshot(
+            record.governed_snapshot_id,
+            record.workflow_run_id,
+            record.research_plan_id,
+            record.governed_snapshot_version,
+        )
+        self._require_typed_parent(
+            "content_research_report_drafts", record.report_draft_id, "report draft"
+        )
         return self._save_typed_record(
             "content_research_report_faithfulness_decisions",
             record,
-            {"workflow_run_id": record.workflow_run_id, "research_plan_id": record.research_plan_id, "governed_snapshot_id": record.governed_snapshot_id, "governed_snapshot_version": record.governed_snapshot_version, "input_fingerprint": record.input_fingerprint, "policy_version": record.policy_version, "algorithm_version": record.algorithm_version, "report_draft_id": record.report_draft_id, "previous_version_id": record.previous_version_id},
+            {
+                "workflow_run_id": record.workflow_run_id,
+                "research_plan_id": record.research_plan_id,
+                "governed_snapshot_id": record.governed_snapshot_id,
+                "governed_snapshot_version": record.governed_snapshot_version,
+                "input_fingerprint": record.input_fingerprint,
+                "policy_version": record.policy_version,
+                "algorithm_version": record.algorithm_version,
+                "report_draft_id": record.report_draft_id,
+                "previous_version_id": record.previous_version_id,
+            },
         )  # type: ignore[return-value]
 
     def save_report_publication(self, record: ReportPublicationRecord) -> ReportPublicationRecord:
-        self._require_result_snapshot(record.governed_snapshot_id, record.workflow_run_id, record.research_plan_id, record.governed_snapshot_version)
-        self._require_typed_parent("content_research_report_drafts", record.report_draft_id, "report draft")
-        self._require_typed_parent("content_research_report_faithfulness_decisions", record.faithfulness_decision_id, "report faithfulness decision")
+        self._require_result_snapshot(
+            record.governed_snapshot_id,
+            record.workflow_run_id,
+            record.research_plan_id,
+            record.governed_snapshot_version,
+        )
+        self._require_typed_parent(
+            "content_research_report_drafts", record.report_draft_id, "report draft"
+        )
+        self._require_typed_parent(
+            "content_research_report_faithfulness_decisions",
+            record.faithfulness_decision_id,
+            "report faithfulness decision",
+        )
         return self._save_typed_record(
             "content_research_report_publications",
             record,
-            {"workflow_run_id": record.workflow_run_id, "research_plan_id": record.research_plan_id, "governed_snapshot_id": record.governed_snapshot_id, "governed_snapshot_version": record.governed_snapshot_version, "input_fingerprint": record.input_fingerprint, "policy_version": record.policy_version, "algorithm_version": record.algorithm_version, "report_draft_id": record.report_draft_id, "faithfulness_decision_id": record.faithfulness_decision_id, "publication_state": record.publication_state, "previous_version_id": record.previous_version_id},
+            {
+                "workflow_run_id": record.workflow_run_id,
+                "research_plan_id": record.research_plan_id,
+                "governed_snapshot_id": record.governed_snapshot_id,
+                "governed_snapshot_version": record.governed_snapshot_version,
+                "input_fingerprint": record.input_fingerprint,
+                "policy_version": record.policy_version,
+                "algorithm_version": record.algorithm_version,
+                "report_draft_id": record.report_draft_id,
+                "faithfulness_decision_id": record.faithfulness_decision_id,
+                "publication_state": record.publication_state,
+                "previous_version_id": record.previous_version_id,
+            },
         )  # type: ignore[return-value]
 
     @staticmethod
     def _row_to_snapshot(row: sqlite3.Row) -> RunPolicySnapshot:
-        return RunPolicySnapshot(id=row["id"], workflow_run_id=row["workflow_run_id"], research_brief_id=row["research_brief_id"], research_plan_id=row["research_plan_id"], schema_version=row["schema_version"], effective_policy=_loads(row["effective_policy_json"]), effective_policy_hash=row["effective_policy_hash"], run_as_of_at=_parse_dt(row["run_as_of_at"]), base_policy_ids_and_versions=_loads(row["base_policy_json"]), requested_overrides=_loads(row["requested_overrides_json"]), validation_result=_loads(row["validation_result_json"]), created_at=_parse_dt(row["created_at"]), metadata=_loads(row["metadata_json"]))
+        return RunPolicySnapshot(
+            id=row["id"],
+            workflow_run_id=row["workflow_run_id"],
+            research_brief_id=row["research_brief_id"],
+            research_plan_id=row["research_plan_id"],
+            schema_version=row["schema_version"],
+            effective_policy=_loads(row["effective_policy_json"]),
+            effective_policy_hash=row["effective_policy_hash"],
+            run_as_of_at=_parse_dt(row["run_as_of_at"]),
+            base_policy_ids_and_versions=_loads(row["base_policy_json"]),
+            requested_overrides=_loads(row["requested_overrides_json"]),
+            validation_result=_loads(row["validation_result_json"]),
+            created_at=_parse_dt(row["created_at"]),
+            metadata=_loads(row["metadata_json"]),
+        )
 
     @staticmethod
     def _row_to_brief(row: sqlite3.Row) -> ResearchBriefRecord:
@@ -1981,7 +2988,9 @@ class SQLiteContentResearchStore:
     def _row_to_scope_draft(row: sqlite3.Row) -> ResearchScopeDraft:
         constraints = tuple(
             ScopeConstraint(
-                id=str(item["id"]), label=str(item["label"]), value=str(item["value"]),
+                id=str(item["id"]),
+                label=str(item["label"]),
+                value=str(item["value"]),
                 mode=str(item["mode"]),
                 allowed_aliases=tuple(str(alias) for alias in item.get("allowed_aliases") or ()),
             )
@@ -1989,15 +2998,22 @@ class SQLiteContentResearchStore:
         )
         groups = tuple(
             ScopeQueryGroupInput(
-                suggested_query=str(item["suggested_query"]), final_query=str(item["final_query"]),
-                targeted_required_terms=tuple(str(term) for term in item.get("targeted_required_terms") or ()),
+                suggested_query=str(item["suggested_query"]),
+                final_query=str(item["final_query"]),
+                targeted_required_terms=tuple(
+                    str(term) for term in item.get("targeted_required_terms") or ()
+                ),
             )
             for item in _loads_any_list(row["query_groups_json"])
         )
         return ResearchScopeDraft(
-            id=row["id"], workflow_run_id=row["workflow_run_id"],
-            research_plan_id=row["research_plan_id"], structure_hash=row["structure_hash"],
-            constraints=constraints, query_groups=groups, created_at=_parse_dt(row["created_at"]),
+            id=row["id"],
+            workflow_run_id=row["workflow_run_id"],
+            research_plan_id=row["research_plan_id"],
+            structure_hash=row["structure_hash"],
+            constraints=constraints,
+            query_groups=groups,
+            created_at=_parse_dt(row["created_at"]),
         )
 
     @staticmethod
@@ -2076,6 +3092,45 @@ class SQLiteContentResearchStore:
         )
 
     @staticmethod
+    def _row_to_scope_execution_unit(row: sqlite3.Row) -> ScopeExecutionUnit:
+        return ScopeExecutionUnit(
+            id=row["id"],
+            workflow_run_id=row["workflow_run_id"],
+            scope_contract_id=row["scope_contract_id"],
+            coverage_snapshot_id=row["coverage_snapshot_id"],
+            resolution=row["resolution"],
+            operation=row["operation"],
+            state=row["state"],
+            created_at=_parse_dt(row["created_at"]),
+        )
+
+    @staticmethod
+    def _row_to_scope_execution_attempt(row: sqlite3.Row) -> ScopeExecutionAttempt:
+        return ScopeExecutionAttempt(
+            execution_unit_id=row["execution_unit_id"],
+            attempt_no=int(row["attempt_no"]),
+            state=row["state"],
+            lease_owner=row["lease_owner"],
+            lease_token=row["lease_token"],
+            lease_expires_at=(
+                _parse_dt(row["lease_expires_at"]) if row["lease_expires_at"] else None
+            ),
+            provider_state=row["provider_state"],
+            created_at=_parse_dt(row["created_at"]),
+        )
+
+    @staticmethod
+    def _row_to_execution_fact(row: sqlite3.Row) -> ExecutionFact:
+        return ExecutionFact(
+            execution_unit_id=row["execution_unit_id"],
+            attempt_no=int(row["attempt_no"]),
+            sequence_no=int(row["sequence_no"]),
+            kind=row["kind"],
+            payload=_loads(row["payload_json"]),
+            created_at=_parse_dt(row["created_at"]),
+        )
+
+    @staticmethod
     def _row_to_scope_execution_authorization(
         row: sqlite3.Row,
     ) -> ScopeExecutionAuthorization:
@@ -2089,6 +3144,9 @@ class SQLiteContentResearchStore:
             execution_revision=row["execution_revision"],
             state=row["state"],
             created_at=_parse_dt(row["created_at"]),
+            execution_unit_id=(
+                row["execution_unit_id"] if "execution_unit_id" in row.keys() else None
+            ),
         )
 
     @staticmethod
@@ -2102,11 +3160,13 @@ class SQLiteContentResearchStore:
             execution_revision=row["execution_revision"],
             operation=row["operation"],
             supplementary_queries=tuple(
-                str(item)
-                for item in _loads_any_list(row["supplementary_queries_json"])
+                str(item) for item in _loads_any_list(row["supplementary_queries_json"])
             ),
             state=row["state"],
             created_at=_parse_dt(row["created_at"]),
+            execution_unit_id=(
+                row["execution_unit_id"] if "execution_unit_id" in row.keys() else None
+            ),
         )
 
     @staticmethod
@@ -2127,7 +3187,9 @@ class SQLiteContentResearchStore:
             source_id=row["source_id"],
             source_author_id=row["source_author_id"],
             source_author_name=row["source_author_name"],
-            source_published_at=_parse_dt(row["source_published_at"]) if row["source_published_at"] else None,
+            source_published_at=_parse_dt(row["source_published_at"])
+            if row["source_published_at"]
+            else None,
             collected_at=_parse_dt(row["collected_at"]),
             title=row["title"],
             text_excerpt=row["text_excerpt"],

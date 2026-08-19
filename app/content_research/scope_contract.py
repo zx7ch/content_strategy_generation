@@ -72,7 +72,9 @@ class ScopeDraftConfirmation:
     created_at: datetime = field(default_factory=utcnow)
 
     def __post_init__(self) -> None:
-        if not all((self.draft_id.strip(), self.scope_contract_id.strip(), self.workflow_run_id.strip())):
+        if not all(
+            (self.draft_id.strip(), self.scope_contract_id.strip(), self.workflow_run_id.strip())
+        ):
             raise ValueError("scope draft confirmation identity is required")
 
 
@@ -181,6 +183,7 @@ class ScopeExecutionAuthorization:
     execution_revision: int
     state: Literal["authorized_collection", "authorized_limited_report"]
     created_at: datetime = field(default_factory=utcnow)
+    execution_unit_id: str | None = field(default=None, compare=False)
 
     def __post_init__(self) -> None:
         if not all(
@@ -222,6 +225,7 @@ class ScopeExecutionContinuation:
     state: Literal["pending", "running", "completed", "failed"]
     created_at: datetime = field(default_factory=utcnow)
     lease_token: str | None = field(default=None, compare=False, repr=False)
+    execution_unit_id: str | None = field(default=None, compare=False)
 
     def __post_init__(self) -> None:
         if not all(
@@ -243,6 +247,101 @@ class ScopeExecutionContinuation:
             raise ValueError("scope execution continuation queries must be distinct and non-empty")
         if self.operation == "limited_report" and queries:
             raise ValueError("limited report continuation does not accept queries")
+
+
+ExecutionUnitState = Literal["pending", "running", "completed", "failed", "outcome_unknown"]
+ExecutionFactKind = Literal[
+    "decision_accepted",
+    "attempt_claimed",
+    "provider_request_recorded",
+    "provider_outcome_recorded",
+    "lease_fenced",
+    "coverage_persisted",
+    "publication_persisted",
+    "outcome_unknown",
+]
+
+
+@dataclass(frozen=True)
+class ScopeExecutionUnit:
+    """One immutable, user-accepted coverage decision and its authorized work."""
+
+    id: str
+    workflow_run_id: str
+    scope_contract_id: str
+    coverage_snapshot_id: str
+    resolution: Literal["expand_required_constraint", "generate_limited_report", "relax_constraint"]
+    operation: Literal["limited_report", "supplementary_collection"]
+    state: ExecutionUnitState
+    created_at: datetime = field(default_factory=utcnow)
+
+    def __post_init__(self) -> None:
+        if not all(
+            (
+                self.id.strip(),
+                self.workflow_run_id.strip(),
+                self.scope_contract_id.strip(),
+                self.coverage_snapshot_id.strip(),
+            )
+        ):
+            raise ValueError("scope execution unit identity is required")
+        if self.resolution not in {
+            "expand_required_constraint",
+            "generate_limited_report",
+            "relax_constraint",
+        }:
+            raise ValueError("invalid scope execution unit resolution")
+        if self.operation not in {"limited_report", "supplementary_collection"}:
+            raise ValueError("invalid scope execution unit operation")
+        if self.state not in {"pending", "running", "completed", "failed", "outcome_unknown"}:
+            raise ValueError("invalid scope execution unit state")
+
+
+@dataclass(frozen=True)
+class ScopeExecutionAttempt:
+    """An internal lease-fenced attempt within a stable execution unit."""
+
+    execution_unit_id: str
+    attempt_no: int
+    state: ExecutionUnitState
+    lease_owner: str | None = None
+    lease_token: str | None = field(default=None, compare=False, repr=False)
+    lease_expires_at: datetime | None = None
+    provider_state: str | None = None
+    created_at: datetime = field(default_factory=utcnow)
+
+    def __post_init__(self) -> None:
+        if not self.execution_unit_id.strip() or self.attempt_no < 0:
+            raise ValueError("scope execution attempt identity is required")
+        if self.state not in {"pending", "running", "completed", "failed", "outcome_unknown"}:
+            raise ValueError("invalid scope execution attempt state")
+
+
+@dataclass(frozen=True)
+class ExecutionFact:
+    """Append-only, ordered trace fact for one execution-unit attempt."""
+
+    execution_unit_id: str
+    attempt_no: int
+    sequence_no: int
+    kind: ExecutionFactKind
+    payload: dict[str, object]
+    created_at: datetime = field(default_factory=utcnow)
+
+    def __post_init__(self) -> None:
+        if not self.execution_unit_id.strip() or self.attempt_no < 0 or self.sequence_no < 1:
+            raise ValueError("execution fact identity is required")
+        if self.kind not in {
+            "decision_accepted",
+            "attempt_claimed",
+            "provider_request_recorded",
+            "provider_outcome_recorded",
+            "lease_fenced",
+            "coverage_persisted",
+            "publication_persisted",
+            "outcome_unknown",
+        }:
+            raise ValueError("invalid execution fact kind")
 
 
 def build_scope_contract(
@@ -270,14 +369,19 @@ def build_scope_contract(
     if not query_groups:
         raise ValueError("scope contract requires query groups")
 
-    required_terms = tuple(constraint.value for constraint in constraints if constraint.mode == "required")
-    contract_id = "rsc_" + _fingerprint(
-        {
-            "workflow_run_id": workflow_run_id,
-            "research_plan_id": research_plan_id,
-            "version": version,
-        }
-    )[:24]
+    required_terms = tuple(
+        constraint.value for constraint in constraints if constraint.mode == "required"
+    )
+    contract_id = (
+        "rsc_"
+        + _fingerprint(
+            {
+                "workflow_run_id": workflow_run_id,
+                "research_plan_id": research_plan_id,
+                "version": version,
+            }
+        )[:24]
+    )
     frozen_groups = tuple(
         _build_query_group(
             item,
@@ -300,17 +404,43 @@ def build_scope_contract(
 
 
 def build_scope_draft(
-    *, workflow_run_id: str, research_plan_id: str, structure_hash: str,
-    constraints: tuple[ScopeConstraint, ...], query_groups: tuple[ScopeQueryGroupInput, ...],
+    *,
+    workflow_run_id: str,
+    research_plan_id: str,
+    structure_hash: str,
+    constraints: tuple[ScopeConstraint, ...],
+    query_groups: tuple[ScopeQueryGroupInput, ...],
 ) -> ResearchScopeDraft:
     if not workflow_run_id.strip() or not research_plan_id.strip() or not structure_hash.strip():
         raise ValueError("scope draft identity is required")
     build_scope_contract(
-        workflow_run_id=workflow_run_id, research_plan_id=research_plan_id, version=1,
-        constraints=constraints, query_groups=query_groups,
+        workflow_run_id=workflow_run_id,
+        research_plan_id=research_plan_id,
+        version=1,
+        constraints=constraints,
+        query_groups=query_groups,
     )
-    draft_id = "rsd_" + _fingerprint({"workflow_run_id": workflow_run_id, "research_plan_id": research_plan_id, "structure_hash": structure_hash, "constraints": [item.__dict__ for item in constraints], "query_groups": [item.__dict__ for item in query_groups]})[:24]
-    return ResearchScopeDraft(draft_id, workflow_run_id, research_plan_id, structure_hash, constraints, query_groups, utcnow())
+    draft_id = (
+        "rsd_"
+        + _fingerprint(
+            {
+                "workflow_run_id": workflow_run_id,
+                "research_plan_id": research_plan_id,
+                "structure_hash": structure_hash,
+                "constraints": [item.__dict__ for item in constraints],
+                "query_groups": [item.__dict__ for item in query_groups],
+            }
+        )[:24]
+    )
+    return ResearchScopeDraft(
+        draft_id,
+        workflow_run_id,
+        research_plan_id,
+        structure_hash,
+        constraints,
+        query_groups,
+        utcnow(),
+    )
 
 
 def _build_query_group(
@@ -323,7 +453,9 @@ def _build_query_group(
     suggested_query = _clean_query(value.suggested_query, field_name="suggested_query")
     final_query = _clean_query(value.final_query, field_name="final_query")
     origin: QueryOrigin = (
-        "system_suggested" if _normalized(suggested_query) == _normalized(final_query) else "user_edited"
+        "system_suggested"
+        if _normalized(suggested_query) == _normalized(final_query)
+        else "user_edited"
     )
     role = classify_query_group(
         final_query,

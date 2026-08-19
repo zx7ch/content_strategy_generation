@@ -270,7 +270,9 @@ _V13_LEGACY_SNAPSHOT_COLUMN = "evidence_bundle_ids_json"
 def _apply_0013(conn: sqlite3.Connection) -> None:
     for table in _V13_LEGACY_TABLES:
         conn.execute(f"DROP TABLE IF EXISTS {table}")
-    columns = {row[1] for row in conn.execute("PRAGMA table_info(content_research_result_snapshots)")}
+    columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(content_research_result_snapshots)")
+    }
     if _V13_LEGACY_SNAPSHOT_COLUMN in columns:
         conn.execute(
             f"ALTER TABLE content_research_result_snapshots DROP COLUMN {_V13_LEGACY_SNAPSHOT_COLUMN}"
@@ -648,7 +650,14 @@ def _apply_0024(conn: sqlite3.Connection) -> None:
            WHERE event_name = 'coverage_resolved'
            ORDER BY created_at ASC, id ASC"""
     ).fetchall()
-    for event_id, workflow_run_id, scope_contract_id, scope_version, raw_payload, created_at in rows:
+    for (
+        event_id,
+        workflow_run_id,
+        scope_contract_id,
+        scope_version,
+        raw_payload,
+        created_at,
+    ) in rows:
         try:
             payload = json.loads(raw_payload)
         except (TypeError, json.JSONDecodeError):
@@ -703,9 +712,7 @@ def _apply_0024(conn: sqlite3.Connection) -> None:
             if existing_authorization is not None
             else "sea_" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
         )
-        continuation_id = "sec_" + hashlib.sha256(
-            authorization_id.encode("utf-8")
-        ).hexdigest()[:24]
+        continuation_id = "sec_" + hashlib.sha256(authorization_id.encode("utf-8")).hexdigest()[:24]
         state = (
             "authorized_limited_report"
             if resolution == "generate_limited_report"
@@ -757,6 +764,154 @@ def _apply_0024(conn: sqlite3.Connection) -> None:
                 now,
                 now,
             ),
+        )
+
+
+_V25_EXECUTION_UNITS_SQL = """
+CREATE TABLE content_research_scope_execution_units (
+    id TEXT PRIMARY KEY,
+    decision_fingerprint TEXT NOT NULL UNIQUE,
+    workflow_run_id TEXT NOT NULL,
+    scope_contract_id TEXT NOT NULL,
+    coverage_snapshot_id TEXT NOT NULL UNIQUE,
+    resolution TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    state TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX idx_cr_execution_unit_workflow_scope
+    ON content_research_scope_execution_units(workflow_run_id, scope_contract_id);
+CREATE TABLE content_research_scope_execution_attempts (
+    execution_unit_id TEXT NOT NULL,
+    attempt_no INTEGER NOT NULL,
+    state TEXT NOT NULL,
+    lease_owner TEXT,
+    lease_token TEXT,
+    lease_expires_at TEXT,
+    provider_state TEXT,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(execution_unit_id, attempt_no),
+    FOREIGN KEY(execution_unit_id) REFERENCES content_research_scope_execution_units(id)
+);
+CREATE INDEX idx_cr_execution_attempt_unit_attempt
+    ON content_research_scope_execution_attempts(execution_unit_id, attempt_no);
+CREATE TABLE content_research_execution_facts (
+    execution_unit_id TEXT NOT NULL,
+    attempt_no INTEGER NOT NULL,
+    sequence_no INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(execution_unit_id, attempt_no, sequence_no),
+    FOREIGN KEY(execution_unit_id, attempt_no)
+        REFERENCES content_research_scope_execution_attempts(execution_unit_id, attempt_no)
+);
+CREATE INDEX idx_cr_execution_fact_unit_attempt_sequence
+    ON content_research_execution_facts(execution_unit_id, attempt_no, sequence_no);
+ALTER TABLE content_research_scope_execution_authorizations
+    ADD COLUMN execution_unit_id TEXT;
+ALTER TABLE content_research_scope_execution_continuations
+    ADD COLUMN execution_unit_id TEXT;
+"""
+
+
+def _apply_0025(conn: sqlite3.Connection) -> None:
+    """Backfill legacy authorization rows as aliases without changing Scope meaning."""
+    conn.executescript(_V25_EXECUTION_UNITS_SQL)
+    rows = conn.execute(
+        """SELECT authorization.id, authorization.workflow_run_id, authorization.scope_contract_id,
+                  authorization.coverage_snapshot_id, authorization.resolution,
+                  authorization.created_at, continuation.operation, continuation.state,
+                  continuation.lease_owner, continuation.lease_token,
+                  continuation.lease_expires_at
+           FROM content_research_scope_execution_authorizations AS authorization
+           LEFT JOIN content_research_scope_execution_continuations AS continuation
+             ON continuation.authorization_id=authorization.id
+           ORDER BY authorization.created_at ASC, authorization.id ASC"""
+    ).fetchall()
+    for row in rows:
+        (
+            authorization_id,
+            workflow_run_id,
+            scope_contract_id,
+            coverage_snapshot_id,
+            resolution,
+            created_at,
+            operation,
+            continuation_state,
+            lease_owner,
+            lease_token,
+            lease_expires_at,
+        ) = row
+        operation = operation or (
+            "limited_report"
+            if resolution == "generate_limited_report"
+            else "supplementary_collection"
+        )
+        unit_id = (
+            "seu_"
+            + hashlib.sha256(f"legacy-authorization:{authorization_id}".encode()).hexdigest()[:24]
+        )
+        decision_fingerprint = hashlib.sha256(
+            f"legacy-authorization:{authorization_id}".encode()
+        ).hexdigest()
+        state = continuation_state or "pending"
+        now = created_at or datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            """INSERT OR IGNORE INTO content_research_scope_execution_units
+               (id, decision_fingerprint, workflow_run_id, scope_contract_id,
+                coverage_snapshot_id, resolution, operation, state, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                unit_id,
+                decision_fingerprint,
+                workflow_run_id,
+                scope_contract_id,
+                coverage_snapshot_id,
+                resolution,
+                operation,
+                state if state in {"pending", "running", "completed", "failed"} else "failed",
+                now,
+            ),
+        )
+        conn.execute(
+            """INSERT OR IGNORE INTO content_research_scope_execution_attempts
+               (execution_unit_id, attempt_no, state, lease_owner, lease_token,
+                lease_expires_at, provider_state, created_at)
+               VALUES (?, 0, ?, ?, ?, ?, NULL, ?)""",
+            (
+                unit_id,
+                state if state in {"pending", "running", "completed", "failed"} else "failed",
+                lease_owner,
+                lease_token,
+                lease_expires_at,
+                now,
+            ),
+        )
+        conn.execute(
+            """INSERT OR IGNORE INTO content_research_execution_facts
+               (execution_unit_id, attempt_no, sequence_no, kind, payload_json, created_at)
+               VALUES (?, 0, 1, 'decision_accepted', ?, ?)""",
+            (
+                unit_id,
+                json.dumps(
+                    {"authorization_id": authorization_id, "migration": "legacy_alias_v1"},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                now,
+            ),
+        )
+        conn.execute(
+            """UPDATE content_research_scope_execution_authorizations
+               SET execution_unit_id=? WHERE id=?""",
+            (unit_id, authorization_id),
+        )
+        conn.execute(
+            """UPDATE content_research_scope_execution_continuations
+               SET execution_unit_id=? WHERE authorization_id=?""",
+            (unit_id, authorization_id),
         )
 
 
@@ -819,6 +974,7 @@ def _expected_checksums(migration_0002_sql: str, legacy_checksum: str) -> dict[s
         "0022": hashlib.sha256(_V22_SCOPE_DRAFT_CONFIRMATION_SQL.encode("utf-8")).hexdigest(),
         "0023": hashlib.sha256(_V23_SCOPE_EXECUTION_AUTHORIZATION_SQL.encode("utf-8")).hexdigest(),
         "0024": hashlib.sha256(_V24_SCOPE_EXECUTION_CONTINUATION_SQL.encode("utf-8")).hexdigest(),
+        "0025": hashlib.sha256(_V25_EXECUTION_UNITS_SQL.encode("utf-8")).hexdigest(),
     }
 
 
@@ -1066,6 +1222,13 @@ def apply_content_research_migrations(
                 name="scope_execution_continuation_lifecycle",
                 checksum=expected_checksums["0024"],
                 apply=lambda: _apply_0024(conn),
+            )
+            _apply_migration(
+                conn,
+                version="0025",
+                name="scope_execution_units_and_facts",
+                checksum=expected_checksums["0025"],
+                apply=lambda: _apply_0025(conn),
             )
         except Exception:
             conn.rollback()

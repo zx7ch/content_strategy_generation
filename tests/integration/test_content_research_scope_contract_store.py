@@ -32,9 +32,7 @@ def _contract(*, version: int) -> ResearchScopeContract:
             ScopeConstraint("season", "季节", "夏季", "required"),
             ScopeConstraint("scenario", "使用场景", "通勤", "required"),
         ),
-        query_groups=(
-            ScopeQueryGroupInput("夏季 长袖衬衫 通勤", "夏季 长袖衬衫 通勤"),
-        ),
+        query_groups=(ScopeQueryGroupInput("夏季 长袖衬衫 通勤", "夏季 长袖衬衫 通勤"),),
     )
 
 
@@ -58,8 +56,7 @@ def _confirm_scope(
 ) -> tuple[ResearchScopeContract, ScopeAuditEvent, bool]:
     return store.confirm_scope_atomically(
         draft.id,
-        final_queries=final_queries
-        or tuple(group.final_query for group in draft.query_groups),
+        final_queries=final_queries or tuple(group.final_query for group in draft.query_groups),
         event_id=event_id,
     )
 
@@ -169,9 +166,7 @@ def test_competing_atomic_coverage_resolutions_reconcile_same_and_reject_differe
                 execution_revision=2,
                 operation=operation,
                 supplementary_queries=(
-                    ("夏季 防晒 长袖衬衫",)
-                    if resolution == "expand_required_constraint"
-                    else ()
+                    ("夏季 防晒 长袖衬衫",) if resolution == "expand_required_constraint" else ()
                 ),
                 state="pending",
             )
@@ -231,6 +226,128 @@ def test_competing_atomic_coverage_resolutions_reconcile_same_and_reject_differe
     assert "different persisted resolution" in str(different_errors[0])
     assert len(different_store.list_scope_execution_authorizations("run_scope_1")) == 1
     assert len(different_store.list_scope_execution_continuations("run_scope_1")) == 1
+
+
+def test_coverage_decision_replay_uses_one_execution_unit_and_one_decision_fact(tmp_path) -> None:
+    """Removing decision-unit idempotency must make this exact replay create a new unit."""
+    store = SQLiteContentResearchStore(str(tmp_path / "execution-unit.db"))
+    contract = _contract(version=1)
+    store.save_scope_contract(contract)
+    snapshot = CoverageSnapshot(
+        id="scv_execution_unit",
+        workflow_run_id=contract.workflow_run_id,
+        scope_contract_id=contract.id,
+        scope_contract_version=contract.version,
+        state="awaiting_scope_decision",
+        constraint_counts={},
+        unmet_constraint_ids=("season",),
+    )
+    store.save_coverage_snapshot(snapshot)
+    decision = {
+        "resolution": "expand_required_constraint",
+        "operation": "supplementary_collection",
+        "supplementary_queries": ("夏季 防晒 长袖衬衫",),
+    }
+
+    unit, created = store.resolve_coverage_to_execution_unit_atomically(
+        snapshot=snapshot, decision=decision
+    )
+    replayed, replay_created = store.resolve_coverage_to_execution_unit_atomically(
+        snapshot=snapshot, decision=decision
+    )
+
+    assert unit.id == replayed.id
+    assert created is True
+    assert replay_created is False
+    assert [fact.kind for fact in store.execution_trace(unit.id)] == ["decision_accepted"]
+
+
+def test_competing_execution_unit_decisions_reconcile_exact_replays_and_reject_conflicts(
+    tmp_path,
+) -> None:
+    """Changing a decision for one coverage snapshot must not create another executable unit."""
+    db_path = tmp_path / "execution-unit-race.db"
+    stores = [SQLiteContentResearchStore(str(db_path)) for _ in range(2)]
+    contract = _contract(version=1)
+    stores[0].save_scope_contract(contract)
+    snapshot = CoverageSnapshot(
+        id="scv_execution_unit_race",
+        workflow_run_id=contract.workflow_run_id,
+        scope_contract_id=contract.id,
+        scope_contract_version=contract.version,
+        state="awaiting_scope_decision",
+        constraint_counts={},
+        unmet_constraint_ids=("season",),
+    )
+    stores[0].save_coverage_snapshot(snapshot)
+    decision = {"resolution": "generate_limited_report", "operation": "limited_report"}
+    barrier = threading.Barrier(2)
+    results = []
+
+    def resolve(store: SQLiteContentResearchStore) -> None:
+        barrier.wait()
+        results.append(
+            store.resolve_coverage_to_execution_unit_atomically(
+                snapshot=snapshot, decision=decision
+            )
+        )
+
+    threads = [threading.Thread(target=resolve, args=(store,)) for store in stores]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+    assert all(not thread.is_alive() for thread in threads)
+    assert len(results) == 2
+    assert len({item[0].id for item in results}) == 1
+    assert sorted(item[1] for item in results) == [False, True]
+
+    with pytest.raises(ValueError, match="different persisted decision"):
+        stores[0].resolve_coverage_to_execution_unit_atomically(
+            snapshot=snapshot,
+            decision={
+                "resolution": "expand_required_constraint",
+                "operation": "supplementary_collection",
+                "supplementary_queries": ("夏季 长袖衬衫",),
+            },
+        )
+
+
+def test_execution_trace_rejects_duplicate_attempt_sequence_numbers(tmp_path) -> None:
+    """Dropping the fact sequence uniqueness constraint must make duplicate facts visible."""
+    store = SQLiteContentResearchStore(str(tmp_path / "execution-fact-sequence.db"))
+    contract = _contract(version=1)
+    store.save_scope_contract(contract)
+    snapshot = CoverageSnapshot(
+        id="scv_execution_fact_sequence",
+        workflow_run_id=contract.workflow_run_id,
+        scope_contract_id=contract.id,
+        scope_contract_version=contract.version,
+        state="awaiting_scope_decision",
+        constraint_counts={},
+        unmet_constraint_ids=("season",),
+    )
+    store.save_coverage_snapshot(snapshot)
+    unit, _ = store.resolve_coverage_to_execution_unit_atomically(
+        snapshot=snapshot,
+        decision={"resolution": "generate_limited_report", "operation": "limited_report"},
+    )
+
+    store.append_execution_fact(
+        execution_unit_id=unit.id,
+        attempt_no=0,
+        sequence_no=2,
+        kind="attempt_claimed",
+        payload={"owner": "worker-a"},
+    )
+    with pytest.raises(ValueError, match="append-only"):
+        store.append_execution_fact(
+            execution_unit_id=unit.id,
+            attempt_no=0,
+            sequence_no=2,
+            kind="attempt_claimed",
+            payload={"owner": "worker-a"},
+        )
 
 
 def test_scope_draft_and_suggestion_audit_event_commit_atomically(tmp_path) -> None:
@@ -368,9 +485,7 @@ def test_scope_draft_confirmation_is_idempotent_and_persists_a_single_contract(t
         payload={"schema_version": "content_research_scope_audit_event_v1"},
     )
 
-    first, first_event, created = _confirm_scope(
-        store, draft=draft, event_id=event_v1.id
-    )
+    first, first_event, created = _confirm_scope(store, draft=draft, event_id=event_v1.id)
     second, repeated_event, repeated = _confirm_scope(
         store, draft=draft, event_id="sca_confirmed_repeated"
     )
@@ -406,9 +521,7 @@ def test_scope_draft_confirmation_replay_rejects_a_stale_current_brief(tmp_path)
     _save_current_brief(
         store, workflow_run_id=draft.workflow_run_id, structure_hash=draft.structure_hash
     )
-    first, event, created = _confirm_scope(
-        store, draft=draft, event_id="sca_stale_replay"
-    )
+    first, event, created = _confirm_scope(store, draft=draft, event_id="sca_stale_replay")
     assert created is True
 
     _save_current_brief(
@@ -463,9 +576,7 @@ def test_conflicting_scope_draft_repeat_does_not_create_a_second_contract(tmp_pa
         payload={"schema_version": "content_research_scope_audit_event_v1"},
     )
 
-    first, first_event, created = _confirm_scope(
-        store, draft=draft, event_id=event_v1.id
-    )
+    first, first_event, created = _confirm_scope(store, draft=draft, event_id=event_v1.id)
     repeated, repeated_event, created_again = _confirm_scope(
         store, draft=draft, event_id=event_v2.id
     )
@@ -514,12 +625,12 @@ def test_scope_draft_confirmation_constructs_confirmation_audit_event(tmp_path) 
     assert event.payload["scope_draft_id"] == draft.id
     assert store.list_scope_contracts(draft.workflow_run_id) == [confirmed]
     assert store.list_scope_audit_events(draft.workflow_run_id, version=1) == [event]
-    assert _confirmation_rows(db_path) == [
-        (draft.id, confirmed.id, draft.workflow_run_id)
-    ]
+    assert _confirmation_rows(db_path) == [(draft.id, confirmed.id, draft.workflow_run_id)]
 
 
-def test_scope_draft_confirmation_rolls_back_contract_audit_and_link_on_late_failure(tmp_path) -> None:
+def test_scope_draft_confirmation_rolls_back_contract_audit_and_link_on_late_failure(
+    tmp_path,
+) -> None:
     db_path = tmp_path / "scope-confirmation-rollback.db"
     store = SQLiteContentResearchStore(str(db_path))
     contract = _contract(version=1)
@@ -556,7 +667,12 @@ def test_scope_draft_confirmation_rolls_back_contract_audit_and_link_on_late_fai
             """INSERT INTO content_research_scope_draft_confirmations
                (scope_draft_id, scope_contract_id, workflow_run_id, created_at)
                VALUES (?, ?, ?, ?)""",
-            ("rsd_link_already_taken", contract.id, contract.workflow_run_id, "2026-08-17T00:00:00+00:00"),
+            (
+                "rsd_link_already_taken",
+                contract.id,
+                contract.workflow_run_id,
+                "2026-08-17T00:00:00+00:00",
+            ),
         )
 
     with pytest.raises(sqlite3.IntegrityError):
@@ -630,9 +746,7 @@ def test_two_connections_racing_to_confirm_one_draft_create_one_contract(tmp_pat
     assert confirmed_contracts == [confirmed_contracts[0], confirmed_contracts[0]]
     confirmed_events = [confirmed_event for _, confirmed_event, _ in results]
     assert confirmed_events == [confirmed_events[0], confirmed_events[0]]
-    assert first_store.list_scope_contracts(draft.workflow_run_id) == [
-        confirmed_contracts[0]
-    ]
+    assert first_store.list_scope_contracts(draft.workflow_run_id) == [confirmed_contracts[0]]
     assert first_store.list_scope_audit_events(draft.workflow_run_id, version=1) == [
         confirmed_events[0]
     ]
@@ -697,12 +811,8 @@ def test_two_connections_confirming_distinct_drafts_allocate_distinct_versions(t
         except BaseException as exc:
             errors.append(exc)
 
-    first = threading.Thread(
-        target=confirm, args=(first_store, drafts[0], "sca_distinct_1")
-    )
-    second = threading.Thread(
-        target=confirm, args=(second_store, drafts[1], "sca_distinct_2")
-    )
+    first = threading.Thread(target=confirm, args=(first_store, drafts[0], "sca_distinct_1"))
+    second = threading.Thread(target=confirm, args=(second_store, drafts[1], "sca_distinct_2"))
     first.start()
     second.start()
     first.join(timeout=5)
@@ -716,7 +826,5 @@ def test_two_connections_confirming_distinct_drafts_allocate_distinct_versions(t
     assert all(created for _, _, created in results)
     persisted = first_store.list_scope_contracts(base_contract.workflow_run_id)
     assert [contract.version for contract in persisted] == [1, 2]
-    assert {contract.id for contract in persisted} == {
-        contract.id for contract, _, _ in results
-    }
+    assert {contract.id for contract in persisted} == {contract.id for contract, _, _ in results}
     assert len(_confirmation_rows(db_path)) == 2
