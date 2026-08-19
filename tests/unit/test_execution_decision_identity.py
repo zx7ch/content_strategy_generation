@@ -23,8 +23,8 @@ from app.content_research.execution_decision_identity import (
                 "target_constraint_id": None,
                 "supplementary_queries": (),
             },
-            '{"coverage_snapshot_id":"scv_1","operation":"limited_report","resolution":"generate_limited_report","resulting_scope_contract_id":"rsc_1","schema":"execution_decision_identity_v1","source_scope_contract_id":"rsc_1","supplementary_queries":[],"target_constraint_id":null}',
-            "187960462beb3fca1192b60bfb15a95d743d148ff56ef9471258c853e13eb6bf",
+            '{"coverage_snapshot_id":"scv_1","resolution":"generate_limited_report","resulting_scope_contract_id":"rsc_1","schema":"execution_decision_identity_v1","source_scope_contract_id":"rsc_1","supplementary_queries":[],"target_constraint_id":null}',
+            "6072bdc6dec8b1e40fc2571213a7e80be823a7d5f8a07b3dc8b59fd23bc9ea92",
         ),
         (
             {
@@ -35,8 +35,8 @@ from app.content_research.execution_decision_identity import (
                 "target_constraint_id": "season",
                 "supplementary_queries": ("  夏季   防晒 衬衫 ", "通勤\t衬衫"),
             },
-            '{"coverage_snapshot_id":"scv_2","operation":"supplementary_collection","resolution":"expand_required_constraint","resulting_scope_contract_id":"rsc_2","schema":"execution_decision_identity_v1","source_scope_contract_id":"rsc_2","supplementary_queries":["夏季 防晒 衬衫","通勤 衬衫"],"target_constraint_id":"season"}',
-            "3f8afa2f9c087475dd1ba036535d7f2d66b153705ba4851040779d7b0a504c70",
+            '{"coverage_snapshot_id":"scv_2","resolution":"expand_required_constraint","resulting_scope_contract_id":"rsc_2","schema":"execution_decision_identity_v1","source_scope_contract_id":"rsc_2","supplementary_queries":["夏季 防晒 衬衫","通勤 衬衫"],"target_constraint_id":"season"}',
+            "2dcef3d6858c6010c02d115391ec959674bd6162d96a9cab19c5b9dfdd65ad63",
         ),
         (
             {
@@ -47,8 +47,8 @@ from app.content_research.execution_decision_identity import (
                 "target_constraint_id": "scenario",
                 "supplementary_queries": (),
             },
-            '{"coverage_snapshot_id":"scv_3","operation":"supplementary_collection","resolution":"relax_constraint","resulting_scope_contract_id":"rsc_4","schema":"execution_decision_identity_v1","source_scope_contract_id":"rsc_3","supplementary_queries":[],"target_constraint_id":"scenario"}',
-            "baaac6118dcee72800dde36425528c89b8d5d73bc1bd5d24262bc6c1a3fe3214",
+            '{"coverage_snapshot_id":"scv_3","resolution":"relax_constraint","resulting_scope_contract_id":"rsc_4","schema":"execution_decision_identity_v1","source_scope_contract_id":"rsc_3","supplementary_queries":[],"target_constraint_id":"scenario"}',
+            "96d9c17ee6f301e1ce0cf2dee1d9ced367b497e7f2146902d9e981472dd3cc17",
         ),
         (
             {
@@ -59,8 +59,8 @@ from app.content_research.execution_decision_identity import (
                 "target_constraint_id": "scenario",
                 "supplementary_queries": ("夏季 防晒 衬衫", "通勤 衬衫"),
             },
-            '{"coverage_snapshot_id":"scv_2","operation":"supplementary_collection","resolution":"expand_required_constraint","resulting_scope_contract_id":"rsc_2","schema":"execution_decision_identity_v1","source_scope_contract_id":"rsc_2","supplementary_queries":["夏季 防晒 衬衫","通勤 衬衫"],"target_constraint_id":"scenario"}',
-            "68678e040e0ca13a793bbedbf715f875d5c930b258440839e9a9bf82a00722b2",
+            '{"coverage_snapshot_id":"scv_2","resolution":"expand_required_constraint","resulting_scope_contract_id":"rsc_2","schema":"execution_decision_identity_v1","source_scope_contract_id":"rsc_2","supplementary_queries":["夏季 防晒 衬衫","通勤 衬衫"],"target_constraint_id":"scenario"}',
+            "391d5cd2aef6506a6739f6962c484c47069b386868eefe27a4ce92f84d7b88ed",
         ),
         (
             {
@@ -71,18 +71,19 @@ from app.content_research.execution_decision_identity import (
                 "target_constraint_id": "season",
                 "supplementary_queries": ("夏季 透气 衬衫",),
             },
-            '{"coverage_snapshot_id":"scv_2","operation":"supplementary_collection","resolution":"expand_required_constraint","resulting_scope_contract_id":"rsc_2","schema":"execution_decision_identity_v1","source_scope_contract_id":"rsc_2","supplementary_queries":["夏季 透气 衬衫"],"target_constraint_id":"season"}',
-            "1246372b3d98cfbcfafdba9ee18da3eb4baa22de4d5886084293ac60c515e97b",
+            '{"coverage_snapshot_id":"scv_2","resolution":"expand_required_constraint","resulting_scope_contract_id":"rsc_2","schema":"execution_decision_identity_v1","source_scope_contract_id":"rsc_2","supplementary_queries":["夏季 透气 衬衫"],"target_constraint_id":"season"}',
+            "ea32cdd92e808edd60e01d5d571c32967377ce26b153e0b5adee76cef0510a32",
         ),
     ],
 )
 def test_execution_decision_identity_has_one_canonical_payload_and_digest(
     kwargs, expected_json, expected_digest
 ) -> None:
-    """Changing serialization, normalization, or operation derivation breaks replay parity."""
+    """Changing serialization or normalization breaks replay parity."""
     result = build_execution_decision_identity(**kwargs)
 
     assert result.canonical_json == expected_json
+    assert "operation" not in result.payload
     assert result.decision_fingerprint == expected_digest
     assert result.execution_unit_id == "seu_" + expected_digest[:24]
 

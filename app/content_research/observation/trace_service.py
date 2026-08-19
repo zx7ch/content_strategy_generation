@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -13,13 +14,14 @@ from app.content_research.api_schemas import ContentResearchTraceResponse
 from app.content_research.models import ObservationEventRecord, ResearchBriefRecord, TraceRecord
 from app.content_research.persistence_models import (
     MARKETING_CONCLUSION_DECISION_STATES,
-    MARKETING_CONCLUSION_TRACE_REASON_CODES,
-    MARKETING_CONCLUSION_TRACE_RECOVERY_ACTIONS,
     MARKETING_CONCLUSION_TRACE_FAILURE_CODES,
     MARKETING_CONCLUSION_TRACE_PROTOCOL_DETAILS,
+    MARKETING_CONCLUSION_TRACE_REASON_CODES,
+    MARKETING_CONCLUSION_TRACE_RECOVERY_ACTIONS,
     MARKETING_CONCLUSION_TRACKS,
     StageCheckpointRecord,
 )
+from app.content_research.scope_contract import thaw_execution_payload
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
 from app.memory.workflow_store import WorkflowStore
 from app.services.llm.usage_tracker import LLMUsageSummary, LLMUsageTracker
@@ -113,6 +115,7 @@ class ContentResearchTraceService:
                 _safe_runtime_child_task_dict(task, as_of=trace_as_of)
                 for task in runtime_child_tasks
             ],
+            execution_units=_execution_unit_projection(self._store, workflow_run_id),
             usage_summary={},
             external_api_summary=_external_api_summary(
                 source_operation_events, provider_operations
@@ -257,6 +260,92 @@ def _safe_runtime_child_task_dict(task: Any, *, as_of: datetime) -> dict:
     }
     safe["timing"] = _project_timing(value, as_of=as_of)
     return safe
+
+
+_EXECUTION_IDENTITY_STRING_FIELDS = {
+    "schema",
+    "coverage_snapshot_id",
+    "source_scope_contract_id",
+    "resulting_scope_contract_id",
+    "resolution",
+}
+_SAFE_EXECUTION_FACT_FIELDS = {
+    "provider",
+    "provider_operation",
+    "operation",
+    "operation_fingerprint",
+    "source_kind",
+    "result_status",
+    "status",
+    "failure_code",
+    "retryable",
+    "reason",
+    "coverage_snapshot_id",
+    "publication_id",
+    "report_publication_id",
+}
+
+
+def _safe_execution_identity(value: Any) -> dict[str, Any]:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, json.JSONDecodeError):
+            return {}
+    if not isinstance(value, dict):
+        return {}
+    projected = {
+        key: value[key]
+        for key in _EXECUTION_IDENTITY_STRING_FIELDS
+        if isinstance(value.get(key), str)
+    }
+    target = value.get("target_constraint_id")
+    if "target_constraint_id" in value and (target is None or isinstance(target, str)):
+        projected["target_constraint_id"] = target
+    queries = value.get("supplementary_queries")
+    if isinstance(queries, list) and all(isinstance(item, str) for item in queries):
+        projected["supplementary_queries"] = queries
+    return _json_safe(projected)
+
+
+def _safe_execution_fact_payload(kind: str, value: Any) -> dict[str, Any]:
+    thawed = thaw_execution_payload(value)
+    if not isinstance(thawed, dict):
+        return {}
+    if kind == "decision_accepted":
+        decision = _safe_execution_identity(thawed.get("decision"))
+        return {"decision": decision} if decision else {}
+    return {
+        key: _json_safe(value)
+        for key, value in thawed.items()
+        if key in _SAFE_EXECUTION_FACT_FIELDS
+        and (value is None or isinstance(value, str | int | float | bool))
+    }
+
+
+def _execution_unit_projection(
+    store: SQLiteContentResearchStore, workflow_run_id: str
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "id": unit.id,
+            "state": unit.state,
+            "recovery_state": unit.recovery_state,
+            "identity_schema": unit.identity_schema,
+            "identity_state": unit.identity_state,
+            "identity_json": _safe_execution_identity(unit.identity_json),
+            "facts": [
+                {
+                    "attempt_no": fact.attempt_no,
+                    "sequence_no": fact.sequence_no,
+                    "kind": fact.kind,
+                    "payload": _safe_execution_fact_payload(fact.kind, fact.payload),
+                }
+                for fact in store.execution_trace(unit.id)
+            ],
+        }
+        for unit in store.list_scope_execution_units(workflow_run_id)
+    ]
 
 
 def _llm_recovery_projection(

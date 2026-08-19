@@ -178,6 +178,23 @@ class ContentResearchScopeProjectionResponse(BaseModel):
     allowed_resolutions: list[dict] = Field(default_factory=list)
 
 
+class ContentResearchExecutionFactTraceResponse(BaseModel):
+    attempt_no: int = Field(ge=0)
+    sequence_no: int = Field(ge=1)
+    kind: str
+    payload: dict = Field(default_factory=dict)
+
+
+class ContentResearchExecutionUnitTraceResponse(BaseModel):
+    id: str
+    state: str
+    recovery_state: Literal["replayable", "manual_recovery_required"]
+    identity_schema: str
+    identity_state: Literal["canonical", "legacy_identity_incomplete"]
+    identity_json: dict = Field(default_factory=dict)
+    facts: list[ContentResearchExecutionFactTraceResponse] = Field(default_factory=list)
+
+
 class ContentResearchTraceResponse(BaseModel):
     schema_version: str = CONTENT_RESEARCH_API_SCHEMA_VERSION
     workflow_run_id: str
@@ -193,6 +210,9 @@ class ContentResearchTraceResponse(BaseModel):
     workflow_events: list[dict] = Field(default_factory=list)
     runtime_steps: list[dict] = Field(default_factory=list)
     runtime_child_tasks: list[dict] = Field(default_factory=list)
+    execution_units: list[ContentResearchExecutionUnitTraceResponse] = Field(
+        default_factory=list
+    )
     usage_summary: dict = Field(default_factory=dict)
     external_api_summary: dict = Field(default_factory=dict)
     provider_operations: list[dict] = Field(default_factory=list)

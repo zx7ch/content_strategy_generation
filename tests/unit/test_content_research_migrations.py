@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import threading
@@ -256,6 +257,95 @@ def test_forward_migration_repairs_an_already_applied_pre_identity_0026_schema(t
         "identity_state",
         "legacy_authorization_id",
     } <= columns
+
+
+def test_forward_migration_removes_derived_operation_from_persisted_identity(tmp_path) -> None:
+    db_path = str(tmp_path / "execution-identity-minimal-forward.db")
+    store = SQLiteContentResearchStore(db_path)
+    contract = build_scope_contract(
+        workflow_run_id="run-minimal-forward",
+        research_plan_id="rp-minimal-forward",
+        version=1,
+        constraints=(ScopeConstraint("core_object", "核心对象", "衬衫", "required"),),
+        query_groups=(ScopeQueryGroupInput("衬衫", "衬衫"),),
+    )
+    store.save_scope_contract(contract)
+    snapshot = CoverageSnapshot(
+        id="scv-minimal-forward",
+        workflow_run_id=contract.workflow_run_id,
+        scope_contract_id=contract.id,
+        scope_contract_version=contract.version,
+        state="awaiting_scope_decision",
+        constraint_counts={},
+        unmet_constraint_ids=("core_object",),
+    )
+    store.save_coverage_snapshot(snapshot)
+    expected = build_execution_decision_identity(
+        coverage_snapshot_id=snapshot.id,
+        source_scope_contract_id=contract.id,
+        resulting_scope_contract_id=contract.id,
+        resolution="generate_limited_report",
+        target_constraint_id=None,
+        supplementary_queries=(),
+    )
+    historical_payload = {**expected.payload, "operation": "limited_report"}
+    historical_json = json.dumps(
+        historical_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    historical_digest = hashlib.sha256(historical_json.encode("utf-8")).hexdigest()
+    historical_unit_id = "seu_" + historical_digest[:24]
+    now = "2026-08-19T00:00:00+00:00"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("DELETE FROM content_research_schema_migrations WHERE version='0028'")
+        conn.execute(
+            """INSERT INTO content_research_scope_execution_units
+               (id, decision_fingerprint, workflow_run_id, scope_contract_id,
+                coverage_snapshot_id, resolution, operation, state, created_at,
+                identity_schema, identity_json, identity_state)
+               VALUES (?, ?, ?, ?, ?, 'generate_limited_report', 'limited_report',
+                       'pending', ?, 'execution_decision_identity_v1', ?, 'canonical')""",
+            (
+                historical_unit_id,
+                historical_digest,
+                contract.workflow_run_id,
+                contract.id,
+                snapshot.id,
+                now,
+                historical_json,
+            ),
+        )
+        conn.execute(
+            """INSERT INTO content_research_scope_execution_attempts
+               (execution_unit_id, attempt_no, state, created_at)
+               VALUES (?, 0, 'pending', ?)""",
+            (historical_unit_id, now),
+        )
+        conn.execute(
+            """INSERT INTO content_research_execution_facts
+               (execution_unit_id, attempt_no, sequence_no, kind, payload_json, created_at)
+               VALUES (?, 0, 1, 'decision_accepted', ?, ?)""",
+            (
+                historical_unit_id,
+                json.dumps({"decision": historical_payload}, ensure_ascii=False),
+                now,
+            ),
+        )
+
+    apply_content_research_migrations(db_path, bootstrap_content_research_schema)
+
+    migrated = SQLiteContentResearchStore(db_path)
+    unit = migrated.get_scope_execution_unit(expected.execution_unit_id)
+    assert unit is not None
+    assert unit.identity_json == expected.canonical_json
+    assert "operation" not in json.loads(unit.identity_json)
+    assert [fact.execution_unit_id for fact in migrated.execution_trace(unit.id)] == [unit.id]
+    assert "operation" not in migrated.execution_trace(unit.id)[0].payload["decision"]
+    replay, created = migrated.resolve_coverage_to_execution_unit_atomically(
+        snapshot=snapshot,
+        decision={"resolution": "generate_limited_report"},
+    )
+    assert replay.id == expected.execution_unit_id
+    assert created is False
 
 
 def test_execution_fingerprint_uniqueness_applies_only_to_canonical_identities(tmp_path) -> None:

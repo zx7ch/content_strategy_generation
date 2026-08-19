@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 
 from app.content_research.execution_decision_identity import (
     LegacyDecisionInput,
+    build_execution_decision_identity,
     build_legacy_execution_decision_identity,
 )
 
@@ -1152,6 +1153,195 @@ def _apply_0026(conn: sqlite3.Connection) -> None:
     _remove_legacy_global_fingerprint_uniqueness(conn)
 
 
+def _apply_0028(conn: sqlite3.Connection) -> None:
+    """Rewrite pre-minimal canonical identities and their stable references."""
+    units = conn.execute(
+        """SELECT id, decision_fingerprint, workflow_run_id, scope_contract_id,
+                  coverage_snapshot_id, resolution, operation, state, created_at,
+                  identity_schema, identity_json, identity_state, legacy_authorization_id
+           FROM content_research_scope_execution_units"""
+    ).fetchall()
+    attempts = conn.execute(
+        """SELECT execution_unit_id, attempt_no, state, lease_owner, lease_token,
+                  lease_expires_at, provider_state, created_at
+           FROM content_research_scope_execution_attempts"""
+    ).fetchall()
+    facts = conn.execute(
+        """SELECT execution_unit_id, attempt_no, sequence_no, kind, payload_json, created_at
+           FROM content_research_execution_facts"""
+    ).fetchall()
+
+    id_map: dict[str, str] = {}
+    decision_payloads: dict[str, dict[str, object]] = {}
+    repaired_units: list[tuple[object, ...]] = []
+    for row in units:
+        old_id = str(row[0])
+        try:
+            persisted_identity = json.loads(str(row[10]))
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("execution unit identity JSON is invalid") from exc
+        if not isinstance(persisted_identity, dict):
+            raise RuntimeError("execution unit identity JSON must be an object")
+        if row[11] == "canonical":
+            rebuilt = build_execution_decision_identity(
+                coverage_snapshot_id=str(persisted_identity["coverage_snapshot_id"]),
+                source_scope_contract_id=str(persisted_identity["source_scope_contract_id"]),
+                resulting_scope_contract_id=str(
+                    persisted_identity["resulting_scope_contract_id"]
+                ),
+                resolution=str(persisted_identity["resolution"]),
+                target_constraint_id=(
+                    str(persisted_identity["target_constraint_id"])
+                    if persisted_identity.get("target_constraint_id") is not None
+                    else None
+                ),
+                supplementary_queries=tuple(
+                    str(value)
+                    for value in persisted_identity.get("supplementary_queries", ())
+                ),
+            )
+            new_id = rebuilt.execution_unit_id
+            fingerprint = rebuilt.decision_fingerprint
+            identity_json = rebuilt.canonical_json
+            decision_payloads[old_id] = rebuilt.payload
+        else:
+            persisted_identity.pop("operation", None)
+            new_id = old_id
+            fingerprint = str(row[1])
+            identity_json = json.dumps(
+                persisted_identity,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        id_map[old_id] = new_id
+        repaired_units.append(
+            (
+                new_id,
+                fingerprint,
+                *row[2:10],
+                identity_json,
+                row[11],
+                row[12],
+            )
+        )
+
+    if len(set(id_map.values())) != len(id_map):
+        raise RuntimeError("execution unit identity repair produced duplicate unit IDs")
+
+    conn.execute("DROP TABLE content_research_execution_facts")
+    conn.execute("DROP TABLE content_research_scope_execution_attempts")
+    conn.execute("DROP TABLE content_research_scope_execution_units")
+    conn.execute(
+        """CREATE TABLE content_research_scope_execution_units (
+               id TEXT PRIMARY KEY,
+               decision_fingerprint TEXT NOT NULL,
+               workflow_run_id TEXT NOT NULL,
+               scope_contract_id TEXT NOT NULL,
+               coverage_snapshot_id TEXT NOT NULL UNIQUE,
+               resolution TEXT NOT NULL,
+               operation TEXT NOT NULL,
+               state TEXT NOT NULL,
+               created_at TEXT NOT NULL,
+               identity_schema TEXT NOT NULL,
+               identity_json TEXT NOT NULL,
+               identity_state TEXT NOT NULL,
+               legacy_authorization_id TEXT
+           )"""
+    )
+    conn.execute(
+        """CREATE INDEX idx_cr_execution_unit_workflow_scope
+           ON content_research_scope_execution_units(workflow_run_id, scope_contract_id)"""
+    )
+    conn.execute(
+        """CREATE UNIQUE INDEX idx_cr_execution_unit_canonical_fingerprint
+           ON content_research_scope_execution_units(decision_fingerprint)
+           WHERE identity_state='canonical'"""
+    )
+    conn.execute(
+        """CREATE UNIQUE INDEX idx_cr_execution_unit_legacy_authorization
+           ON content_research_scope_execution_units(legacy_authorization_id)
+           WHERE legacy_authorization_id IS NOT NULL"""
+    )
+    conn.executemany(
+        "INSERT INTO content_research_scope_execution_units VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        repaired_units,
+    )
+
+    conn.execute(
+        """CREATE TABLE content_research_scope_execution_attempts (
+               execution_unit_id TEXT NOT NULL,
+               attempt_no INTEGER NOT NULL,
+               state TEXT NOT NULL,
+               lease_owner TEXT,
+               lease_token TEXT,
+               lease_expires_at TEXT,
+               provider_state TEXT,
+               created_at TEXT NOT NULL,
+               PRIMARY KEY(execution_unit_id, attempt_no),
+               FOREIGN KEY(execution_unit_id) REFERENCES content_research_scope_execution_units(id)
+           )"""
+    )
+    conn.execute(
+        """CREATE INDEX idx_cr_execution_attempt_unit_attempt
+           ON content_research_scope_execution_attempts(execution_unit_id, attempt_no)"""
+    )
+    conn.executemany(
+        "INSERT INTO content_research_scope_execution_attempts VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        [(id_map[str(row[0])], *row[1:]) for row in attempts],
+    )
+
+    conn.execute(
+        """CREATE TABLE content_research_execution_facts (
+               execution_unit_id TEXT NOT NULL,
+               attempt_no INTEGER NOT NULL,
+               sequence_no INTEGER NOT NULL,
+               kind TEXT NOT NULL,
+               payload_json TEXT NOT NULL,
+               created_at TEXT NOT NULL,
+               PRIMARY KEY(execution_unit_id, attempt_no, sequence_no),
+               FOREIGN KEY(execution_unit_id, attempt_no)
+                   REFERENCES content_research_scope_execution_attempts(execution_unit_id, attempt_no)
+           )"""
+    )
+    conn.execute(
+        """CREATE INDEX idx_cr_execution_fact_unit_attempt_sequence
+           ON content_research_execution_facts(execution_unit_id, attempt_no, sequence_no)"""
+    )
+    repaired_facts: list[tuple[object, ...]] = []
+    for row in facts:
+        old_id = str(row[0])
+        payload_json = str(row[4])
+        if row[3] == "decision_accepted" and old_id in decision_payloads:
+            payload = json.loads(payload_json)
+            if isinstance(payload, dict) and isinstance(payload.get("decision"), dict):
+                payload["decision"] = decision_payloads[old_id]
+                payload_json = json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+        repaired_facts.append((id_map[old_id], *row[1:4], payload_json, row[5]))
+    conn.executemany(
+        "INSERT INTO content_research_execution_facts VALUES (?, ?, ?, ?, ?, ?)",
+        repaired_facts,
+    )
+    for old_id, new_id in id_map.items():
+        if old_id == new_id:
+            continue
+        conn.execute(
+            """UPDATE content_research_scope_execution_authorizations
+               SET execution_unit_id=? WHERE execution_unit_id=?""",
+            (new_id, old_id),
+        )
+        conn.execute(
+            """UPDATE content_research_scope_execution_continuations
+               SET execution_unit_id=? WHERE execution_unit_id=?""",
+            (new_id, old_id),
+        )
+
+
 def _apply_0015(conn: sqlite3.Connection) -> None:
     conn.execute(_V15_LLM_CONFIGURATION_SQL)
 
@@ -1214,6 +1404,7 @@ def _expected_checksums(migration_0002_sql: str, legacy_checksum: str) -> dict[s
         "0025": hashlib.sha256(_V25_EXECUTION_UNITS_SQL.encode("utf-8")).hexdigest(),
         "0026": _checksum("execution_unit_alias_canonical_repair_v1"),
         "0027": _checksum("execution_decision_identity_contract_v1"),
+        "0028": _checksum("minimal_execution_decision_identity_v1"),
     }
 
 
@@ -1482,6 +1673,13 @@ def apply_content_research_migrations(
                 name="execution_decision_identity_contract",
                 checksum=expected_checksums["0027"],
                 apply=lambda: _apply_0026(conn),
+            )
+            _apply_migration(
+                conn,
+                version="0028",
+                name="minimal_execution_decision_identity",
+                checksum=expected_checksums["0028"],
+                apply=lambda: _apply_0028(conn),
             )
         except Exception:
             conn.rollback()

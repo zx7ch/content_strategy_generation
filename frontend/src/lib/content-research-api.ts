@@ -129,6 +129,20 @@ export interface ContentResearchTrace {
   workflow_events: JsonObject[];
   runtime_steps: JsonObject[];
   runtime_child_tasks: JsonObject[];
+  execution_units: Array<{
+    id: string;
+    state: string;
+    recovery_state: "replayable" | "manual_recovery_required";
+    identity_schema: string;
+    identity_state: "canonical" | "legacy_identity_incomplete";
+    identity_json: JsonObject;
+    facts: Array<{
+      attempt_no: number;
+      sequence_no: number;
+      kind: string;
+      payload: JsonObject;
+    }>;
+  }>;
   usage_summary: JsonObject;
   external_api_summary: JsonObject;
   provider_operations: Array<{

@@ -710,22 +710,57 @@ async def test_versioned_coverage_resolution_replays_after_lost_response(scope_c
     first = await scope_client.post(
         endpoint, json={"action": "resolve_coverage", "payload": payload}
     )
+    assert first.status_code == 200
+    first_result = first.json()["result"]
+    original_unit_id = first_result["execution_unit"]["id"]
+    store = app.state.content_research_service._store
+    authorization = store.list_scope_execution_authorizations(workflow_run_id)[0]
+    original_fact_sequence = [
+        (fact.attempt_no, fact.sequence_no, fact.kind)
+        for fact in store.execution_trace(original_unit_id)
+    ]
+    resulting_version = 2 if payload["resolution"] == "relax_constraint" else 1
+    resulting_contract = store.get_scope_contract(
+        workflow_run_id, version=resulting_version
+    )
+    assert resulting_contract is not None
+    later_snapshot = CoverageSnapshot(
+        id=f"scv_api_later_{payload['resolution']}",
+        workflow_run_id=workflow_run_id,
+        scope_contract_id=resulting_contract.id,
+        scope_contract_version=resulting_version,
+        state="satisfied",
+        constraint_counts={},
+        unmet_constraint_ids=(),
+        execution_revision=authorization.execution_revision,
+        execution_authorization_id=authorization.id,
+        source_coverage_snapshot_id=payload["coverage_snapshot_id"],
+    )
+    store.save_coverage_snapshot(later_snapshot)
+    assert (
+        store.get_coverage_snapshot(workflow_run_id, version=resulting_version).id
+        == later_snapshot.id
+    )
+
     replay = await scope_client.post(
         endpoint, json={"action": "resolve_coverage", "payload": payload}
     )
 
-    assert first.status_code == 200
     assert replay.status_code == 200
-    assert replay.json()["result"] == first.json()["result"]
+    assert replay.json()["result"] == first_result
+    assert replay.json()["result"]["execution_unit"]["id"] == original_unit_id
     assert replay.json()["result"]["execution_unit"]["recovery_state"] == "replayable"
-    store = app.state.content_research_service._store
+    assert [
+        (fact.attempt_no, fact.sequence_no, fact.kind)
+        for fact in store.execution_trace(original_unit_id)
+    ] == original_fact_sequence
+    assert original_fact_sequence == [(0, 1, "decision_accepted")]
     expected_versions = [1, 2] if payload["resolution"] == "relax_constraint" else [1]
     assert [
         contract.version for contract in store.list_scope_contracts(workflow_run_id)
     ] == expected_versions
     assert len(store.list_scope_execution_authorizations(workflow_run_id)) == 1
     assert len(store.list_scope_execution_continuations(workflow_run_id)) == 1
-    resulting_version = 2 if payload["resolution"] == "relax_constraint" else 1
     assert (
         len(
             [

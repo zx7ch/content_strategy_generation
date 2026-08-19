@@ -14,6 +14,7 @@ import {
   getContentResearchLiteReport,
   getContentResearchLiteReportWithRetry,
   getContentResearchScope,
+  getContentResearchTrace,
   getContentResearchWorkflow,
   prepareContentResearchScope,
   retryContentResearchFormalResearch,
@@ -43,6 +44,48 @@ test("report publication gaps remain pending instead of becoming permanent failu
   assert.equal(
     isContentResearchReportPending(new ContentResearchApiError("database unavailable", 500)),
     false
+  );
+});
+
+test("trace contract exposes stored decision identity and ordered safe execution facts", async () => {
+  globalThis.fetch = (async () => jsonResponse({
+    schema_version: "content_research_api_v1",
+    workflow_run_id: "run_1",
+    recoverable: true,
+    duration_ms: 0,
+    error_count: 0,
+    retry_count: 0,
+    traces: [],
+    observation_events: [],
+    workflow_events: [],
+    runtime_steps: [],
+    runtime_child_tasks: [],
+    execution_units: [{
+      id: "seu_1",
+      state: "pending",
+      recovery_state: "replayable",
+      identity_schema: "execution_decision_identity_v1",
+      identity_state: "canonical",
+      identity_json: {
+        schema: "execution_decision_identity_v1",
+        coverage_snapshot_id: "scv_1",
+      },
+      facts: [{ attempt_no: 0, sequence_no: 1, kind: "decision_accepted", payload: {} }],
+    }],
+    usage_summary: {},
+    external_api_summary: {},
+    provider_operations: [],
+    logical_checkpoints: [],
+    usage_steps: [],
+    usage_events: [],
+  })) as typeof fetch;
+
+  const trace = await getContentResearchTrace("run_1");
+
+  assert.equal(trace.execution_units[0].identity_json.coverage_snapshot_id, "scv_1");
+  assert.deepEqual(
+    trace.execution_units[0].facts.map((fact) => [fact.attempt_no, fact.sequence_no, fact.kind]),
+    [[0, 1, "decision_accepted"]],
   );
 });
 

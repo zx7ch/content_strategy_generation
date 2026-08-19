@@ -1207,6 +1207,15 @@ class SQLiteContentResearchStore:
             ).fetchone()
         return self._row_to_scope_execution_unit(row) if row else None
 
+    def list_scope_execution_units(self, workflow_run_id: str) -> list[ScopeExecutionUnit]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """SELECT * FROM content_research_scope_execution_units
+                   WHERE workflow_run_id=? ORDER BY created_at ASC, id ASC""",
+                (workflow_run_id,),
+            ).fetchall()
+        return [self._row_to_scope_execution_unit(row) for row in rows]
+
     def append_execution_fact(
         self,
         *,

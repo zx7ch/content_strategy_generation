@@ -6,6 +6,7 @@ from datetime import timedelta
 import pytest
 
 from app.content_research.api_schemas import ContentResearchBriefConfirmRequest
+from app.content_research.execution_decision_identity import build_execution_decision_identity
 from app.content_research.models import ResearchBriefRecord
 from app.content_research.observation.trace_service import (
     _duration_ms,
@@ -15,6 +16,12 @@ from app.content_research.observation.trace_service import (
 )
 from app.content_research.persistence_models import StageCheckpointRecord
 from app.content_research.presearch.service import PresearchService
+from app.content_research.scope_contract import (
+    CoverageSnapshot,
+    ScopeConstraint,
+    ScopeQueryGroupInput,
+    build_scope_contract,
+)
 from app.content_research.service import (
     ContentResearchNotFoundError,
     ContentResearchService,
@@ -503,6 +510,121 @@ async def test_trace_returns_zero_usage_defaults_when_no_usage_rows(service):
     assert trace.usage_summary == {}
     assert trace.usage_steps == []
     assert trace.usage_events == []
+
+
+@pytest.mark.asyncio
+async def test_trace_projects_execution_identity_and_ordered_safe_facts(service, store):
+    presearch = await _unconfirmed_workflow(service)
+    contract = build_scope_contract(
+        workflow_run_id=presearch.workflow_run_id,
+        research_plan_id="rp_trace_identity",
+        version=1,
+        constraints=(
+            ScopeConstraint("core_object", "核心对象", "徒步短裤", "required"),
+            ScopeConstraint("season", "季节", "夏季", "required"),
+        ),
+        query_groups=(ScopeQueryGroupInput("夏季 徒步短裤", "夏季 徒步短裤"),),
+    )
+    store.save_scope_contract(contract)
+    snapshot = CoverageSnapshot(
+        id="scv_trace_identity",
+        workflow_run_id=presearch.workflow_run_id,
+        scope_contract_id=contract.id,
+        scope_contract_version=contract.version,
+        state="awaiting_scope_decision",
+        constraint_counts={},
+        unmet_constraint_ids=("season",),
+    )
+    store.save_coverage_snapshot(snapshot)
+    unit, _created = store.resolve_coverage_to_execution_unit_atomically(
+        snapshot=snapshot,
+        decision={
+            "resolution": "expand_required_constraint",
+            "constraint_id": "season",
+            "supplementary_queries": ("夏季 徒步短裤 防晒",),
+        },
+    )
+    attempt = store.claim_execution_unit(execution_unit_id=unit.id, owner="worker-secret")
+    assert attempt is not None and attempt.lease_token is not None
+    assert store.record_provider_request(
+        execution_unit_id=unit.id,
+        attempt_no=attempt.attempt_no,
+        lease_token=attempt.lease_token,
+        payload={
+            "provider": "xiaohongshu",
+            "provider_operation": "discover_candidates",
+            "query": "must-not-reach-trace",
+            "cookie": "must-not-reach-trace",
+        },
+    )
+    assert store.record_provider_outcome(
+        execution_unit_id=unit.id,
+        attempt_no=attempt.attempt_no,
+        lease_token=attempt.lease_token,
+        provider_state="completed",
+        payload={
+            "provider": "xiaohongshu",
+            "provider_operation": "discover_candidates",
+            "result_status": "completed",
+            "raw_response": "must-not-reach-trace",
+        },
+    )
+
+    trace = await service.get_workflow_trace(presearch.workflow_run_id)
+
+    expected_identity = build_execution_decision_identity(
+        coverage_snapshot_id=snapshot.id,
+        source_scope_contract_id=contract.id,
+        resulting_scope_contract_id=contract.id,
+        resolution="expand_required_constraint",
+        target_constraint_id="season",
+        supplementary_queries=("夏季 徒步短裤 防晒",),
+    )
+    assert trace.model_dump(mode="json")["execution_units"] == [
+        {
+            "id": unit.id,
+            "state": "running",
+            "recovery_state": "replayable",
+            "identity_schema": "execution_decision_identity_v1",
+            "identity_state": "canonical",
+            "identity_json": expected_identity.payload,
+            "facts": [
+                {
+                    "attempt_no": 0,
+                    "sequence_no": 1,
+                    "kind": "decision_accepted",
+                    "payload": {"decision": expected_identity.payload},
+                },
+                {
+                    "attempt_no": 0,
+                    "sequence_no": 2,
+                    "kind": "attempt_claimed",
+                    "payload": {},
+                },
+                {
+                    "attempt_no": 0,
+                    "sequence_no": 3,
+                    "kind": "provider_request_recorded",
+                    "payload": {
+                        "provider": "xiaohongshu",
+                        "provider_operation": "discover_candidates",
+                    },
+                },
+                {
+                    "attempt_no": 0,
+                    "sequence_no": 4,
+                    "kind": "provider_outcome_recorded",
+                    "payload": {
+                        "provider": "xiaohongshu",
+                        "provider_operation": "discover_candidates",
+                        "result_status": "completed",
+                    },
+                },
+            ],
+        }
+    ]
+    assert "must-not-reach-trace" not in trace.model_dump_json()
+    assert "worker-secret" not in trace.model_dump_json()
 
 
 @pytest.mark.asyncio

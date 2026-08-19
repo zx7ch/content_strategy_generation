@@ -23,9 +23,13 @@ class ExecutionDecisionIdentity:
     source_scope_contract_id: str
     resulting_scope_contract_id: str
     resolution: DecisionResolution
-    operation: DecisionOperation
     target_constraint_id: str | None
     supplementary_queries: tuple[str, ...]
+
+    @property
+    def operation(self) -> DecisionOperation:
+        """Execution mechanics are derived and never identity-bearing."""
+        return _operation_for_resolution(self.resolution)
 
 
 @dataclass(frozen=True)
@@ -106,7 +110,7 @@ def build_execution_decision_identity(
         )
     ):
         raise ValueError("execution decision identity fields must be non-empty")
-    operation = _operation_for_resolution(resolution)
+    _operation_for_resolution(resolution)
     queries = _clean_queries(supplementary_queries)
     if resolution == "generate_limited_report":
         if target_constraint_id is not None or queries:
@@ -129,7 +133,6 @@ def build_execution_decision_identity(
         source_scope_contract_id=source_scope_contract_id.strip(),
         resulting_scope_contract_id=resulting_scope_contract_id.strip(),
         resolution=resolution,  # type: ignore[arg-type]
-        operation=operation,
         target_constraint_id=target_constraint_id.strip() if target_constraint_id else None,
         supplementary_queries=queries,
     )
@@ -177,7 +180,6 @@ def build_legacy_execution_decision_identity(
         "source_scope_contract_id": value.source_scope_contract_id,
         "resulting_scope_contract_id": value.resulting_scope_contract_id,
         "resolution": value.resolution,
-        "operation": expected_operation,
         "target_constraint_id": None,
         "supplementary_queries": list(_clean_queries(value.supplementary_queries)),
     }
