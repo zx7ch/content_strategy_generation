@@ -14,6 +14,8 @@ import sqlite3
 from collections.abc import Callable
 from datetime import datetime, timezone
 
+from app.content_research.execution_decision_identity import build_execution_decision_identity
+
 _TYPED_TABLES = (
     "content_research_canonical_sources",
     "content_research_direction_source_projections",
@@ -828,7 +830,12 @@ def _apply_0025(conn: sqlite3.Connection) -> None:
                   authorization.created_at, continuation.operation, continuation.state,
                   continuation.lease_owner, continuation.lease_token,
                   continuation.lease_expires_at, continuation.supplementary_queries_json,
-                  snapshot.scope_contract_id
+                  snapshot.scope_contract_id,
+                  (SELECT json_extract(event.payload_json, '$.constraint_id')
+                     FROM content_research_scope_audit_events AS event
+                    WHERE event.event_name='coverage_resolved'
+                      AND json_extract(event.payload_json, '$.coverage_snapshot_id')=authorization.coverage_snapshot_id
+                    LIMIT 1)
            FROM content_research_scope_execution_authorizations AS authorization
            LEFT JOIN content_research_scope_execution_continuations AS continuation
              ON continuation.authorization_id=authorization.id
@@ -851,6 +858,7 @@ def _apply_0025(conn: sqlite3.Connection) -> None:
             lease_expires_at,
             supplementary_queries_json,
             source_scope_contract_id,
+            target_constraint_id,
         ) = row
         operation = operation or (
             "limited_report"
@@ -858,14 +866,11 @@ def _apply_0025(conn: sqlite3.Connection) -> None:
             else "supplementary_collection"
         )
         queries = json.loads(supplementary_queries_json or "[]")
-        identity = json.dumps(
-            {"coverage_snapshot_id": coverage_snapshot_id,
-             "source_scope_contract_id": source_scope_contract_id,
-             "resulting_scope_contract_id": scope_contract_id,
-             "resolution": resolution, "operation": operation, "supplementary_queries": queries},
-            ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        _, _identity_json, decision_fingerprint = build_execution_decision_identity(
+            coverage_snapshot_id=coverage_snapshot_id, source_scope_contract_id=source_scope_contract_id,
+            resulting_scope_contract_id=scope_contract_id, resolution=resolution,
+            target_constraint_id=target_constraint_id, supplementary_queries=tuple(queries),
         )
-        decision_fingerprint = hashlib.sha256(identity.encode()).hexdigest()
         unit_id = "seu_" + decision_fingerprint[:24]
         state = continuation_state or "pending"
         now = created_at or datetime.now(timezone.utc).isoformat()
