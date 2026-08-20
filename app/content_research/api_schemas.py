@@ -176,6 +176,7 @@ class ContentResearchScopeProjectionResponse(BaseModel):
     allowed_actions: list[dict] = Field(default_factory=list)
     coverage_snapshot: dict | None = None
     allowed_resolutions: list[dict] = Field(default_factory=list)
+    decision_recovery: dict | None = None
 
 
 class ContentResearchExecutionFactTraceResponse(BaseModel):

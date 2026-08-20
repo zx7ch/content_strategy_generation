@@ -17,6 +17,7 @@ from app.content_research.scope_contract import (
     ScopeQueryGroupInput,
     build_scope_contract,
 )
+from app.content_research.service import ContentResearchService
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
 from app.content_research.workflow.directional_pipeline import (
     persist_scope_coverage_evaluation,
@@ -250,6 +251,89 @@ def test_supplementary_execution_persists_a_new_coverage_revision_with_lineage(
     assert store.get_coverage_snapshot(
         contract.workflow_run_id, version=1, execution_revision=1
     ) == initial
+
+
+def test_authorized_older_coverage_remains_executable_if_legacy_data_has_a_later_scope(
+    tmp_path,
+) -> None:
+    """Selecting contracts[-1] must not strand an already-authorized older decision."""
+    store = SQLiteContentResearchStore(str(tmp_path / "legacy-later-scope.db"))
+    original = build_scope_contract(
+        workflow_run_id="run_legacy_later_scope",
+        research_plan_id="rp_legacy_later_scope",
+        version=1,
+        constraints=(
+            ScopeConstraint("core_object", "核心对象", "衬衫", "required"),
+            ScopeConstraint("season", "季节", "夏季", "required"),
+        ),
+        query_groups=(ScopeQueryGroupInput("夏季 衬衫", "夏季 衬衫", ("夏季",)),),
+    )
+    store.save_scope_contract(original)
+    initial = CoverageSnapshot(
+        id="scv_legacy_later_scope",
+        workflow_run_id=original.workflow_run_id,
+        scope_contract_id=original.id,
+        scope_contract_version=original.version,
+        state="awaiting_scope_decision",
+        constraint_counts={},
+        unmet_constraint_ids=("season",),
+    )
+    store.save_coverage_snapshot(initial)
+    authorization = ScopeExecutionAuthorization(
+        id="sea_legacy_later_scope",
+        workflow_run_id=original.workflow_run_id,
+        scope_contract_id=original.id,
+        scope_contract_version=original.version,
+        coverage_snapshot_id=initial.id,
+        resolution="expand_required_constraint",
+        execution_revision=2,
+        state="authorized_collection",
+    )
+    continuation = ScopeExecutionContinuation(
+        id="sec_legacy_later_scope",
+        authorization_id=authorization.id,
+        workflow_run_id=original.workflow_run_id,
+        execution_revision=2,
+        operation="supplementary_collection",
+        supplementary_queries=("夏季 防晒 衬衫",),
+        state="pending",
+    )
+    event = ScopeAuditEvent(
+        id="sae_legacy_later_scope",
+        workflow_run_id=original.workflow_run_id,
+        scope_contract_id=original.id,
+        scope_contract_version=original.version,
+        event_name="coverage_resolved",
+        payload={
+            "schema_version": "content_research_scope_audit_event_v1",
+            "coverage_snapshot_id": initial.id,
+            "resolution": authorization.resolution,
+            "constraint_id": "season",
+        },
+    )
+    _, _, persisted, _, _ = store.resolve_coverage_and_authorize_execution_atomically(
+        snapshot=initial,
+        authorization=authorization,
+        continuation=continuation,
+        event=event,
+    )
+    later = build_scope_contract(
+        workflow_run_id=original.workflow_run_id,
+        research_plan_id=original.research_plan_id,
+        version=2,
+        constraints=(
+            ScopeConstraint("core_object", "核心对象", "衬衫", "required"),
+            ScopeConstraint("season", "季节", "夏季", "preferred"),
+        ),
+        query_groups=(ScopeQueryGroupInput("衬衫", "衬衫"),),
+    )
+    store.save_scope_contract(later)
+
+    service = ContentResearchService(store=store, presearch=None, workflow_runtime=object())
+    service._require_scope_execution_authority(
+        workflow_run_id=original.workflow_run_id,
+        execution_authorization=persisted,
+    )
 
 
 def test_coverage_snapshot_rolls_back_when_its_audit_cannot_commit(

@@ -177,6 +177,37 @@ def test_stage_checkpoint_status_can_be_retired_without_creating_a_second_row(tm
         assert conn.execute("SELECT COUNT(*) FROM content_research_stage_checkpoints").fetchone() == (1,)
 
 
+def test_stage_checkpoint_retry_cannot_change_immutable_execution_ownership(tmp_path):
+    store = SQLiteContentResearchStore(str(tmp_path / "checkpoint-ownership.db"))
+    checkpoint = StageCheckpointRecord(
+        "scp_owned",
+        "v1",
+        {"attempt": 1},
+        workflow_run_id="run_owned",
+        subagent_task_id="task_owned",
+        stage_name="operation",
+        input_fingerprint="owned:fp",
+        status="running",
+        scope_contract_id="rsc_owned",
+        execution_unit_id="seu_owned",
+        attempt_no=1,
+        execution_revision=2,
+    )
+    store.save_stage_checkpoint(checkpoint)
+
+    with pytest.raises(ValueError, match="immutable execution ownership"):
+        store.save_stage_checkpoint(
+            replace(
+                checkpoint,
+                status="completed",
+                execution_unit_id="seu_foreign",
+                attempt_no=2,
+            )
+        )
+
+    assert store.get_typed_record(StageCheckpointRecord, checkpoint.id) == checkpoint
+
+
 def test_run_independent_source_count_is_distinct_and_workflow_scoped(tmp_path):
     store = SQLiteContentResearchStore(str(tmp_path / "run-union.db"))
 

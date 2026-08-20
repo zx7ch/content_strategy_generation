@@ -19,6 +19,7 @@ from app.content_research.persistence_models import (
     TypedPersistenceRecord,
 )
 from app.content_research.scope_contract import (
+    DispatchLeaseContext,
     ExecutionContext,
     ExecutionLeaseFencedError,
     ScopeAuditEvent,
@@ -37,9 +38,16 @@ T = TypeVar("T", bound=TypedPersistenceRecord)
 class AsyncDirectionalPersistenceSession:
     """In-memory typed-record view backed by asynchronous, explicit flushes."""
 
-    def __init__(self, db_path: str, *, execution_context: ExecutionContext | None = None) -> None:
+    def __init__(
+        self,
+        db_path: str,
+        *,
+        execution_context: ExecutionContext | None = None,
+        dispatch_context: DispatchLeaseContext | None = None,
+    ) -> None:
         self._db_path = db_path
         self._execution_context = execution_context
+        self._dispatch_context = dispatch_context
         self._records: dict[type[TypedPersistenceRecord], dict[str, TypedPersistenceRecord]] = (
             defaultdict(dict)
         )
@@ -54,8 +62,13 @@ class AsyncDirectionalPersistenceSession:
         *,
         workflow_run_id: str | None = None,
         execution_context: ExecutionContext | None = None,
+        dispatch_context: DispatchLeaseContext | None = None,
     ) -> AsyncDirectionalPersistenceSession:
-        session = cls(db_path, execution_context=execution_context)
+        session = cls(
+            db_path,
+            execution_context=execution_context,
+            dispatch_context=dispatch_context,
+        )
         async with aiosqlite.connect(db_path) as conn:
             conn.row_factory = aiosqlite.Row
             for record_type, (table, fields) in _TYPED_RECORD_TABLES.items():
@@ -202,6 +215,25 @@ class AsyncDirectionalPersistenceSession:
                         await conn.commit()
                         raise ExecutionLeaseFencedError(
                             "execution attempt lease was fenced before directional persistence"
+                        )
+                if self._dispatch_context is not None:
+                    context = self._dispatch_context
+                    cursor = await conn.execute(
+                        """SELECT 1 FROM content_research_dispatch_jobs
+                           WHERE workflow_run_id=? AND status='running'
+                             AND lease_owner=? AND lease_token=?
+                             AND lease_expires_at IS NOT NULL AND lease_expires_at > ?""",
+                        (
+                            context.workflow_run_id,
+                            context.lease_owner,
+                            context.lease_token,
+                            _fmt_dt(datetime.now(timezone.utc)),
+                        ),
+                    )
+                    if await cursor.fetchone() is None:
+                        await conn.rollback()
+                        raise ExecutionLeaseFencedError(
+                            "dispatch lease was fenced before directional persistence"
                         )
                 for record in pending:
                     table, fields = _TYPED_RECORD_TABLES[type(record)]

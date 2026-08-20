@@ -19,9 +19,12 @@ from app.content_research.persistence_models import (
     AggregateClaimRecord,
     CanonicalSourceRecord,
     ClaimAdmissionDecisionRecord,
+    CoverageManifest,
     CrossDirectionRecord,
     DirectionalEvidencePacketRecord,
     DirectionResultDecisionRecord,
+    MarketingConclusionCandidateRecord,
+    MarketingConclusionDecisionRecord,
     StageCheckpointRecord,
     WeakSignalRecord,
 )
@@ -300,3 +303,193 @@ def test_governed_snapshot_partitions_admitted_claims_and_weak_signals(tmp_path)
         "observation_event_count": 1,
         "observation_event_types": {"admission": 1},
     }
+
+
+def test_governed_snapshot_uses_only_manifest_owned_claims_governance_and_checkpoints(
+    tmp_path,
+) -> None:
+    """Workflow-wide reads must not reintroduce an older execution's records."""
+    store = SQLiteContentResearchStore(str(tmp_path / "manifest-governed-snapshot.db"))
+    policy, policies, contracts = build_default_snapshot(
+        snapshot_id="rps_manifest",
+        workflow_run_id="run_manifest",
+        brief_id="rb_manifest",
+        plan_id="rp_manifest",
+    )
+    store.save_run_policy_snapshot(policy)
+    for sample_policy in policies:
+        store.save_sample_policy(sample_policy)
+    for direction_contract in contracts:
+        store.save_direction_contract(direction_contract)
+    ownership = {
+        "scope_contract_id": "rsc_manifest",
+        "execution_unit_id": "seu_current",
+        "attempt_no": 1,
+        "execution_revision": 2,
+    }
+    old_ownership = {**ownership, "execution_unit_id": "seu_old", "attempt_no": 0}
+    candidates = []
+    for suffix, record_ownership in (("current", ownership), ("old", old_ownership)):
+        source = CanonicalSourceRecord(
+            f"cs_{suffix}",
+            "v1",
+            {},
+            platform="xhs",
+            platform_source_kind="note",
+            platform_source_id=f"note_{suffix}",
+        )
+        store.save_canonical_source(source)
+        packet = DirectionalEvidencePacketRecord(
+            f"dep_{suffix}",
+            "v1",
+            {
+                "field_projection": {
+                    "content_text": f"{suffix} claim",
+                    "source_url": f"https://example/{suffix}",
+                },
+                "field_availability": {},
+                "retrieval_context": {},
+            },
+            workflow_run_id="run_manifest",
+            research_direction_id="product_marketing",
+            canonical_source_id=source.id,
+            field_projection_hash=f"hash_{suffix}",
+            **record_ownership,
+        )
+        store.save_directional_evidence_packet(packet)
+        candidate = replace(
+            build_claim_candidate(
+                workflow_run_id="run_manifest",
+                direction_id="product_marketing",
+                intent_id="value",
+                claim_type="observation",
+                statement=f"{suffix} statement",
+                scope={"sample": "selected_notes"},
+                fact=extract_facts(packet)[0],
+                quote=suffix,
+                text_start=0,
+                text_end=len(suffix),
+            ),
+            **record_ownership,
+        )
+        store.save_claim_candidate(candidate)
+        store.save_claim_admission_decision(
+            ClaimAdmissionDecisionRecord(
+                f"cad_{suffix}",
+                "v1",
+                {},
+                research_direction_id="product_marketing",
+                claim_candidate_id=candidate.id,
+                decision="admitted",
+                policy_snapshot_id=policy.id,
+            )
+        )
+        candidates.append(candidate)
+        store.save_cross_direction_record(
+            CrossDirectionRecord(
+                f"cdr_{suffix}",
+                "v1",
+                {"workflow_run_id": "run_manifest", "claim_ids": [candidate.id]},
+                research_plan_id="rp_manifest",
+                record_type="overlap",
+            )
+        )
+        store.save_aggregate_claim(
+            AggregateClaimRecord(
+                f"ac_{suffix}",
+                "v1",
+                {"workflow_run_id": "run_manifest", "source_claim_ids": [candidate.id]},
+                research_plan_id="rp_manifest",
+                aggregate_type="cross_direction_corroboration",
+            )
+        )
+        store.save_stage_checkpoint(
+            StageCheckpointRecord(
+                f"scp_marketing_{suffix}",
+                "v1",
+                {},
+                workflow_run_id="run_manifest",
+                subagent_task_id=f"marketing:{suffix}",
+                stage_name="marketing_conclusion",
+                input_fingerprint=f"fp_{suffix}",
+                status="completed",
+                **record_ownership,
+            )
+        )
+        marketing_candidate = MarketingConclusionCandidateRecord(
+            f"mcc_{suffix}",
+            "v1",
+            {"statement": f"{suffix} conclusion", "supporting_claim_ids": [candidate.id]},
+            workflow_run_id="run_manifest",
+            research_plan_id="rp_manifest",
+            track="value",
+        )
+        store.save_marketing_conclusion_candidate(marketing_candidate)
+        store.save_marketing_conclusion_decision(
+            MarketingConclusionDecisionRecord(
+                f"mcd_{suffix}",
+                "v1",
+                {"input_fingerprint": f"fp_{suffix}"},
+                workflow_run_id="run_manifest",
+                research_plan_id="rp_manifest",
+                candidate_id=marketing_candidate.id,
+                track="value",
+                state="selected",
+            )
+        )
+
+    store.save_stage_checkpoint(
+        StageCheckpointRecord(
+            "scp_marketing_unmanifested",
+            "v1",
+            {},
+            workflow_run_id="run_manifest",
+            subagent_task_id="marketing:unmanifested",
+            stage_name="marketing_conclusion",
+            input_fingerprint="fp_unmanifested",
+            status="completed",
+            **ownership,
+        )
+    )
+    manifest = CoverageManifest(
+        workflow_run_id="run_manifest",
+        packet_ids=("dep_current",),
+        checkpoint_ids=("scp_marketing_current",),
+        **ownership,
+    )
+    service = ContentResearchService(
+        store=store, presearch=None, workflow_runtime=CapturingRuntime()
+    )
+    direction = ResearchDirectionRecord(
+        "rd_manifest",
+        "rp_manifest",
+        "run_manifest",
+        "thread",
+        "v1",
+        "completed",
+        1,
+        {"schema_version": "v1", "direction_id": "product_marketing"},
+    )
+
+    governed = service._build_governed_snapshot(
+        workflow_run_id="run_manifest",
+        plan_id="rp_manifest",
+        direction_records=[direction],
+        manifest=manifest,
+    )
+
+    assert [item["claim_candidate_id"] for item in governed["claim_cards"]] == [
+        candidates[0].id
+    ]
+    assert [item["cross_direction_record_id"] for item in governed["cross_direction_records"]] == [
+        "cdr_current"
+    ]
+    assert [item["aggregate_claim_id"] for item in governed["aggregate_claims"]] == [
+        "ac_current"
+    ]
+    assert [item["statement"] for item in governed["marketing_conclusions"]] == [
+        "current conclusion"
+    ]
+    assert [item["checkpoint_id"] for item in governed["checkpoint_summary"]["stages"]] == [
+        "scp_marketing_current"
+    ]

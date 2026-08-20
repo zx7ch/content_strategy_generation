@@ -15,7 +15,11 @@ from app.content_research.models import (
     TraceRecord,
     utcnow,
 )
-from app.content_research.scope_contract import ExecutionContext, ExecutionLeaseFencedError
+from app.content_research.scope_contract import (
+    DispatchLeaseContext,
+    ExecutionContext,
+    ExecutionLeaseFencedError,
+)
 from app.content_research.sources import SourceAdapterRegistry
 from app.content_research.sources.base import (
     CollectCommentsRequest,
@@ -118,6 +122,7 @@ class SubagentTaskRouter:
         limit: int = 10,
         source_result: SourceOperationResult | None = None,
         execution_context: ExecutionContext | None = None,
+        dispatch_context: DispatchLeaseContext | None = None,
     ) -> SubagentTaskRecord:
         if self._store is None:
             raise ValueError("SubagentTaskRouter requires a store to execute tasks")
@@ -153,6 +158,7 @@ class SubagentTaskRouter:
                 limit=limit,
                 source_result=source_result,
                 execution_context=execution_context,
+                dispatch_context=dispatch_context,
             )
         except OperationOutcomeUnknownError as exc:
             self._require_live_execution(execution_context, "subagent_outcome_unknown")
@@ -235,6 +241,7 @@ class SubagentTaskRouter:
         limit: int,
         source_result: SourceOperationResult | None,
         execution_context: ExecutionContext | None = None,
+        dispatch_context: DispatchLeaseContext | None = None,
     ) -> SubagentExecutionResult:
         input_payload = dict(task.payload.get("input_payload") or {})
         scope_execution = dict(input_payload.get("scope_execution") or {})
@@ -256,7 +263,17 @@ class SubagentTaskRouter:
             raise ValueError(f"sample policy not found: {contract.sample_policy_id}")
         adapter = self._source_registry.get(provider)
 
+        def require_live_dispatch(operation: str) -> None:
+            if (
+                dispatch_context is not None
+                and not self._store.dispatch_context_is_live(dispatch_context)
+            ):
+                raise ExecutionLeaseFencedError(
+                    f"dispatch lease was fenced before provider {operation}"
+                )
+
         async def discover(group: QueryGroup) -> SourceOperationResult:
+            require_live_dispatch("discovery")
             if source_result is not None:
                 result = source_result
             else:
@@ -295,6 +312,7 @@ class SubagentTaskRouter:
             )
 
         async def collect_detail(candidate: dict[str, Any]) -> SourceOperationResult:
+            require_live_dispatch("detail collection")
             return await adapter.collect_note_detail(
                 CollectNoteDetailRequest(
                     workflow_run_id=task.workflow_run_id,
@@ -310,6 +328,7 @@ class SubagentTaskRouter:
             )
 
         async def collect_comments(candidate: dict[str, Any]) -> SourceOperationResult:
+            require_live_dispatch("comment collection")
             return await adapter.collect_comments(
                 CollectCommentsRequest(
                     workflow_run_id=task.workflow_run_id,
@@ -339,6 +358,7 @@ class SubagentTaskRouter:
                 self._store._db_path,
                 workflow_run_id=task.workflow_run_id,
                 execution_context=execution_context,
+                dispatch_context=dispatch_context,
             )
         ).execute(
             workflow_run_id=task.workflow_run_id,

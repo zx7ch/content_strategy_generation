@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from typing import TypeAlias
 
@@ -11,7 +10,10 @@ import httpx
 import pytest
 
 from app.api.routes.router import app
-from app.content_research.persistence_models import ReportPublicationRecord
+from app.content_research.persistence_models import (
+    DirectionalEvidencePacketRecord,
+    ReportPublicationRecord,
+)
 from app.content_research.presearch.service import PresearchService
 from app.content_research.service import ContentResearchService, WorkflowRunManagerRuntime
 from app.content_research.sources import SourceAdapterRegistry
@@ -183,6 +185,68 @@ async def _confirmed_scope_awaiting_coverage(
     return workflow_run_id, contract, snapshot.id
 
 
+async def _queue_initial_scope_dispatch(
+    client: httpx.AsyncClient,
+    db_path: str,
+) -> tuple[str, dict]:
+    thread_store = ThreadStore(db_path)
+    await thread_store.connect()
+    thread = await thread_store.create_thread(title="normal dispatch takeover")
+    created = await client.post(
+        "/content-research/presearch",
+        json={"seed_text": "夏季通勤长袖", "thread_id": thread["id"]},
+    )
+    assert created.status_code == 201, created.text
+    workflow = created.json()
+    confirmed = await client.post(
+        f"/content-research/briefs/{workflow['brief_id']}/confirm",
+        json={
+            "confirmed_subject": "夏季通勤长袖",
+            "subject_structure_hash": workflow["subject_structure_hash"],
+            "subject_type": "category",
+            "selected_directions": ["product_marketing"],
+            "primary_marketing_goal": "content_seeding",
+            "subject_structure_confirmation": {
+                "core_object": "长袖衬衫",
+                "research_intent": "通勤",
+                "context_modifiers": ["夏季"],
+            },
+        },
+    )
+    assert confirmed.status_code == 200, confirmed.text
+    workflow_run_id = workflow["workflow_run_id"]
+    prepared = await client.post(
+        f"/content-research/workflows/{workflow_run_id}/actions",
+        json={"action": "prepare_scope", "payload": {"direction_id": "product_marketing"}},
+    )
+    assert prepared.status_code == 200, prepared.text
+    draft = prepared.json()["result"]["scope"]
+    scope_response = await client.post(
+        f"/content-research/workflows/{workflow_run_id}/actions",
+        json={
+            "action": "confirm_scope",
+            "payload": {
+                "scope_draft_id": draft["id"],
+                "structure_hash": draft["structure_hash"],
+                "query_groups": [
+                    {"final_query": group["final_query"]} for group in draft["query_groups"]
+                ],
+            },
+        },
+    )
+    assert scope_response.status_code == 200, scope_response.text
+    started = await client.post(
+        f"/content-research/workflows/{workflow_run_id}/actions",
+        json={
+            "action": "start_formal_research",
+            "payload": {"provider": "xiaohongshu", "source_kind": "search_result", "limit": 20},
+        },
+    )
+    assert started.status_code == 200, started.text
+    await thread_store.close()
+    return workflow_run_id, scope_response.json()["result"]["scope_contract"]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("resolution", "payload", "expected_scope_version"),
@@ -211,6 +275,12 @@ async def test_authorized_collection_continuations_run_through_worker_and_pipeli
         original_scope,
         coverage_snapshot_id,
     ) = await _confirmed_scope_awaiting_coverage(client, worker, db_path)
+    initial_packet_ids = {
+        item.id
+        for item in service._store.list_typed_records(DirectionalEvidencePacketRecord)
+        if item.workflow_run_id == workflow_run_id
+    }
+    assert initial_packet_ids
     resolved = await client.post(
         f"/content-research/workflows/{workflow_run_id}/actions",
         json={
@@ -244,72 +314,16 @@ async def test_authorized_collection_continuations_run_through_worker_and_pipeli
     assert continuation_snapshot.execution_authorization_id == authorization["id"]
     assert continuation_snapshot.scope_contract_version == expected_scope_version
     assert continuation_snapshot.source_coverage_snapshot_id
+    assert continuation_snapshot.manifest is not None
+    assert set(continuation_snapshot.manifest.packet_ids).isdisjoint(initial_packet_ids)
+    assert all(
+        continuation_snapshot.manifest.owns(item)
+        for item in service._store.list_typed_records(DirectionalEvidencePacketRecord)
+        if item.id in continuation_snapshot.manifest.packet_ids
+    )
     assert (
         service._store.list_scope_execution_continuations(workflow_run_id)[0].state == "completed"
     )
-
-
-@pytest.mark.asyncio
-async def test_governance_consumes_only_the_coverage_manifest_attempt(
-    continuation_harness: ContinuationHarness,
-) -> None:
-    """Removing manifest filtering must re-admit the initial Scope's claim records."""
-    client, service, worker, _adapter, db_path = continuation_harness
-    workflow_run_id, _scope, coverage_snapshot_id = await _confirmed_scope_awaiting_coverage(
-        client, worker, db_path
-    )
-    resolved = await client.post(
-        f"/content-research/workflows/{workflow_run_id}/actions",
-        json={
-            "action": "resolve_coverage",
-            "payload": {
-                "scope_contract_version": 1,
-                "coverage_snapshot_id": coverage_snapshot_id,
-                "resolution": "relax_constraint",
-                "constraint_id": "core_object",
-            },
-        },
-    )
-    assert resolved.status_code == 200, resolved.text
-    authorization = resolved.json()["result"]["execution_authorization"]
-    assert await worker.run_once()
-    terminal = service._store.get_coverage_snapshot(
-        workflow_run_id,
-        version=2,
-        execution_revision=authorization["execution_revision"],
-    )
-    assert terminal is not None and terminal.manifest is not None
-    plan = service._store.list_plans_for_brief(
-        service._store.get_brief_by_workflow(workflow_run_id).id
-    )[-1]
-
-    governed = service._cross_direction_governance.execute(
-        workflow_run_id=workflow_run_id,
-        research_plan_id=plan.id,
-        subagent_task_id=f"governance:manifest-test:{plan.id}",
-        manifest=terminal.manifest,
-    )
-    packet_ids = set(terminal.manifest.packet_ids)
-    all_claim_ids = {
-        claim_id
-        for record in (*governed.overlaps, *governed.contradictions, *governed.aggregates)
-        for claim_id in (
-            record.payload.get("claim_ids")
-            or record.payload.get("source_claim_ids")
-            or []
-        )
-    }
-    candidates = {
-        item.id: item
-        for item in service._store.list_claim_candidates(
-            workflow_run_id, "product_marketing"
-        )
-    }
-    assert all_claim_ids <= {
-        candidate.id
-        for candidate in candidates.values()
-        if candidate.evidence_packet_id in packet_ids
-    }
 
 
 @pytest.mark.asyncio
@@ -635,61 +649,6 @@ async def test_stale_execution_claim_is_fenced_before_any_continuation_artifact(
 
 
 @pytest.mark.asyncio
-async def test_stale_normal_dispatch_recovery_is_zero_write(
-    continuation_harness: ContinuationHarness,
-) -> None:
-    """Removing the normal-dispatch lease check must rewrite the running task."""
-    client, service, worker, adapter, db_path = continuation_harness
-    workflow_run_id, _scope, _coverage_snapshot_id = await _confirmed_scope_awaiting_coverage(
-        client, worker, db_path
-    )
-    adapter.discover_queries.clear()
-    task = service._store.list_subagent_tasks_for_workflow(workflow_run_id)[0]
-    service._store.save_subagent_task(
-        replace(task, status="running", payload={**task.payload, "status": "running"})
-    )
-    with service._store._connect() as conn:
-        conn.execute(
-            """UPDATE content_research_dispatch_jobs
-               SET status='running', lease_owner='worker-b', lease_token='live-token-b',
-                   lease_expires_at=? WHERE workflow_run_id=?""",
-            ((datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(), workflow_run_id),
-        )
-
-    guarded_tables = (
-        "content_research_subagent_tasks",
-        "content_research_stage_checkpoints",
-        "content_research_scope_coverage_snapshots",
-        "content_research_cross_direction_records",
-        "content_research_aggregate_claims",
-        "content_research_report_drafts",
-        "content_research_report_faithfulness_decisions",
-        "content_research_report_publications",
-    )
-
-    def durable_state() -> dict[str, tuple[tuple[object, ...], ...]]:
-        with service._store._connect() as conn:
-            return {
-                table: tuple(
-                    tuple(row)
-                    for row in conn.execute(f"SELECT * FROM {table} ORDER BY rowid").fetchall()
-                )
-                for table in guarded_tables
-            }
-
-    before = durable_state()
-    recovered = worker._recover_interrupted_tasks(
-        workflow_run_id,
-        owner="worker-a",
-        token="stale-token-a",
-    )
-
-    assert recovered is False
-    assert durable_state() == before
-    assert adapter.discover_queries == []
-
-
-@pytest.mark.asyncio
 async def test_real_worker_late_provider_callback_cannot_mutate_after_takeover(
     continuation_harness: ContinuationHarness,
 ) -> None:
@@ -774,3 +733,61 @@ async def test_real_worker_late_provider_callback_cannot_mutate_after_takeover(
         fact.kind == "lease_fenced" and fact.attempt_no == 0
         for fact in service._store.execution_trace(unit_id)
     )
+
+
+@pytest.mark.asyncio
+async def test_normal_dispatch_late_provider_callback_is_fenced_after_takeover(
+    continuation_harness: ContinuationHarness,
+) -> None:
+    """The real normal-dispatch worker cannot persist a late provider response."""
+    client, service, worker_a, adapter, db_path = continuation_harness
+    workflow_run_id, _scope = await _queue_initial_scope_dispatch(client, db_path)
+    adapter.pause_next_discover = True
+    running_a = asyncio.create_task(worker_a.run_once())
+    await asyncio.wait_for(adapter.discover_started.wait(), timeout=5)
+
+    with service._store._connect() as conn:
+        conn.execute(
+            """UPDATE content_research_dispatch_jobs
+               SET lease_expires_at='2000-01-01T00:00:00+00:00'
+               WHERE workflow_run_id=? AND status='running'""",
+            (workflow_run_id,),
+        )
+    worker_b = ContentResearchDispatchWorker(
+        store=service._store,
+        service_factory=lambda: service,
+    )
+    assert await worker_b.run_once()
+
+    guarded_tables = (
+        "content_research_subagent_tasks",
+        "content_research_observation_events",
+        "content_research_stage_checkpoints",
+        "content_research_scope_coverage_snapshots",
+        "content_research_cross_direction_records",
+        "content_research_aggregate_claims",
+        "content_research_report_drafts",
+        "content_research_report_faithfulness_decisions",
+        "content_research_report_publications",
+        "workflow_events",
+        "workflow_artifacts",
+    )
+
+    def durable_domain_state() -> dict[str, tuple[tuple[object, ...], ...]]:
+        with service._store._connect() as conn:
+            return {
+                table: tuple(
+                    tuple(row)
+                    for row in conn.execute(f"SELECT * FROM {table} ORDER BY rowid").fetchall()
+                )
+                for table in guarded_tables
+            }
+
+    after_takeover = durable_domain_state()
+    adapter.release_discover.set()
+    assert await running_a
+
+    assert durable_domain_state() == after_takeover
+    assert len(adapter.discover_queries) == 1
+    task = service._store.list_subagent_tasks_for_workflow(workflow_run_id)[0]
+    assert task.status == "outcome_unknown"

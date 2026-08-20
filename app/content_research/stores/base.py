@@ -39,6 +39,7 @@ from app.content_research.persistence_models import (
 )
 from app.content_research.scope_contract import (
     CoverageSnapshot,
+    DispatchLeaseContext,
     ExecutionContext,
     ExecutionFact,
     ResearchScopeContract,
@@ -99,6 +100,9 @@ class ContentResearchStore(Protocol):
     def initial_execution_eligibility(
         self, workflow_run_id: str, scope_contract_id: str
     ) -> bool: ...
+    def get_unresolved_coverage_snapshot(
+        self, workflow_run_id: str
+    ) -> CoverageSnapshot | None: ...
     def save_coverage_snapshot(self, snapshot: CoverageSnapshot) -> CoverageSnapshot: ...
     def save_coverage_snapshot_with_audit_event(
         self,
@@ -129,6 +133,7 @@ class ContentResearchStore(Protocol):
         lease_seconds: int = 120,
     ) -> bool: ...
     def execution_context_is_live(self, context: ExecutionContext, *, operation: str) -> bool: ...
+    def dispatch_context_is_live(self, context: DispatchLeaseContext) -> bool: ...
     def get_scope_execution_attempt(
         self, execution_unit_id: str, attempt_no: int
     ) -> ScopeExecutionAttempt | None: ...

@@ -11,18 +11,13 @@ from app.api.routes.router import app
 from app.content_research.api_schemas import ContentResearchSourceCollectionRequest
 from app.content_research.async_dispatch import AsyncScopeExecutionContinuationRepository
 from app.content_research.persistence_models import (
-    CanonicalSourceRecord,
     DirectionalEvidencePacketRecord,
     ReportPublicationRecord,
-    StageCheckpointRecord,
 )
 from app.content_research.presearch.service import PresearchService
-from app.content_research.runtime import canonical_fingerprint
 from app.content_research.scope_contract import (
     CoverageSnapshot,
-    ExecutionContext,
     ScopeAuditEvent,
-    ScopeDraftAuditEvent,
 )
 from app.content_research.service import ContentResearchService, ContentResearchValidationError
 from app.content_research.sources import SourceAdapterRegistry
@@ -324,75 +319,38 @@ async def test_relax_successor_requires_its_persisted_continuation_authority(sco
 
 @pytest.mark.asyncio
 async def test_later_scope_confirmation_cannot_reset_unresolved_workflow_coverage(scope_client):
-    """Deleting the workflow-wide eligibility check must reopen provider execution."""
+    """Ordinary confirmation cannot strand an unresolved Coverage decision."""
     workflow_run_id, _contract = await _confirmed_scope_with_unmet_season(scope_client)
     service = app.state.content_research_service
     original_draft = service._store.get_latest_scope_draft(workflow_run_id)
     assert original_draft is not None
-    later_draft = replace(
-        original_draft,
-        id="rsd_semantically_relaxed_after_unresolved_coverage",
-        query_groups=tuple(
-            replace(group, final_query=group.final_query.replace("夏季 ", ""))
-            for group in original_draft.query_groups
-        ),
-    )
-    service._store.save_scope_draft_with_audit_event(
-        later_draft,
-        ScopeDraftAuditEvent(
-            id="sae_semantically_relaxed_after_unresolved_coverage",
-            workflow_run_id=workflow_run_id,
-            scope_draft_id=later_draft.id,
-            event_name="scope_suggested",
-            payload={
-                "schema_version": "content_research_scope_audit_event_v1",
-                "scope_draft_id": later_draft.id,
-                "structure_hash": later_draft.structure_hash,
-            },
-        ),
-    )
     confirmed = await scope_client.post(
         f"/content-research/workflows/{workflow_run_id}/actions",
         json={
             "action": "confirm_scope",
             "payload": {
-                "scope_draft_id": later_draft.id,
-                "structure_hash": later_draft.structure_hash,
+                "scope_draft_id": original_draft.id,
+                "structure_hash": original_draft.structure_hash,
                 "query_groups": [
-                    {"final_query": group.final_query} for group in later_draft.query_groups
+                    {"final_query": group.final_query} for group in original_draft.query_groups
                 ],
             },
         },
     )
-    assert confirmed.status_code == 200, confirmed.text
-    assert confirmed.json()["result"]["scope_contract"]["version"] == 2
+    assert confirmed.status_code == 422, confirmed.text
+    assert "coverage_decision_required" in confirmed.text
+    assert len(service._store.list_scope_contracts(workflow_run_id)) == 1
 
-    started = await scope_client.post(
+    prepared = await scope_client.post(
         f"/content-research/workflows/{workflow_run_id}/actions",
         json={
-            "action": "start_formal_research",
-            "payload": {
-                "provider": "xiaohongshu",
-                "source_kind": "search_result",
-                "limit": 20,
-            },
+            "action": "prepare_scope",
+            "payload": {"direction_id": "product_marketing"},
         },
     )
+    assert prepared.status_code == 422, prepared.text
+    assert "coverage_decision_required" in prepared.text
 
-    assert started.status_code == 422, started.text
-    assert "unresolved coverage decision" in started.text
-    with service._store._connect() as conn:
-        assert conn.execute(
-            "SELECT 1 FROM content_research_dispatch_jobs WHERE workflow_run_id=?",
-            (workflow_run_id,),
-        ).fetchone() is None
-    assert service._store.list_result_snapshots_for_workflow(workflow_run_id) == []
-
-
-@pytest.mark.asyncio
-async def test_coverage_manifest_excludes_packets_from_other_scope_attempts(scope_client):
-    """Dropping any lineage predicate must include the deliberately matching old packet."""
-    workflow_run_id, original_contract = await _confirmed_scope_with_unmet_season(scope_client)
     resolved = await scope_client.post(
         f"/content-research/workflows/{workflow_run_id}/actions",
         json={
@@ -406,135 +364,7 @@ async def test_coverage_manifest_excludes_packets_from_other_scope_attempts(scop
         },
     )
     assert resolved.status_code == 200, resolved.text
-    service = app.state.content_research_service
-    result = resolved.json()["result"]
-    authorization = service._store.get_scope_execution_authorization(
-        result["execution_authorization"]["id"]
-    )
-    assert authorization is not None
-    unit_id = result["execution_unit"]["id"]
-    claim = service._store.claim_execution_unit(
-        execution_unit_id=unit_id, owner="manifest-test", lease_seconds=120
-    )
-    assert claim is not None and claim.lease_token
-    context = ExecutionContext(
-        execution_unit_id=unit_id,
-        attempt_no=claim.attempt_no,
-        lease_token=claim.lease_token,
-        scope_contract_id=authorization.scope_contract_id,
-    )
-    assert service._store.record_provider_outcome(
-        execution_unit_id=unit_id,
-        attempt_no=claim.attempt_no,
-        lease_token=claim.lease_token,
-        provider_state="succeeded",
-        payload={"operation": "manifest-test"},
-    )
-
-    for source_id in ("src_old_scope", "src_current_attempt"):
-        service._store.save_canonical_source(
-            CanonicalSourceRecord(
-                source_id,
-                "content_research_canonical_source_v1",
-                {"schema_version": "content_research_canonical_source_v1"},
-                platform="xiaohongshu",
-                platform_source_kind="note",
-                platform_source_id=source_id,
-                canonical_url=f"https://example.test/{source_id}",
-            )
-        )
-
-    def packet(packet_id: str, source_id: str, author_id: str, **ownership):
-        return DirectionalEvidencePacketRecord(
-            packet_id,
-            "content_research_directional_packet_v1",
-            {
-                "schema_version": "content_research_directional_packet_v1",
-                "field_projection": {
-                    "title": "长袖衬衫通勤实测",
-                    "content_text": "长袖衬衫适合通勤",
-                    "author_id": author_id,
-                },
-                "field_availability": {},
-                "retrieval_context": {},
-            },
-            workflow_run_id=workflow_run_id,
-            research_direction_id="product_marketing",
-            canonical_source_id=source_id,
-            field_projection_hash=f"hash-{packet_id}",
-            **ownership,
-        )
-
-    old_packet = packet(
-        "dep_old_scope",
-        "src_old_scope",
-        "author-old",
-        scope_contract_id=original_contract["id"],
-        execution_unit_id=None,
-        attempt_no=0,
-        execution_revision=1,
-    )
-    current_packet = packet(
-        "dep_current_attempt",
-        "src_current_attempt",
-        "author-current",
-        scope_contract_id=authorization.scope_contract_id,
-        execution_unit_id=unit_id,
-        attempt_no=claim.attempt_no,
-        execution_revision=authorization.execution_revision,
-    )
-    service._store.save_directional_evidence_packet(old_packet)
-    service._store.save_directional_evidence_packet(current_packet)
-    current_checkpoint = StageCheckpointRecord(
-        "scp_current_attempt",
-        "content_research_stage_checkpoint_v1",
-        {
-            "schema_version": "content_research_stage_checkpoint_v1",
-            "query_group_id": result["scope_contract"]["query_groups"][0]["id"],
-            "page_no": 1,
-            "status": "completed",
-            "actual_count": 1,
-        },
-        workflow_run_id=workflow_run_id,
-        subagent_task_id="crt_"
-        + canonical_fingerprint(
-            {
-                "authorization_id": authorization.id,
-                "direction_id": "product_marketing",
-            }
-        )[:24],
-        stage_name="collect_page",
-        input_fingerprint="manifest-current-checkpoint",
-        status="completed",
-        scope_contract_id=authorization.scope_contract_id,
-        execution_unit_id=unit_id,
-        attempt_no=claim.attempt_no,
-        execution_revision=authorization.execution_revision,
-    )
-    service._store.save_stage_checkpoint(current_checkpoint)
-
-    snapshot = service._persist_scope_coverage(
-        workflow_run_id,
-        execution_authorization=authorization,
-        execution_context=context,
-    )
-
-    assert snapshot is not None
-    assert snapshot.manifest is not None
-    assert snapshot.manifest.packet_ids == (current_packet.id,)
-    assert snapshot.manifest.checkpoint_ids == (current_checkpoint.id,)
-    assert snapshot.manifest.scope_contract_id == authorization.scope_contract_id
-    assert snapshot.manifest.execution_unit_id == unit_id
-    assert snapshot.manifest.attempt_no == claim.attempt_no
-    assert snapshot.constraint_counts["core_object"]["matched_candidate_count"] == 1
-
-    foreign_manifest_snapshot = replace(
-        snapshot,
-        id="scv_foreign_packet_manifest",
-        manifest=replace(snapshot.manifest, packet_ids=(old_packet.id,)),
-    )
-    with pytest.raises(ValueError, match="evidence ownership mismatch"):
-        service._store.save_coverage_snapshot(foreign_manifest_snapshot)
+    assert resolved.json()["result"]["scope_contract"]["version"] == 2
 
 
 @pytest.mark.asyncio
@@ -1503,6 +1333,18 @@ async def test_confirmed_scope_projection_includes_current_action_metadata(scope
     assert body["scope_contract"] == contract
     assert body["allowed_actions"] == [
         {
+            "action": "prepare_scope",
+            "available": False,
+            "unavailable_reason": "coverage_decision_required",
+            "recovery_action": "resolve_coverage",
+        },
+        {
+            "action": "confirm_scope",
+            "available": False,
+            "unavailable_reason": "coverage_decision_required",
+            "recovery_action": "resolve_coverage",
+        },
+        {
             "action": "resolve_coverage",
             "available": True,
             "scope_contract_version": contract["version"],
@@ -1531,12 +1373,37 @@ async def test_scope_projection_exposes_initial_unresolved_coverage_without_auth
     assert body["coverage_snapshot"]["execution_authorization_id"] is None
     assert body["allowed_actions"] == [
         {
+            "action": "prepare_scope",
+            "available": False,
+            "unavailable_reason": "coverage_decision_required",
+            "recovery_action": "resolve_coverage",
+        },
+        {
+            "action": "confirm_scope",
+            "available": False,
+            "unavailable_reason": "coverage_decision_required",
+            "recovery_action": "resolve_coverage",
+        },
+        {
             "action": "resolve_coverage",
             "available": True,
             "scope_contract_version": contract["version"],
             "coverage_snapshot_id": "scv_api_unmet_season",
         }
     ]
+    assert body["decision_recovery"] == {
+        "state": "coverage_decision_required",
+        "message": (
+            "Current Coverage is awaiting a user decision; ordinary Scope preparation and "
+            "confirmation are unavailable."
+        ),
+        "required_action": "resolve_coverage",
+        "allowed_resolutions": [
+            "expand_required_constraint",
+            "generate_limited_report",
+            "relax_constraint",
+        ],
+    }
     resolutions = {item["action"]: item for item in body["allowed_resolutions"]}
     assert resolutions["expand_required_constraint"]["valid_constraint_ids"] == ["season"]
     assert resolutions["relax_constraint"]["valid_constraint_ids"] == ["season"]

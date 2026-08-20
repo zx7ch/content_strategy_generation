@@ -67,7 +67,10 @@ from app.content_research.evidence.governance_reader import (
     safe_public_projection,
 )
 from app.content_research.evidence.packet_reader import PacketEvidenceReader
-from app.content_research.execution_lease import LeaseFencedWorkflowRunManager
+from app.content_research.execution_lease import (
+    DispatchLeaseFencedWorkflowRunManager,
+    LeaseFencedWorkflowRunManager,
+)
 from app.content_research.marketing_conclusion_analysis import (
     MarketingConclusionAnalysisError,
     MarketingConclusionAnalysisService,
@@ -113,6 +116,7 @@ from app.content_research.reporting.publication_materializer import ReportPublic
 from app.content_research.reporting.read_model import PublishedReportNotFoundError
 from app.content_research.runtime import canonical_fingerprint
 from app.content_research.scope_contract import (
+    DispatchLeaseContext,
     ExecutionContext,
     ExecutionLeaseFencedError,
     ResearchScopeDraft,
@@ -282,16 +286,29 @@ class WorkflowRunManagerRuntime:
         db_path: str,
         *,
         execution_context: ExecutionContext | None = None,
+        dispatch_context: DispatchLeaseContext | None = None,
     ) -> None:
         self._db_path = db_path
         self._execution_context = execution_context
+        self._dispatch_context = dispatch_context
 
     def for_execution_context(self, context: ExecutionContext) -> WorkflowRunManagerRuntime:
         return WorkflowRunManagerRuntime(self._db_path, execution_context=context)
 
+    def for_dispatch_context(
+        self, context: DispatchLeaseContext
+    ) -> WorkflowRunManagerRuntime:
+        return WorkflowRunManagerRuntime(self._db_path, dispatch_context=context)
+
     def _manager(self, operation: str) -> WorkflowRunManager:
         if self._execution_context is None:
-            return WorkflowRunManager(self._db_path)
+            if self._dispatch_context is None:
+                return WorkflowRunManager(self._db_path)
+            return DispatchLeaseFencedWorkflowRunManager(
+                self._db_path,
+                dispatch_context=self._dispatch_context,
+                operation=operation,
+            )
         return LeaseFencedWorkflowRunManager(
             self._db_path,
             execution_context=self._execution_context,
@@ -1714,6 +1731,11 @@ class ContentResearchService:
             coverage_snapshot=coverage_snapshot,
             authorizations=authorizations,
         )
+        allowed_resolutions = _scope_projection_resolutions(
+            contract=contract,
+            coverage_snapshot=coverage_snapshot,
+            authorizations=authorizations,
+        )
         return ContentResearchScopeProjectionResponse(
             workflow_run_id=workflow_run_id,
             state=(
@@ -1735,10 +1757,11 @@ class ContentResearchService:
                 if coverage_snapshot is not None
                 else None
             ),
-            allowed_resolutions=_scope_projection_resolutions(
-                contract=contract,
+            allowed_resolutions=allowed_resolutions,
+            decision_recovery=_scope_decision_recovery(
                 coverage_snapshot=coverage_snapshot,
                 authorizations=authorizations,
+                allowed_resolutions=allowed_resolutions,
             ),
         )
 
@@ -1855,6 +1878,7 @@ class ContentResearchService:
         workflow_run_id: str,
         *,
         result_type: str = "topic_research",
+        manifest: CoverageManifest | None = None,
     ) -> SnapshotResponse:
         brief = self._store.get_brief_by_workflow(workflow_run_id)
         if brief is None:
@@ -1870,6 +1894,7 @@ class ContentResearchService:
             workflow_run_id=workflow_run_id,
             plan_id=plan.id if plan else None,
             direction_records=direction_records,
+            manifest=manifest,
         )
         governed_input_fingerprint = _governed_input_fingerprint(governed)
         snapshot = ResearchResultSnapshotRecord(
@@ -2226,6 +2251,7 @@ class ContentResearchService:
         workflow_run_id: str,
         plan_id: str | None,
         direction_records: list[ResearchDirectionRecord],
+        manifest: CoverageManifest | None = None,
     ) -> dict[str, Any]:
         policy = self._store.get_run_policy_snapshot_for_workflow(workflow_run_id)
         if policy is None:
@@ -2245,6 +2271,7 @@ class ContentResearchService:
             item.id: item
             for direction_id in direction_ids
             for item in self._store.list_claim_candidates(workflow_run_id, direction_id)
+            if manifest is None or manifest.owns(item)
         }
         decisions = [
             item
@@ -2272,6 +2299,20 @@ class ContentResearchService:
             if plan_id is not None
             else None
         )
+        if governance_read is not None and manifest is not None:
+            allowed_claim_ids = set(candidates_by_id)
+            governance_read.cross_direction_records[:] = [
+                item
+                for item in governance_read.cross_direction_records
+                if (claim_ids := set(item.get("claim_ids") or ()))
+                and claim_ids <= allowed_claim_ids
+            ]
+            governance_read.aggregate_claims[:] = [
+                item
+                for item in governance_read.aggregate_claims
+                if (claim_ids := set(item.get("source_claim_ids") or ()))
+                and claim_ids <= allowed_claim_ids
+            ]
         claim_cards = [
             _governed_claim_card(
                 candidate=candidates_by_id[item.claim_candidate_id],
@@ -2291,6 +2332,7 @@ class ContentResearchService:
                 if item.workflow_run_id == workflow_run_id
                 and item.stage_name == "marketing_conclusion"
                 and item.status in {"completed", "insufficient", "tied"}
+                and (manifest is None or manifest.owns(item))
             ),
             key=lambda item: (item.created_at, item.id),
         )
@@ -2303,6 +2345,11 @@ class ContentResearchService:
                 self._store.list_marketing_conclusion_candidates(workflow_run_id, plan_id)
                 if plan_id is not None
                 else []
+            )
+            if manifest is None
+            or (
+                (supporting_ids := set(item.payload.get("supporting_claim_ids") or ()))
+                and supporting_ids <= set(candidates_by_id)
             )
         }
         conclusion_decisions = [
@@ -2371,12 +2418,12 @@ class ContentResearchService:
                     else None
                 ),
                 "admitted_claim_ids": list(
-                    (
+                    claim_id for claim_id in (
                         result_by_direction.get(direction_id).payload.get("admitted_claim_ids")
                         if direction_id in result_by_direction
                         else []
                     )
-                    or []
+                    or [] if claim_id in candidates_by_id
                 ),
                 "limitations": list(
                     (
@@ -2483,7 +2530,9 @@ class ContentResearchService:
             "aggregate_claims": list(governance_read.aggregate_claims if governance_read else []),
             "report_section_refs": report_section_refs,
             "limitations_recovery": limitations,
-            "checkpoint_summary": _checkpoint_summary(self._store, workflow_run_id),
+            "checkpoint_summary": _checkpoint_summary(
+                self._store, workflow_run_id, manifest=manifest
+            ),
             "faithfulness_audit": {"state": "pending"},
             "executive_summary": _governed_summary(claim_cards, publication_state),
             "research_plan_id": plan_id,
@@ -2719,6 +2768,12 @@ class ContentResearchService:
         )
 
     def _prepare_scope(self, *, brief: ResearchBriefRecord, direction_id: str) -> dict[str, Any]:
+        unresolved = self._store.get_unresolved_coverage_snapshot(brief.workflow_run_id)
+        if unresolved is not None:
+            raise ContentResearchValidationError(
+                "coverage_decision_required: resolve_coverage must resolve the current "
+                "Coverage before prepare_scope can create another Scope draft"
+            )
         plans = self._store.list_plans_for_brief(brief.id)
         if not plans:
             raise ContentResearchValidationError(
@@ -2818,6 +2873,12 @@ class ContentResearchService:
     def _confirm_scope(
         self, *, workflow_run_id: str, request: ConfirmScopeRequest
     ) -> dict[str, Any]:
+        unresolved = self._store.get_unresolved_coverage_snapshot(workflow_run_id)
+        if unresolved is not None:
+            raise ContentResearchValidationError(
+                "coverage_decision_required: resolve_coverage must resolve the current "
+                "Coverage before confirm_scope can create another Scope"
+            )
         draft = self._store.get_scope_draft(request.scope_draft_id)
         if draft is None or draft.workflow_run_id != workflow_run_id:
             raise ContentResearchValidationError("Scope draft was not found for this workflow")
@@ -3433,6 +3494,27 @@ class ContentResearchService:
         contracts = self._store.list_scope_contracts(workflow_run_id)
         if not contracts:
             raise ContentResearchValidationError("scope_confirmation_required")
+        if execution_authorization is not None:
+            persisted = self._store.get_scope_execution_authorization(execution_authorization.id)
+            contract = self._store.get_scope_contract(
+                workflow_run_id, version=execution_authorization.scope_contract_version
+            )
+            source_coverage = self._store.get_coverage_snapshot_by_id(
+                execution_authorization.coverage_snapshot_id
+            )
+            if (
+                persisted is None
+                or persisted != execution_authorization
+                or persisted.workflow_run_id != workflow_run_id
+                or contract is None
+                or persisted.scope_contract_id != contract.id
+                or source_coverage is None
+                or source_coverage.workflow_run_id != workflow_run_id
+                or source_coverage.state != "awaiting_scope_decision"
+            ):
+                raise ContentResearchValidationError("scope_execution_authorization_invalid")
+            return
+
         contract = contracts[-1]
         coverage = self._store.get_coverage_snapshot(workflow_run_id, version=contract.version)
         has_persisted_continuation_authority = any(
@@ -3440,17 +3522,6 @@ class ContentResearchService:
             and item.scope_contract_version == contract.version
             for item in self._store.list_scope_execution_authorizations(workflow_run_id)
         )
-
-        if execution_authorization is not None:
-            persisted = self._store.get_scope_execution_authorization(execution_authorization.id)
-            if (
-                persisted is None
-                or persisted != execution_authorization
-                or persisted.workflow_run_id != workflow_run_id
-                or persisted.scope_contract_id != contract.id
-                or persisted.scope_contract_version != contract.version
-            ):
-                raise ContentResearchValidationError("scope_execution_authorization_invalid")
 
         if execution_authorization is None and not self._store.initial_execution_eligibility(
             workflow_run_id, contract.id
@@ -3468,11 +3539,6 @@ class ContentResearchService:
             return
         if execution_authorization is None:
             raise ContentResearchValidationError("scope_execution_authorization_required")
-        if (
-            execution_authorization.coverage_snapshot_id != coverage.id
-            or execution_authorization.execution_revision != coverage.execution_revision + 1
-        ):
-            raise ContentResearchValidationError("scope_execution_authorization_invalid")
 
     def _require_frozen_product_marketing_dispatch_contract(
         self, brief: ResearchBriefRecord
@@ -3837,6 +3903,84 @@ class ContentResearchService:
             task_count=len(tasks),
             completed_task_count=completed,
             partial_completed_task_count=partial_completed,
+            failed_tasks=failed_tasks,
+            provider=request.provider,
+            source_kind=request.source_kind,
+            limit_per_specialist=request.limit,
+        )
+
+    async def execute_claimed_dispatch(
+        self,
+        *,
+        context: DispatchLeaseContext,
+        request: ContentResearchSourceCollectionRequest,
+    ) -> ContentResearchFormalResearchResponse:
+        """Execute a normal dispatch through a store view fenced to its exact claim."""
+        if not self._store.dispatch_context_is_live(context):
+            raise ExecutionLeaseFencedError("dispatch lease was fenced before formal research")
+        bind_runtime = getattr(self._workflow_runtime, "for_dispatch_context", None)
+        scoped_runtime = (
+            bind_runtime(context) if callable(bind_runtime) else self._workflow_runtime
+        )
+        scoped_service = ContentResearchService(
+            store=self._store.for_dispatch_context(context),
+            presearch=self._presearch,
+            workflow_runtime=scoped_runtime,
+            source_registry=self._source_registry,
+            analysis_llm=self._analysis_llm,
+            report_semantic_auditor=self._report_semantic_auditor,
+            dispatch_wake_event=self._dispatch_wake_event,
+        )
+        return await scoped_service._start_formal_research_for_dispatch(
+            workflow_run_id=context.workflow_run_id,
+            request=request,
+            dispatch_context=context,
+        )
+
+    async def _start_formal_research_for_dispatch(
+        self,
+        *,
+        workflow_run_id: str,
+        request: ContentResearchSourceCollectionRequest,
+        dispatch_context: DispatchLeaseContext,
+    ) -> ContentResearchFormalResearchResponse:
+        brief = self._store.get_brief_by_workflow(workflow_run_id)
+        if brief is None:
+            raise ContentResearchNotFoundError(
+                f"Content research workflow not found: {workflow_run_id}"
+            )
+        self._require_scope_execution_authority(workflow_run_id=workflow_run_id)
+        async with ThreadStore(self._store._db_path) as thread_store:
+            if await thread_store.get_thread(brief.thread_id) is None:
+                raise ContentResearchValidationError(
+                    "Content research cannot start because its Creator thread no longer exists. "
+                    "Create a new checklist from an active Creator conversation."
+                )
+        await self._execute_formal_research(
+            brief=brief,
+            provider=request.provider,
+            source_kind=request.source_kind,
+            limit=request.limit,
+            dispatch_context=dispatch_context,
+        )
+        tasks = self._store.list_subagent_tasks_for_workflow(workflow_run_id)
+        failed_tasks = [
+            {
+                "task_id": task.id,
+                "agent_name": task.payload.get("agent_name"),
+                "error": (task.payload.get("output_payload") or {}).get("error_message"),
+            }
+            for task in tasks
+            if task.status in {"failed", "outcome_unknown"}
+        ]
+        return ContentResearchFormalResearchResponse(
+            workflow_run_id=workflow_run_id,
+            status="failed" if failed_tasks else "completed",
+            task_count=len(tasks),
+            completed_task_count=sum(task.status == "completed" for task in tasks),
+            partial_completed_task_count=sum(
+                task.status == "partial_completed" for task in tasks
+            ),
             failed_tasks=failed_tasks,
             provider=request.provider,
             source_kind=request.source_kind,
@@ -4432,6 +4576,7 @@ class ContentResearchService:
         execution_authorization: ScopeExecutionAuthorization | None = None,
         executable_task_ids: set[str] | None = None,
         execution_context: ExecutionContext | None = None,
+        dispatch_context: DispatchLeaseContext | None = None,
     ) -> None:
         self._require_live_execution_context(execution_context, "formal_research_start")
         self._require_scope_execution_authority(
@@ -4461,6 +4606,7 @@ class ContentResearchService:
                     # Each specialist owns its own query and source result.
                     source_result=None,
                     execution_context=execution_context,
+                    dispatch_context=dispatch_context,
                 )
                 for task in executable_tasks
             )
@@ -4785,14 +4931,7 @@ class ContentResearchService:
         candidates_by_id = {
             item.id: item
             for item in self._store.list_claim_candidates(workflow_run_id, "product_marketing")
-            if manifest is None
-            or (
-                item.scope_contract_id == manifest.scope_contract_id
-                and item.execution_unit_id == manifest.execution_unit_id
-                and item.attempt_no == manifest.attempt_no
-                and item.execution_revision == manifest.execution_revision
-                and item.evidence_packet_id in set(manifest.packet_ids)
-            )
+            if manifest is None or manifest.owns(item)
         }
         admitted_claims = sorted(
             (
@@ -5044,10 +5183,47 @@ class ContentResearchService:
                 "Marketing conclusion governance requires a research plan"
             )
         direction_records = self._store.list_directions_for_plan(plans[-1].id)
+        coverage = (
+            self._store.get_coverage_snapshot_by_id(
+                execution_authorization.coverage_snapshot_id
+            )
+            if execution_authorization is not None
+            and execution_authorization.resolution == "generate_limited_report"
+            else self._store.get_coverage_snapshot(
+                workflow_run_id,
+                version=execution_authorization.scope_contract_version,
+                execution_revision=execution_authorization.execution_revision,
+            )
+            if execution_authorization is not None
+            else self._store.get_coverage_snapshot(
+                workflow_run_id,
+                version=self._store.list_scope_contracts(workflow_run_id)[-1].version,
+                execution_revision=1,
+            )
+        )
+        manifest = coverage.manifest if coverage is not None else None
+        if (
+            execution_authorization is not None
+            and (
+                coverage is None
+                or (
+                    execution_authorization.resolution != "generate_limited_report"
+                    and coverage.execution_authorization_id != execution_authorization.id
+                )
+                or (
+                    execution_authorization.resolution == "generate_limited_report"
+                    and coverage.id != execution_authorization.coverage_snapshot_id
+                )
+            )
+        ):
+            raise ContentResearchValidationError(
+                "governed snapshot requires the exact authorized Coverage manifest"
+            )
         governed = self._build_governed_snapshot(
             workflow_run_id=workflow_run_id,
             plan_id=plans[-1].id,
             direction_records=direction_records,
+            manifest=manifest,
         )
         governed_input_fingerprint = _governed_input_fingerprint(governed)
         matching_snapshot_ids = {
@@ -5079,7 +5255,9 @@ class ContentResearchService:
                 "publication_state": existing_publication.publication_state,
             }
         snapshot_response = self.create_result_snapshot(
-            workflow_run_id, result_type="governed_research_report"
+            workflow_run_id,
+            result_type="governed_research_report",
+            manifest=manifest,
         )
         snapshot = next(
             item
@@ -5748,11 +5926,17 @@ def _safe_trace_summary(store: Any, workflow_run_id: str) -> dict[str, Any]:
     }
 
 
-def _checkpoint_summary(store: Any, workflow_run_id: str) -> dict[str, Any]:
+def _checkpoint_summary(
+    store: Any,
+    workflow_run_id: str,
+    *,
+    manifest: CoverageManifest | None = None,
+) -> dict[str, Any]:
     checkpoints = [
         item
         for item in store.list_typed_records(StageCheckpointRecord)
         if item.workflow_run_id == workflow_run_id
+        and (manifest is None or manifest.owns(item))
     ]
     return {
         "workflow_run_id": workflow_run_id,
@@ -5928,12 +6112,49 @@ def _scope_projection_actions(
         return []
     return [
         {
+            "action": "prepare_scope",
+            "available": False,
+            "unavailable_reason": "coverage_decision_required",
+            "recovery_action": "resolve_coverage",
+        },
+        {
+            "action": "confirm_scope",
+            "available": False,
+            "unavailable_reason": "coverage_decision_required",
+            "recovery_action": "resolve_coverage",
+        },
+        {
             "action": "resolve_coverage",
             "available": True,
             "scope_contract_version": contract.version,
             "coverage_snapshot_id": coverage_snapshot.id,
         }
     ]
+
+
+def _scope_decision_recovery(
+    *,
+    coverage_snapshot: Any | None,
+    authorizations: list[ScopeExecutionAuthorization],
+    allowed_resolutions: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    if (
+        coverage_snapshot is None
+        or coverage_snapshot.state != "awaiting_scope_decision"
+        or any(item.coverage_snapshot_id == coverage_snapshot.id for item in authorizations)
+    ):
+        return None
+    return {
+        "state": "coverage_decision_required",
+        "message": (
+            "Current Coverage is awaiting a user decision; ordinary Scope preparation and "
+            "confirmation are unavailable."
+        ),
+        "required_action": "resolve_coverage",
+        "allowed_resolutions": [
+            str(item["action"]) for item in allowed_resolutions if item.get("available")
+        ],
+    }
 
 
 def _scope_projection_resolutions(
@@ -6079,16 +6300,7 @@ def _admitted_claim_ids_for_run(
         item.id
         for item in store.list_typed_records(ClaimCandidateRecord)
         if item.workflow_run_id == workflow_run_id
-        and (
-            manifest is None
-            or (
-                item.scope_contract_id == manifest.scope_contract_id
-                and item.execution_unit_id == manifest.execution_unit_id
-                and item.attempt_no == manifest.attempt_no
-                and item.execution_revision == manifest.execution_revision
-                and item.evidence_packet_id in set(manifest.packet_ids)
-            )
-        )
+        and (manifest is None or manifest.owns(item))
     }
     return sorted(
         item.claim_candidate_id

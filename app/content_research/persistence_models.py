@@ -47,16 +47,14 @@ def _validate_execution_ownership(
 
 
 @dataclass(frozen=True)
-class CoverageManifest:
-    """Frozen evidence/checkpoint membership for one Coverage evaluation."""
+class ExecutionOwnership:
+    """Typed identity shared by execution-owned persisted records."""
 
     workflow_run_id: str
     scope_contract_id: str
     execution_unit_id: str | None
     attempt_no: int
     execution_revision: int
-    packet_ids: tuple[str, ...] = ()
-    checkpoint_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         _required(self.workflow_run_id, self.scope_contract_id)
@@ -66,10 +64,52 @@ class CoverageManifest:
             attempt_no=self.attempt_no,
             execution_revision=self.execution_revision,
         )
+
+    def matches(self, record: Any) -> bool:
+        return all(
+            getattr(record, field) == getattr(self, field)
+            for field in (
+                "workflow_run_id",
+                "scope_contract_id",
+                "execution_unit_id",
+                "attempt_no",
+                "execution_revision",
+            )
+        )
+
+    def as_record_kwargs(self) -> dict[str, Any]:
+        return {
+            "scope_contract_id": self.scope_contract_id,
+            "execution_unit_id": self.execution_unit_id,
+            "attempt_no": self.attempt_no,
+            "execution_revision": self.execution_revision,
+        }
+
+
+@dataclass(frozen=True)
+class CoverageManifest(ExecutionOwnership):
+    """Frozen evidence/checkpoint membership for one Coverage evaluation."""
+
+    packet_ids: tuple[str, ...] = ()
+    checkpoint_ids: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
         if len(set(self.packet_ids)) != len(self.packet_ids):
             raise ValueError("coverage manifest packet ids must be unique")
         if len(set(self.checkpoint_ids)) != len(self.checkpoint_ids):
             raise ValueError("coverage manifest checkpoint ids must be unique")
+
+    def owns(self, record: Any) -> bool:
+        if not self.matches(record):
+            return False
+        if isinstance(record, DirectionalEvidencePacketRecord):
+            return record.id in self.packet_ids
+        if isinstance(record, ClaimCandidateRecord):
+            return record.evidence_packet_id in self.packet_ids
+        if isinstance(record, StageCheckpointRecord):
+            return record.id in self.checkpoint_ids
+        return True
 
 
 @dataclass(frozen=True)

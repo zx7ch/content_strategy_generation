@@ -24,6 +24,19 @@ QueryExecutionRole = Literal["coverage", "supplementary", "exploratory"]
 
 
 @dataclass(frozen=True)
+class DispatchLeaseContext:
+    """Exact ownership of one normal formal-research dispatch claim."""
+
+    workflow_run_id: str
+    lease_owner: str
+    lease_token: str
+
+    def __post_init__(self) -> None:
+        if not all((self.workflow_run_id, self.lease_owner, self.lease_token)):
+            raise ValueError("dispatch lease context requires workflow, owner, and token")
+
+
+@dataclass(frozen=True)
 class ScopeConstraint:
     id: str
     label: str

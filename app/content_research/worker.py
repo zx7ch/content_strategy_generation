@@ -6,7 +6,7 @@ import asyncio
 import logging
 import uuid
 from collections.abc import Callable
-from dataclasses import replace
+from datetime import datetime
 
 from app.content_research.api_schemas import ContentResearchSourceCollectionRequest
 from app.content_research.async_dispatch import (
@@ -15,7 +15,7 @@ from app.content_research.async_dispatch import (
     AsyncScopeExecutionUnitRepository,
 )
 from app.content_research.models import utcnow
-from app.content_research.persistence_models import StageCheckpointRecord
+from app.content_research.scope_contract import DispatchLeaseContext
 from app.content_research.service import ContentResearchService
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
 
@@ -33,6 +33,7 @@ class ContentResearchDispatchWorker:
         wake_event: asyncio.Event | None = None,
         recovery_scan_seconds: float = 5.0,
         lease_seconds: int = 120,
+        clock: Callable[[], datetime] = utcnow,
     ) -> None:
         self._store = store
         self._dispatch = AsyncFormalResearchDispatchRepository(store._db_path)
@@ -42,6 +43,7 @@ class ContentResearchDispatchWorker:
         self._wake_event = wake_event or asyncio.Event()
         self._recovery_scan_seconds = recovery_scan_seconds
         self._lease_seconds = lease_seconds
+        self._clock = clock
         self._owner = f"content-research-worker:{uuid.uuid4().hex}"
 
     async def run_once(self) -> bool:
@@ -81,21 +83,31 @@ class ContentResearchDispatchWorker:
         result = None
         execution_error: Exception | None = None
         try:
-            if not self._recover_interrupted_tasks(
-                str(job["workflow_run_id"]),
-                owner=self._owner,
-                token=str(job["lease_token"]),
-            ):
+            dispatch_context = DispatchLeaseContext(
+                workflow_run_id=str(job["workflow_run_id"]),
+                lease_owner=self._owner,
+                lease_token=str(job["lease_token"]),
+            )
+            if not self._recover_interrupted_tasks(dispatch_context):
                 lease_lost.set()
                 return True
-            result = await self._service_factory().start_formal_research(
-                workflow_run_id=str(job["workflow_run_id"]),
-                request=ContentResearchSourceCollectionRequest(
-                    provider=str(job["provider"]),
-                    source_kind=str(job["source_kind"]),
-                    limit=int(job["limit_per_specialist"]),
-                ),
+            service = self._service_factory()
+            execute_claimed = getattr(service, "execute_claimed_dispatch", None)
+            request = ContentResearchSourceCollectionRequest(
+                provider=str(job["provider"]),
+                source_kind=str(job["source_kind"]),
+                limit=int(job["limit_per_specialist"]),
             )
+            if callable(execute_claimed):
+                result = await execute_claimed(
+                    context=dispatch_context,
+                    request=request,
+                )
+            else:
+                result = await service.start_formal_research(
+                    workflow_run_id=dispatch_context.workflow_run_id,
+                    request=request,
+                )
         except Exception as exc:  # preserve a durable diagnostic for retry/recovery
             execution_error = exc
             logger.exception(
@@ -293,10 +305,7 @@ class ContentResearchDispatchWorker:
 
     def _recover_interrupted_tasks(
         self,
-        workflow_run_id: str,
-        *,
-        owner: str,
-        token: str,
+        context: DispatchLeaseContext,
     ) -> bool:
         """Recover parent task state without ever repeating an unknown call.
 
@@ -305,43 +314,9 @@ class ContentResearchDispatchWorker:
         operation checkpoint was claimed.  A claimed provider operation is
         deliberately surfaced as retryable/unknown instead of being replayed.
         """
-        with self._store._connect() as conn:
-            live_claim = conn.execute(
-                """SELECT 1 FROM content_research_dispatch_jobs
-                   WHERE workflow_run_id=? AND status='running'
-                     AND lease_owner=? AND lease_token=?
-                     AND lease_expires_at IS NOT NULL AND lease_expires_at > ?""",
-                (workflow_run_id, owner, token, utcnow().isoformat()),
-            ).fetchone()
-        if live_claim is None:
-            return False
-        operation_checkpoints = self._store.list_typed_records(StageCheckpointRecord)
-        for task in self._store.list_subagent_tasks_for_workflow(workflow_run_id):
-            if task.status != "running":
-                continue
-            has_unknown_operation = any(
-                checkpoint.workflow_run_id == workflow_run_id
-                and checkpoint.subagent_task_id == task.id
-                and checkpoint.stage_name == "operation"
-                and checkpoint.status == "running"
-                for checkpoint in operation_checkpoints
-            )
-            payload = dict(task.payload)
-            if has_unknown_operation:
-                payload["status"] = "failed"
-                payload["output_payload"] = {
-                    "error_code": "OPERATION_OUTCOME_UNKNOWN",
-                    "error_message": "Previous provider operation was interrupted; its outcome is unknown and was not replayed.",
-                    "retryable": True,
-                }
-                next_status = "failed"
-            else:
-                payload["status"] = "queued"
-                next_status = "queued"
-            self._store.save_subagent_task(
-                replace(task, status=next_status, payload=payload, updated_at=utcnow())
-            )
-        return True
+        return self._store.recover_interrupted_tasks_atomically(
+            context, recovered_at=self._clock()
+        )
 
     async def run_loop(self, *, stop_event: asyncio.Event) -> None:
         while not stop_event.is_set():

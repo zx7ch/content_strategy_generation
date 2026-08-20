@@ -11,6 +11,13 @@ import app.content_research.migrations as migrations
 from app.content_research.bootstrap import bootstrap_content_research_schema
 from app.content_research.execution_decision_identity import build_execution_decision_identity
 from app.content_research.migrations import apply_content_research_migrations
+from app.content_research.persistence_models import (
+    CanonicalSourceRecord,
+    ClaimCandidateRecord,
+    CoverageManifest,
+    DirectionalEvidencePacketRecord,
+    StageCheckpointRecord,
+)
 from app.content_research.scope_contract import (
     CoverageSnapshot,
     ScopeAuditEvent,
@@ -44,6 +51,180 @@ def test_migration_0015_creates_scoped_configuration_table(tmp_path):
         "validation_status",
     } <= columns
     assert "0015" in versions
+
+
+def test_migration_0029_leaves_legacy_execution_evidence_unowned_and_manifest_fenced(
+    tmp_path,
+) -> None:
+    db_path = str(tmp_path / "legacy-0029-lineage.db")
+    store = SQLiteContentResearchStore(db_path)
+    contract = build_scope_contract(
+        workflow_run_id="run_legacy_0029",
+        research_plan_id="rp_legacy_0029",
+        version=1,
+        constraints=(ScopeConstraint("core_object", "核心对象", "衬衫", "required"),),
+        query_groups=(ScopeQueryGroupInput("衬衫", "衬衫", ("衬衫",)),),
+    )
+    store.save_scope_contract(contract)
+    store.save_canonical_source(
+        CanonicalSourceRecord(
+            "cs_legacy_0029",
+            "v1",
+            {},
+            platform="xhs",
+            platform_source_kind="note",
+            platform_source_id="legacy-0029",
+        )
+    )
+    store.save_directional_evidence_packet(
+        DirectionalEvidencePacketRecord(
+            "dep_legacy_0029",
+            "v1",
+            {
+                "field_projection": {
+                    "content_text": "legacy claim",
+                    "source_url": "https://example/legacy-0029",
+                },
+                "field_availability": {"content_text": "present"},
+                "retrieval_context": {},
+            },
+            workflow_run_id=contract.workflow_run_id,
+            research_direction_id="product_marketing",
+            canonical_source_id="cs_legacy_0029",
+            field_projection_hash="legacy-hash",
+        )
+    )
+    store.save_claim_candidate(
+        ClaimCandidateRecord(
+            "cc_legacy_0029",
+            "v1",
+            {
+                "quote_refs": [
+                    {
+                        "field_path": "content_text",
+                        "quote": "legacy claim",
+                        "text_start": 0,
+                        "text_end": 12,
+                        "source_text_hash": hashlib.sha256(
+                            b"legacy claim"
+                        ).hexdigest(),
+                        "source_url": "https://example/legacy-0029",
+                    }
+                ]
+            },
+            workflow_run_id=contract.workflow_run_id,
+            research_direction_id="product_marketing",
+            evidence_packet_id="dep_legacy_0029",
+            statement="legacy claim",
+            intent_id="value",
+            claim_type="observation",
+        )
+    )
+    store.save_stage_checkpoint(
+        StageCheckpointRecord(
+            "scp_legacy_0029",
+            "v1",
+            {},
+            workflow_run_id=contract.workflow_run_id,
+            subagent_task_id="task_legacy_0029",
+            stage_name="collect",
+            input_fingerprint="legacy-0029",
+            status="completed",
+        )
+    )
+    store.save_coverage_snapshot(
+        CoverageSnapshot(
+            id="scv_legacy_0029",
+            workflow_run_id=contract.workflow_run_id,
+            scope_contract_id=contract.id,
+            scope_contract_version=1,
+            state="satisfied",
+            constraint_counts={},
+            unmet_constraint_ids=(),
+        )
+    )
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("DELETE FROM content_research_schema_migrations WHERE version='0029'")
+        for index in (
+            "idx_cr_packet_execution_lineage",
+            "idx_cr_candidate_execution_lineage",
+            "idx_cr_checkpoint_execution_lineage",
+        ):
+            conn.execute(f"DROP INDEX {index}")
+        for table, columns in migrations._V29_EXECUTION_LINEAGE_COLUMNS.items():
+            for definition in reversed(columns):
+                conn.execute(f"ALTER TABLE {table} DROP COLUMN {definition.split()[0]}")
+
+    bootstrap_content_research_schema(db_path)
+    migrated = SQLiteContentResearchStore(db_path)
+    packet = migrated.get_typed_record(
+        DirectionalEvidencePacketRecord, "dep_legacy_0029"
+    )
+    candidate = migrated.get_typed_record(ClaimCandidateRecord, "cc_legacy_0029")
+    checkpoint = migrated.get_typed_record(StageCheckpointRecord, "scp_legacy_0029")
+    coverage = migrated.get_coverage_snapshot(contract.workflow_run_id, version=1)
+    assert packet is not None and candidate is not None and checkpoint is not None
+    assert (packet.scope_contract_id, packet.execution_unit_id, packet.attempt_no) == (
+        None,
+        None,
+        0,
+    )
+    assert (candidate.scope_contract_id, candidate.execution_unit_id, candidate.attempt_no) == (
+        None,
+        None,
+        0,
+    )
+    assert (checkpoint.scope_contract_id, checkpoint.execution_unit_id, checkpoint.attempt_no) == (
+        None,
+        None,
+        0,
+    )
+    assert coverage is not None and coverage.manifest is None
+    with sqlite3.connect(db_path) as conn:
+        versions = {
+            row[0]
+            for row in conn.execute(
+                "SELECT version FROM content_research_schema_migrations WHERE version='0029'"
+            )
+        }
+        indexes = {
+            row[1]
+            for table in (
+                "content_research_directional_evidence_packets",
+                "content_research_claim_candidates",
+                "content_research_stage_checkpoints",
+            )
+            for row in conn.execute(f"PRAGMA index_list({table})")
+        }
+    assert versions == {"0029"}
+    assert {
+        "idx_cr_packet_execution_lineage",
+        "idx_cr_candidate_execution_lineage",
+        "idx_cr_checkpoint_execution_lineage",
+    } <= indexes
+
+    with pytest.raises(ValueError, match="evidence ownership mismatch"):
+        migrated.save_coverage_snapshot(
+            CoverageSnapshot(
+                id="scv_new_manifest_0029",
+                workflow_run_id=contract.workflow_run_id,
+                scope_contract_id=contract.id,
+                scope_contract_version=1,
+                execution_revision=2,
+                state="satisfied",
+                constraint_counts={},
+                unmet_constraint_ids=(),
+                manifest=CoverageManifest(
+                    workflow_run_id=contract.workflow_run_id,
+                    scope_contract_id=contract.id,
+                    execution_unit_id=None,
+                    attempt_no=0,
+                    execution_revision=2,
+                    packet_ids=("dep_legacy_0029",),
+                ),
+            )
+        )
 
 
 def test_current_schema_bootstrap_does_not_wait_for_active_writer(tmp_path):

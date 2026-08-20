@@ -154,34 +154,15 @@ class CrossDirectionGovernanceService:
         *,
         manifest: CoverageManifest | None = None,
     ) -> list[GovernedClaim]:
-        packet_ids = set(manifest.packet_ids) if manifest is not None else None
         candidates = {
             item.id: item for item in self._store.list_typed_records(ClaimCandidateRecord)
             if item.workflow_run_id == workflow_run_id
-            and (
-                manifest is None
-                or (
-                    item.scope_contract_id == manifest.scope_contract_id
-                    and item.execution_unit_id == manifest.execution_unit_id
-                    and item.attempt_no == manifest.attempt_no
-                    and item.execution_revision == manifest.execution_revision
-                    and item.evidence_packet_id in packet_ids
-                )
-            )
+            and (manifest is None or manifest.owns(item))
         }
         packets = {
             item.id: item for item in self._store.list_typed_records(DirectionalEvidencePacketRecord)
             if item.workflow_run_id == workflow_run_id
-            and (
-                manifest is None
-                or (
-                    item.id in packet_ids
-                    and item.scope_contract_id == manifest.scope_contract_id
-                    and item.execution_unit_id == manifest.execution_unit_id
-                    and item.attempt_no == manifest.attempt_no
-                    and item.execution_revision == manifest.execution_revision
-                )
-            )
+            and (manifest is None or manifest.owns(item))
         }
         result: list[GovernedClaim] = []
         for decision in self._store.list_typed_records(ClaimAdmissionDecisionRecord):

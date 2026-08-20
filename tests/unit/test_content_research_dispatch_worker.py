@@ -13,9 +13,11 @@ import pytest
 from app.content_research.api_schemas import ContentResearchFormalResearchResponse
 from app.content_research.async_dispatch import AsyncFormalResearchDispatchRepository
 from app.content_research.async_pipeline_store import AsyncDirectionalPersistenceSession
+from app.content_research.models import SubagentTaskRecord
 from app.content_research.persistence_models import StageCheckpointRecord
 from app.content_research.scope_contract import (
     CoverageSnapshot,
+    DispatchLeaseContext,
     ExecutionContext,
     ExecutionLeaseFencedError,
     ScopeAuditEvent,
@@ -310,6 +312,116 @@ async def test_stale_worker_token_cannot_terminalize_released_job(tmp_path):
     assert await dispatch.complete(
         workflow_run_id="run-fenced", owner="worker-b", token=str(second["lease_token"])
     )
+
+
+@pytest.mark.asyncio
+async def test_dispatch_recovery_serializes_takeover_and_uses_controlled_time(
+    tmp_path: Path,
+) -> None:
+    """Lease validation and every interrupted-task rewrite share one transaction."""
+    entered_update = threading.Event()
+    release_update = threading.Event()
+    fixed_now = datetime(2040, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+
+    class BlockingStore(SQLiteContentResearchStore):
+        def _raw_connect(self) -> sqlite3.Connection:
+            conn = cast(sqlite3.Connection, super()._raw_connect())
+
+            def block_recovery_update() -> int:
+                entered_update.set()
+                release_update.wait(timeout=5)
+                return 1
+
+            conn.create_function("block_recovery_update", 0, block_recovery_update)
+            return conn
+
+    store = BlockingStore(str(tmp_path / "dispatch-recovery-atomic.db"))
+    for task_id in ("task-replayable", "task-unknown"):
+        store.save_subagent_task(
+            SubagentTaskRecord(
+                id=task_id,
+                workflow_run_id="run-recovery-atomic",
+                thread_id="thread-recovery-atomic",
+                schema_version="v1",
+                status="running",
+                plan_id="plan-recovery-atomic",
+                direction_id="product_marketing",
+                payload={"schema_version": "v1", "status": "running"},
+            )
+        )
+    store.save_stage_checkpoint(
+        StageCheckpointRecord(
+            id="scp-recovery-unknown",
+            schema_version="v1",
+            payload={},
+            workflow_run_id="run-recovery-atomic",
+            subagent_task_id="task-unknown",
+            stage_name="operation",
+            input_fingerprint="operation-unknown",
+            status="running",
+        )
+    )
+    with store._connect() as conn:
+        conn.execute(
+            """INSERT INTO content_research_dispatch_jobs
+               (workflow_run_id, provider, source_kind, limit_per_specialist, status,
+                attempt_count, lease_expires_at, lease_owner, lease_token, created_at, updated_at)
+               VALUES (?, 'xiaohongshu', 'search_result', 10, 'running', 1, ?, ?, ?, ?, ?)""",
+            (
+                "run-recovery-atomic",
+                datetime(2040, 1, 2, 3, 9, 5, tzinfo=timezone.utc).isoformat(),
+                "worker-a",
+                "token-a",
+                fixed_now.isoformat(),
+                fixed_now.isoformat(),
+            ),
+        )
+        conn.execute(
+            """CREATE TRIGGER block_dispatch_recovery_update
+               BEFORE UPDATE ON content_research_subagent_tasks
+               WHEN NEW.id='task-replayable'
+               BEGIN SELECT block_recovery_update(); END"""
+        )
+
+    context = DispatchLeaseContext("run-recovery-atomic", "worker-a", "token-a")
+    recovery = asyncio.create_task(
+        asyncio.to_thread(
+            store.recover_interrupted_tasks_atomically,
+            context,
+            recovered_at=fixed_now,
+        )
+    )
+    assert await asyncio.to_thread(entered_update.wait, 2)
+
+    def takeover() -> None:
+        with store._raw_connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """UPDATE content_research_dispatch_jobs
+                   SET lease_owner='worker-b', lease_token='token-b'
+                   WHERE workflow_run_id='run-recovery-atomic'"""
+            )
+
+    takeover_task = asyncio.create_task(asyncio.to_thread(takeover))
+    await asyncio.sleep(0.05)
+    assert not takeover_task.done(), "takeover must wait for the recovery transaction"
+    release_update.set()
+    assert await recovery is True
+    await takeover_task
+
+    tasks = {
+        task.id: task for task in store.list_subagent_tasks_for_workflow("run-recovery-atomic")
+    }
+    assert tasks["task-replayable"].status == "queued"
+    assert tasks["task-unknown"].status == "outcome_unknown"
+    assert tasks["task-unknown"].payload["output_payload"]["error_code"] == (
+        "OPERATION_OUTCOME_UNKNOWN"
+    )
+    before = tasks
+    assert not store.recover_interrupted_tasks_atomically(context, recovered_at=fixed_now)
+    assert {
+        task.id: task for task in store.list_subagent_tasks_for_workflow("run-recovery-atomic")
+    } == before
 
 
 @pytest.mark.asyncio

@@ -9,7 +9,11 @@ from typing import TypeVar
 
 import aiosqlite
 
-from app.content_research.scope_contract import ExecutionContext, ExecutionLeaseFencedError
+from app.content_research.scope_contract import (
+    DispatchLeaseContext,
+    ExecutionContext,
+    ExecutionLeaseFencedError,
+)
 from app.services.workflow_run_manager import WorkflowRunManager
 
 T = TypeVar("T")
@@ -41,6 +45,44 @@ class LeaseFencedWorkflowRunManager(WorkflowRunManager):
         except ExecutionLeaseFencedError:
             await self._conn.commit()
             raise
+        except Exception:
+            await self._conn.rollback()
+            raise
+        self._transaction_depth += 1
+        try:
+            result = await fn()
+        except Exception:
+            await self._conn.rollback()
+            raise
+        finally:
+            self._transaction_depth -= 1
+        await self._conn.commit()
+        return result
+
+
+class DispatchLeaseFencedWorkflowRunManager(WorkflowRunManager):
+    """Workflow manager whose writes are conditional on a normal dispatch claim."""
+
+    def __init__(
+        self,
+        db_path: str,
+        *,
+        dispatch_context: DispatchLeaseContext,
+        operation: str,
+    ) -> None:
+        super().__init__(db_path)
+        self._dispatch_guard = workflow_dispatch_guard(
+            dispatch_context,
+            operation=operation,
+        )
+
+    async def _transaction(self, fn: Callable[[], Awaitable[T]]) -> T:
+        assert self._conn is not None
+        if self._transaction_depth:
+            return await fn()
+        await self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            await self._dispatch_guard(self._conn)
         except Exception:
             await self._conn.rollback()
             raise
@@ -109,5 +151,33 @@ def workflow_execution_guard(
         raise ExecutionLeaseFencedError(
             f"execution attempt lease was fenced before {operation}"
         )
+
+    return guard
+
+
+def workflow_dispatch_guard(
+    context: DispatchLeaseContext,
+    *,
+    operation: str,
+) -> Callable[[aiosqlite.Connection], Awaitable[None]]:
+    """Return a transaction guard for the exact live normal-dispatch lease."""
+
+    async def guard(conn: aiosqlite.Connection) -> None:
+        cursor = await conn.execute(
+            """SELECT 1 FROM content_research_dispatch_jobs
+               WHERE workflow_run_id=? AND status='running'
+                 AND lease_owner=? AND lease_token=?
+                 AND lease_expires_at IS NOT NULL AND lease_expires_at > ?""",
+            (
+                context.workflow_run_id,
+                context.lease_owner,
+                context.lease_token,
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+        if await cursor.fetchone() is None:
+            raise ExecutionLeaseFencedError(
+                f"dispatch lease was fenced before {operation}"
+            )
 
     return guard

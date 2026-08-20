@@ -40,11 +40,13 @@ from app.content_research.persistence_models import (
     CoverageManifest,
     DirectionalEvidencePacketRecord,
     DirectionSourceProjectionRecord,
+    ExecutionOwnership,
     StageCheckpointRecord,
 )
 from app.content_research.runtime import canonical_fingerprint
 from app.content_research.scope_contract import (
     CoverageSnapshot,
+    DispatchLeaseContext,
     ExecutionContext,
     ExecutionLeaseFencedError,
     ResearchScopeContract,
@@ -949,16 +951,21 @@ class DirectionalExecutionPipeline:
         *,
         workflow_run_id: str,
         execution_context: ExecutionContext | None = None,
+        dispatch_context: DispatchLeaseContext | None = None,
     ) -> DirectionalExecutionPipeline:
         from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
 
+        scope_store = SQLiteContentResearchStore(db_path)
+        if dispatch_context is not None:
+            scope_store = scope_store.for_dispatch_context(dispatch_context)
         return cls(
             await AsyncDirectionalPersistenceSession.open(
                 db_path,
                 workflow_run_id=workflow_run_id,
                 execution_context=execution_context,
+                dispatch_context=dispatch_context,
             ),
-            scope_store=SQLiteContentResearchStore(db_path),
+            scope_store=scope_store,
             execution_context=execution_context,
         )  # type: ignore[arg-type]
 
@@ -986,27 +993,30 @@ class DirectionalExecutionPipeline:
             else set()
         )
 
-    def _execution_ownership(self) -> dict[str, Any]:
-        return {
-            "scope_contract_id": (
-                self._scope_contract.id if self._scope_contract is not None else None
-            ),
-            "execution_unit_id": (
+    def _execution_owner(self) -> ExecutionOwnership:
+        if self._scope_contract is None:
+            raise RuntimeError("execution ownership requires a loaded Scope contract")
+        return ExecutionOwnership(
+            workflow_run_id=self._scope_contract.workflow_run_id,
+            scope_contract_id=self._scope_contract.id,
+            execution_unit_id=(
                 self._execution_context.execution_unit_id
                 if self._execution_context is not None
                 else None
             ),
-            "attempt_no": (
+            attempt_no=(
                 self._execution_context.attempt_no
                 if self._execution_context is not None
                 else 0
             ),
-            "execution_revision": self._scope_execution_revision,
-        }
+            execution_revision=self._scope_execution_revision,
+        )
+
+    def _execution_ownership(self) -> dict[str, Any]:
+        return self._execution_owner().as_record_kwargs()
 
     def _owns_current_execution(self, record: Any) -> bool:
-        ownership = self._execution_ownership()
-        return all(getattr(record, key, None) == value for key, value in ownership.items())
+        return self._execution_owner().matches(record)
 
     def _queue_scope_audit_event(self, event: ScopeAuditEvent) -> None:
         if event.id in self._scope_audit_event_ids:

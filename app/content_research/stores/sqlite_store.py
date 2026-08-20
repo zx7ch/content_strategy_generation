@@ -49,6 +49,7 @@ from app.content_research.persistence_models import (
 )
 from app.content_research.scope_contract import (
     CoverageSnapshot,
+    DispatchLeaseContext,
     ExecutionContext,
     ExecutionFact,
     ExecutionLeaseFencedError,
@@ -317,9 +318,11 @@ class SQLiteContentResearchStore:
         db_path: str,
         *,
         execution_context: ExecutionContext | None = None,
+        dispatch_context: DispatchLeaseContext | None = None,
     ) -> None:
         self._db_path = db_path
         self._execution_context = execution_context
+        self._dispatch_context = dispatch_context
         bootstrap_content_research_schema(db_path)
 
     def for_execution_context(
@@ -328,6 +331,16 @@ class SQLiteContentResearchStore:
         """Bind every transaction on this store view to one exact live lease."""
         scoped = copy.copy(self)
         scoped._execution_context = context
+        scoped._dispatch_context = None
+        return scoped
+
+    def for_dispatch_context(
+        self, context: DispatchLeaseContext
+    ) -> SQLiteContentResearchStore:
+        """Bind every transaction on this store view to one dispatch claim."""
+        scoped = copy.copy(self)
+        scoped._execution_context = None
+        scoped._dispatch_context = context
         return scoped
 
     def _raw_connect(self) -> sqlite3.Connection:
@@ -357,6 +370,19 @@ class SQLiteContentResearchStore:
                     conn.commit()
                     raise ExecutionLeaseFencedError(
                         "execution attempt lease was fenced before content research persistence"
+                    )
+            except Exception:
+                conn.close()
+                raise
+        dispatch_context = self._dispatch_context
+        if dispatch_context is not None:
+            try:
+                if not conn.in_transaction:
+                    conn.execute("BEGIN IMMEDIATE")
+                if not self._dispatch_context_is_live_in_transaction(conn, dispatch_context):
+                    conn.rollback()
+                    raise ExecutionLeaseFencedError(
+                        "dispatch lease was fenced before content research persistence"
                     )
             except Exception:
                 conn.close()
@@ -702,6 +728,13 @@ class SQLiteContentResearchStore:
         ]
         try:
             with self._connect() as conn:
+                if not conn.in_transaction:
+                    conn.execute("BEGIN IMMEDIATE")
+                if self._unresolved_coverage_row(conn, draft.workflow_run_id) is not None:
+                    raise ValueError(
+                        "coverage_decision_required: resolve_coverage must resolve the current "
+                        "Coverage before prepare_scope can create another Scope draft"
+                    )
                 conn.execute(
                     """INSERT INTO content_research_scope_drafts
                        (id, workflow_run_id, research_plan_id, structure_hash, constraints_json,
@@ -794,6 +827,12 @@ class SQLiteContentResearchStore:
             )
             if draft.structure_hash != current_structure_hash:
                 raise ValueError("Scope draft structure hash does not match the current brief")
+            unresolved_coverage = self._unresolved_coverage_row(conn, draft.workflow_run_id)
+            if unresolved_coverage is not None:
+                raise ValueError(
+                    "coverage_decision_required: resolve_coverage must resolve the current "
+                    "Coverage before confirm_scope can create another Scope"
+                )
             confirmation = conn.execute(
                 """SELECT scope_contract_id FROM content_research_scope_draft_confirmations
                    WHERE scope_draft_id = ?""",
@@ -1077,6 +1116,32 @@ class SQLiteContentResearchStore:
                 (workflow_run_id,) * 12,
             ).fetchone()
         return not bool(row[0] if row else True)
+
+    def get_unresolved_coverage_snapshot(
+        self, workflow_run_id: str
+    ) -> CoverageSnapshot | None:
+        """Return the workflow decision that still exclusively owns Scope evolution."""
+        with self._connect() as conn:
+            row = self._unresolved_coverage_row(conn, workflow_run_id)
+        return self._row_to_coverage_snapshot(row) if row is not None else None
+
+    @staticmethod
+    def _unresolved_coverage_row(
+        conn: sqlite3.Connection, workflow_run_id: str
+    ) -> sqlite3.Row | None:
+        return conn.execute(
+            """SELECT coverage.*
+               FROM content_research_scope_coverage_snapshots AS coverage
+               WHERE coverage.workflow_run_id=?
+                 AND coverage.state='awaiting_scope_decision'
+                 AND NOT EXISTS(
+                   SELECT 1 FROM content_research_scope_execution_authorizations AS auth
+                   WHERE auth.coverage_snapshot_id=coverage.id
+                 )
+               ORDER BY coverage.created_at ASC, coverage.id ASC
+               LIMIT 1""",
+            (workflow_run_id,),
+        ).fetchone()
 
     @staticmethod
     def _validate_coverage_manifest_in_transaction(
@@ -1650,6 +1715,85 @@ class SQLiteContentResearchStore:
                 )
             conn.commit()
             return live
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def dispatch_context_is_live(self, context: DispatchLeaseContext) -> bool:
+        with self._raw_connect() as conn:
+            return self._dispatch_context_is_live_in_transaction(conn, context)
+
+    @staticmethod
+    def _dispatch_context_is_live_in_transaction(
+        conn: sqlite3.Connection,
+        context: DispatchLeaseContext,
+        *,
+        checked_at: datetime | None = None,
+    ) -> bool:
+        row = conn.execute(
+            """SELECT 1 FROM content_research_dispatch_jobs
+               WHERE workflow_run_id=? AND status='running'
+                 AND lease_owner=? AND lease_token=?
+                 AND lease_expires_at IS NOT NULL AND lease_expires_at > ?""",
+            (
+                context.workflow_run_id,
+                context.lease_owner,
+                context.lease_token,
+                _fmt_dt(checked_at or datetime.now(timezone.utc)),
+            ),
+        ).fetchone()
+        return row is not None
+
+    def recover_interrupted_tasks_atomically(
+        self, context: DispatchLeaseContext, *, recovered_at: datetime
+    ) -> bool:
+        """Validate a dispatch claim and rewrite all interrupted tasks in one transaction."""
+        conn = self._raw_connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            if not self._dispatch_context_is_live_in_transaction(
+                conn, context, checked_at=recovered_at
+            ):
+                conn.rollback()
+                return False
+            checkpoints = conn.execute(
+                """SELECT subagent_task_id FROM content_research_stage_checkpoints
+                   WHERE workflow_run_id=? AND stage_name='operation' AND status='running'""",
+                (context.workflow_run_id,),
+            ).fetchall()
+            unknown_task_ids = {str(row[0]) for row in checkpoints}
+            rows = conn.execute(
+                """SELECT * FROM content_research_subagent_tasks
+                   WHERE workflow_run_id=? AND status='running'
+                   ORDER BY created_at ASC, id ASC""",
+                (context.workflow_run_id,),
+            ).fetchall()
+            for row in rows:
+                payload = _loads(row["payload_json"])
+                if str(row["id"]) in unknown_task_ids:
+                    payload["status"] = "outcome_unknown"
+                    payload["output_payload"] = {
+                        "error_code": "OPERATION_OUTCOME_UNKNOWN",
+                        "error_message": (
+                            "Previous provider operation was interrupted; its outcome is unknown "
+                            "and was not replayed."
+                        ),
+                        "retryable": False,
+                        "recovery_action": "confirm_collection_outcome_before_retry",
+                    }
+                    status = "outcome_unknown"
+                else:
+                    payload["status"] = "queued"
+                    status = "queued"
+                conn.execute(
+                    """UPDATE content_research_subagent_tasks
+                       SET status=?, payload_json=?, updated_at=? WHERE id=?""",
+                    (status, _dumps(payload), _fmt_dt(recovered_at), row["id"]),
+                )
+            conn.commit()
+            return True
         except Exception:
             conn.rollback()
             raise
@@ -3306,8 +3450,34 @@ class SQLiteContentResearchStore:
         }
         columns = ("id", "schema_version", *values, "payload_json", "metadata_json", "created_at")
         placeholders = ", ".join("?" for _ in columns)
-        updates = ", ".join(f"{column} = excluded.{column}" for column in columns if column != "id")
+        ownership_columns = {
+            "workflow_run_id",
+            "scope_contract_id",
+            "execution_unit_id",
+            "attempt_no",
+            "execution_revision",
+        }
+        updates = ", ".join(
+            f"{column} = excluded.{column}"
+            for column in columns
+            if column != "id" and column not in ownership_columns
+        )
         with self._connect() as conn:
+            existing = conn.execute(
+                """SELECT workflow_run_id, scope_contract_id, execution_unit_id,
+                          attempt_no, execution_revision
+                   FROM content_research_stage_checkpoints WHERE id=?""",
+                (record.id,),
+            ).fetchone()
+            incoming_ownership = (
+                record.workflow_run_id,
+                record.scope_contract_id,
+                record.execution_unit_id,
+                record.attempt_no,
+                record.execution_revision,
+            )
+            if existing is not None and tuple(existing) != incoming_ownership:
+                raise ValueError("stage checkpoint has immutable execution ownership")
             conn.execute(
                 "INSERT INTO content_research_stage_checkpoints "
                 f"({', '.join(columns)}) VALUES ({placeholders}) "

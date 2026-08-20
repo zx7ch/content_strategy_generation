@@ -768,6 +768,79 @@ def test_scope_draft_confirmation_replay_rejects_a_stale_current_brief(tmp_path)
     assert store.list_scope_audit_events(draft.workflow_run_id, version=1) == [event]
 
 
+def test_unresolved_coverage_atomically_blocks_new_draft_and_confirmation(tmp_path) -> None:
+    store = SQLiteContentResearchStore(str(tmp_path / "scope-decision-exclusion.db"))
+    template = _contract(version=1)
+    first_draft = build_scope_draft(
+        workflow_run_id=template.workflow_run_id,
+        research_plan_id=template.research_plan_id,
+        structure_hash="structure_hash_exclusion",
+        constraints=template.constraints,
+        query_groups=(ScopeQueryGroupInput("夏季 长袖衬衫 通勤", "夏季 长袖衬衫 通勤"),),
+    )
+    pending_draft = build_scope_draft(
+        workflow_run_id=template.workflow_run_id,
+        research_plan_id=template.research_plan_id,
+        structure_hash="structure_hash_exclusion",
+        constraints=template.constraints,
+        query_groups=(ScopeQueryGroupInput("长袖衬衫 通勤", "长袖衬衫 通勤"),),
+    )
+    for draft, event_id in (
+        (first_draft, "sda_exclusion_first"),
+        (pending_draft, "sda_exclusion_pending"),
+    ):
+        store.save_scope_draft_with_audit_event(
+            draft,
+            ScopeDraftAuditEvent(
+                id=event_id,
+                workflow_run_id=draft.workflow_run_id,
+                scope_draft_id=draft.id,
+                event_name="scope_suggested",
+                payload={"schema_version": "content_research_scope_audit_event_v1"},
+            ),
+        )
+    _save_current_brief(
+        store,
+        workflow_run_id=template.workflow_run_id,
+        structure_hash=first_draft.structure_hash,
+    )
+    contract, _, _ = _confirm_scope(
+        store, draft=first_draft, event_id="sca_exclusion_first"
+    )
+    store.save_coverage_snapshot(
+        CoverageSnapshot(
+            id="scv_exclusion",
+            workflow_run_id=contract.workflow_run_id,
+            scope_contract_id=contract.id,
+            scope_contract_version=contract.version,
+            state="awaiting_scope_decision",
+            constraint_counts={},
+            unmet_constraint_ids=("season",),
+        )
+    )
+
+    with pytest.raises(ValueError, match="coverage_decision_required"):
+        _confirm_scope(store, draft=pending_draft, event_id="sca_exclusion_pending")
+
+    later_draft = replace(
+        pending_draft,
+        id="rsd_exclusion_later",
+    )
+    with pytest.raises(ValueError, match="coverage_decision_required"):
+        store.save_scope_draft_with_audit_event(
+            later_draft,
+            ScopeDraftAuditEvent(
+                id="sda_exclusion_later",
+                workflow_run_id=later_draft.workflow_run_id,
+                scope_draft_id=later_draft.id,
+                event_name="scope_suggested",
+                payload={"schema_version": "content_research_scope_audit_event_v1"},
+            ),
+        )
+
+    assert store.list_scope_contracts(contract.workflow_run_id) == [contract]
+
+
 def test_conflicting_scope_draft_repeat_does_not_create_a_second_contract(tmp_path) -> None:
     store = SQLiteContentResearchStore(str(tmp_path / "scope-confirmation-conflict.db"))
     contract_v1 = _contract(version=1)
