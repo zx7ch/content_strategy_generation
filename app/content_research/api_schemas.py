@@ -188,7 +188,9 @@ class ContentResearchExecutionFactTraceResponse(BaseModel):
 class ContentResearchExecutionUnitTraceResponse(BaseModel):
     id: str
     state: str
-    recovery_state: Literal["replayable", "manual_recovery_required"]
+    recovery_state: Literal[
+        "replayable", "outcome_unknown", "manual_recovery_required"
+    ]
     identity_schema: str
     identity_state: Literal["canonical", "legacy_identity_incomplete"]
     identity_json: dict = Field(default_factory=dict)

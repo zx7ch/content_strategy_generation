@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import sqlite3
 import uuid
@@ -286,18 +287,55 @@ class RetryableLocalPersistenceError(RuntimeError):
 class SQLiteContentResearchStore:
     """Local SQLite persistence for Content Research business records."""
 
-    def __init__(self, db_path: str) -> None:
+    def __init__(
+        self,
+        db_path: str,
+        *,
+        execution_context: ExecutionContext | None = None,
+    ) -> None:
         self._db_path = db_path
+        self._execution_context = execution_context
         bootstrap_content_research_schema(db_path)
 
-    def _connect(self) -> sqlite3.Connection:
+    def for_execution_context(
+        self, context: ExecutionContext
+    ) -> SQLiteContentResearchStore:
+        """Bind every transaction on this store view to one exact live lease."""
+        scoped = copy.copy(self)
+        scoped._execution_context = context
+        return scoped
+
+    def _raw_connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self._db_path, timeout=30)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA busy_timeout=30000")
+        conn.execute("PRAGMA foreign_keys=ON")
+        return conn
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = self._raw_connect()
         # WAL is a database-level bootstrap setting. Re-applying it on every
         # Trace/read connection can wait behind a checkpoint writer and turns
         # an otherwise read-only request into a lock-contending operation.
-        conn.execute("PRAGMA foreign_keys=ON")
+        context = self._execution_context
+        if context is not None:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                if not self._execution_context_is_live_in_transaction(conn, context):
+                    self._append_execution_fact_in_transaction(
+                        conn,
+                        execution_unit_id=context.execution_unit_id,
+                        attempt_no=context.attempt_no,
+                        kind="lease_fenced",
+                        payload={"operation": "content_research_store_transaction"},
+                    )
+                    conn.commit()
+                    raise ExecutionLeaseFencedError(
+                        "execution attempt lease was fenced before content research persistence"
+                    )
+            except Exception:
+                conn.close()
+                raise
         return conn
 
     def save_brief(self, brief: ResearchBriefRecord) -> ResearchBriefRecord:
@@ -710,7 +748,8 @@ class SQLiteContentResearchStore:
     ) -> tuple[ResearchScopeContract, ScopeAuditEvent, bool]:
         conn = self._connect()
         try:
-            conn.execute("BEGIN IMMEDIATE")
+            if not conn.in_transaction:
+                conn.execute("BEGIN IMMEDIATE")
             draft_row = conn.execute(
                 "SELECT * FROM content_research_scope_drafts WHERE id = ?",
                 (draft_id,),
@@ -1021,7 +1060,8 @@ class SQLiteContentResearchStore:
         try:
             conn = self._connect()
             try:
-                conn.execute("BEGIN IMMEDIATE")
+                if not conn.in_transaction:
+                    conn.execute("BEGIN IMMEDIATE")
                 if (
                     execution_context is not None
                     and not self._execution_context_is_live_in_transaction(conn, execution_context)
@@ -1174,7 +1214,8 @@ class SQLiteContentResearchStore:
         )
         conn = self._connect()
         try:
-            conn.execute("BEGIN IMMEDIATE")
+            if not conn.in_transaction:
+                conn.execute("BEGIN IMMEDIATE")
             snapshot_row = conn.execute(
                 "SELECT * FROM content_research_scope_coverage_snapshots WHERE id=?", (snapshot.id,)
             ).fetchone()
@@ -1243,7 +1284,12 @@ class SQLiteContentResearchStore:
     def get_scope_execution_unit(self, execution_unit_id: str) -> ScopeExecutionUnit | None:
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT * FROM content_research_scope_execution_units WHERE id=?",
+                """SELECT unit.*,
+                          (SELECT attempt.provider_state
+                           FROM content_research_scope_execution_attempts AS attempt
+                           WHERE attempt.execution_unit_id=unit.id
+                           ORDER BY attempt.attempt_no DESC LIMIT 1) AS latest_provider_state
+                   FROM content_research_scope_execution_units AS unit WHERE unit.id=?""",
                 (execution_unit_id,),
             ).fetchone()
         return self._row_to_scope_execution_unit(row) if row else None
@@ -1251,8 +1297,13 @@ class SQLiteContentResearchStore:
     def list_scope_execution_units(self, workflow_run_id: str) -> list[ScopeExecutionUnit]:
         with self._connect() as conn:
             rows = conn.execute(
-                """SELECT * FROM content_research_scope_execution_units
-                   WHERE workflow_run_id=? ORDER BY created_at ASC, id ASC""",
+                """SELECT unit.*,
+                          (SELECT attempt.provider_state
+                           FROM content_research_scope_execution_attempts AS attempt
+                           WHERE attempt.execution_unit_id=unit.id
+                           ORDER BY attempt.attempt_no DESC LIMIT 1) AS latest_provider_state
+                   FROM content_research_scope_execution_units AS unit
+                   WHERE unit.workflow_run_id=? ORDER BY unit.created_at ASC, unit.id ASC""",
                 (workflow_run_id,),
             ).fetchall()
         return [self._row_to_scope_execution_unit(row) for row in rows]
@@ -1286,7 +1337,8 @@ class SQLiteContentResearchStore:
         token = uuid.uuid4().hex
         conn = self._connect()
         try:
-            conn.execute("BEGIN IMMEDIATE")
+            if not conn.in_transaction:
+                conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 """SELECT * FROM content_research_scope_execution_attempts
                    WHERE execution_unit_id=? ORDER BY attempt_no DESC LIMIT 1""",
@@ -1423,9 +1475,10 @@ class SQLiteContentResearchStore:
 
     def execution_context_is_live(self, context: ExecutionContext, *, operation: str) -> bool:
         """Validate the exact latest attempt and durably explain a rejected write."""
-        conn = self._connect()
+        conn = self._raw_connect()
         try:
-            conn.execute("BEGIN IMMEDIATE")
+            if not conn.in_transaction:
+                conn.execute("BEGIN IMMEDIATE")
             live = self._execution_context_is_live_in_transaction(conn, context)
             if not live:
                 self._append_execution_fact_in_transaction(
@@ -1553,7 +1606,8 @@ class SQLiteContentResearchStore:
             raise ValueError("invalid execution unit terminal state")
         conn = self._connect()
         try:
-            conn.execute("BEGIN IMMEDIATE")
+            if not conn.in_transaction:
+                conn.execute("BEGIN IMMEDIATE")
             result = conn.execute(
                 """UPDATE content_research_scope_execution_attempts
                    SET state=?, lease_owner=NULL, lease_token=NULL, lease_expires_at=NULL
@@ -1610,7 +1664,8 @@ class SQLiteContentResearchStore:
     ) -> bool:
         conn = self._connect()
         try:
-            conn.execute("BEGIN IMMEDIATE")
+            if not conn.in_transaction:
+                conn.execute("BEGIN IMMEDIATE")
             result = conn.execute(
                 """UPDATE content_research_scope_execution_attempts
                    SET provider_state=?
@@ -1730,7 +1785,8 @@ class SQLiteContentResearchStore:
 
         conn = self._connect()
         try:
-            conn.execute("BEGIN IMMEDIATE")
+            if not conn.in_transaction:
+                conn.execute("BEGIN IMMEDIATE")
             snapshot_row = conn.execute(
                 "SELECT * FROM content_research_scope_coverage_snapshots WHERE id = ?",
                 (snapshot.id,),
@@ -2585,6 +2641,18 @@ class SQLiteContentResearchStore:
             raise TypeError("new persistence APIs require typed records")
         with self._connect() as conn:
             self._insert_typed_record(conn, table, record, values)
+            if (
+                table == "content_research_report_publications"
+                and self._execution_context is not None
+            ):
+                context = self._execution_context
+                self._append_execution_fact_in_transaction(
+                    conn,
+                    execution_unit_id=context.execution_unit_id,
+                    attempt_no=context.attempt_no,
+                    kind="publication_persisted",
+                    payload={"publication_id": record.id},
+                )
         return record
 
     @staticmethod
@@ -3395,6 +3463,11 @@ class SQLiteContentResearchStore:
 
     @staticmethod
     def _row_to_scope_execution_unit(row: sqlite3.Row) -> ScopeExecutionUnit:
+        latest_provider_state = (
+            row["latest_provider_state"]
+            if "latest_provider_state" in row.keys()
+            else None
+        )
         return ScopeExecutionUnit(
             id=row["id"],
             workflow_run_id=row["workflow_run_id"],
@@ -3407,6 +3480,7 @@ class SQLiteContentResearchStore:
             identity_json=row["identity_json"],
             identity_state=row["identity_state"],
             legacy_authorization_id=row["legacy_authorization_id"],
+            latest_provider_state=latest_provider_state,
             created_at=_parse_dt(row["created_at"]),
         )
 

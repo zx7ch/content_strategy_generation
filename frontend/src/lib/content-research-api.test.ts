@@ -62,8 +62,8 @@ test("trace contract exposes stored decision identity and ordered safe execution
     runtime_child_tasks: [],
     execution_units: [{
       id: "seu_1",
-      state: "pending",
-      recovery_state: "replayable",
+      state: "outcome_unknown",
+      recovery_state: "outcome_unknown",
       identity_schema: "execution_decision_identity_v1",
       identity_state: "canonical",
       identity_json: {
@@ -82,6 +82,7 @@ test("trace contract exposes stored decision identity and ordered safe execution
 
   const trace = await getContentResearchTrace("run_1");
 
+  assert.equal(trace.execution_units[0].recovery_state, "outcome_unknown");
   assert.equal(trace.execution_units[0].identity_json.coverage_snapshot_id, "scv_1");
   assert.deepEqual(
     trace.execution_units[0].facts.map((fact) => [fact.attempt_no, fact.sequence_no, fact.kind]),

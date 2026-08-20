@@ -280,6 +280,7 @@ class ScopeExecutionUnit:
     identity_json: str = ""
     identity_state: Literal["canonical", "legacy_identity_incomplete"] = "canonical"
     legacy_authorization_id: str | None = None
+    latest_provider_state: str | None = field(default=None, compare=False, repr=False)
     created_at: datetime = field(default_factory=utcnow)
 
     def __post_init__(self) -> None:
@@ -317,6 +318,8 @@ class ScopeExecutionUnit:
             return "manual_recovery_required"
         if self.state == "outcome_unknown":
             return "outcome_unknown"
+        if self.state == "failed" and self.latest_provider_state == "terminal_failed":
+            return "manual_recovery_required"
         return "replayable"
 
 

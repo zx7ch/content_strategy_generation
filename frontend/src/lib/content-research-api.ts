@@ -132,7 +132,7 @@ export interface ContentResearchTrace {
   execution_units: Array<{
     id: string;
     state: string;
-    recovery_state: "replayable" | "manual_recovery_required";
+    recovery_state: "replayable" | "outcome_unknown" | "manual_recovery_required";
     identity_schema: string;
     identity_state: "canonical" | "legacy_identity_incomplete";
     identity_json: JsonObject;
@@ -341,7 +341,7 @@ export interface ContentResearchResolveCoverageResult {
   execution_unit: {
     id: string;
     state: string;
-    recovery_state: "replayable" | "manual_recovery_required";
+    recovery_state: "replayable" | "outcome_unknown" | "manual_recovery_required";
   };
 }
 

@@ -4,12 +4,17 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.content_research.execution_lease import (
+    LeaseFencedWorkflowRunManager,
+    workflow_execution_guard,
+)
 from app.content_research.models import ResearchResultSnapshotRecord
 from app.content_research.persistence_models import (
     ReportDraftRecord,
     ReportFaithfulnessDecisionRecord,
     ReportPublicationRecord,
 )
+from app.content_research.scope_contract import ExecutionContext, ExecutionLeaseFencedError
 from app.content_research.stores.base import ContentResearchStore
 from app.memory.thread_store import ThreadStore
 from app.memory.workflow_store import WorkflowStore
@@ -24,9 +29,16 @@ class ReportPublicationMaterializer:
     persisted publication lineage into the single Creator-visible final result.
     """
 
-    def __init__(self, store: ContentResearchStore, db_path: str) -> None:
+    def __init__(
+        self,
+        store: ContentResearchStore,
+        db_path: str,
+        *,
+        execution_context: ExecutionContext | None = None,
+    ) -> None:
         self._store = store
         self._db_path = db_path
+        self._execution_context = execution_context
 
     async def materialize(self, publication_id: str) -> WorkflowArtifact:
         publication = self._require_publication(publication_id)
@@ -57,7 +69,16 @@ class ReportPublicationMaterializer:
             None,
         )
         if artifact is None:
-            async with WorkflowRunManager(self._db_path) as manager:
+            manager = (
+                LeaseFencedWorkflowRunManager(
+                    self._db_path,
+                    execution_context=self._execution_context,
+                    operation="materialize_report_publication",
+                )
+                if self._execution_context is not None
+                else WorkflowRunManager(self._db_path)
+            )
+            async with manager:
                 artifact = await manager.attach_artifact(
                     run_id=publication.workflow_run_id,
                     artifact_type=WorkflowArtifactType.FINAL_RESULT,
@@ -90,6 +111,17 @@ class ReportPublicationMaterializer:
         if artifact is None:
             raise ValueError("missing materialized report artifact")
         async with ThreadStore(self._db_path) as thread_store:
+            if self._execution_context is not None:
+                assert thread_store._conn is not None
+                await thread_store._conn.execute("BEGIN IMMEDIATE")
+                try:
+                    await workflow_execution_guard(
+                        self._execution_context,
+                        operation="publish_report_timeline_message",
+                    )(thread_store._conn)
+                except ExecutionLeaseFencedError:
+                    await thread_store._conn.commit()
+                    raise
             await thread_store.append_artifact_result_message(
                 thread_id=run.thread_id,
                 run_id=publication.workflow_run_id,

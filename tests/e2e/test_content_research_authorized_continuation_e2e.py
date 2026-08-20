@@ -3,17 +3,20 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timedelta, timezone
 
 import httpx
 import pytest
 
 from app.api.routes.router import app
+from app.content_research.persistence_models import ReportPublicationRecord
 from app.content_research.presearch.service import PresearchService
 from app.content_research.service import ContentResearchService, WorkflowRunManagerRuntime
 from app.content_research.sources import SourceAdapterRegistry
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
 from app.content_research.worker import ContentResearchDispatchWorker
 from app.memory.thread_store import ThreadStore
+from app.memory.workflow_store import WorkflowStore
 from tests.e2e.test_content_research_formal_workflow_e2e import (
     CapableFakeAdapter,
     FakeLLM,
@@ -29,10 +32,17 @@ class RecordingCapableFakeAdapter(CapableFakeAdapter):
         self.discover_queries: list[str] = []
         self.discover_contexts: list[dict] = []
         self.discover_exception: Exception | None = None
+        self.pause_next_discover = False
+        self.discover_started = asyncio.Event()
+        self.release_discover = asyncio.Event()
 
     async def discover_candidates(self, request):
         self.discover_queries.append(request.query)
         self.discover_contexts.append(dict(request.context))
+        if self.pause_next_discover:
+            self.pause_next_discover = False
+            self.discover_started.set()
+            await self.release_discover.wait()
         if self.discover_exception is not None:
             raise self.discover_exception
         return await super().discover_candidates(request)
@@ -257,6 +267,15 @@ async def test_limited_continuation_replays_then_publishes_through_real_worker(
     report = await client.get(f"/content-research/workflows/{workflow_run_id}/lite-report")
     assert report.status_code == 200, report.text
     assert report.json()["publication"]["state"] == "evidence_only_report"
+    execution_unit_id = authorization["execution_unit_id"]
+    publication_facts = [
+        fact
+        for fact in service._store.execution_trace(execution_unit_id)
+        if fact.kind == "publication_persisted"
+    ]
+    assert len(publication_facts) == 1
+    publication_id = publication_facts[0].payload["publication_id"]
+    assert service._store.get_typed_record(ReportPublicationRecord, publication_id) is not None
 
 
 @pytest.mark.asyncio
@@ -388,6 +407,12 @@ async def test_unknown_provider_outcome_is_durable_and_exact_replay_does_not_cal
     }
     assert await worker.run_once() is False
     assert len(adapter.discover_queries) == 1
+    trace = await client.get(f"/content-research/workflows/{workflow_run_id}/trace")
+    assert trace.status_code == 200, trace.text
+    projected = next(
+        item for item in trace.json()["execution_units"] if item["id"] == unit["id"]
+    )
+    assert projected["recovery_state"] == "outcome_unknown"
 
 
 @pytest.mark.asyncio
@@ -423,8 +448,61 @@ async def test_terminal_provider_failure_is_not_requeued_by_exact_replay(
 
     replay = await client.post(endpoint, json=request)
     assert replay.status_code == 200, replay.text
+    assert replay.json()["result"]["execution_unit"]["recovery_state"] == (
+        "manual_recovery_required"
+    )
     assert await worker.run_once() is False
     assert len(adapter.discover_queries) == 1
+    trace = await client.get(f"/content-research/workflows/{workflow_run_id}/trace")
+    assert trace.status_code == 200, trace.text
+    projected = next(
+        item for item in trace.json()["execution_units"] if item["id"] == unit_id
+    )
+    assert projected["recovery_state"] == "manual_recovery_required"
+
+
+@pytest.mark.asyncio
+async def test_limited_report_without_owned_publication_remains_recoverable(
+    continuation_harness,
+) -> None:
+    """A runtime status alone cannot terminalize an execution unit as completed."""
+    client, service, worker, _adapter, db_path = continuation_harness
+    workflow_run_id, _scope, coverage_snapshot_id = await _confirmed_scope_awaiting_coverage(
+        client, worker, db_path
+    )
+    response = await client.post(
+        f"/content-research/workflows/{workflow_run_id}/actions",
+        json={
+            "action": "resolve_coverage",
+            "payload": {
+                "scope_contract_version": 1,
+                "coverage_snapshot_id": coverage_snapshot_id,
+                "resolution": "generate_limited_report",
+            },
+        },
+    )
+    assert response.status_code == 200, response.text
+    unit_id = response.json()["result"]["execution_unit"]["id"]
+    async with WorkflowStore(db_path) as workflow_store:
+        assert workflow_store._conn is not None
+        await workflow_store._conn.execute(
+            "UPDATE workflow_runs SET status='succeeded' WHERE run_id=?",
+            (workflow_run_id,),
+        )
+        await workflow_store._conn.commit()
+
+    assert await worker.run_once()
+
+    durable_unit = service._store.get_scope_execution_unit(unit_id)
+    assert durable_unit is not None
+    assert durable_unit.state == "failed"
+    assert durable_unit.recovery_state == "replayable"
+    assert not any(
+        fact.kind == "publication_persisted"
+        for fact in service._store.execution_trace(unit_id)
+    )
+    continuation = service._store.list_scope_execution_continuations(workflow_run_id)[0]
+    assert continuation.state == "failed"
 
 
 @pytest.mark.asyncio
@@ -475,5 +553,90 @@ async def test_stale_execution_claim_is_fenced_before_any_continuation_artifact(
     assert adapter.discover_queries == []
     assert any(
         fact.attempt_no == claim_a.attempt_no and fact.kind == "lease_fenced"
+        for fact in service._store.execution_trace(unit_id)
+    )
+
+
+@pytest.mark.asyncio
+async def test_real_worker_late_provider_callback_cannot_mutate_after_takeover(
+    continuation_harness,
+) -> None:
+    """A worker that passed its entry check cannot write after a real takeover."""
+    client, service, worker_a, adapter, db_path = continuation_harness
+    workflow_run_id, _scope, coverage_snapshot_id = await _confirmed_scope_awaiting_coverage(
+        client, worker_a, db_path
+    )
+    response = await client.post(
+        f"/content-research/workflows/{workflow_run_id}/actions",
+        json={
+            "action": "resolve_coverage",
+            "payload": {
+                "scope_contract_version": 1,
+                "coverage_snapshot_id": coverage_snapshot_id,
+                "resolution": "expand_required_constraint",
+                "constraint_id": "core_object",
+                "supplementary_queries": ["长袖衬衫 防晒"],
+            },
+        },
+    )
+    assert response.status_code == 200, response.text
+    unit_id = response.json()["result"]["execution_unit"]["id"]
+    adapter.discover_queries.clear()
+    adapter.pause_next_discover = True
+    running_a = asyncio.create_task(worker_a.run_once())
+    await asyncio.wait_for(adapter.discover_started.wait(), timeout=5)
+
+    expired = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+    with service._store._connect() as conn:
+        conn.execute(
+            """UPDATE content_research_scope_execution_attempts
+               SET lease_expires_at=? WHERE execution_unit_id=? AND state='running'""",
+            (expired, unit_id),
+        )
+        conn.execute(
+            """UPDATE content_research_scope_execution_continuations
+               SET lease_expires_at=? WHERE execution_unit_id=? AND state='running'""",
+            (expired, unit_id),
+        )
+
+    worker_b = ContentResearchDispatchWorker(
+        store=service._store,
+        service_factory=lambda: service,
+    )
+    assert await worker_b.run_once()
+
+    guarded_tables = (
+        "content_research_subagent_tasks",
+        "content_research_observation_events",
+        "content_research_stage_checkpoints",
+        "content_research_scope_coverage_snapshots",
+        "content_research_cross_direction_records",
+        "content_research_aggregate_claims",
+        "content_research_report_drafts",
+        "content_research_report_faithfulness_decisions",
+        "content_research_report_publications",
+        "workflow_events",
+        "workflow_artifacts",
+    )
+
+    def durable_domain_state() -> dict[str, tuple[tuple[object, ...], ...]]:
+        with service._store._connect() as conn:
+            return {
+                table: tuple(
+                    tuple(row)
+                    for row in conn.execute(f"SELECT * FROM {table} ORDER BY rowid").fetchall()
+                )
+                for table in guarded_tables
+            }
+
+    after_takeover = durable_domain_state()
+    adapter.release_discover.set()
+    assert await running_a
+
+    assert durable_domain_state() == after_takeover
+    assert len(adapter.discover_queries) == 1
+    assert service._store.get_scope_execution_unit(unit_id).state == "outcome_unknown"
+    assert any(
+        fact.kind == "lease_fenced" and fact.attempt_no == 0
         for fact in service._store.execution_trace(unit_id)
     )

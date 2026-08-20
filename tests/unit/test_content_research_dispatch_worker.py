@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
@@ -12,6 +13,8 @@ from app.content_research.async_pipeline_store import AsyncDirectionalPersistenc
 from app.content_research.persistence_models import StageCheckpointRecord
 from app.content_research.scope_contract import (
     CoverageSnapshot,
+    ExecutionContext,
+    ExecutionLeaseFencedError,
     ScopeAuditEvent,
     ScopeConstraint,
     ScopeExecutionAuthorization,
@@ -421,3 +424,93 @@ async def test_stale_async_session_cannot_overwrite_recovered_checkpoint(tmp_pat
         db_path, workflow_run_id="run-recovery"
     )
     assert reloaded.get_typed_record(StageCheckpointRecord, original.id).payload == {"attempt": 1}
+
+
+@pytest.mark.asyncio
+async def test_live_context_write_serializes_takeover_and_rejects_later_stale_checkpoint(
+    tmp_path,
+) -> None:
+    """A takeover cannot interleave between the live predicate and its domain insert."""
+    db_path = str(tmp_path / "atomic-execution-write.db")
+    entered_insert = threading.Event()
+    release_insert = threading.Event()
+
+    class BlockingSQLiteContentResearchStore(SQLiteContentResearchStore):
+        def _raw_connect(self):
+            conn = super()._raw_connect()
+            conn.create_function(
+                "block_execution_checkpoint_insert",
+                0,
+                lambda: (entered_insert.set(), release_insert.wait(timeout=5), 1)[-1],
+            )
+            return conn
+
+    store = BlockingSQLiteContentResearchStore(db_path)
+    authorization, _continuation = _save_execution_unit_continuation(store)
+    claim_a = store.claim_execution_unit(
+        execution_unit_id=str(authorization.execution_unit_id),
+        owner="worker-a",
+        lease_seconds=1,
+    )
+    assert claim_a is not None and claim_a.lease_token
+    context_a = ExecutionContext(
+        execution_unit_id=claim_a.execution_unit_id,
+        attempt_no=claim_a.attempt_no,
+        lease_token=claim_a.lease_token,
+        scope_contract_id=authorization.scope_contract_id,
+    )
+    with store._connect() as conn:
+        conn.execute(
+            """CREATE TRIGGER block_execution_checkpoint_insert
+               BEFORE INSERT ON content_research_stage_checkpoints
+               WHEN NEW.id='scp-atomic-before-takeover'
+               BEGIN
+                 SELECT block_execution_checkpoint_insert();
+               END"""
+        )
+
+    scoped = store.for_execution_context(context_a)
+    before_takeover = StageCheckpointRecord(
+        id="scp-atomic-before-takeover",
+        schema_version="content_research_stage_checkpoint_v1",
+        payload={"attempt": 0},
+        workflow_run_id=authorization.workflow_run_id,
+        subagent_task_id="task-atomic",
+        stage_name="aggregate",
+        input_fingerprint="before-takeover",
+        status="completed",
+    )
+
+    first_write = asyncio.create_task(asyncio.to_thread(scoped.save_stage_checkpoint, before_takeover))
+    assert await asyncio.to_thread(entered_insert.wait, 2)
+    await asyncio.sleep(1.05)
+    takeover = asyncio.create_task(
+        asyncio.to_thread(
+            store.claim_execution_unit,
+            execution_unit_id=claim_a.execution_unit_id,
+            owner="worker-b",
+            lease_seconds=120,
+        )
+    )
+    await asyncio.sleep(0.05)
+    assert not takeover.done(), "takeover must wait for the guarded write transaction"
+    release_insert.set()
+    await first_write
+    claim_b = await takeover
+    assert claim_b is not None
+
+    after_takeover = replace(
+        before_takeover,
+        id="scp-stale-after-takeover",
+        input_fingerprint="after-takeover",
+    )
+    with pytest.raises(ExecutionLeaseFencedError):
+        await asyncio.to_thread(scoped.save_stage_checkpoint, after_takeover)
+    assert store.get_typed_record(StageCheckpointRecord, before_takeover.id) == before_takeover
+    assert store.get_typed_record(StageCheckpointRecord, after_takeover.id) is None
+    assert any(
+        fact.attempt_no == claim_a.attempt_no
+        and fact.kind == "lease_fenced"
+        and fact.payload.get("operation") == "content_research_store_transaction"
+        for fact in store.execution_trace(claim_a.execution_unit_id)
+    )

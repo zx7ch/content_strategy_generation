@@ -67,6 +67,7 @@ from app.content_research.evidence.governance_reader import (
     safe_public_projection,
 )
 from app.content_research.evidence.packet_reader import PacketEvidenceReader
+from app.content_research.execution_lease import LeaseFencedWorkflowRunManager
 from app.content_research.marketing_conclusion_analysis import (
     MarketingConclusionAnalysisError,
     MarketingConclusionAnalysisService,
@@ -275,8 +276,26 @@ class WorkflowRuntime(Protocol):
 
 
 class WorkflowRunManagerRuntime:
-    def __init__(self, db_path: str) -> None:
+    def __init__(
+        self,
+        db_path: str,
+        *,
+        execution_context: ExecutionContext | None = None,
+    ) -> None:
         self._db_path = db_path
+        self._execution_context = execution_context
+
+    def for_execution_context(self, context: ExecutionContext) -> WorkflowRunManagerRuntime:
+        return WorkflowRunManagerRuntime(self._db_path, execution_context=context)
+
+    def _manager(self, operation: str) -> WorkflowRunManager:
+        if self._execution_context is None:
+            return WorkflowRunManager(self._db_path)
+        return LeaseFencedWorkflowRunManager(
+            self._db_path,
+            execution_context=self._execution_context,
+            operation=operation,
+        )
 
     async def start_presearch_run(self, *, thread_id: str, user_id: str, seed_text: str) -> str:
         async with WorkflowRunManager(self._db_path) as manager:
@@ -388,15 +407,15 @@ class WorkflowRunManagerRuntime:
         }
 
     async def record_step_execution_started(self, workflow_run_id: str, step_name: str) -> None:
-        async with WorkflowRunManager(self._db_path) as manager:
+        async with self._manager("record_step_execution_started") as manager:
             await manager.record_step_execution_started(workflow_run_id, step_name)
 
     async def record_step_execution_finished(self, workflow_run_id: str, step_name: str) -> None:
-        async with WorkflowRunManager(self._db_path) as manager:
+        async with self._manager("record_step_execution_finished") as manager:
             await manager.record_step_execution_finished(workflow_run_id, step_name)
 
     async def abort_step_execution(self, workflow_run_id: str, step_name: str) -> None:
-        async with WorkflowRunManager(self._db_path) as manager:
+        async with self._manager("abort_step_execution") as manager:
             await manager.abort_step_execution(workflow_run_id, step_name)
 
     async def complete_brief_and_plan_atomically(
@@ -445,7 +464,7 @@ class WorkflowRunManagerRuntime:
                 "Cannot complete formal research before every child task has a terminal outcome: "
                 + ", ".join(sorted(missing_child_ids))
             )
-        async with WorkflowRunManager(self._db_path) as manager:
+        async with self._manager("complete_formal_research") as manager:
             for outcome in task_outcomes:
                 child_id = str(outcome["child_task_id"])
                 child_status = str(child_by_id[child_id].get("status") or "pending")
@@ -478,12 +497,12 @@ class WorkflowRunManagerRuntime:
         return True
 
     async def complete_report_publication(self, *, workflow_run_id: str) -> bool:
-        async with WorkflowRunManager(self._db_path) as manager:
+        async with self._manager("complete_report_publication") as manager:
             await manager.complete_report_finalization(workflow_run_id)
         return True
 
     async def retry_failed_report_publication(self, *, workflow_run_id: str) -> bool:
-        async with WorkflowRunManager(self._db_path) as manager:
+        async with self._manager("retry_failed_report_publication") as manager:
             await manager.retry_failed_report_finalization(workflow_run_id)
         return True
 
@@ -493,7 +512,7 @@ class WorkflowRunManagerRuntime:
         workflow_run_id: str,
         reason: dict,
     ) -> dict:
-        async with WorkflowRunManager(self._db_path) as manager:
+        async with self._manager("wait_for_user_recovery") as manager:
             run = await manager.wait_for_user_recovery(
                 workflow_run_id,
                 step_name="formal_research",
@@ -509,7 +528,7 @@ class WorkflowRunManagerRuntime:
     ) -> dict:
         async with WorkflowStore(self._db_path) as store:
             current_run = await store.get_run(workflow_run_id)
-        async with WorkflowRunManager(self._db_path) as manager:
+        async with self._manager("fail_formal_research") as manager:
             # Report composition begins only after formal_research has already
             # completed.  A finalization error must fail the parent directly;
             # trying to fail that completed step would leave the run stuck.
@@ -535,10 +554,9 @@ class WorkflowRunManagerRuntime:
         event_type: str,
         payload: dict,
     ) -> None:
-        async with WorkflowStore(self._db_path) as store:
-            await store.append_event(
+        async with self._manager("append_workflow_event") as manager:
+            await manager.append_event(
                 run_id=workflow_run_id,
-                thread_id=thread_id,
                 event_type=event_type,
                 payload=payload,
             )
@@ -585,12 +603,12 @@ class WorkflowRunManagerRuntime:
         }
 
     async def pause_content_research_run(self, *, workflow_run_id: str) -> dict:
-        async with WorkflowRunManager(self._db_path) as manager:
+        async with self._manager("pause_content_research_run") as manager:
             run = await manager.pause_run(workflow_run_id, reason="content_research_user_pause")
         return {"workflow_run_id": workflow_run_id, "status": run.status.value, "recoverable": True}
 
     async def resume_content_research_run(self, *, workflow_run_id: str) -> dict:
-        async with WorkflowRunManager(self._db_path) as manager:
+        async with self._manager("resume_content_research_run") as manager:
             run = await manager.resume_run(workflow_run_id)
         return {"workflow_run_id": workflow_run_id, "status": run.status.value, "recoverable": True}
 
@@ -602,7 +620,7 @@ class WorkflowRunManagerRuntime:
         resume_parent: bool = True,
     ) -> dict:
         """Resume a waiting Content Research run and restart its retryable parent step."""
-        async with WorkflowRunManager(self._db_path) as manager:
+        async with self._manager("restart_formal_research_step") as manager:
             snapshot = await self.get_runtime_snapshot(workflow_run_id)
             run_status = str((snapshot.get("run") or {}).get("status") or "")
             formal_step = next(
@@ -643,7 +661,7 @@ class WorkflowRunManagerRuntime:
         }
 
     async def acknowledge_pause_at_safe_boundary(self, *, workflow_run_id: str) -> dict:
-        async with WorkflowRunManager(self._db_path) as manager:
+        async with self._manager("acknowledge_pause_at_safe_boundary") as manager:
             run = await manager.ack_pause_at_boundary(workflow_run_id, "formal_research")
         return {"workflow_run_id": workflow_run_id, "status": run.status.value, "recoverable": True}
 
@@ -4092,7 +4110,20 @@ class ContentResearchService:
             scope_contract_id=unit.scope_contract_id,
         )
         self._require_live_execution_context(context, "execute_execution_unit")
-        await self.execute_scope_continuation(
+        bind_runtime = getattr(self._workflow_runtime, "for_execution_context", None)
+        scoped_runtime = (
+            bind_runtime(context) if callable(bind_runtime) else self._workflow_runtime
+        )
+        scoped_service = ContentResearchService(
+            store=self._store.for_execution_context(context),
+            presearch=self._presearch,
+            workflow_runtime=scoped_runtime,
+            source_registry=self._source_registry,
+            analysis_llm=self._analysis_llm,
+            report_semantic_auditor=self._report_semantic_auditor,
+            dispatch_wake_event=self._dispatch_wake_event,
+        )
+        await scoped_service.execute_scope_continuation(
             continuation,
             execution_context=context,
         )
@@ -4112,13 +4143,33 @@ class ContentResearchService:
                     "execution unit supplementary collection has no terminal Coverage"
                 )
         else:
-            runtime = await self._workflow_runtime.get_runtime_snapshot(
-                continuation.workflow_run_id
+            publication_facts = [
+                fact
+                for fact in self._store.execution_trace(context.execution_unit_id)
+                if fact.kind == "publication_persisted"
+                and isinstance(fact.payload.get("publication_id"), str)
+            ]
+            publication_id = (
+                str(publication_facts[-1].payload["publication_id"])
+                if publication_facts
+                else ""
             )
-            runtime_status = str(
-                (runtime.get("run") or {}).get("status") or runtime.get("run_status") or ""
+            publication = (
+                self._store.get_typed_record(ReportPublicationRecord, publication_id)
+                if publication_id
+                else None
             )
-            if runtime_status != "succeeded":
+            async with WorkflowStore(self._store._db_path) as workflow_store:
+                artifacts = await workflow_store.list_artifacts(continuation.workflow_run_id)
+            materialized = any(
+                (artifact.payload_json or {}).get("report_publication_id") == publication_id
+                for artifact in artifacts
+            )
+            if (
+                publication is None
+                or publication.workflow_run_id != continuation.workflow_run_id
+                or not materialized
+            ):
                 raise ContentResearchValidationError(
                     "execution unit limited report has no terminal publication"
                 )
@@ -4615,6 +4666,7 @@ class ContentResearchService:
                     workflow_run_id=brief.workflow_run_id,
                     thread_id=brief.thread_id,
                     execution_authorization=execution_authorization,
+                    execution_context=execution_context,
                 )
                 if report_artifact_ref is not None:
                     complete_report = getattr(
@@ -4623,7 +4675,9 @@ class ContentResearchService:
                     if complete_report is not None:
                         await complete_report(workflow_run_id=brief.workflow_run_id)
                         await ReportPublicationMaterializer(
-                            self._store, self._store._db_path
+                            self._store,
+                            self._store._db_path,
+                            execution_context=execution_context,
                         ).publish_timeline_message(report_artifact_ref["id"])
             except Exception as exc:
                 await self._workflow_runtime.fail_formal_research(
@@ -4878,6 +4932,7 @@ class ContentResearchService:
         workflow_run_id: str,
         thread_id: str,
         execution_authorization: ScopeExecutionAuthorization | None = None,
+        execution_context: ExecutionContext | None = None,
     ) -> dict[str, str] | None:
         """Materialize the report during the dedicated finalization boundary."""
         self._require_scope_execution_authority(
@@ -4924,7 +4979,9 @@ class ContentResearchService:
         )
         if existing_publication is not None:
             artifact = await ReportPublicationMaterializer(
-                self._store, self._store._db_path
+                self._store,
+                self._store._db_path,
+                execution_context=execution_context,
             ).materialize(existing_publication.id)
             return {
                 "type": "content_research_report_publication",
@@ -4942,7 +4999,9 @@ class ContentResearchService:
         )
         publication = await self._report_execution.execute(snapshot, self._report_semantic_auditor)
         artifact = await ReportPublicationMaterializer(
-            self._store, self._store._db_path
+            self._store,
+            self._store._db_path,
+            execution_context=execution_context,
         ).materialize(publication.id)
         return {
             "type": "content_research_report_publication",
