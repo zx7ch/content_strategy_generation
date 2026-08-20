@@ -33,6 +33,45 @@ def _forbid_legacy_report_payload(value: Any) -> None:
             _forbid_legacy_report_payload(nested)
 
 
+def _validate_execution_ownership(
+    *,
+    scope_contract_id: str | None,
+    execution_unit_id: str | None,
+    attempt_no: int,
+    execution_revision: int,
+) -> None:
+    if attempt_no < 0 or execution_revision < 1:
+        raise ValueError("execution ownership revisions are invalid")
+    if execution_unit_id and not scope_contract_id:
+        raise ValueError("execution unit ownership requires a Scope contract")
+
+
+@dataclass(frozen=True)
+class CoverageManifest:
+    """Frozen evidence/checkpoint membership for one Coverage evaluation."""
+
+    workflow_run_id: str
+    scope_contract_id: str
+    execution_unit_id: str | None
+    attempt_no: int
+    execution_revision: int
+    packet_ids: tuple[str, ...] = ()
+    checkpoint_ids: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        _required(self.workflow_run_id, self.scope_contract_id)
+        _validate_execution_ownership(
+            scope_contract_id=self.scope_contract_id,
+            execution_unit_id=self.execution_unit_id,
+            attempt_no=self.attempt_no,
+            execution_revision=self.execution_revision,
+        )
+        if len(set(self.packet_ids)) != len(self.packet_ids):
+            raise ValueError("coverage manifest packet ids must be unique")
+        if len(set(self.checkpoint_ids)) != len(self.checkpoint_ids):
+            raise ValueError("coverage manifest checkpoint ids must be unique")
+
+
 @dataclass(frozen=True)
 class TypedPersistenceRecord:
     id: str
@@ -80,6 +119,10 @@ class DirectionalEvidencePacketRecord(TypedPersistenceRecord):
     research_direction_id: str = ""
     canonical_source_id: str = ""
     field_projection_hash: str = ""
+    scope_contract_id: str | None = None
+    execution_unit_id: str | None = None
+    attempt_no: int = 0
+    execution_revision: int = 1
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -88,6 +131,12 @@ class DirectionalEvidencePacketRecord(TypedPersistenceRecord):
             self.research_direction_id,
             self.canonical_source_id,
             self.field_projection_hash,
+        )
+        _validate_execution_ownership(
+            scope_contract_id=self.scope_contract_id,
+            execution_unit_id=self.execution_unit_id,
+            attempt_no=self.attempt_no,
+            execution_revision=self.execution_revision,
         )
 
 
@@ -100,6 +149,10 @@ class ClaimCandidateRecord(TypedPersistenceRecord):
     intent_id: str = ""
     claim_type: str = ""
     requested_state: str = "pending_admission"
+    scope_contract_id: str | None = None
+    execution_unit_id: str | None = None
+    attempt_no: int = 0
+    execution_revision: int = 1
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -111,6 +164,12 @@ class ClaimCandidateRecord(TypedPersistenceRecord):
             self.intent_id,
             self.claim_type,
             self.requested_state,
+        )
+        _validate_execution_ownership(
+            scope_contract_id=self.scope_contract_id,
+            execution_unit_id=self.execution_unit_id,
+            attempt_no=self.attempt_no,
+            execution_revision=self.execution_revision,
         )
 
 
@@ -287,6 +346,10 @@ class StageCheckpointRecord(TypedPersistenceRecord):
     retry_count: int = 0
     started_at: datetime | None = None
     finished_at: datetime | None = None
+    scope_contract_id: str | None = None
+    execution_unit_id: str | None = None
+    attempt_no: int = 0
+    execution_revision: int = 1
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -327,6 +390,12 @@ class StageCheckpointRecord(TypedPersistenceRecord):
             and self.finished_at < self.started_at
         ):
             raise ValueError("checkpoint finished_at cannot precede started_at")
+        _validate_execution_ownership(
+            scope_contract_id=self.scope_contract_id,
+            execution_unit_id=self.execution_unit_id,
+            attempt_no=self.attempt_no,
+            execution_revision=self.execution_revision,
+        )
 
 
 @dataclass(frozen=True)

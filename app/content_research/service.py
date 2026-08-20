@@ -87,6 +87,7 @@ from app.content_research.observation import ContentResearchTraceService
 from app.content_research.persistence_models import (
     ClaimAdmissionDecisionRecord,
     ClaimCandidateRecord,
+    CoverageManifest,
     DirectionalEvidencePacketRecord,
     DirectionResultDecisionRecord,
     MarketingConclusionDecisionRecord,
@@ -3451,6 +3452,14 @@ class ContentResearchService:
             ):
                 raise ContentResearchValidationError("scope_execution_authorization_invalid")
 
+        if execution_authorization is None and not self._store.initial_execution_eligibility(
+            workflow_run_id, contract.id
+        ):
+            raise ContentResearchValidationError(
+                "scope_execution_authorization_required: unresolved coverage decision "
+                "already owns this workflow lineage"
+            )
+
         if coverage is None:
             if execution_authorization is None and has_persisted_continuation_authority:
                 raise ContentResearchValidationError("scope_execution_authorization_required")
@@ -4017,9 +4026,25 @@ class ContentResearchService:
         if sample_policy is None:
             return None
 
-        packets = self._store.list_directional_evidence_packets(
-            workflow_run_id, "product_marketing"
+        execution_revision = (
+            execution_authorization.execution_revision
+            if execution_authorization is not None
+            else 1
         )
+        execution_unit_id = (
+            execution_context.execution_unit_id if execution_context is not None else None
+        )
+        attempt_no = execution_context.attempt_no if execution_context is not None else 0
+        packets = [
+            packet
+            for packet in self._store.list_typed_records(DirectionalEvidencePacketRecord)
+            if packet.workflow_run_id == workflow_run_id
+            and packet.research_direction_id == "product_marketing"
+            and packet.scope_contract_id == scope_contract.id
+            and packet.execution_unit_id == execution_unit_id
+            and packet.attempt_no == attempt_no
+            and packet.execution_revision == execution_revision
+        ]
         candidates = tuple(
             {
                 **dict(packet.payload.get("field_projection") or {}),
@@ -4048,7 +4073,25 @@ class ContentResearchService:
             if execution_authorization is not None
             else None
         )
-        for checkpoint in self._store.list_typed_records(StageCheckpointRecord):
+        coverage_task_ids = {
+            task.id
+            for task in self._store.list_subagent_tasks_for_workflow(workflow_run_id)
+            if task.direction_id == "product_marketing"
+        }
+        if execution_task_id is not None:
+            coverage_task_ids.add(execution_task_id)
+        owned_checkpoints = [
+            checkpoint
+            for checkpoint in self._store.list_typed_records(StageCheckpointRecord)
+            if checkpoint.workflow_run_id == workflow_run_id
+            and checkpoint.status == "completed"
+            and checkpoint.scope_contract_id == scope_contract.id
+            and checkpoint.execution_unit_id == execution_unit_id
+            and checkpoint.attempt_no == attempt_no
+            and checkpoint.execution_revision == execution_revision
+            and checkpoint.subagent_task_id in coverage_task_ids
+        ]
+        for checkpoint in owned_checkpoints:
             group_id = str(checkpoint.payload.get("query_group_id") or "")
             if (
                 checkpoint.workflow_run_id != workflow_run_id
@@ -4075,6 +4118,15 @@ class ContentResearchService:
                 "discovered_count": int(checkpoint.payload.get("actual_count") or 0),
                 "failure_code": checkpoint.payload.get("failure_reason"),
             }
+        manifest = CoverageManifest(
+            workflow_run_id=workflow_run_id,
+            scope_contract_id=scope_contract.id,
+            execution_unit_id=execution_unit_id,
+            attempt_no=attempt_no,
+            execution_revision=execution_revision,
+            packet_ids=tuple(sorted(packet.id for packet in packets)),
+            checkpoint_ids=tuple(sorted(checkpoint.id for checkpoint in owned_checkpoints)),
+        )
         return persist_scope_coverage_evaluation(
             store=self._store,
             contract=scope_contract,
@@ -4085,6 +4137,7 @@ class ContentResearchService:
             execution_authorization=execution_authorization,
             source_snapshot=source_snapshot,
             execution_context=execution_context,
+            manifest=manifest,
         )
 
     async def execute_execution_unit(
@@ -4604,8 +4657,15 @@ class ContentResearchService:
             subagent_task_id=f"governance:{plans[-1].id}",
             action_hypotheses=_requested_action_hypotheses(
                 question=str(brief.payload.get("custom_research_question") or ""),
-                claim_ids=tuple(_admitted_claim_ids_for_run(self._store, brief.workflow_run_id)),
+                claim_ids=tuple(
+                    _admitted_claim_ids_for_run(
+                        self._store,
+                        brief.workflow_run_id,
+                        manifest=scope_coverage.manifest if scope_coverage is not None else None,
+                    )
+                ),
             ),
+            manifest=scope_coverage.manifest if scope_coverage is not None else None,
         )
         governance_refs = _unique_artifact_refs(
             [
@@ -4626,6 +4686,7 @@ class ContentResearchService:
                 await self._govern_marketing_conclusions(
                     workflow_run_id=brief.workflow_run_id,
                     research_plan_id=plans[-1].id,
+                    manifest=scope_coverage.manifest if scope_coverage is not None else None,
                 )
             except (LLMProviderFailure, MarketingConclusionAnalysisError):
                 await self._workflow_runtime.append_event(
@@ -4713,6 +4774,7 @@ class ContentResearchService:
         *,
         workflow_run_id: str,
         research_plan_id: str,
+        manifest: CoverageManifest | None = None,
     ) -> StageCheckpointRecord:
         """Analyze and evaluate only durable admitted product-marketing claims."""
         policy = self._store.get_run_policy_snapshot_for_workflow(workflow_run_id)
@@ -4723,6 +4785,14 @@ class ContentResearchService:
         candidates_by_id = {
             item.id: item
             for item in self._store.list_claim_candidates(workflow_run_id, "product_marketing")
+            if manifest is None
+            or (
+                item.scope_contract_id == manifest.scope_contract_id
+                and item.execution_unit_id == manifest.execution_unit_id
+                and item.attempt_no == manifest.attempt_no
+                and item.execution_revision == manifest.execution_revision
+                and item.evidence_packet_id in set(manifest.packet_ids)
+            )
         }
         admitted_claims = sorted(
             (
@@ -4747,6 +4817,17 @@ class ContentResearchService:
                     }
                     for _decision, claim in admitted_claims
                 ],
+                "execution_manifest": (
+                    {
+                        "scope_contract_id": manifest.scope_contract_id,
+                        "execution_unit_id": manifest.execution_unit_id,
+                        "attempt_no": manifest.attempt_no,
+                        "execution_revision": manifest.execution_revision,
+                        "packet_ids": list(manifest.packet_ids),
+                    }
+                    if manifest is not None
+                    else None
+                ),
             }
         )
         checkpoint_id = f"scp_{canonical_fingerprint({'run': workflow_run_id, 'stage': 'marketing_conclusion', 'input': fingerprint})[:24]}"
@@ -4829,6 +4910,10 @@ class ContentResearchService:
                 retry_count=retry_count,
                 started_at=started_at,
                 finished_at=utcnow(),
+                scope_contract_id=manifest.scope_contract_id if manifest else None,
+                execution_unit_id=manifest.execution_unit_id if manifest else None,
+                attempt_no=manifest.attempt_no if manifest else 0,
+                execution_revision=manifest.execution_revision if manifest else 1,
             )
             self._store.save_stage_checkpoint(failure_checkpoint)
             for track in ("need", "value", "message"):
@@ -4922,6 +5007,10 @@ class ContentResearchService:
             retry_count=retry_count,
             started_at=started_at,
             finished_at=utcnow(),
+            scope_contract_id=manifest.scope_contract_id if manifest else None,
+            execution_unit_id=manifest.execution_unit_id if manifest else None,
+            attempt_no=manifest.attempt_no if manifest else 0,
+            execution_revision=manifest.execution_revision if manifest else 1,
         )
         self._store.save_stage_checkpoint(checkpoint)
         return checkpoint
@@ -5980,11 +6069,26 @@ def _publication_lineage_is_materializable(
     return draft is not None and decision is not None and decision.report_draft_id == draft.id
 
 
-def _admitted_claim_ids_for_run(store: Any, workflow_run_id: str) -> list[str]:
+def _admitted_claim_ids_for_run(
+    store: Any,
+    workflow_run_id: str,
+    *,
+    manifest: CoverageManifest | None = None,
+) -> list[str]:
     candidates = {
         item.id
         for item in store.list_typed_records(ClaimCandidateRecord)
         if item.workflow_run_id == workflow_run_id
+        and (
+            manifest is None
+            or (
+                item.scope_contract_id == manifest.scope_contract_id
+                and item.execution_unit_id == manifest.execution_unit_id
+                and item.attempt_no == manifest.attempt_no
+                and item.execution_revision == manifest.execution_revision
+                and item.evidence_packet_id in set(manifest.packet_ids)
+            )
+        )
     }
     return sorted(
         item.claim_candidate_id

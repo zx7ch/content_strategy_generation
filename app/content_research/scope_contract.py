@@ -13,6 +13,7 @@ from types import MappingProxyType
 from typing import Literal
 
 from app.content_research.models import utcnow
+from app.content_research.persistence_models import CoverageManifest
 
 SCOPE_CONTRACT_SCHEMA_VERSION = "content_research_scope_contract_v1"
 MAX_LITE_QUERY_GROUPS = 3
@@ -149,6 +150,7 @@ class CoverageSnapshot:
     execution_revision: int = 1
     execution_authorization_id: str | None = None
     source_coverage_snapshot_id: str | None = None
+    manifest: CoverageManifest | None = None
     created_at: datetime = field(default_factory=utcnow)
 
     def __post_init__(self) -> None:
@@ -166,6 +168,12 @@ class CoverageSnapshot:
             raise ValueError("coverage execution revision must be positive")
         if self.state not in {"satisfied", "awaiting_scope_decision"}:
             raise ValueError("invalid coverage snapshot state")
+        if self.manifest is not None and (
+            self.manifest.workflow_run_id != self.workflow_run_id
+            or self.manifest.scope_contract_id != self.scope_contract_id
+            or self.manifest.execution_revision != self.execution_revision
+        ):
+            raise ValueError("coverage manifest lineage does not match its snapshot")
 
 
 @dataclass(frozen=True)

@@ -1342,6 +1342,45 @@ def _apply_0028(conn: sqlite3.Connection) -> None:
         )
 
 
+_V29_EXECUTION_LINEAGE_COLUMNS = {
+    "content_research_directional_evidence_packets": (
+        "scope_contract_id TEXT",
+        "execution_unit_id TEXT",
+        "attempt_no INTEGER NOT NULL DEFAULT 0",
+        "execution_revision INTEGER NOT NULL DEFAULT 1",
+    ),
+    "content_research_claim_candidates": (
+        "scope_contract_id TEXT",
+        "execution_unit_id TEXT",
+        "attempt_no INTEGER NOT NULL DEFAULT 0",
+        "execution_revision INTEGER NOT NULL DEFAULT 1",
+    ),
+    "content_research_stage_checkpoints": (
+        "scope_contract_id TEXT",
+        "execution_unit_id TEXT",
+        "attempt_no INTEGER NOT NULL DEFAULT 0",
+        "execution_revision INTEGER NOT NULL DEFAULT 1",
+    ),
+    "content_research_scope_coverage_snapshots": (
+        "execution_unit_id TEXT",
+        "attempt_no INTEGER NOT NULL DEFAULT 0",
+        "evidence_manifest_json TEXT",
+    ),
+}
+
+_V29_EXECUTION_LINEAGE_INDEXES = (
+    "CREATE INDEX idx_cr_packet_execution_lineage ON content_research_directional_evidence_packets(workflow_run_id, scope_contract_id, execution_unit_id, attempt_no, execution_revision)",
+    "CREATE INDEX idx_cr_candidate_execution_lineage ON content_research_claim_candidates(workflow_run_id, scope_contract_id, execution_unit_id, attempt_no, execution_revision)",
+    "CREATE INDEX idx_cr_checkpoint_execution_lineage ON content_research_stage_checkpoints(workflow_run_id, scope_contract_id, execution_unit_id, attempt_no, execution_revision)",
+)
+
+
+def _apply_0029(conn: sqlite3.Connection) -> None:
+    _add_columns(conn, _V29_EXECUTION_LINEAGE_COLUMNS)
+    for statement in _V29_EXECUTION_LINEAGE_INDEXES:
+        conn.execute(statement)
+
+
 def _apply_0015(conn: sqlite3.Connection) -> None:
     conn.execute(_V15_LLM_CONFIGURATION_SQL)
 
@@ -1405,6 +1444,9 @@ def _expected_checksums(migration_0002_sql: str, legacy_checksum: str) -> dict[s
         "0026": _checksum("execution_unit_alias_canonical_repair_v1"),
         "0027": _checksum("execution_decision_identity_contract_v1"),
         "0028": _checksum("minimal_execution_decision_identity_v1"),
+        "0029": _checksum(
+            (_V29_EXECUTION_LINEAGE_COLUMNS, _V29_EXECUTION_LINEAGE_INDEXES)
+        ),
     }
 
 
@@ -1680,6 +1722,13 @@ def apply_content_research_migrations(
                 name="minimal_execution_decision_identity",
                 checksum=expected_checksums["0028"],
                 apply=lambda: _apply_0028(conn),
+            )
+            _apply_migration(
+                conn,
+                version="0029",
+                name="execution_lineage_owned_evidence",
+                checksum=expected_checksums["0029"],
+                apply=lambda: _apply_0029(conn),
             )
         except Exception:
             conn.rollback()

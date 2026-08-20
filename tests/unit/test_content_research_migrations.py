@@ -406,7 +406,12 @@ def test_execution_unit_repair_rolls_back_seeded_legacy_alias_then_retries(tmp_p
             ("rsc_relaxed", "run-repair", "rp-repair", 2, "v", "[]", "[]", now),
         )
         conn.execute(
-            "INSERT INTO content_research_scope_coverage_snapshots VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            """INSERT INTO content_research_scope_coverage_snapshots
+               (id, workflow_run_id, scope_contract_id, scope_contract_version,
+                execution_revision, execution_authorization_id,
+                source_coverage_snapshot_id, state, constraint_counts_json,
+                unmet_constraint_ids_json, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             ("scv-repair", "run-repair", "rsc_source", 1, 1, None, None, "awaiting_scope_decision", "{}", '["season"]', now),
         )
         conn.execute(
@@ -554,7 +559,12 @@ def test_migration_backfills_legacy_decision_identity_matrix(
                 ),
             )
         conn.execute(
-            "INSERT INTO content_research_scope_coverage_snapshots VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            """INSERT INTO content_research_scope_coverage_snapshots
+               (id, workflow_run_id, scope_contract_id, scope_contract_version,
+                execution_revision, execution_authorization_id,
+                source_coverage_snapshot_id, state, constraint_counts_json,
+                unmet_constraint_ids_json, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 snapshot_id,
                 "run-legacy-matrix",

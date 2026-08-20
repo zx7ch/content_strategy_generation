@@ -81,7 +81,13 @@ class ContentResearchDispatchWorker:
         result = None
         execution_error: Exception | None = None
         try:
-            self._recover_interrupted_tasks(str(job["workflow_run_id"]))
+            if not self._recover_interrupted_tasks(
+                str(job["workflow_run_id"]),
+                owner=self._owner,
+                token=str(job["lease_token"]),
+            ):
+                lease_lost.set()
+                return True
             result = await self._service_factory().start_formal_research(
                 workflow_run_id=str(job["workflow_run_id"]),
                 request=ContentResearchSourceCollectionRequest(
@@ -285,7 +291,13 @@ class ContentResearchDispatchWorker:
                 lease_lost.set()
                 return
 
-    def _recover_interrupted_tasks(self, workflow_run_id: str) -> None:
+    def _recover_interrupted_tasks(
+        self,
+        workflow_run_id: str,
+        *,
+        owner: str,
+        token: str,
+    ) -> bool:
         """Recover parent task state without ever repeating an unknown call.
 
         A process can stop between marking a task running and entering the
@@ -293,6 +305,16 @@ class ContentResearchDispatchWorker:
         operation checkpoint was claimed.  A claimed provider operation is
         deliberately surfaced as retryable/unknown instead of being replayed.
         """
+        with self._store._connect() as conn:
+            live_claim = conn.execute(
+                """SELECT 1 FROM content_research_dispatch_jobs
+                   WHERE workflow_run_id=? AND status='running'
+                     AND lease_owner=? AND lease_token=?
+                     AND lease_expires_at IS NOT NULL AND lease_expires_at > ?""",
+                (workflow_run_id, owner, token, utcnow().isoformat()),
+            ).fetchone()
+        if live_claim is None:
+            return False
         operation_checkpoints = self._store.list_typed_records(StageCheckpointRecord)
         for task in self._store.list_subagent_tasks_for_workflow(workflow_run_id):
             if task.status != "running":
@@ -319,6 +341,7 @@ class ContentResearchDispatchWorker:
             self._store.save_subagent_task(
                 replace(task, status=next_status, payload=payload, updated_at=utcnow())
             )
+        return True
 
     async def run_loop(self, *, stop_event: asyncio.Event) -> None:
         while not stop_event.is_set():

@@ -71,6 +71,18 @@ def build_claim_candidate(
 def validate_candidate_packet(candidate: ClaimCandidateRecord, packet: DirectionalEvidencePacketRecord) -> None:
     if (packet.workflow_run_id, packet.research_direction_id, packet.id) != (candidate.workflow_run_id, candidate.research_direction_id, candidate.evidence_packet_id):
         raise ValueError("candidate packet reference is outside its workflow run or direction")
+    if (
+        packet.scope_contract_id,
+        packet.execution_unit_id,
+        packet.attempt_no,
+        packet.execution_revision,
+    ) != (
+        candidate.scope_contract_id,
+        candidate.execution_unit_id,
+        candidate.attempt_no,
+        candidate.execution_revision,
+    ):
+        raise ValueError("candidate packet reference is outside its execution lineage")
     projection = dict(packet.payload.get("field_projection") or {})
     availability = dict(packet.payload.get("field_availability") or {})
     refs = list(candidate.payload.get("quote_refs") or [])

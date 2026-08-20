@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from typing import TypeAlias
 
@@ -246,6 +247,69 @@ async def test_authorized_collection_continuations_run_through_worker_and_pipeli
     assert (
         service._store.list_scope_execution_continuations(workflow_run_id)[0].state == "completed"
     )
+
+
+@pytest.mark.asyncio
+async def test_governance_consumes_only_the_coverage_manifest_attempt(
+    continuation_harness: ContinuationHarness,
+) -> None:
+    """Removing manifest filtering must re-admit the initial Scope's claim records."""
+    client, service, worker, _adapter, db_path = continuation_harness
+    workflow_run_id, _scope, coverage_snapshot_id = await _confirmed_scope_awaiting_coverage(
+        client, worker, db_path
+    )
+    resolved = await client.post(
+        f"/content-research/workflows/{workflow_run_id}/actions",
+        json={
+            "action": "resolve_coverage",
+            "payload": {
+                "scope_contract_version": 1,
+                "coverage_snapshot_id": coverage_snapshot_id,
+                "resolution": "relax_constraint",
+                "constraint_id": "core_object",
+            },
+        },
+    )
+    assert resolved.status_code == 200, resolved.text
+    authorization = resolved.json()["result"]["execution_authorization"]
+    assert await worker.run_once()
+    terminal = service._store.get_coverage_snapshot(
+        workflow_run_id,
+        version=2,
+        execution_revision=authorization["execution_revision"],
+    )
+    assert terminal is not None and terminal.manifest is not None
+    plan = service._store.list_plans_for_brief(
+        service._store.get_brief_by_workflow(workflow_run_id).id
+    )[-1]
+
+    governed = service._cross_direction_governance.execute(
+        workflow_run_id=workflow_run_id,
+        research_plan_id=plan.id,
+        subagent_task_id=f"governance:manifest-test:{plan.id}",
+        manifest=terminal.manifest,
+    )
+    packet_ids = set(terminal.manifest.packet_ids)
+    all_claim_ids = {
+        claim_id
+        for record in (*governed.overlaps, *governed.contradictions, *governed.aggregates)
+        for claim_id in (
+            record.payload.get("claim_ids")
+            or record.payload.get("source_claim_ids")
+            or []
+        )
+    }
+    candidates = {
+        item.id: item
+        for item in service._store.list_claim_candidates(
+            workflow_run_id, "product_marketing"
+        )
+    }
+    assert all_claim_ids <= {
+        candidate.id
+        for candidate in candidates.values()
+        if candidate.evidence_packet_id in packet_ids
+    }
 
 
 @pytest.mark.asyncio
@@ -568,6 +632,61 @@ async def test_stale_execution_claim_is_fenced_before_any_continuation_artifact(
         fact.attempt_no == claim_a.attempt_no and fact.kind == "lease_fenced"
         for fact in service._store.execution_trace(unit_id)
     )
+
+
+@pytest.mark.asyncio
+async def test_stale_normal_dispatch_recovery_is_zero_write(
+    continuation_harness: ContinuationHarness,
+) -> None:
+    """Removing the normal-dispatch lease check must rewrite the running task."""
+    client, service, worker, adapter, db_path = continuation_harness
+    workflow_run_id, _scope, _coverage_snapshot_id = await _confirmed_scope_awaiting_coverage(
+        client, worker, db_path
+    )
+    adapter.discover_queries.clear()
+    task = service._store.list_subagent_tasks_for_workflow(workflow_run_id)[0]
+    service._store.save_subagent_task(
+        replace(task, status="running", payload={**task.payload, "status": "running"})
+    )
+    with service._store._connect() as conn:
+        conn.execute(
+            """UPDATE content_research_dispatch_jobs
+               SET status='running', lease_owner='worker-b', lease_token='live-token-b',
+                   lease_expires_at=? WHERE workflow_run_id=?""",
+            ((datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(), workflow_run_id),
+        )
+
+    guarded_tables = (
+        "content_research_subagent_tasks",
+        "content_research_stage_checkpoints",
+        "content_research_scope_coverage_snapshots",
+        "content_research_cross_direction_records",
+        "content_research_aggregate_claims",
+        "content_research_report_drafts",
+        "content_research_report_faithfulness_decisions",
+        "content_research_report_publications",
+    )
+
+    def durable_state() -> dict[str, tuple[tuple[object, ...], ...]]:
+        with service._store._connect() as conn:
+            return {
+                table: tuple(
+                    tuple(row)
+                    for row in conn.execute(f"SELECT * FROM {table} ORDER BY rowid").fetchall()
+                )
+                for table in guarded_tables
+            }
+
+    before = durable_state()
+    recovered = worker._recover_interrupted_tasks(
+        workflow_run_id,
+        owner="worker-a",
+        token="stale-token-a",
+    )
+
+    assert recovered is False
+    assert durable_state() == before
+    assert adapter.discover_queries == []
 
 
 @pytest.mark.asyncio

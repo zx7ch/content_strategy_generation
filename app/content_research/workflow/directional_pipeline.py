@@ -37,6 +37,7 @@ from app.content_research.contracts import (
 )
 from app.content_research.persistence_models import (
     ClaimAdmissionDecisionRecord,
+    CoverageManifest,
     DirectionalEvidencePacketRecord,
     DirectionSourceProjectionRecord,
     StageCheckpointRecord,
@@ -186,6 +187,20 @@ class DirectionCoverageDecision:
     counts: DirectionCoverageCounts
 
 
+def _coverage_manifest_payload(manifest: CoverageManifest | None) -> dict[str, Any] | None:
+    if manifest is None:
+        return None
+    return {
+        "workflow_run_id": manifest.workflow_run_id,
+        "scope_contract_id": manifest.scope_contract_id,
+        "execution_unit_id": manifest.execution_unit_id,
+        "attempt_no": manifest.attempt_no,
+        "execution_revision": manifest.execution_revision,
+        "packet_ids": list(manifest.packet_ids),
+        "checkpoint_ids": list(manifest.checkpoint_ids),
+    }
+
+
 def persist_scope_coverage_evaluation(
     *,
     store: Any,
@@ -197,17 +212,50 @@ def persist_scope_coverage_evaluation(
     execution_authorization: ScopeExecutionAuthorization | None = None,
     source_snapshot: CoverageSnapshot | None = None,
     execution_context: ExecutionContext | None = None,
+    manifest: CoverageManifest | None = None,
 ) -> CoverageSnapshot:
     """Persist candidate Scope projections and their decision-ready aggregate."""
     execution_revision = (
         execution_authorization.execution_revision if execution_authorization is not None else 1
     )
+    if manifest is not None and (
+        manifest.workflow_run_id != contract.workflow_run_id
+        or manifest.scope_contract_id != contract.id
+        or manifest.execution_revision != execution_revision
+        or (
+            execution_context is None
+            and (manifest.execution_unit_id is not None or manifest.attempt_no != 0)
+        )
+        or (
+            execution_context is not None
+            and (
+                manifest.execution_unit_id != execution_context.execution_unit_id
+                or manifest.attempt_no != execution_context.attempt_no
+                or manifest.scope_contract_id != execution_context.scope_contract_id
+            )
+        )
+        or (
+            execution_authorization is None
+            and source_snapshot is not None
+        )
+        or (
+            execution_authorization is not None
+            and (
+                execution_authorization.scope_contract_id != manifest.scope_contract_id
+                or source_snapshot is None
+                or source_snapshot.id != execution_authorization.coverage_snapshot_id
+            )
+        )
+    ):
+        raise ValueError("Coverage manifest does not match execution authorization lineage")
     existing = store.get_coverage_snapshot(
         contract.workflow_run_id,
         version=contract.version,
         execution_revision=execution_revision,
     )
     if existing is not None:
+        if manifest is not None and existing.manifest != manifest:
+            raise ValueError("persisted Coverage manifest does not match this execution")
         existing_events = store.list_scope_audit_events(
             contract.workflow_run_id, version=contract.version
         )
@@ -396,6 +444,7 @@ def persist_scope_coverage_evaluation(
                 ),
                 "candidate_ids": sorted(candidate_id for candidate_id, _author, _match in matches),
                 "constraint_counts": constraint_counts,
+                "manifest": _coverage_manifest_payload(manifest),
             }
         )[:24],
         workflow_run_id=contract.workflow_run_id,
@@ -409,6 +458,7 @@ def persist_scope_coverage_evaluation(
             execution_authorization.id if execution_authorization else None
         ),
         source_coverage_snapshot_id=(source_snapshot.id if source_snapshot is not None else None),
+        manifest=manifest,
     )
     coverage_event = ScopeAuditEvent(
         id=_scope_event_id(
@@ -431,6 +481,7 @@ def persist_scope_coverage_evaluation(
             "constraint_counts": snapshot.constraint_counts,
             "unmet_constraint_ids": list(snapshot.unmet_constraint_ids),
             "reason_codes": reason_codes,
+            "manifest": _coverage_manifest_payload(manifest),
         },
     )
     if execution_context is None:
@@ -934,6 +985,28 @@ class DirectionalExecutionPipeline:
             if self._scope_store is not None and self._scope_contract is not None
             else set()
         )
+
+    def _execution_ownership(self) -> dict[str, Any]:
+        return {
+            "scope_contract_id": (
+                self._scope_contract.id if self._scope_contract is not None else None
+            ),
+            "execution_unit_id": (
+                self._execution_context.execution_unit_id
+                if self._execution_context is not None
+                else None
+            ),
+            "attempt_no": (
+                self._execution_context.attempt_no
+                if self._execution_context is not None
+                else 0
+            ),
+            "execution_revision": self._scope_execution_revision,
+        }
+
+    def _owns_current_execution(self, record: Any) -> bool:
+        ownership = self._execution_ownership()
+        return all(getattr(record, key, None) == value for key, value in ownership.items())
 
     def _queue_scope_audit_event(self, event: ScopeAuditEvent) -> None:
         if event.id in self._scope_audit_event_ids:
@@ -1680,6 +1753,20 @@ class DirectionalExecutionPipeline:
                     )
                     for candidate in candidates
                 ]
+            candidates = [
+                replace(
+                    candidate,
+                    id="cc_"
+                    + canonical_fingerprint(
+                        {
+                            "candidate_id": candidate.id,
+                            "execution_ownership": self._execution_ownership(),
+                        }
+                    )[:24],
+                    **self._execution_ownership(),
+                )
+                for candidate in candidates
+            ]
             candidates_by_packet.append((packet, candidates))
         comment_packets = [
             packet
@@ -2355,7 +2442,13 @@ class DirectionalExecutionPipeline:
                     "source_kind": candidate.get("source_kind"),
                 },
             )
-            packet_id = f"dep_{canonical_fingerprint({'run': self._workflow_run_id, 'packet': packet['field_projection_hash']})[:24]}"
+            packet_id = "dep_" + canonical_fingerprint(
+                {
+                    "run": self._workflow_run_id,
+                    "packet": packet["field_projection_hash"],
+                    "execution_ownership": self._execution_ownership(),
+                }
+            )[:24]
             if self._store.get_typed_record(DirectionalEvidencePacketRecord, packet_id) is None:
                 self._store.save_directional_evidence_packet(
                     DirectionalEvidencePacketRecord(
@@ -2366,6 +2459,7 @@ class DirectionalExecutionPipeline:
                         research_direction_id=direction_id,
                         canonical_source_id=source.id,
                         field_projection_hash=packet["field_projection_hash"],
+                        **self._execution_ownership(),
                     )
                 )
             projection_id = f"dsp_{canonical_fingerprint({'run': self._workflow_run_id, 'direction': direction_id, 'source': source.id, 'packet': packet_id})[:24]}"
@@ -2471,7 +2565,13 @@ class DirectionalExecutionPipeline:
                 availability=dict(item.get("field_availability") or {}),
                 retrieval_context=context,
             )
-            packet_id = f"dep_{canonical_fingerprint({'run': self._workflow_run_id, 'packet': packet['field_projection_hash']})[:24]}"
+            packet_id = "dep_" + canonical_fingerprint(
+                {
+                    "run": self._workflow_run_id,
+                    "packet": packet["field_projection_hash"],
+                    "execution_ownership": self._execution_ownership(),
+                }
+            )[:24]
             if self._store.get_typed_record(DirectionalEvidencePacketRecord, packet_id) is None:
                 self._store.save_directional_evidence_packet(
                     DirectionalEvidencePacketRecord(
@@ -2482,6 +2582,7 @@ class DirectionalExecutionPipeline:
                         research_direction_id=direction_id,
                         canonical_source_id=source.id,
                         field_projection_hash=packet["field_projection_hash"],
+                        **self._execution_ownership(),
                     )
                 )
             projection_id = f"dsp_{canonical_fingerprint({'run': self._workflow_run_id, 'direction': direction_id, 'source': source.id, 'packet': packet_id})[:24]}"
@@ -2520,6 +2621,7 @@ class DirectionalExecutionPipeline:
             and item.subagent_task_id == task_id
             and item.stage_name == stage
             and item.status == "completed"
+            and self._owns_current_execution(item)
             and item.payload.get("base_fingerprint") == base_fingerprint
             and (
                 scope_id is None
@@ -2534,7 +2636,13 @@ class DirectionalExecutionPipeline:
     ) -> StageCheckpointRecord | None:
         checkpoint = self._store.get_typed_record(
             StageCheckpointRecord,
-            _checkpoint_id(self._workflow_run_id, task_id, stage, fingerprint),
+            _checkpoint_id(
+                self._workflow_run_id,
+                task_id,
+                stage,
+                fingerprint,
+                self._execution_ownership(),
+            ),
         )
         return checkpoint if checkpoint is not None and checkpoint.status == "completed" else None
 
@@ -2718,6 +2826,7 @@ class DirectionalExecutionPipeline:
             and item.subagent_task_id == task_id
             and item.stage_name == "operation"
             and item.payload.get("operation_fingerprint") == operation_fingerprint
+            and self._owns_current_execution(item)
         ]
 
     def _save_operation_checkpoint(
@@ -2731,7 +2840,11 @@ class DirectionalExecutionPipeline:
         completion: Mapping[str, Any] | None = None,
     ) -> None:
         record_id = _operation_checkpoint_id(
-            self._workflow_run_id, task_id, operation_fingerprint, status
+            self._workflow_run_id,
+            task_id,
+            operation_fingerprint,
+            status,
+            self._execution_ownership(),
         )
         existing = self._store.get_typed_record(StageCheckpointRecord, record_id)
         if existing is not None and existing.status != "superseded":
@@ -2772,6 +2885,7 @@ class DirectionalExecutionPipeline:
                 status=status,
                 started_at=started_at,
                 finished_at=finished_at,
+                **self._execution_ownership(),
             )
         )
 
@@ -2785,6 +2899,7 @@ class DirectionalExecutionPipeline:
             and item.subagent_task_id == task_id
             and item.stage_name == "selection_revision"
             and item.status == "completed"
+            and self._owns_current_execution(item)
             and item.payload.get("base_selection_fingerprint") == selection_fingerprint
         ]
         return sorted(revisions, key=lambda item: int(item.payload["revision"]))
@@ -2800,7 +2915,13 @@ class DirectionalExecutionPipeline:
         finished_at = _utcnow() if started_at is not None else None
         self._store.save_stage_checkpoint(
             StageCheckpointRecord(
-                _checkpoint_id(self._workflow_run_id, task_id, stage, fingerprint),
+                _checkpoint_id(
+                    self._workflow_run_id,
+                    task_id,
+                    stage,
+                    fingerprint,
+                    self._execution_ownership(),
+                ),
                 "content_research_stage_checkpoint_v1",
                 stored_payload,
                 workflow_run_id=self._workflow_run_id,
@@ -2810,6 +2931,7 @@ class DirectionalExecutionPipeline:
                 status="completed",
                 started_at=started_at,
                 finished_at=finished_at,
+                **self._execution_ownership(),
             )
         )
 
@@ -2819,8 +2941,22 @@ class DirectionalExecutionPipeline:
 DirectionalEvidencePipeline = DirectionalExecutionPipeline
 
 
-def _checkpoint_id(workflow_run_id: str, task_id: str, stage: str, fingerprint: str) -> str:
-    return f"scp_{canonical_fingerprint({'run': workflow_run_id, 'task': task_id, 'stage': stage, 'input': fingerprint})[:24]}"
+def _checkpoint_id(
+    workflow_run_id: str,
+    task_id: str,
+    stage: str,
+    fingerprint: str,
+    ownership: Mapping[str, Any] | None = None,
+) -> str:
+    return "scp_" + canonical_fingerprint(
+        {
+            "run": workflow_run_id,
+            "task": task_id,
+            "stage": stage,
+            "input": fingerprint,
+            "execution_ownership": dict(ownership or {}),
+        }
+    )[:24]
 
 
 def _utcnow() -> datetime:
@@ -2828,9 +2964,22 @@ def _utcnow() -> datetime:
 
 
 def _operation_checkpoint_id(
-    workflow_run_id: str, task_id: str, operation_fingerprint: str, status: str
+    workflow_run_id: str,
+    task_id: str,
+    operation_fingerprint: str,
+    status: str,
+    ownership: Mapping[str, Any] | None = None,
 ) -> str:
-    return f"scp_{canonical_fingerprint({'run': workflow_run_id, 'task': task_id, 'stage': 'operation', 'input': operation_fingerprint, 'status': status})[:24]}"
+    return "scp_" + canonical_fingerprint(
+        {
+            "run": workflow_run_id,
+            "task": task_id,
+            "stage": "operation",
+            "input": operation_fingerprint,
+            "status": status,
+            "execution_ownership": dict(ownership or {}),
+        }
+    )[:24]
 
 
 def _operation_terminal_status(failure_code: str | None) -> str:

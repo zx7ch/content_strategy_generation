@@ -12,6 +12,7 @@ from app.content_research.persistence_models import (
     AggregateClaimRecord,
     ClaimAdmissionDecisionRecord,
     ClaimCandidateRecord,
+    CoverageManifest,
     CrossDirectionRecord,
     DirectionalEvidencePacketRecord,
     StageCheckpointRecord,
@@ -61,18 +62,29 @@ class CrossDirectionGovernanceService:
         research_plan_id: str,
         subagent_task_id: str,
         action_hypotheses: Iterable[ActionHypothesisRequest] = (),
+        manifest: CoverageManifest | None = None,
     ) -> GovernanceOutput:
         snapshot = self._store.get_run_policy_snapshot_for_workflow(workflow_run_id)
         if snapshot is None or snapshot.research_plan_id != research_plan_id:
             raise ValueError("governance requires the run's frozen policy snapshot")
-        claims = self._admitted_claims(workflow_run_id, snapshot.effective_policy)
+        if manifest is not None and manifest.workflow_run_id != workflow_run_id:
+            raise ValueError("governance manifest belongs to another workflow")
+        claims = self._admitted_claims(
+            workflow_run_id, snapshot.effective_policy, manifest=manifest
+        )
         hypotheses = tuple(action_hypotheses)
-        fingerprint = canonical_fingerprint({
-            "workflow_run_id": workflow_run_id,
-            "research_plan_id": research_plan_id,
-            "claims": [(item.candidate.id, item.decision.id) for item in claims],
-            "hypotheses": [(item.statement, item.claim_ids, item.derivation_method) for item in hypotheses],
-        })
+        fingerprint = canonical_fingerprint(
+            {
+                "workflow_run_id": workflow_run_id,
+                "research_plan_id": research_plan_id,
+                "claims": [(item.candidate.id, item.decision.id) for item in claims],
+                "execution_manifest": _manifest_identity(manifest),
+                "hypotheses": [
+                    (item.statement, item.claim_ids, item.derivation_method)
+                    for item in hypotheses
+                ],
+            }
+        )
         checkpoint_id = _checkpoint_id(workflow_run_id, subagent_task_id, "aggregate", fingerprint)
         existing = self._store.get_typed_record(StageCheckpointRecord, checkpoint_id)
         if existing is not None:
@@ -97,38 +109,79 @@ class CrossDirectionGovernanceService:
         for record in (*overlaps, *contradictions):
             if self._store.get_typed_record(CrossDirectionRecord, record.id) is None:
                 self._store.save_cross_direction_record(record)
-        reconcile_fingerprint = canonical_fingerprint({"aggregate_input": fingerprint, "kind": "reconcile"})
+        reconcile_fingerprint = canonical_fingerprint(
+            {"aggregate_input": fingerprint, "kind": "reconcile"}
+        )
         self._save_checkpoint(
-            workflow_run_id, subagent_task_id, "reconcile", reconcile_fingerprint,
+            workflow_run_id,
+            subagent_task_id,
+            "reconcile",
+            reconcile_fingerprint,
             {"cross_direction_record_ids": [item.id for item in (*overlaps, *contradictions)]},
             started_at=reconcile_started_at,
+            manifest=manifest,
         )
 
         aggregate_started_at = _utcnow()
         aggregates = self._aggregates(
-            research_plan_id, workflow_run_id, claims, contradictions, hypotheses,
+            research_plan_id,
+            workflow_run_id,
+            claims,
+            contradictions,
+            hypotheses,
         )
         for record in aggregates:
             if self._store.get_typed_record(AggregateClaimRecord, record.id) is None:
                 self._store.save_aggregate_claim(record)
         self._save_checkpoint(
-            workflow_run_id, subagent_task_id, "aggregate", fingerprint,
+            workflow_run_id,
+            subagent_task_id,
+            "aggregate",
+            fingerprint,
             {
                 "cross_direction_record_ids": [item.id for item in (*overlaps, *contradictions)],
                 "aggregate_claim_ids": [item.id for item in aggregates],
             },
             started_at=aggregate_started_at,
+            manifest=manifest,
         )
         return GovernanceOutput(overlaps, contradictions, aggregates, False)
 
-    def _admitted_claims(self, workflow_run_id: str, policy: dict[str, Any]) -> list[GovernedClaim]:
+    def _admitted_claims(
+        self,
+        workflow_run_id: str,
+        policy: dict[str, Any],
+        *,
+        manifest: CoverageManifest | None = None,
+    ) -> list[GovernedClaim]:
+        packet_ids = set(manifest.packet_ids) if manifest is not None else None
         candidates = {
             item.id: item for item in self._store.list_typed_records(ClaimCandidateRecord)
             if item.workflow_run_id == workflow_run_id
+            and (
+                manifest is None
+                or (
+                    item.scope_contract_id == manifest.scope_contract_id
+                    and item.execution_unit_id == manifest.execution_unit_id
+                    and item.attempt_no == manifest.attempt_no
+                    and item.execution_revision == manifest.execution_revision
+                    and item.evidence_packet_id in packet_ids
+                )
+            )
         }
         packets = {
             item.id: item for item in self._store.list_typed_records(DirectionalEvidencePacketRecord)
             if item.workflow_run_id == workflow_run_id
+            and (
+                manifest is None
+                or (
+                    item.id in packet_ids
+                    and item.scope_contract_id == manifest.scope_contract_id
+                    and item.execution_unit_id == manifest.execution_unit_id
+                    and item.attempt_no == manifest.attempt_no
+                    and item.execution_revision == manifest.execution_revision
+                )
+            )
         }
         result: list[GovernedClaim] = []
         for decision in self._store.list_typed_records(ClaimAdmissionDecisionRecord):
@@ -203,10 +256,49 @@ class CrossDirectionGovernanceService:
             records.append(_aggregate_record(plan_id, run_id, "action_hypothesis", request.claim_ids, tuple(sorted({item.canonical_source_id for item in members})), request.derivation_method, request.statement, members, hypothesis_only=True, request_origin=request.request_origin))
         return tuple(records)
 
-    def _save_checkpoint(self, run_id: str, task_id: str, stage: str, fingerprint: str, payload: dict[str, Any], *, started_at: datetime | None = None) -> None:
+    def _save_checkpoint(
+        self,
+        run_id: str,
+        task_id: str,
+        stage: str,
+        fingerprint: str,
+        payload: dict[str, Any],
+        *,
+        started_at: datetime | None = None,
+        manifest: CoverageManifest | None = None,
+    ) -> None:
         record_id = _checkpoint_id(run_id, task_id, stage, fingerprint)
         if self._store.get_typed_record(StageCheckpointRecord, record_id) is None:
-            self._store.save_stage_checkpoint(StageCheckpointRecord(record_id, "content_research_stage_checkpoint_v1", {"workflow_run_id": run_id, **payload}, workflow_run_id=run_id, subagent_task_id=task_id, stage_name=stage, input_fingerprint=fingerprint, status="completed", started_at=started_at, finished_at=_utcnow() if started_at else None))
+            self._store.save_stage_checkpoint(
+                StageCheckpointRecord(
+                    record_id,
+                    "content_research_stage_checkpoint_v1",
+                    {"workflow_run_id": run_id, **payload},
+                    workflow_run_id=run_id,
+                    subagent_task_id=task_id,
+                    stage_name=stage,
+                    input_fingerprint=fingerprint,
+                    status="completed",
+                    started_at=started_at,
+                    finished_at=_utcnow() if started_at else None,
+                    scope_contract_id=manifest.scope_contract_id if manifest else None,
+                    execution_unit_id=manifest.execution_unit_id if manifest else None,
+                    attempt_no=manifest.attempt_no if manifest else 0,
+                    execution_revision=manifest.execution_revision if manifest else 1,
+                )
+            )
+
+
+def _manifest_identity(manifest: CoverageManifest | None) -> dict[str, Any] | None:
+    if manifest is None:
+        return None
+    return {
+        "scope_contract_id": manifest.scope_contract_id,
+        "execution_unit_id": manifest.execution_unit_id,
+        "attempt_no": manifest.attempt_no,
+        "execution_revision": manifest.execution_revision,
+        "packet_ids": list(manifest.packet_ids),
+    }
 
 
 def _utcnow() -> datetime:

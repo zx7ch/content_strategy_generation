@@ -33,6 +33,7 @@ from app.content_research.persistence_models import (
     CanonicalSourceRecord,
     ClaimAdmissionDecisionRecord,
     ClaimCandidateRecord,
+    CoverageManifest,
     CrossDirectionRecord,
     DirectionalEvidencePacketRecord,
     DirectionResultDecisionRecord,
@@ -123,6 +124,18 @@ def _dumps_any_list(value: list[Any]) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
 
 
+def _coverage_manifest_payload(manifest: CoverageManifest) -> dict[str, Any]:
+    return {
+        "workflow_run_id": manifest.workflow_run_id,
+        "scope_contract_id": manifest.scope_contract_id,
+        "execution_unit_id": manifest.execution_unit_id,
+        "attempt_no": manifest.attempt_no,
+        "execution_revision": manifest.execution_revision,
+        "packet_ids": list(manifest.packet_ids),
+        "checkpoint_ids": list(manifest.checkpoint_ids),
+    }
+
+
 def _execution_decision_identity(
     *,
     coverage_snapshot_id: str,
@@ -170,6 +183,10 @@ _TYPED_RECORD_TABLES: dict[type[TypedPersistenceRecord], tuple[str, tuple[str, .
             "research_direction_id",
             "canonical_source_id",
             "field_projection_hash",
+            "scope_contract_id",
+            "execution_unit_id",
+            "attempt_no",
+            "execution_revision",
         ),
     ),
     ClaimCandidateRecord: (
@@ -182,6 +199,10 @@ _TYPED_RECORD_TABLES: dict[type[TypedPersistenceRecord], tuple[str, tuple[str, .
             "intent_id",
             "claim_type",
             "requested_state",
+            "scope_contract_id",
+            "execution_unit_id",
+            "attempt_no",
+            "execution_revision",
         ),
     ),
     ClaimAdmissionDecisionRecord: (
@@ -220,6 +241,10 @@ _TYPED_RECORD_TABLES: dict[type[TypedPersistenceRecord], tuple[str, tuple[str, .
             "retry_count",
             "started_at",
             "finished_at",
+            "scope_contract_id",
+            "execution_unit_id",
+            "attempt_no",
+            "execution_revision",
         ),
     ),
     BudgetLedgerEntryRecord: (
@@ -1005,6 +1030,127 @@ class SQLiteContentResearchStore:
             ).fetchall()
         return [self._row_to_scope_contract(row) for row in rows]
 
+    def initial_execution_eligibility(
+        self, workflow_run_id: str, scope_contract_id: str
+    ) -> bool:
+        """Return whether this Scope still owns the workflow's sole initial execution."""
+        with self._connect() as conn:
+            contract = conn.execute(
+                """SELECT 1 FROM content_research_scope_contracts
+                   WHERE workflow_run_id=? AND id=?""",
+                (workflow_run_id, scope_contract_id),
+            ).fetchone()
+            if contract is None:
+                return False
+            row = conn.execute(
+                """SELECT
+                    EXISTS(SELECT 1 FROM content_research_scope_coverage_snapshots
+                           WHERE workflow_run_id=?)
+                  OR EXISTS(SELECT 1 FROM content_research_scope_execution_authorizations
+                           WHERE workflow_run_id=?)
+                  OR EXISTS(SELECT 1 FROM content_research_scope_execution_units
+                           WHERE workflow_run_id=?)
+                  OR EXISTS(SELECT 1 FROM content_research_scope_execution_attempts AS attempt
+                              JOIN content_research_scope_execution_units AS unit
+                                ON unit.id=attempt.execution_unit_id
+                             WHERE unit.workflow_run_id=?)
+                  OR EXISTS(SELECT 1 FROM content_research_result_snapshots
+                           WHERE workflow_run_id=?)
+                  OR EXISTS(SELECT 1 FROM content_research_cross_direction_records AS record
+                              JOIN content_research_plans AS plan
+                                ON plan.id=record.research_plan_id
+                             WHERE plan.workflow_run_id=?)
+                  OR EXISTS(SELECT 1 FROM content_research_aggregate_claims AS record
+                              JOIN content_research_plans AS plan
+                                ON plan.id=record.research_plan_id
+                             WHERE plan.workflow_run_id=?)
+                  OR EXISTS(SELECT 1 FROM content_research_marketing_conclusion_candidates
+                           WHERE workflow_run_id=?)
+                  OR EXISTS(SELECT 1 FROM content_research_marketing_conclusion_decisions
+                           WHERE workflow_run_id=?)
+                  OR EXISTS(SELECT 1 FROM content_research_report_drafts
+                           WHERE workflow_run_id=?)
+                  OR EXISTS(SELECT 1 FROM content_research_report_faithfulness_decisions
+                           WHERE workflow_run_id=?)
+                  OR EXISTS(SELECT 1 FROM content_research_report_publications
+                           WHERE workflow_run_id=?) AS lineage_exists""",
+                (workflow_run_id,) * 12,
+            ).fetchone()
+        return not bool(row[0] if row else True)
+
+    @staticmethod
+    def _validate_coverage_manifest_in_transaction(
+        conn: sqlite3.Connection, snapshot: CoverageSnapshot
+    ) -> None:
+        manifest = snapshot.manifest
+        if manifest is None:
+            return
+        if snapshot.execution_authorization_id is None:
+            if manifest.execution_unit_id is not None or snapshot.source_coverage_snapshot_id:
+                raise ValueError("initial Coverage manifest cannot claim continuation lineage")
+        else:
+            authorization = conn.execute(
+                """SELECT scope_contract_id, execution_revision, coverage_snapshot_id,
+                          execution_unit_id
+                   FROM content_research_scope_execution_authorizations WHERE id=?""",
+                (snapshot.execution_authorization_id,),
+            ).fetchone()
+            if (
+                authorization is None
+                or authorization[0] != snapshot.scope_contract_id
+                or int(authorization[1]) != snapshot.execution_revision
+                or authorization[2] != snapshot.source_coverage_snapshot_id
+                or authorization[3] != manifest.execution_unit_id
+            ):
+                raise ValueError("Coverage manifest authorization lineage mismatch")
+        if manifest.execution_unit_id is not None:
+            attempt = conn.execute(
+                """SELECT attempt.state, attempt.provider_state, unit.scope_contract_id
+                   FROM content_research_scope_execution_attempts AS attempt
+                   JOIN content_research_scope_execution_units AS unit
+                     ON unit.id=attempt.execution_unit_id
+                   WHERE attempt.execution_unit_id=? AND attempt.attempt_no=?""",
+                (manifest.execution_unit_id, manifest.attempt_no),
+            ).fetchone()
+            if (
+                attempt is None
+                or attempt[0] != "running"
+                or attempt[1] != "succeeded"
+                or attempt[2] != manifest.scope_contract_id
+            ):
+                raise ValueError("Coverage manifest requires the matching successful attempt")
+
+        def validate_owned_ids(table: str, ids: tuple[str, ...], *, completed: bool) -> None:
+            if not ids:
+                return
+            placeholders = ", ".join("?" for _ in ids)
+            rows = conn.execute(
+                f"""SELECT id, workflow_run_id, scope_contract_id, execution_unit_id,
+                           attempt_no, execution_revision{', status' if completed else ''}
+                    FROM {table} WHERE id IN ({placeholders})""",
+                ids,
+            ).fetchall()
+            expected = set(ids)
+            if {str(row[0]) for row in rows} != expected:
+                raise ValueError("Coverage manifest references missing evidence")
+            for row in rows:
+                if (
+                    row[1] != manifest.workflow_run_id
+                    or row[2] != manifest.scope_contract_id
+                    or row[3] != manifest.execution_unit_id
+                    or int(row[4]) != manifest.attempt_no
+                    or int(row[5]) != manifest.execution_revision
+                    or (completed and row[6] != "completed")
+                ):
+                    raise ValueError("Coverage manifest evidence ownership mismatch")
+
+        validate_owned_ids(
+            "content_research_directional_evidence_packets", manifest.packet_ids, completed=False
+        )
+        validate_owned_ids(
+            "content_research_stage_checkpoints", manifest.checkpoint_ids, completed=True
+        )
+
     def save_coverage_snapshot(self, snapshot: CoverageSnapshot) -> CoverageSnapshot:
         try:
             with self._connect() as conn:
@@ -1014,13 +1160,15 @@ class SQLiteContentResearchStore:
                     scope_contract_id=snapshot.scope_contract_id,
                     scope_contract_version=snapshot.scope_contract_version,
                 )
+                self._validate_coverage_manifest_in_transaction(conn, snapshot)
                 conn.execute(
                     """INSERT INTO content_research_scope_coverage_snapshots
                        (id, workflow_run_id, scope_contract_id, scope_contract_version,
                         execution_revision, execution_authorization_id,
                         source_coverage_snapshot_id, state, constraint_counts_json,
-                        unmet_constraint_ids_json, created_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        unmet_constraint_ids_json, execution_unit_id, attempt_no,
+                        evidence_manifest_json, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         snapshot.id,
                         snapshot.workflow_run_id,
@@ -1032,6 +1180,11 @@ class SQLiteContentResearchStore:
                         snapshot.state,
                         _dumps(snapshot.constraint_counts),
                         _dumps_any_list(list(snapshot.unmet_constraint_ids)),
+                        snapshot.manifest.execution_unit_id if snapshot.manifest else None,
+                        snapshot.manifest.attempt_no if snapshot.manifest else 0,
+                        _dumps(_coverage_manifest_payload(snapshot.manifest))
+                        if snapshot.manifest
+                        else None,
                         _fmt_dt(snapshot.created_at),
                     ),
                 )
@@ -1083,13 +1236,15 @@ class SQLiteContentResearchStore:
                     scope_contract_id=snapshot.scope_contract_id,
                     scope_contract_version=snapshot.scope_contract_version,
                 )
+                self._validate_coverage_manifest_in_transaction(conn, snapshot)
                 conn.execute(
                     """INSERT INTO content_research_scope_coverage_snapshots
                        (id, workflow_run_id, scope_contract_id, scope_contract_version,
                         execution_revision, execution_authorization_id,
                         source_coverage_snapshot_id, state, constraint_counts_json,
-                        unmet_constraint_ids_json, created_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        unmet_constraint_ids_json, execution_unit_id, attempt_no,
+                        evidence_manifest_json, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         snapshot.id,
                         snapshot.workflow_run_id,
@@ -1101,6 +1256,11 @@ class SQLiteContentResearchStore:
                         snapshot.state,
                         _dumps(snapshot.constraint_counts),
                         _dumps_any_list(list(snapshot.unmet_constraint_ids)),
+                        snapshot.manifest.execution_unit_id if snapshot.manifest else None,
+                        snapshot.manifest.attempt_no if snapshot.manifest else 0,
+                        _dumps(_coverage_manifest_payload(snapshot.manifest))
+                        if snapshot.manifest
+                        else None,
                         _fmt_dt(snapshot.created_at),
                     ),
                 )
@@ -2841,6 +3001,10 @@ class SQLiteContentResearchStore:
                 "research_direction_id": record.research_direction_id,
                 "canonical_source_id": record.canonical_source_id,
                 "field_projection_hash": record.field_projection_hash,
+                "scope_contract_id": record.scope_contract_id,
+                "execution_unit_id": record.execution_unit_id,
+                "attempt_no": record.attempt_no,
+                "execution_revision": record.execution_revision,
             },
         )  # type: ignore[return-value]
 
@@ -2896,6 +3060,10 @@ class SQLiteContentResearchStore:
                     "research_direction_id",
                     "canonical_source_id",
                     "field_projection_hash",
+                    "scope_contract_id",
+                    "execution_unit_id",
+                    "attempt_no",
+                    "execution_revision",
                 ),
             )
             for row in rows
@@ -2923,6 +3091,10 @@ class SQLiteContentResearchStore:
                 "intent_id": record.intent_id,
                 "claim_type": record.claim_type,
                 "requested_state": record.requested_state,
+                "scope_contract_id": record.scope_contract_id,
+                "execution_unit_id": record.execution_unit_id,
+                "attempt_no": record.attempt_no,
+                "execution_revision": record.execution_revision,
             },
         )  # type: ignore[return-value]
 
@@ -2950,6 +3122,10 @@ class SQLiteContentResearchStore:
             "intent_id": record.intent_id,
             "claim_type": record.claim_type,
             "requested_state": record.requested_state,
+            "scope_contract_id": record.scope_contract_id,
+            "execution_unit_id": record.execution_unit_id,
+            "attempt_no": record.attempt_no,
+            "execution_revision": record.execution_revision,
         }
         try:
             with self._connect() as conn:
@@ -2983,6 +3159,10 @@ class SQLiteContentResearchStore:
             "intent_id",
             "claim_type",
             "requested_state",
+            "scope_contract_id",
+            "execution_unit_id",
+            "attempt_no",
+            "execution_revision",
         )
         return [self._row_to_typed_record(row, ClaimCandidateRecord, fields) for row in rows]  # type: ignore[return-value]
 
@@ -3119,6 +3299,10 @@ class SQLiteContentResearchStore:
             "retry_count": record.retry_count,
             "started_at": _fmt_dt(record.started_at) if record.started_at else None,
             "finished_at": _fmt_dt(record.finished_at) if record.finished_at else None,
+            "scope_contract_id": record.scope_contract_id,
+            "execution_unit_id": record.execution_unit_id,
+            "attempt_no": record.attempt_no,
+            "execution_revision": record.execution_revision,
         }
         columns = ("id", "schema_version", *values, "payload_json", "metadata_json", "created_at")
         placeholders = ", ".join("?" for _ in columns)
@@ -3445,6 +3629,11 @@ class SQLiteContentResearchStore:
 
     @staticmethod
     def _row_to_coverage_snapshot(row: sqlite3.Row) -> CoverageSnapshot:
+        manifest_payload = (
+            _loads(row["evidence_manifest_json"])
+            if "evidence_manifest_json" in row.keys() and row["evidence_manifest_json"]
+            else None
+        )
         return CoverageSnapshot(
             id=row["id"],
             workflow_run_id=row["workflow_run_id"],
@@ -3458,6 +3647,25 @@ class SQLiteContentResearchStore:
             execution_revision=row["execution_revision"],
             execution_authorization_id=row["execution_authorization_id"],
             source_coverage_snapshot_id=row["source_coverage_snapshot_id"],
+            manifest=(
+                CoverageManifest(
+                    workflow_run_id=str(manifest_payload["workflow_run_id"]),
+                    scope_contract_id=str(manifest_payload["scope_contract_id"]),
+                    execution_unit_id=(
+                        str(manifest_payload["execution_unit_id"])
+                        if manifest_payload.get("execution_unit_id")
+                        else None
+                    ),
+                    attempt_no=int(manifest_payload["attempt_no"]),
+                    execution_revision=int(manifest_payload["execution_revision"]),
+                    packet_ids=tuple(str(value) for value in manifest_payload["packet_ids"]),
+                    checkpoint_ids=tuple(
+                        str(value) for value in manifest_payload["checkpoint_ids"]
+                    ),
+                )
+                if manifest_payload is not None
+                else None
+            ),
             created_at=_parse_dt(row["created_at"]),
         )
 
