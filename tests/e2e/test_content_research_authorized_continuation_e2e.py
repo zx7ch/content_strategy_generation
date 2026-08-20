@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timedelta, timezone
+from typing import TypeAlias
 
 import httpx
 import pytest
@@ -13,6 +14,7 @@ from app.content_research.persistence_models import ReportPublicationRecord
 from app.content_research.presearch.service import PresearchService
 from app.content_research.service import ContentResearchService, WorkflowRunManagerRuntime
 from app.content_research.sources import SourceAdapterRegistry
+from app.content_research.sources.base import DiscoverCandidatesRequest, SourceOperationResult
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
 from app.content_research.worker import ContentResearchDispatchWorker
 from app.memory.thread_store import ThreadStore
@@ -36,7 +38,9 @@ class RecordingCapableFakeAdapter(CapableFakeAdapter):
         self.discover_started = asyncio.Event()
         self.release_discover = asyncio.Event()
 
-    async def discover_candidates(self, request):
+    async def discover_candidates(
+        self, request: DiscoverCandidatesRequest
+    ) -> SourceOperationResult:
         self.discover_queries.append(request.query)
         self.discover_contexts.append(dict(request.context))
         if self.pause_next_discover:
@@ -46,6 +50,15 @@ class RecordingCapableFakeAdapter(CapableFakeAdapter):
         if self.discover_exception is not None:
             raise self.discover_exception
         return await super().discover_candidates(request)
+
+
+ContinuationHarness: TypeAlias = tuple[
+    httpx.AsyncClient,
+    ContentResearchService,
+    ContentResearchDispatchWorker,
+    RecordingCapableFakeAdapter,
+    str,
+]
 
 
 @pytest.fixture()
@@ -362,8 +375,8 @@ async def test_failed_expand_replay_uses_a_new_worker_attempt_and_reaches_covera
 
 @pytest.mark.asyncio
 async def test_unknown_provider_outcome_is_durable_and_exact_replay_does_not_call_again(
-    continuation_harness,
-):
+    continuation_harness: ContinuationHarness,
+) -> None:
     """Replaying a request whose external outcome is unknown must never duplicate that call."""
     client, service, worker, adapter, db_path = continuation_harness
     workflow_run_id, _scope, coverage_snapshot_id = await _confirmed_scope_awaiting_coverage(
@@ -417,8 +430,8 @@ async def test_unknown_provider_outcome_is_durable_and_exact_replay_does_not_cal
 
 @pytest.mark.asyncio
 async def test_terminal_provider_failure_is_not_requeued_by_exact_replay(
-    continuation_harness,
-):
+    continuation_harness: ContinuationHarness,
+) -> None:
     client, service, worker, adapter, db_path = continuation_harness
     workflow_run_id, _scope, coverage_snapshot_id = await _confirmed_scope_awaiting_coverage(
         client, worker, db_path
@@ -463,7 +476,7 @@ async def test_terminal_provider_failure_is_not_requeued_by_exact_replay(
 
 @pytest.mark.asyncio
 async def test_limited_report_without_owned_publication_remains_recoverable(
-    continuation_harness,
+    continuation_harness: ContinuationHarness,
 ) -> None:
     """A runtime status alone cannot terminalize an execution unit as completed."""
     client, service, worker, _adapter, db_path = continuation_harness
@@ -507,8 +520,8 @@ async def test_limited_report_without_owned_publication_remains_recoverable(
 
 @pytest.mark.asyncio
 async def test_stale_execution_claim_is_fenced_before_any_continuation_artifact(
-    continuation_harness,
-):
+    continuation_harness: ContinuationHarness,
+) -> None:
     """A superseded worker claim must fail before task recovery or task creation writes."""
     client, service, worker, adapter, db_path = continuation_harness
     workflow_run_id, _scope, coverage_snapshot_id = await _confirmed_scope_awaiting_coverage(
@@ -559,7 +572,7 @@ async def test_stale_execution_claim_is_fenced_before_any_continuation_artifact(
 
 @pytest.mark.asyncio
 async def test_real_worker_late_provider_callback_cannot_mutate_after_takeover(
-    continuation_harness,
+    continuation_harness: ContinuationHarness,
 ) -> None:
     """A worker that passed its entry check cannot write after a real takeover."""
     client, service, worker_a, adapter, db_path = continuation_harness

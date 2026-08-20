@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 import threading
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -17,6 +20,7 @@ from app.content_research.scope_contract import (
     ExecutionLeaseFencedError,
     ScopeAuditEvent,
     ScopeConstraint,
+    ScopeExecutionAttempt,
     ScopeExecutionAuthorization,
     ScopeExecutionContinuation,
     ScopeQueryGroupInput,
@@ -62,14 +66,18 @@ class FailingContinuationService(FakeContinuationService):
 class ExecutionUnitContinuationService(FakeFormalResearchService):
     def __init__(self) -> None:
         super().__init__()
-        self.executions = []
+        self.executions: list[tuple[ScopeExecutionAttempt, ScopeExecutionContinuation]] = []
 
-    async def execute_execution_unit(self, claim, continuation):
+    async def execute_execution_unit(
+        self, claim: ScopeExecutionAttempt, continuation: ScopeExecutionContinuation
+    ) -> str:
         self.executions.append((claim, continuation))
         return "completed"
 
 
-def _save_execution_unit_continuation(store: SQLiteContentResearchStore):
+def _save_execution_unit_continuation(
+    store: SQLiteContentResearchStore,
+) -> tuple[ScopeExecutionAuthorization, ScopeExecutionContinuation]:
     contract = build_scope_contract(
         workflow_run_id="run-execution-context",
         research_plan_id="plan-execution-context",
@@ -221,7 +229,7 @@ async def test_worker_claims_persisted_scope_continuation_with_its_queries(tmp_p
 
 
 @pytest.mark.asyncio
-async def test_worker_passes_the_claimed_execution_attempt_to_the_service(tmp_path):
+async def test_worker_passes_the_claimed_execution_attempt_to_the_service(tmp_path: Path) -> None:
     """Dropping the attempt claim must fail before an authorized continuation can execute."""
     store = SQLiteContentResearchStore(str(tmp_path / "execution-context.db"))
     authorization, continuation = _save_execution_unit_continuation(store)
@@ -428,7 +436,7 @@ async def test_stale_async_session_cannot_overwrite_recovered_checkpoint(tmp_pat
 
 @pytest.mark.asyncio
 async def test_live_context_write_serializes_takeover_and_rejects_later_stale_checkpoint(
-    tmp_path,
+    tmp_path: Path,
 ) -> None:
     """A takeover cannot interleave between the live predicate and its domain insert."""
     db_path = str(tmp_path / "atomic-execution-write.db")
@@ -436,12 +444,18 @@ async def test_live_context_write_serializes_takeover_and_rejects_later_stale_ch
     release_insert = threading.Event()
 
     class BlockingSQLiteContentResearchStore(SQLiteContentResearchStore):
-        def _raw_connect(self):
-            conn = super()._raw_connect()
+        def _raw_connect(self) -> sqlite3.Connection:
+            conn = cast(sqlite3.Connection, super()._raw_connect())
+
+            def block_execution_checkpoint_insert() -> int:
+                entered_insert.set()
+                release_insert.wait(timeout=5)
+                return 1
+
             conn.create_function(
                 "block_execution_checkpoint_insert",
                 0,
-                lambda: (entered_insert.set(), release_insert.wait(timeout=5), 1)[-1],
+                block_execution_checkpoint_insert,
             )
             return conn
 
