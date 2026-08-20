@@ -648,7 +648,9 @@ async def test_real_worker_late_provider_callback_cannot_mutate_after_takeover(
 
     assert durable_domain_state() == after_takeover
     assert len(adapter.discover_queries) == 1
-    assert service._store.get_scope_execution_unit(unit_id).state == "outcome_unknown"
+    execution_unit = service._store.get_scope_execution_unit(unit_id)
+    assert execution_unit is not None
+    assert execution_unit.state == "outcome_unknown"
     assert any(
         fact.kind == "lease_fenced" and fact.attempt_no == 0
         for fact in service._store.execution_trace(unit_id)

@@ -26,6 +26,7 @@ from app.content_research.scope_contract import (
     ScopeQueryGroupInput,
     build_scope_contract,
 )
+from app.content_research.service import ContentResearchService
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
 from app.content_research.worker import ContentResearchDispatchWorker
 
@@ -234,7 +235,10 @@ async def test_worker_passes_the_claimed_execution_attempt_to_the_service(tmp_pa
     store = SQLiteContentResearchStore(str(tmp_path / "execution-context.db"))
     authorization, continuation = _save_execution_unit_continuation(store)
     service = ExecutionUnitContinuationService()
-    worker = ContentResearchDispatchWorker(store=store, service_factory=lambda: service)
+    worker = ContentResearchDispatchWorker(
+        store=store,
+        service_factory=lambda: cast(ContentResearchService, service),
+    )
 
     assert await worker.run_once() is True
 
