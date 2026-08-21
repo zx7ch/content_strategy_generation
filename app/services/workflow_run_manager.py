@@ -1029,7 +1029,17 @@ class WorkflowRunManager:
                 thread_id=row["thread_id"],
                 event_type="run_failed",
                 event_level="error",
-                payload={"error_code": code, "error_message": message},
+                payload={
+                    "error_code": code,
+                    "error_message": message,
+                    **(
+                        {"publication_id": error["publication_id"]}
+                        if isinstance(error, dict)
+                        and isinstance(error.get("publication_id"), str)
+                        and error["publication_id"]
+                        else {}
+                    ),
+                },
             )
             return self._run(await self._fetch_run_row(run_id))
 

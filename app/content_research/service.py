@@ -199,6 +199,14 @@ class ContentResearchReportIntegrityError(RuntimeError):
     """Raised when an existing published report cannot be safely projected."""
 
 
+class _ReportPublicationMaterializationError(RuntimeError):
+    """Carry the exact persisted publication across the materialization boundary."""
+
+    def __init__(self, publication_id: str, cause: Exception) -> None:
+        super().__init__(str(cause) or "Report publication failed.")
+        self.publication_id = publication_id
+
+
 class WorkflowRuntime(Protocol):
     async def start_presearch_run(self, *, thread_id: str, user_id: str, seed_text: str) -> str: ...
 
@@ -3433,30 +3441,41 @@ class ContentResearchService:
         request: ContentResearchSourceCollectionRequest,
     ) -> ContentResearchFormalResearchResponse:
         """Re-materialize a report after a safe, terminal publication failure."""
-        await self._workflow_runtime.retry_failed_report_publication(
-            workflow_run_id=workflow_run_id
+        events = await self._workflow_runtime.list_events(workflow_run_id)
+        latest_failure = next(
+            (event for event in reversed(events) if event.get("event_type") == "run_failed"),
+            {},
+        )
+        failure_payload = latest_failure.get("payload_json") or {}
+        failed_publication_id = (
+            failure_payload.get("publication_id")
+            if failure_payload.get("error_code") == "report_publication_failed"
+            and isinstance(failure_payload.get("publication_id"), str)
+            and failure_payload.get("publication_id")
+            else None
         )
         brief = self._store.get_brief_by_workflow(workflow_run_id)
         if brief is None:
             raise ContentResearchNotFoundError(
                 f"Content research workflow not found: {workflow_run_id}"
             )
-        try:
-            publications = sorted(
-                (
-                    item
-                    for item in self._store.list_typed_records(ReportPublicationRecord)
-                    if item.workflow_run_id == workflow_run_id
-                    and _publication_lineage_is_materializable(self._store, item)
-                ),
-                key=lambda item: (item.created_at, item.id),
-                reverse=True,
+        publication = (
+            self._store.get_typed_record(ReportPublicationRecord, failed_publication_id)
+            if failed_publication_id is not None
+            else None
+        )
+        if (
+            publication is None
+            or publication.workflow_run_id != workflow_run_id
+            or not _publication_lineage_is_materializable(self._store, publication)
+        ):
+            raise ContentResearchValidationError(
+                "Report publication retry requires the exact persisted failed publication"
             )
-            if not publications:
-                raise ContentResearchValidationError(
-                    "Report publication retry requires the persisted failed publication"
-                )
-            publication = publications[0]
+        await self._workflow_runtime.retry_failed_report_publication(
+            workflow_run_id=workflow_run_id
+        )
+        try:
             artifact = await ReportPublicationMaterializer(
                 self._store, self._store._db_path
             ).materialize(publication.id)
@@ -3478,6 +3497,7 @@ class ContentResearchService:
                 reason={
                     "code": "report_publication_failed",
                     "message": str(exc) or "Report publication failed.",
+                    "publication_id": publication.id,
                 },
             )
             raise
@@ -4952,6 +4972,7 @@ class ContentResearchService:
                 task_outcomes=outcomes,
                 artifact_refs=artifact_refs,
             )
+            report_artifact_ref = None
             try:
                 self._require_live_execution_context(execution_context, "report_publication")
                 # The report artifact is produced while finalizing_report.  It
@@ -4978,12 +4999,20 @@ class ContentResearchService:
                             dispatch_context=dispatch_context,
                         ).publish_timeline_message(report_artifact_ref["id"])
             except Exception as exc:
+                failed_publication_id = (
+                    report_artifact_ref["id"]
+                    if report_artifact_ref is not None
+                    else getattr(exc, "publication_id", None)
+                )
+                failure_reason = {
+                    "code": "report_publication_failed",
+                    "message": str(exc) or "Report publication failed.",
+                }
+                if failed_publication_id is not None:
+                    failure_reason["publication_id"] = failed_publication_id
                 await self._workflow_runtime.fail_formal_research(
                     workflow_run_id=brief.workflow_run_id,
-                    reason={
-                        "code": "report_publication_failed",
-                        "message": str(exc) or "Report publication failed.",
-                    },
+                    reason=failure_reason,
                 )
                 raise
             if report_artifact_ref is not None:
@@ -5385,12 +5414,17 @@ class ContentResearchService:
             None,
         )
         if existing_publication is not None:
-            artifact = await ReportPublicationMaterializer(
-                self._store,
-                self._store._db_path,
-                execution_context=execution_context,
-                dispatch_context=dispatch_context,
-            ).materialize(existing_publication.id)
+            try:
+                artifact = await ReportPublicationMaterializer(
+                    self._store,
+                    self._store._db_path,
+                    execution_context=execution_context,
+                    dispatch_context=dispatch_context,
+                ).materialize(existing_publication.id)
+            except Exception as exc:
+                raise _ReportPublicationMaterializationError(
+                    existing_publication.id, exc
+                ) from exc
             return {
                 "type": "content_research_report_publication",
                 "id": existing_publication.id,
@@ -5410,12 +5444,15 @@ class ContentResearchService:
             if item.id == snapshot_response.snapshot_id
         )
         publication = await self._report_execution.execute(snapshot, self._report_semantic_auditor)
-        artifact = await ReportPublicationMaterializer(
-            self._store,
-            self._store._db_path,
-            execution_context=execution_context,
-            dispatch_context=dispatch_context,
-        ).materialize(publication.id)
+        try:
+            artifact = await ReportPublicationMaterializer(
+                self._store,
+                self._store._db_path,
+                execution_context=execution_context,
+                dispatch_context=dispatch_context,
+            ).materialize(publication.id)
+        except Exception as exc:
+            raise _ReportPublicationMaterializationError(publication.id, exc) from exc
         return {
             "type": "content_research_report_publication",
             "id": publication.id,

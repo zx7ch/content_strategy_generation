@@ -251,7 +251,7 @@ async def test_publication_dedupe_keeps_identical_nonempty_claims_distinct_acros
 async def test_failed_materialization_retry_reuses_the_exact_persisted_execution_publication(
     tmp_path,
 ):
-    """Recomposing without the original lease context must not create a legacy report."""
+    """A newer valid publication must not replace the exact failed publication on retry."""
     db_path = str(tmp_path / "failed-materialization-lineage-retry.db")
     store = SQLiteContentResearchStore(db_path)
     async with ThreadStore(db_path) as threads:
@@ -265,10 +265,6 @@ async def test_failed_materialization_retry_reuses_the_exact_persisted_execution
         await manager.start_step(run.run_id, "formal_research")
         await manager.complete_step(run.run_id, "formal_research")
         await manager.begin_report_finalization(run.run_id)
-        await manager.fail_run(
-            run.run_id,
-            {"code": "report_publication_failed", "message": "artifact write failed"},
-        )
     brief = ResearchBriefRecord(
         id="rb_publication_retry",
         workflow_run_id=run.run_id,
@@ -371,6 +367,94 @@ async def test_failed_materialization_retry_reuses_the_exact_persisted_execution
     store.save_report_draft(draft.to_record())
     store.save_report_faithfulness_decision(decision.to_record())
     store.save_report_publication(publication.to_record())
+
+    async with WorkflowRunManager(db_path) as manager:
+        await manager.fail_run(
+            run.run_id,
+            {
+                "code": "report_publication_failed",
+                "message": "artifact write failed",
+                "publication_id": publication.id,
+            },
+        )
+
+    newer_scope = build_scope_contract(
+        workflow_run_id=run.run_id,
+        research_plan_id="rp_1",
+        version=2,
+        constraints=(ScopeConstraint("core_object", "核心对象", "短袖衬衫", "required"),),
+        query_groups=(ScopeQueryGroupInput("短袖衬衫", "短袖衬衫"),),
+    )
+    store.save_scope_contract(newer_scope)
+    newer_coverage = CoverageSnapshot(
+        id="scv_publication_retry_newer",
+        workflow_run_id=run.run_id,
+        scope_contract_id=newer_scope.id,
+        scope_contract_version=newer_scope.version,
+        state="awaiting_scope_decision",
+        constraint_counts={},
+        unmet_constraint_ids=("core_object",),
+    )
+    store.save_coverage_snapshot(newer_coverage)
+    newer_unit, _created = store.resolve_coverage_to_execution_unit_atomically(
+        snapshot=newer_coverage,
+        decision={"resolution": "generate_limited_report"},
+    )
+    newer_attempt = store.claim_execution_unit(
+        execution_unit_id=newer_unit.id,
+        owner="worker-2",
+    )
+    assert newer_attempt is not None
+    newer_governed = {
+        **governed,
+        "execution_lineage": {
+            "scope_contract_id": newer_scope.id,
+            "execution_unit_id": newer_unit.id,
+            "coverage_snapshot_id": newer_coverage.id,
+            "successful_attempt_no": newer_attempt.attempt_no,
+        },
+        "scope_contract": {"id": newer_scope.id, "version": newer_scope.version},
+        "coverage_snapshot": {
+            "id": newer_coverage.id,
+            "state": newer_coverage.state,
+        },
+        "execution_trace": {
+            "execution_unit_id": newer_unit.id,
+            "attempt_no": newer_attempt.attempt_no,
+            "outcome_state": "not_requested",
+            "facts": [],
+        },
+    }
+    newer_snapshot = replace(
+        snapshot,
+        id="rps_publication_retry_newer",
+        metadata={
+            "governed_snapshot": newer_governed,
+            "governed_input_fingerprint": _governed_input_fingerprint(newer_governed),
+        },
+    )
+    newer_draft = ResearchReportComposer().compose(newer_snapshot)
+    newer_decision = replace(
+        _decision(newer_draft),
+        workflow_run_id=run.run_id,
+        scope_contract_id=newer_draft.scope_contract_id,
+        execution_unit_id=newer_draft.execution_unit_id,
+        coverage_snapshot_id=newer_draft.coverage_snapshot_id,
+        attempt_no=newer_draft.attempt_no,
+    )
+    newer_publication = replace(
+        _publication(newer_draft, newer_decision, compose_mode="template_only"),
+        workflow_run_id=run.run_id,
+        scope_contract_id=newer_draft.scope_contract_id,
+        execution_unit_id=newer_draft.execution_unit_id,
+        coverage_snapshot_id=newer_draft.coverage_snapshot_id,
+        attempt_no=newer_draft.attempt_no,
+    )
+    store.save_result_snapshot(newer_snapshot)
+    store.save_report_draft(newer_draft.to_record())
+    store.save_report_faithfulness_decision(newer_decision.to_record())
+    store.save_report_publication(newer_publication.to_record())
+
     service = ContentResearchService(
         store=store,
         presearch=None,
@@ -389,16 +473,29 @@ async def test_failed_materialization_retry_reuses_the_exact_persisted_execution
         for item in store.list_typed_records(ReportPublicationRecord)
         if item.workflow_run_id == run.run_id
     ]
-    assert [item.id for item in persisted] == [publication.id]
+    assert {item.id for item in persisted} == {publication.id, newer_publication.id}
     assert (
-        persisted[0].scope_contract_id,
-        persisted[0].execution_unit_id,
-        persisted[0].coverage_snapshot_id,
-        persisted[0].attempt_no,
+        publication.scope_contract_id,
+        publication.execution_unit_id,
+        publication.coverage_snapshot_id,
+        publication.attempt_no,
     ) == (scope.id, unit.id, coverage.id, attempt.attempt_no)
-    report = await PublishedReportReader(store, db_path).read(workflow_run_id=run.run_id)
+    report = await PublishedReportReader(store, db_path).read(
+        workflow_run_id=run.run_id,
+        publication_id=publication.id,
+    )
     assert report["publication"]["report_publication_id"] == publication.id
     assert report["scope_contract_id"] == scope.id
+    async with WorkflowRunManager(db_path) as manager:
+        events = await manager.list_events(run.run_id)
+        runtime_snapshot = await manager.get_run_snapshot(run.run_id)
+    failure = next(event for event in events if event.event_type == "run_failed")
+    assert failure.payload_json["publication_id"] == publication.id
+    assert [
+        (artifact.get("payload_json") or {}).get("report_publication_id")
+        for artifact in runtime_snapshot["artifacts"]
+        if (artifact.get("payload_json") or {}).get("report_publication_id") is not None
+    ] == [publication.id]
 
 
 @pytest.mark.asyncio
