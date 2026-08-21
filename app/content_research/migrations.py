@@ -1374,10 +1374,42 @@ _V29_EXECUTION_LINEAGE_INDEXES = (
     "CREATE INDEX idx_cr_checkpoint_execution_lineage ON content_research_stage_checkpoints(workflow_run_id, scope_contract_id, execution_unit_id, attempt_no, execution_revision)",
 )
 
+_V30_REPORT_LINEAGE_COLUMNS = {
+    "content_research_report_drafts": (
+        "scope_contract_id TEXT",
+        "execution_unit_id TEXT",
+        "coverage_snapshot_id TEXT",
+        "attempt_no INTEGER",
+    ),
+    "content_research_report_faithfulness_decisions": (
+        "scope_contract_id TEXT",
+        "execution_unit_id TEXT",
+        "coverage_snapshot_id TEXT",
+        "attempt_no INTEGER",
+    ),
+    "content_research_report_publications": (
+        "scope_contract_id TEXT",
+        "execution_unit_id TEXT",
+        "coverage_snapshot_id TEXT",
+        "attempt_no INTEGER",
+    ),
+}
+
+_V30_REPORT_LINEAGE_INDEXES = (
+    "CREATE INDEX idx_cr_report_draft_execution_lineage ON content_research_report_drafts(workflow_run_id, scope_contract_id, execution_unit_id, attempt_no)",
+    "CREATE INDEX idx_cr_report_publication_execution_lineage ON content_research_report_publications(workflow_run_id, scope_contract_id, execution_unit_id, attempt_no)",
+)
+
 
 def _apply_0029(conn: sqlite3.Connection) -> None:
     _add_columns(conn, _V29_EXECUTION_LINEAGE_COLUMNS)
     for statement in _V29_EXECUTION_LINEAGE_INDEXES:
+        conn.execute(statement)
+
+
+def _apply_0030(conn: sqlite3.Connection) -> None:
+    _add_columns(conn, _V30_REPORT_LINEAGE_COLUMNS)
+    for statement in _V30_REPORT_LINEAGE_INDEXES:
         conn.execute(statement)
 
 
@@ -1446,6 +1478,9 @@ def _expected_checksums(migration_0002_sql: str, legacy_checksum: str) -> dict[s
         "0028": _checksum("minimal_execution_decision_identity_v1"),
         "0029": _checksum(
             (_V29_EXECUTION_LINEAGE_COLUMNS, _V29_EXECUTION_LINEAGE_INDEXES)
+        ),
+        "0030": _checksum(
+            (_V30_REPORT_LINEAGE_COLUMNS, _V30_REPORT_LINEAGE_INDEXES)
         ),
     }
 
@@ -1729,6 +1764,13 @@ def apply_content_research_migrations(
                 name="execution_lineage_owned_evidence",
                 checksum=expected_checksums["0029"],
                 apply=lambda: _apply_0029(conn),
+            )
+            _apply_migration(
+                conn,
+                version="0030",
+                name="report_execution_lineage",
+                checksum=expected_checksums["0030"],
+                apply=lambda: _apply_0030(conn),
             )
         except Exception:
             conn.rollback()

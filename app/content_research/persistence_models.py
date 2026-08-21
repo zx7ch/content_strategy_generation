@@ -46,6 +46,25 @@ def _validate_execution_ownership(
         raise ValueError("execution unit ownership requires a Scope contract")
 
 
+def _validate_report_lineage(
+    *,
+    scope_contract_id: str | None,
+    execution_unit_id: str | None,
+    coverage_snapshot_id: str | None,
+    attempt_no: int | None,
+) -> None:
+    values = (scope_contract_id, execution_unit_id, coverage_snapshot_id, attempt_no)
+    if all(value is None for value in values):
+        return
+    if any(value is None for value in values):
+        raise ValueError("report execution lineage must be complete")
+    if not all(
+        isinstance(value, str) and value.strip()
+        for value in (scope_contract_id, execution_unit_id, coverage_snapshot_id)
+    ) or not isinstance(attempt_no, int) or isinstance(attempt_no, bool) or attempt_no < 0:
+        raise ValueError("report execution lineage is invalid")
+
+
 @dataclass(frozen=True)
 class ExecutionOwnership:
     """Typed identity shared by execution-owned persisted records."""
@@ -473,6 +492,10 @@ class ReportDraftRecord(TypedPersistenceRecord):
     policy_version: str = ""
     algorithm_version: str = ""
     previous_version_id: str | None = None
+    scope_contract_id: str | None = None
+    execution_unit_id: str | None = None
+    coverage_snapshot_id: str | None = None
+    attempt_no: int | None = None
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -485,6 +508,12 @@ class ReportDraftRecord(TypedPersistenceRecord):
             self.input_fingerprint,
             self.policy_version,
             self.algorithm_version,
+        )
+        _validate_report_lineage(
+            scope_contract_id=self.scope_contract_id,
+            execution_unit_id=self.execution_unit_id,
+            coverage_snapshot_id=self.coverage_snapshot_id,
+            attempt_no=self.attempt_no,
         )
 
 
@@ -499,6 +528,10 @@ class ReportFaithfulnessDecisionRecord(TypedPersistenceRecord):
     algorithm_version: str = ""
     report_draft_id: str = ""
     previous_version_id: str | None = None
+    scope_contract_id: str | None = None
+    execution_unit_id: str | None = None
+    coverage_snapshot_id: str | None = None
+    attempt_no: int | None = None
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -512,6 +545,12 @@ class ReportFaithfulnessDecisionRecord(TypedPersistenceRecord):
             self.policy_version,
             self.algorithm_version,
             self.report_draft_id,
+        )
+        _validate_report_lineage(
+            scope_contract_id=self.scope_contract_id,
+            execution_unit_id=self.execution_unit_id,
+            coverage_snapshot_id=self.coverage_snapshot_id,
+            attempt_no=self.attempt_no,
         )
 
 
@@ -528,6 +567,10 @@ class ReportPublicationRecord(TypedPersistenceRecord):
     faithfulness_decision_id: str = ""
     publication_state: str = ""
     previous_version_id: str | None = None
+    scope_contract_id: str | None = None
+    execution_unit_id: str | None = None
+    coverage_snapshot_id: str | None = None
+    attempt_no: int | None = None
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -551,3 +594,9 @@ class ReportPublicationRecord(TypedPersistenceRecord):
             "evidence_only_report",
         }:
             raise ValueError("invalid report publication state")
+        _validate_report_lineage(
+            scope_contract_id=self.scope_contract_id,
+            execution_unit_id=self.execution_unit_id,
+            coverage_snapshot_id=self.coverage_snapshot_id,
+            attempt_no=self.attempt_no,
+        )

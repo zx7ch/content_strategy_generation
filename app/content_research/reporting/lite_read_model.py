@@ -78,7 +78,6 @@ class LiteReportReader:
         publication_id: str | None = None,
         citation_group_ids: list[str] | None = None,
     ) -> dict[str, Any]:
-        scope_projection = self._scope_projection(workflow_run_id)
         try:
             report = await self._published.read(
                 workflow_run_id=workflow_run_id,
@@ -111,7 +110,17 @@ class LiteReportReader:
         projection = self._published_projection(
             report, citation_group_ids=citation_group_ids
         )
-        if scope_projection is not None:
+        if report.get("scope_contract_id"):
+            coverage = report.get("coverage_snapshot")
+            coverage = coverage if isinstance(coverage, dict) else {}
+            projection["status_strip"]["report_mode"] = (
+                "limited"
+                if coverage.get("state") == "awaiting_scope_decision"
+                else "normal"
+            )
+        else:
+            scope_projection = self._scope_projection(workflow_run_id)
+        if not report.get("scope_contract_id") and scope_projection is not None:
             projection = self._apply_scope_projection(projection, scope_projection)
             self._record_scope_projection(workflow_run_id, scope_projection)
         return projection
@@ -484,11 +493,31 @@ class LiteReportReader:
 def _frozen_scope(report: dict[str, Any]) -> dict[str, Any]:
     release = report.get("release") if isinstance(report.get("release"), dict) else {}
     publication = report.get("publication") if isinstance(report.get("publication"), dict) else {}
-    return {
+    scope = report.get("scope_contract")
+    scope = scope if isinstance(scope, dict) else {}
+    coverage = report.get("coverage_snapshot")
+    coverage = coverage if isinstance(coverage, dict) else {}
+    frozen = {
         "direction_set_version": release.get("direction_set_version"),
         "direction_ids": list(release.get("direction_ids") or []),
         "report_compose_mode": publication.get("compose_mode") or "prose",
     }
+    if report.get("scope_contract_id"):
+        frozen.update(
+            {
+                "scope_contract_id": report.get("scope_contract_id"),
+                "scope_contract_version": scope.get("version"),
+                "query_groups": list(scope.get("query_groups") or []),
+                "coverage_snapshot_id": coverage.get("id"),
+                "constraint_counts": dict(coverage.get("constraint_counts") or {}),
+                "unmet_constraint_ids": list(
+                    coverage.get("unmet_constraint_ids") or []
+                ),
+                "execution_unit_id": publication.get("execution_unit_id"),
+                "attempt_no": publication.get("attempt_no"),
+            }
+        )
+    return frozen
 
 
 def _scope_limitations(contract: Any, snapshot: Any) -> list[dict[str, Any]]:

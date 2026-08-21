@@ -113,9 +113,13 @@ from app.content_research.reporting.faithfulness import (
 )
 from app.content_research.reporting.lite_read_model import LiteReportReader
 from app.content_research.reporting.publication_materializer import ReportPublicationMaterializer
-from app.content_research.reporting.read_model import PublishedReportNotFoundError
+from app.content_research.reporting.read_model import (
+    ExecutionTraceReader,
+    PublishedReportNotFoundError,
+)
 from app.content_research.runtime import canonical_fingerprint
 from app.content_research.scope_contract import (
+    CoverageSnapshot,
     DispatchLeaseContext,
     ExecutionContext,
     ExecutionLeaseFencedError,
@@ -1879,6 +1883,8 @@ class ContentResearchService:
         *,
         result_type: str = "topic_research",
         manifest: CoverageManifest | None = None,
+        coverage_snapshot: CoverageSnapshot | None = None,
+        execution_context: ExecutionContext | None = None,
     ) -> SnapshotResponse:
         brief = self._store.get_brief_by_workflow(workflow_run_id)
         if brief is None:
@@ -1895,6 +1901,8 @@ class ContentResearchService:
             plan_id=plan.id if plan else None,
             direction_records=direction_records,
             manifest=manifest,
+            coverage_snapshot=coverage_snapshot,
+            execution_context=execution_context,
         )
         governed_input_fingerprint = _governed_input_fingerprint(governed)
         snapshot = ResearchResultSnapshotRecord(
@@ -2252,6 +2260,8 @@ class ContentResearchService:
         plan_id: str | None,
         direction_records: list[ResearchDirectionRecord],
         manifest: CoverageManifest | None = None,
+        coverage_snapshot: CoverageSnapshot | None = None,
+        execution_context: ExecutionContext | None = None,
     ) -> dict[str, Any]:
         policy = self._store.get_run_policy_snapshot_for_workflow(workflow_run_id)
         if policy is None:
@@ -2472,6 +2482,62 @@ class ContentResearchService:
             or item["recovery_actions"]
             or item["state"] != "formal_directional_result"
         ]
+        frozen_execution: dict[str, Any] = {}
+        if execution_context is not None:
+            if coverage_snapshot is None:
+                raise ContentResearchValidationError(
+                    "Governed report snapshot requires explicit execution Coverage lineage"
+                )
+            unit = self._store.get_scope_execution_unit(
+                execution_context.execution_unit_id
+            )
+            attempt = self._store.get_scope_execution_attempt(
+                execution_context.execution_unit_id, execution_context.attempt_no
+            )
+            contract = next(
+                (
+                    item
+                    for item in self._store.list_scope_contracts(workflow_run_id)
+                    if item.id == execution_context.scope_contract_id
+                ),
+                None,
+            )
+            coverage_owned = (
+                unit is not None
+                and (
+                    unit.coverage_snapshot_id == coverage_snapshot.id
+                    or coverage_snapshot.manifest is not None
+                    and coverage_snapshot.manifest.execution_unit_id == unit.id
+                    and coverage_snapshot.manifest.attempt_no == execution_context.attempt_no
+                )
+            )
+            if (
+                unit is None
+                or unit.workflow_run_id != workflow_run_id
+                or unit.scope_contract_id != execution_context.scope_contract_id
+                or attempt is None
+                or contract is None
+                or coverage_snapshot.workflow_run_id != workflow_run_id
+                or coverage_snapshot.scope_contract_id != manifest.scope_contract_id
+                or not coverage_owned
+            ):
+                raise ContentResearchValidationError(
+                    "Governed report snapshot execution lineage is not owned"
+                )
+            frozen_execution = {
+                "execution_lineage": {
+                    "scope_contract_id": contract.id,
+                    "execution_unit_id": unit.id,
+                    "coverage_snapshot_id": coverage_snapshot.id,
+                    "successful_attempt_no": execution_context.attempt_no,
+                },
+                "scope_contract": _scope_contract_payload(contract),
+                "coverage_snapshot": _coverage_snapshot_payload(coverage_snapshot),
+                "execution_trace": {
+                    **ExecutionTraceReader(self._store).read(unit.id),
+                    "attempt_no": execution_context.attempt_no,
+                },
+            }
         return {
             "schema_version": "content_research_governed_snapshot_v2",
             "workflow_execution_state": workflow_execution_state,
@@ -2536,6 +2602,7 @@ class ContentResearchService:
             "faithfulness_audit": {"state": "pending"},
             "executive_summary": _governed_summary(claim_cards, publication_state),
             "research_plan_id": plan_id,
+            **frozen_execution,
         }
 
     def get_governance_read_model(
@@ -5281,6 +5348,8 @@ class ContentResearchService:
             plan_id=plans[-1].id,
             direction_records=direction_records,
             manifest=manifest,
+            coverage_snapshot=coverage,
+            execution_context=execution_context,
         )
         governed_input_fingerprint = _governed_input_fingerprint(governed)
         matching_snapshot_ids = {
@@ -5316,6 +5385,8 @@ class ContentResearchService:
             workflow_run_id,
             result_type="governed_research_report",
             manifest=manifest,
+            coverage_snapshot=coverage,
+            execution_context=execution_context,
         )
         snapshot = next(
             item
@@ -6019,6 +6090,7 @@ def _checkpoint_summary(
 def _governed_input_fingerprint(governed: dict[str, Any]) -> str:
     return canonical_fingerprint(
         {
+            "execution_lineage": governed.get("execution_lineage"),
             "policy_scope": governed["policy_scope"],
             "research_plan_id": governed["research_plan_id"],
             "direction_results": governed["direction_results"],

@@ -17,6 +17,7 @@ from app.content_research.reporting.faithfulness import (
     UnavailableReportSemanticAuditor,
 )
 from app.content_research.reporting.publication_materializer import ReportPublicationMaterializer
+from app.content_research.reporting.read_model import ExecutionTraceReader
 
 __all__ = [
     "CitationAnchor",
@@ -27,6 +28,7 @@ __all__ = [
     "ResearchReportComposer",
     "ReportExecutionService",
     "ReportPublicationMaterializer",
+    "ExecutionTraceReader",
     "FaithfulnessEvaluation",
     "ReportFaithfulnessEvaluator",
     "ReportSemanticAuditor",

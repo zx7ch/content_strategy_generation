@@ -1,4 +1,3 @@
-import sqlite3
 from dataclasses import replace
 
 import httpx
@@ -10,7 +9,16 @@ from app.content_research.contracts import build_default_snapshot
 from app.content_research.models import ResearchBriefRecord
 from app.content_research.persistence_models import StageCheckpointRecord
 from app.content_research.reporting.composer import ResearchReportComposer
+from app.content_research.reporting.lite_read_model import LiteReportReader
 from app.content_research.reporting.publication_materializer import ReportPublicationMaterializer
+from app.content_research.reporting.read_model import PublishedReportReader
+from app.content_research.scope_contract import (
+    CoverageSnapshot,
+    ScopeConstraint,
+    ScopeQueryGroupInput,
+    build_scope_contract,
+)
+from app.content_research.service import _governed_input_fingerprint
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
 from app.memory.thread_store import ThreadStore
 from app.services.workflow_run_manager import WorkflowRunManager
@@ -19,6 +27,226 @@ from tests.integration.test_content_research_report_store import (
     _publication,
 )
 from tests.unit.test_content_research_report_composer import _snapshot as _governed_snapshot
+
+
+@pytest.mark.asyncio
+async def test_selected_historical_publication_freezes_semantic_scope_coverage_and_trace(
+    tmp_path,
+):
+    """Dropping report lineage from identity/readback must collapse R1 into latest Scope."""
+    db_path = str(tmp_path / "historical-publication-lineage.db")
+    store = SQLiteContentResearchStore(db_path)
+    async with ThreadStore(db_path) as threads:
+        thread = await threads.create_thread(title="历史报告")
+    async with WorkflowRunManager(db_path) as manager:
+        run = await manager.start_run(thread_id=thread["id"], user_id="user-1")
+
+    scopes = (
+        build_scope_contract(
+            workflow_run_id=run.run_id,
+            research_plan_id="rp_1",
+            version=1,
+            constraints=(
+                ScopeConstraint("core_object", "核心对象", "长袖衬衫", "required"),
+                ScopeConstraint("season", "季节", "夏季", "required"),
+            ),
+            query_groups=(
+                ScopeQueryGroupInput("夏季 长袖衬衫", "夏季 长袖衬衫"),
+            ),
+        ),
+        build_scope_contract(
+            workflow_run_id=run.run_id,
+            research_plan_id="rp_1",
+            version=2,
+            constraints=(
+                ScopeConstraint("core_object", "核心对象", "长袖衬衫", "required"),
+                ScopeConstraint("season", "季节", "夏季", "preferred"),
+            ),
+            query_groups=(
+                ScopeQueryGroupInput("通勤 长袖衬衫", "通勤 长袖衬衫"),
+            ),
+        ),
+    )
+    base = _governed_snapshot()
+    base_governed = base.metadata["governed_snapshot"]
+    snapshots = []
+    coverages = []
+    publications = []
+    for index, scope in enumerate(scopes, start=1):
+        store.save_scope_contract(scope)
+        coverage = CoverageSnapshot(
+            id=f"scv_historical_{index}",
+            workflow_run_id=run.run_id,
+            scope_contract_id=scope.id,
+            scope_contract_version=scope.version,
+            state="awaiting_scope_decision",
+            constraint_counts={
+                "_summary": {
+                    "minimum_samples": 1,
+                    "minimum_independent_authors": 1,
+                    "reason_codes": ["required_constraint_coverage_unmet:season"],
+                }
+            },
+            unmet_constraint_ids=("season",),
+        )
+        store.save_coverage_snapshot(coverage)
+        unit, created = store.resolve_coverage_to_execution_unit_atomically(
+            snapshot=coverage,
+            decision={"resolution": "generate_limited_report"},
+        )
+        assert created is True
+        claim = store.claim_execution_unit(execution_unit_id=unit.id, owner=f"worker-{index}")
+        assert claim is not None
+        frozen_trace = {
+            "execution_unit_id": unit.id,
+            "attempt_no": claim.attempt_no,
+            "outcome_state": "not_requested",
+            "facts": [
+                {
+                    "attempt_no": fact.attempt_no,
+                    "sequence_no": fact.sequence_no,
+                    "kind": fact.kind,
+                    "payload": {},
+                }
+                for fact in store.execution_trace(unit.id)
+            ],
+        }
+        scope_payload = {
+            "id": scope.id,
+            "version": scope.version,
+            "constraints": [
+                {"id": item.id, "value": item.value, "mode": item.mode}
+                for item in scope.constraints
+            ],
+            "query_groups": [
+                {"id": item.id, "final_query": item.final_query}
+                for item in scope.query_groups
+            ],
+        }
+        coverage_payload = {
+            "id": coverage.id,
+            "state": coverage.state,
+            "constraint_counts": coverage.constraint_counts,
+            "unmet_constraint_ids": list(coverage.unmet_constraint_ids),
+        }
+        governed = {
+            **base_governed,
+            "research_plan_id": "rp_1",
+            "policy_scope": {
+                **base_governed["policy_scope"],
+                "direction_set_version": "direction_set_historical",
+                "direction_ids": ["product_marketing"],
+                "report_compose_mode": "template_only",
+            },
+            "direction_results": [],
+            "claim_cards": [],
+            "citation_groups": [],
+            "weak_signals": [],
+            "cross_direction_records": [],
+            "aggregate_claims": [],
+            "marketing_conclusions": [],
+            "execution_lineage": {
+                "scope_contract_id": scope.id,
+                "execution_unit_id": unit.id,
+                "coverage_snapshot_id": coverage.id,
+                "successful_attempt_no": claim.attempt_no,
+            },
+            "scope_contract": scope_payload,
+            "coverage_snapshot": coverage_payload,
+            "execution_trace": frozen_trace,
+        }
+        snapshot = replace(
+            base,
+            id=f"rrs_historical_{index}",
+            workflow_run_id=run.run_id,
+            snapshot_version=str(index),
+            metadata={
+                "governed_snapshot": governed,
+                "governed_input_fingerprint": _governed_input_fingerprint(governed),
+            },
+        )
+        draft = ResearchReportComposer().compose(snapshot)
+        decision = replace(
+            _decision(draft),
+            workflow_run_id=run.run_id,
+            scope_contract_id=draft.scope_contract_id,
+            execution_unit_id=draft.execution_unit_id,
+            coverage_snapshot_id=draft.coverage_snapshot_id,
+            attempt_no=draft.attempt_no,
+        )
+        publication = replace(
+            _publication(draft, decision, compose_mode="template_only"),
+            workflow_run_id=run.run_id,
+            scope_contract_id=draft.scope_contract_id,
+            execution_unit_id=draft.execution_unit_id,
+            coverage_snapshot_id=draft.coverage_snapshot_id,
+            attempt_no=draft.attempt_no,
+        )
+        store.save_result_snapshot(snapshot)
+        store.save_report_draft(draft.to_record())
+        store.save_report_faithfulness_decision(decision.to_record())
+        store.save_report_publication(publication.to_record())
+        snapshots.append(snapshot)
+        coverages.append(coverage)
+        publications.append(publication)
+
+    assert snapshots[0].metadata["governed_input_fingerprint"] != snapshots[1].metadata[
+        "governed_input_fingerprint"
+    ]
+    assert publications[0].id != publications[1].id
+
+    foreign_coverage_publication = replace(
+        publications[1].to_record(),
+        id="rpp_foreign_coverage",
+        coverage_snapshot_id=coverages[0].id,
+    )
+    with pytest.raises(ValueError, match="report.*lineage mismatch"):
+        store.save_report_publication(foreign_coverage_publication)
+
+    async with WorkflowRunManager(db_path) as manager:
+        await manager.begin_report_finalization(run.run_id)
+    materializer = ReportPublicationMaterializer(store, db_path)
+    for publication in publications:
+        await materializer.materialize(publication.id)
+    async with WorkflowRunManager(db_path) as manager:
+        await manager.complete_report_finalization(run.run_id)
+
+    reader = PublishedReportReader(store, db_path)
+    first = await reader.read(
+        workflow_run_id=run.run_id,
+        publication_id=publications[0].id,
+    )
+    second = await reader.read(
+        workflow_run_id=run.run_id,
+        publication_id=publications[1].id,
+    )
+
+    assert first["scope_contract_id"] == scopes[0].id
+    assert second["scope_contract_id"] == scopes[1].id
+    assert first["scope_contract"]["constraints"][1]["mode"] == "required"
+    assert second["scope_contract"]["constraints"][1]["mode"] == "preferred"
+    assert first["coverage_snapshot"]["id"] == "scv_historical_1"
+    assert second["coverage_snapshot"]["id"] == "scv_historical_2"
+    assert first["trace"]["execution"]["execution_unit_id"] != second["trace"][
+        "execution"
+    ]["execution_unit_id"]
+
+    lite_first = await LiteReportReader(store, db_path).read(
+        workflow_run_id=run.run_id,
+        publication_id=publications[0].id,
+    )
+    lite_second = await LiteReportReader(store, db_path).read(
+        workflow_run_id=run.run_id,
+        publication_id=publications[1].id,
+    )
+    assert lite_first["frozen_scope"]["scope_contract_id"] == scopes[0].id
+    assert lite_second["frozen_scope"]["scope_contract_id"] == scopes[1].id
+    assert lite_first["frozen_scope"]["coverage_snapshot_id"] == coverages[0].id
+    assert lite_second["frozen_scope"]["coverage_snapshot_id"] == coverages[1].id
+    assert lite_first["publication"]["execution_unit_id"] != lite_second["publication"][
+        "execution_unit_id"
+    ]
+    assert lite_first["publication"]["attempt_no"] == 0
 
 
 @pytest.mark.asyncio

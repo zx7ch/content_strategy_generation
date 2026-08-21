@@ -28,6 +28,7 @@ class ResearchReportComposer:
             snapshot.metadata.get("governed_input_fingerprint"), "governed_input_fingerprint"
         )
         policy_scope = _required_mapping(governed.get("policy_scope"), "policy_scope")
+        lineage = _report_lineage(governed)
         policy_version = _required_string(policy_scope.get("effective_policy_hash"), "effective_policy_hash")
         citation_groups = _citation_groups(governed.get("citation_groups"))
         claim_cards = _mapping_list(governed.get("claim_cards"), "claim_cards")
@@ -69,6 +70,7 @@ class ResearchReportComposer:
                 governed_snapshot_id=snapshot.id, governed_snapshot_version=snapshot.snapshot_version,
                 input_fingerprint=input_fingerprint, policy_version=policy_version,
                 algorithm_version=_COMPOSER_ALGORITHM_VERSION, sections=tuple(sections),
+                **lineage,
             )
         tension = self._tensions(snapshot, cross_records, claim_citations)
         if tension is not None:
@@ -89,6 +91,7 @@ class ResearchReportComposer:
             policy_version=policy_version,
             algorithm_version=_COMPOSER_ALGORITHM_VERSION,
             sections=tuple(sections),
+            **lineage,
         )
 
     def _marketing_sections(
@@ -272,6 +275,50 @@ def _required_mapping(value: object, field_name: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"governed snapshot requires {field_name}")
     return value
+
+
+def _report_lineage(governed: dict[str, Any]) -> dict[str, Any]:
+    value = governed.get("execution_lineage")
+    if value is None:
+        return {
+            "scope_contract_id": None,
+            "execution_unit_id": None,
+            "coverage_snapshot_id": None,
+            "attempt_no": None,
+        }
+    lineage = _required_mapping(value, "execution_lineage")
+    scope_contract_id = _required_string(
+        lineage.get("scope_contract_id"), "execution_lineage.scope_contract_id"
+    )
+    execution_unit_id = _required_string(
+        lineage.get("execution_unit_id"), "execution_lineage.execution_unit_id"
+    )
+    coverage_snapshot_id = _required_string(
+        lineage.get("coverage_snapshot_id"), "execution_lineage.coverage_snapshot_id"
+    )
+    attempt_no = lineage.get("successful_attempt_no")
+    if isinstance(attempt_no, bool) or not isinstance(attempt_no, int) or attempt_no < 0:
+        raise ValueError(
+            "governed snapshot requires execution_lineage.successful_attempt_no"
+        )
+    scope = _required_mapping(governed.get("scope_contract"), "scope_contract")
+    coverage = _required_mapping(governed.get("coverage_snapshot"), "coverage_snapshot")
+    trace = _required_mapping(governed.get("execution_trace"), "execution_trace")
+    if scope.get("id") != scope_contract_id:
+        raise ValueError("governed snapshot Scope execution lineage mismatch")
+    if coverage.get("id") != coverage_snapshot_id:
+        raise ValueError("governed snapshot Coverage execution lineage mismatch")
+    if (
+        trace.get("execution_unit_id") != execution_unit_id
+        or trace.get("attempt_no") != attempt_no
+    ):
+        raise ValueError("governed snapshot trace execution lineage mismatch")
+    return {
+        "scope_contract_id": scope_contract_id,
+        "execution_unit_id": execution_unit_id,
+        "coverage_snapshot_id": coverage_snapshot_id,
+        "attempt_no": attempt_no,
+    }
 
 
 def _mapping_list(value: object, field_name: str) -> list[dict[str, Any]]:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from typing import Any
 
@@ -12,6 +13,7 @@ from app.content_research.persistence_models import (
     ReportPublicationRecord,
     StageCheckpointRecord,
 )
+from app.content_research.scope_contract import thaw_execution_payload
 from app.content_research.stores.base import ContentResearchStore
 from app.memory.workflow_store import WorkflowStore
 from app.models.workflow import WorkflowArtifactType
@@ -19,6 +21,113 @@ from app.models.workflow import WorkflowArtifactType
 
 class PublishedReportNotFoundError(ValueError):
     """Raised when a run-scoped published report cannot be resolved safely."""
+
+
+_SAFE_EXECUTION_FACT_FIELDS = frozenset(
+    {
+        "provider",
+        "provider_operation",
+        "operation",
+        "operation_fingerprint",
+        "source_kind",
+        "result_status",
+        "provider_state",
+        "status",
+        "failure_code",
+        "retryable",
+        "reason",
+        "coverage_snapshot_id",
+        "publication_id",
+        "report_publication_id",
+    }
+)
+
+
+class ExecutionTraceReader:
+    """Project one execution unit solely from its ordered durable facts."""
+
+    def __init__(self, store: ContentResearchStore) -> None:
+        self._store = store
+
+    def read(self, execution_unit_id: str) -> dict[str, Any]:
+        unit = self._store.get_scope_execution_unit(execution_unit_id)
+        if unit is None:
+            raise PublishedReportNotFoundError("execution unit not found")
+        facts = self._store.execution_trace(execution_unit_id)
+        sequence = [fact.sequence_no for fact in facts]
+        if sequence != sorted(sequence) or len(sequence) != len(set(sequence)):
+            raise PublishedReportNotFoundError("execution facts are not monotonic")
+
+        outcome_state = "not_requested"
+        for fact in facts:
+            payload = thaw_execution_payload(fact.payload)
+            payload = payload if isinstance(payload, dict) else {}
+            if fact.kind == "provider_request_recorded":
+                outcome_state = "outcome_unknown"
+            elif fact.kind == "provider_outcome_recorded":
+                outcome_state = str(
+                    payload.get("provider_state")
+                    or payload.get("result_status")
+                    or "outcome_unknown"
+                )
+            elif fact.kind == "outcome_unknown":
+                outcome_state = "outcome_unknown"
+
+        return {
+            "execution_unit_id": unit.id,
+            "scope_contract_id": unit.scope_contract_id,
+            "coverage_snapshot_id": unit.coverage_snapshot_id,
+            "state": unit.state,
+            "outcome_state": outcome_state,
+            "facts": [
+                {
+                    "attempt_no": fact.attempt_no,
+                    "sequence_no": fact.sequence_no,
+                    "kind": fact.kind,
+                    "payload": _safe_execution_fact_payload(fact.kind, fact.payload),
+                }
+                for fact in facts
+            ],
+        }
+
+
+def _safe_execution_fact_payload(kind: str, value: object) -> dict[str, Any]:
+    payload = thaw_execution_payload(value)
+    if not isinstance(payload, dict):
+        return {}
+    if kind == "decision_accepted":
+        decision = payload.get("decision")
+        if isinstance(decision, str):
+            try:
+                decision = json.loads(decision)
+            except (TypeError, json.JSONDecodeError):
+                decision = None
+        if not isinstance(decision, dict):
+            return {}
+        return {
+            "decision": safe_public_projection(
+                {
+                    key: item
+                    for key, item in decision.items()
+                    if key
+                    in {
+                        "schema",
+                        "coverage_snapshot_id",
+                        "source_scope_contract_id",
+                        "resulting_scope_contract_id",
+                        "resolution",
+                        "target_constraint_id",
+                        "supplementary_queries",
+                    }
+                }
+            )
+        }
+    return {
+        key: safe_public_projection(item)
+        for key, item in payload.items()
+        if key in _SAFE_EXECUTION_FACT_FIELDS
+        and (item is None or isinstance(item, str | int | float | bool))
+    }
 
 
 class PublishedReportReader:
@@ -69,6 +178,9 @@ class PublishedReportReader:
         if not isinstance(governed, dict):
             raise PublishedReportNotFoundError("published report governed snapshot is missing")
         policy_scope = governed.get("policy_scope") if isinstance(governed.get("policy_scope"), dict) else {}
+        execution_lineage = governed.get("execution_lineage")
+        if not isinstance(execution_lineage, dict):
+            execution_lineage = {}
         direction_ids = list(policy_scope.get("direction_ids") or [])
         direction_results = {
             item.get("direction_id"): item
@@ -77,6 +189,11 @@ class PublishedReportReader:
         }
         return {
             "workflow_run_id": workflow_run_id,
+            "scope_contract_id": execution_lineage.get("scope_contract_id"),
+            "scope_contract": safe_public_projection(governed.get("scope_contract") or {}),
+            "coverage_snapshot": safe_public_projection(
+                governed.get("coverage_snapshot") or {}
+            ),
             "workflow_terminal_state": terminal_state,
             "publication_state": publication.publication_state,
             "artifact": {
@@ -96,6 +213,10 @@ class PublishedReportReader:
                 "omitted_section_ids": list(publication.payload.get("omitted_section_ids") or []),
                 "audit_recovery_state": publication.payload.get("audit_recovery_state"),
                 "compose_mode": publication.payload.get("compose_mode") or "prose",
+                "scope_contract_id": publication.scope_contract_id,
+                "execution_unit_id": publication.execution_unit_id,
+                "coverage_snapshot_id": publication.coverage_snapshot_id,
+                "attempt_no": publication.attempt_no,
             },
             "sections": safe_public_projection(sections),
             "citation_groups": [_citation_group(group) for group in page],
@@ -124,7 +245,10 @@ class PublishedReportReader:
                 }
                 for direction_id in direction_ids
             ],
-            "trace": _trace_projection(self._store, publication, decision),
+            "trace": {
+                **_trace_projection(self._store, publication, decision),
+                "execution": safe_public_projection(governed.get("execution_trace") or {}),
+            },
         }
 
     async def citation_groups(
@@ -215,6 +339,10 @@ class PublishedReportReader:
             "input_fingerprint",
             "policy_version",
             "algorithm_version",
+            "scope_contract_id",
+            "execution_unit_id",
+            "coverage_snapshot_id",
+            "attempt_no",
         )
         if any(getattr(publication, field) != getattr(decision, field) for field in fields):
             raise PublishedReportNotFoundError("published report audit lineage mismatch")
@@ -223,6 +351,18 @@ class PublishedReportReader:
             or snapshot.research_plan_id != publication.research_plan_id
         ):
             raise PublishedReportNotFoundError("published report snapshot lineage mismatch")
+        governed = snapshot.metadata.get("governed_snapshot")
+        lineage = governed.get("execution_lineage") if isinstance(governed, dict) else None
+        if publication.execution_unit_id is not None and (
+            not isinstance(lineage, dict)
+            or lineage.get("scope_contract_id") != publication.scope_contract_id
+            or lineage.get("execution_unit_id") != publication.execution_unit_id
+            or lineage.get("coverage_snapshot_id") != publication.coverage_snapshot_id
+            or lineage.get("successful_attempt_no") != publication.attempt_no
+        ):
+            raise PublishedReportNotFoundError(
+                "published report frozen execution lineage mismatch"
+            )
 
     async def _artifact(self, publication: ReportPublicationRecord) -> tuple[Any, str]:
         async with WorkflowStore(self._db_path) as workflow_store:

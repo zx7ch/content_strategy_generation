@@ -271,6 +271,10 @@ _TYPED_RECORD_TABLES: dict[type[TypedPersistenceRecord], tuple[str, tuple[str, .
             "policy_version",
             "algorithm_version",
             "previous_version_id",
+            "scope_contract_id",
+            "execution_unit_id",
+            "coverage_snapshot_id",
+            "attempt_no",
         ),
     ),
     ReportFaithfulnessDecisionRecord: (
@@ -285,6 +289,10 @@ _TYPED_RECORD_TABLES: dict[type[TypedPersistenceRecord], tuple[str, tuple[str, .
             "algorithm_version",
             "report_draft_id",
             "previous_version_id",
+            "scope_contract_id",
+            "execution_unit_id",
+            "coverage_snapshot_id",
+            "attempt_no",
         ),
     ),
     ReportPublicationRecord: (
@@ -301,6 +309,10 @@ _TYPED_RECORD_TABLES: dict[type[TypedPersistenceRecord], tuple[str, tuple[str, .
             "faithfulness_decision_id",
             "publication_state",
             "previous_version_id",
+            "scope_contract_id",
+            "execution_unit_id",
+            "coverage_snapshot_id",
+            "attempt_no",
         ),
     ),
 }
@@ -2992,7 +3004,7 @@ class SQLiteContentResearchStore:
         workflow_run_id: str,
         research_plan_id: str,
         snapshot_version: str,
-    ) -> None:
+    ) -> ResearchResultSnapshotRecord:
         snapshot = self.get_result_snapshot(snapshot_id)
         if snapshot is None:
             raise ValueError(f"missing governed snapshot: {snapshot_id}")
@@ -3002,6 +3014,88 @@ class SQLiteContentResearchStore:
             or snapshot.snapshot_version != snapshot_version
         ):
             raise ValueError("governed snapshot identity does not match report record")
+        return snapshot
+
+    def _validate_report_execution_lineage(
+        self,
+        record: ReportDraftRecord | ReportFaithfulnessDecisionRecord | ReportPublicationRecord,
+        snapshot: ResearchResultSnapshotRecord,
+    ) -> None:
+        frozen = snapshot.metadata.get("governed_snapshot")
+        frozen = frozen if isinstance(frozen, dict) else {}
+        frozen_lineage = frozen.get("execution_lineage")
+        fields = (
+            "scope_contract_id",
+            "execution_unit_id",
+            "coverage_snapshot_id",
+            "attempt_no",
+        )
+        record_lineage = tuple(getattr(record, field) for field in fields)
+        if all(value is None for value in record_lineage):
+            if frozen_lineage is not None:
+                raise ValueError("report record is missing frozen execution lineage")
+            return
+        if not isinstance(frozen_lineage, dict):
+            raise ValueError("report record execution lineage lacks a frozen snapshot lineage")
+        expected = (
+            frozen_lineage.get("scope_contract_id"),
+            frozen_lineage.get("execution_unit_id"),
+            frozen_lineage.get("coverage_snapshot_id"),
+            frozen_lineage.get("successful_attempt_no"),
+        )
+        if record_lineage != expected:
+            raise ValueError("report record and frozen snapshot execution lineage mismatch")
+        scope = frozen.get("scope_contract")
+        coverage_payload = frozen.get("coverage_snapshot")
+        trace = frozen.get("execution_trace")
+        if (
+            not isinstance(scope, dict)
+            or scope.get("id") != record.scope_contract_id
+            or not isinstance(coverage_payload, dict)
+            or coverage_payload.get("id") != record.coverage_snapshot_id
+            or not isinstance(trace, dict)
+            or trace.get("execution_unit_id") != record.execution_unit_id
+            or trace.get("attempt_no") != record.attempt_no
+        ):
+            raise ValueError("report frozen Scope, Coverage, or trace lineage mismatch")
+        unit = self.get_scope_execution_unit(str(record.execution_unit_id))
+        coverage = self.get_coverage_snapshot_by_id(str(record.coverage_snapshot_id))
+        attempt = self.get_scope_execution_attempt(
+            str(record.execution_unit_id), int(record.attempt_no)
+        )
+        coverage_owned = coverage is not None and (
+            unit is not None
+            and unit.coverage_snapshot_id == coverage.id
+            or coverage.manifest is not None
+            and coverage.manifest.execution_unit_id == record.execution_unit_id
+            and coverage.manifest.attempt_no == record.attempt_no
+        )
+        if (
+            unit is None
+            or unit.workflow_run_id != record.workflow_run_id
+            or unit.scope_contract_id != record.scope_contract_id
+            or coverage is None
+            or coverage.workflow_run_id != record.workflow_run_id
+            or coverage.scope_contract_id != record.scope_contract_id
+            or not coverage_owned
+            or attempt is None
+        ):
+            raise ValueError("report execution lineage is not owned by its Scope/Coverage unit")
+
+    @staticmethod
+    def _validate_report_parent_lineage(
+        record: ReportFaithfulnessDecisionRecord | ReportPublicationRecord,
+        parent: ReportDraftRecord | ReportFaithfulnessDecisionRecord,
+        name: str,
+    ) -> None:
+        fields = (
+            "scope_contract_id",
+            "execution_unit_id",
+            "coverage_snapshot_id",
+            "attempt_no",
+        )
+        if any(getattr(record, field) != getattr(parent, field) for field in fields):
+            raise ValueError(f"report {name} execution lineage mismatch")
 
     def _get_typed_record(
         self,
@@ -3513,12 +3607,13 @@ class SQLiteContentResearchStore:
         )  # type: ignore[return-value]
 
     def save_report_draft(self, record: ReportDraftRecord) -> ReportDraftRecord:
-        self._require_result_snapshot(
+        snapshot = self._require_result_snapshot(
             record.governed_snapshot_id,
             record.workflow_run_id,
             record.research_plan_id,
             record.governed_snapshot_version,
         )
+        self._validate_report_execution_lineage(record, snapshot)
         return self._save_typed_record(
             "content_research_report_drafts",
             record,
@@ -3531,21 +3626,29 @@ class SQLiteContentResearchStore:
                 "policy_version": record.policy_version,
                 "algorithm_version": record.algorithm_version,
                 "previous_version_id": record.previous_version_id,
+                "scope_contract_id": record.scope_contract_id,
+                "execution_unit_id": record.execution_unit_id,
+                "coverage_snapshot_id": record.coverage_snapshot_id,
+                "attempt_no": record.attempt_no,
             },
         )  # type: ignore[return-value]
 
     def save_report_faithfulness_decision(
         self, record: ReportFaithfulnessDecisionRecord
     ) -> ReportFaithfulnessDecisionRecord:
-        self._require_result_snapshot(
+        snapshot = self._require_result_snapshot(
             record.governed_snapshot_id,
             record.workflow_run_id,
             record.research_plan_id,
             record.governed_snapshot_version,
         )
+        self._validate_report_execution_lineage(record, snapshot)
         self._require_typed_parent(
             "content_research_report_drafts", record.report_draft_id, "report draft"
         )
+        draft = self.get_typed_record(ReportDraftRecord, record.report_draft_id)
+        assert draft is not None
+        self._validate_report_parent_lineage(record, draft, "faithfulness decision")
         return self._save_typed_record(
             "content_research_report_faithfulness_decisions",
             record,
@@ -3559,16 +3662,21 @@ class SQLiteContentResearchStore:
                 "algorithm_version": record.algorithm_version,
                 "report_draft_id": record.report_draft_id,
                 "previous_version_id": record.previous_version_id,
+                "scope_contract_id": record.scope_contract_id,
+                "execution_unit_id": record.execution_unit_id,
+                "coverage_snapshot_id": record.coverage_snapshot_id,
+                "attempt_no": record.attempt_no,
             },
         )  # type: ignore[return-value]
 
     def save_report_publication(self, record: ReportPublicationRecord) -> ReportPublicationRecord:
-        self._require_result_snapshot(
+        snapshot = self._require_result_snapshot(
             record.governed_snapshot_id,
             record.workflow_run_id,
             record.research_plan_id,
             record.governed_snapshot_version,
         )
+        self._validate_report_execution_lineage(record, snapshot)
         self._require_typed_parent(
             "content_research_report_drafts", record.report_draft_id, "report draft"
         )
@@ -3577,6 +3685,13 @@ class SQLiteContentResearchStore:
             record.faithfulness_decision_id,
             "report faithfulness decision",
         )
+        draft = self.get_typed_record(ReportDraftRecord, record.report_draft_id)
+        decision = self.get_typed_record(
+            ReportFaithfulnessDecisionRecord, record.faithfulness_decision_id
+        )
+        assert draft is not None and decision is not None
+        self._validate_report_parent_lineage(record, draft, "publication")
+        self._validate_report_parent_lineage(record, decision, "publication")
         return self._save_typed_record(
             "content_research_report_publications",
             record,
@@ -3592,6 +3707,10 @@ class SQLiteContentResearchStore:
                 "faithfulness_decision_id": record.faithfulness_decision_id,
                 "publication_state": record.publication_state,
                 "previous_version_id": record.previous_version_id,
+                "scope_contract_id": record.scope_contract_id,
+                "execution_unit_id": record.execution_unit_id,
+                "coverage_snapshot_id": record.coverage_snapshot_id,
+                "attempt_no": record.attempt_no,
             },
         )  # type: ignore[return-value]
 

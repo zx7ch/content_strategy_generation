@@ -9,6 +9,7 @@ from app.content_research.contracts import build_default_snapshot
 from app.content_research.migrations import apply_content_research_migrations
 from app.content_research.models import ResearchBriefRecord
 from app.content_research.persistence_models import StageCheckpointRecord
+from app.content_research.reporting import read_model as report_read_model
 from app.content_research.reporting.composer import ResearchReportComposer
 from app.content_research.reporting.lite_read_model import (
     LiteReportReader,
@@ -31,6 +32,127 @@ from app.memory.workflow_store import WorkflowStore
 from app.services.workflow_run_manager import WorkflowRunManager
 from tests.integration.test_content_research_report_store import _decision, _publication
 from tests.unit.test_content_research_report_composer import _snapshot
+
+
+def test_execution_trace_reader_reports_unknown_request_outcome_and_fenced_fact(tmp_path):
+    """Trusting mutable unit state must not invent provider success without an outcome fact."""
+    db_path = str(tmp_path / "durable-execution-trace.db")
+    store = SQLiteContentResearchStore(db_path)
+    contract = build_scope_contract(
+        workflow_run_id="run_durable_trace",
+        research_plan_id="rp_durable_trace",
+        version=1,
+        constraints=(
+            ScopeConstraint("core_object", "核心对象", "长袖衬衫", "required"),
+            ScopeConstraint("season", "季节", "夏季", "required"),
+        ),
+        query_groups=(
+            ScopeQueryGroupInput("夏季 长袖衬衫", "夏季 长袖衬衫"),
+        ),
+    )
+    store.save_scope_contract(contract)
+    coverage = CoverageSnapshot(
+        id="scv_durable_trace",
+        workflow_run_id=contract.workflow_run_id,
+        scope_contract_id=contract.id,
+        scope_contract_version=contract.version,
+        state="awaiting_scope_decision",
+        constraint_counts={},
+        unmet_constraint_ids=("season",),
+    )
+    store.save_coverage_snapshot(coverage)
+    unit, _created = store.resolve_coverage_to_execution_unit_atomically(
+        snapshot=coverage,
+        decision={"resolution": "generate_limited_report"},
+    )
+    claim = store.claim_execution_unit(execution_unit_id=unit.id, owner="worker-secret")
+    assert claim is not None and claim.lease_token is not None
+    assert store.record_provider_request(
+        execution_unit_id=unit.id,
+        attempt_no=claim.attempt_no,
+        lease_token=claim.lease_token,
+        payload={
+            "provider": "xiaohongshu",
+            "provider_operation": "compose_report",
+            "query": "secret-query",
+            "cookie": "secret-cookie",
+        },
+    )
+    assert not store.record_provider_outcome(
+        execution_unit_id=unit.id,
+        attempt_no=claim.attempt_no,
+        lease_token="stale-token",
+        provider_state="succeeded",
+        payload={"result_status": "succeeded"},
+    )
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE content_research_scope_execution_units SET state='completed' WHERE id=?",
+            (unit.id,),
+        )
+        conn.execute(
+            "UPDATE content_research_scope_execution_attempts SET state='completed' "
+            "WHERE execution_unit_id=? AND attempt_no=?",
+            (unit.id, claim.attempt_no),
+        )
+
+    trace = report_read_model.ExecutionTraceReader(store).read(unit.id)
+
+    assert trace["outcome_state"] == "outcome_unknown"
+    assert [fact["kind"] for fact in trace["facts"]][-2:] == [
+        "provider_request_recorded",
+        "lease_fenced",
+    ]
+    assert [fact["sequence_no"] for fact in trace["facts"]] == list(
+        range(1, len(trace["facts"]) + 1)
+    )
+    assert "secret-query" not in json.dumps(trace)
+    assert "secret-cookie" not in json.dumps(trace)
+
+
+def test_report_composer_carries_frozen_execution_lineage_into_the_draft():
+    """Removing any governed lineage field must change the report draft contract."""
+    base = _snapshot()
+    governed = {
+        **base.metadata["governed_snapshot"],
+        "execution_lineage": {
+            "scope_contract_id": "rsc_frozen",
+            "execution_unit_id": "seu_frozen",
+            "coverage_snapshot_id": "scv_frozen",
+            "successful_attempt_no": 3,
+        },
+        "scope_contract": {"id": "rsc_frozen", "version": 2},
+        "coverage_snapshot": {"id": "scv_frozen", "state": "satisfied"},
+        "execution_trace": {
+            "execution_unit_id": "seu_frozen",
+            "attempt_no": 3,
+            "outcome_state": "succeeded",
+            "facts": [],
+        },
+    }
+    snapshot = replace(
+        base,
+        metadata={
+            **base.metadata,
+            "governed_snapshot": governed,
+            "governed_input_fingerprint": "frozen-lineage-fingerprint",
+        },
+    )
+
+    draft = ResearchReportComposer().compose(snapshot)
+
+    assert (
+        draft.scope_contract_id,
+        draft.execution_unit_id,
+        draft.coverage_snapshot_id,
+        draft.attempt_no,
+    ) == ("rsc_frozen", "seu_frozen", "scv_frozen", 3)
+    assert (
+        draft.to_record().scope_contract_id,
+        draft.to_record().execution_unit_id,
+        draft.to_record().coverage_snapshot_id,
+        draft.to_record().attempt_no,
+    ) == ("rsc_frozen", "seu_frozen", "scv_frozen", 3)
 
 
 async def _materialize_completed_publication(store, db_path: str, run_id: str, publication_id: str):

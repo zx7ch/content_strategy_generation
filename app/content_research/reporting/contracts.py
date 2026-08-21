@@ -58,6 +58,24 @@ def _unique_nonempty(values: tuple[str, ...], field_name: str) -> None:
         raise ValueError(f"{field_name} must be unique")
 
 
+def _validate_report_lineage(
+    scope_contract_id: str | None,
+    execution_unit_id: str | None,
+    coverage_snapshot_id: str | None,
+    attempt_no: int | None,
+) -> None:
+    values = (scope_contract_id, execution_unit_id, coverage_snapshot_id, attempt_no)
+    if all(value is None for value in values):
+        return
+    if any(value is None for value in values):
+        raise ValueError("report execution lineage must be complete")
+    if not all(
+        isinstance(value, str) and value.strip()
+        for value in (scope_contract_id, execution_unit_id, coverage_snapshot_id)
+    ) or not isinstance(attempt_no, int) or isinstance(attempt_no, bool) or attempt_no < 0:
+        raise ValueError("report execution lineage is invalid")
+
+
 @dataclass(frozen=True)
 class CitationAnchor:
     """A persisted link from one stable prose block/span to a snapshot citation."""
@@ -216,6 +234,10 @@ class ReportDraft:
     algorithm_version: str
     sections: tuple[ReportSection, ...]
     previous_version_id: str | None = None
+    scope_contract_id: str | None = None
+    execution_unit_id: str | None = None
+    coverage_snapshot_id: str | None = None
+    attempt_no: int | None = None
     created_at: datetime = field(default_factory=utcnow, compare=False)
 
     def __post_init__(self) -> None:
@@ -234,6 +256,12 @@ class ReportDraft:
         _unique_nonempty(section_ids, "report section ids")
         if self.previous_version_id == self.id:
             raise ValueError("report draft cannot point to itself as a predecessor")
+        _validate_report_lineage(
+            self.scope_contract_id,
+            self.execution_unit_id,
+            self.coverage_snapshot_id,
+            self.attempt_no,
+        )
 
     @property
     def id(self) -> str:
@@ -249,6 +277,10 @@ class ReportDraft:
             "input_fingerprint": self.input_fingerprint,
             "policy_version": self.policy_version,
             "algorithm_version": self.algorithm_version,
+            "scope_contract_id": self.scope_contract_id,
+            "execution_unit_id": self.execution_unit_id,
+            "coverage_snapshot_id": self.coverage_snapshot_id,
+            "attempt_no": self.attempt_no,
             "previous_version_id": self.previous_version_id,
             "sections": [asdict(section) for section in self.sections],
         }
@@ -267,6 +299,10 @@ class ReportDraft:
             input_fingerprint=self.input_fingerprint,
             policy_version=self.policy_version,
             algorithm_version=self.algorithm_version,
+            scope_contract_id=self.scope_contract_id,
+            execution_unit_id=self.execution_unit_id,
+            coverage_snapshot_id=self.coverage_snapshot_id,
+            attempt_no=self.attempt_no,
             previous_version_id=self.previous_version_id,
             created_at=self.created_at,
         )
@@ -287,6 +323,10 @@ class ReportFaithfulnessDecision:
     omitted_section_ids: tuple[str, ...] = ()
     semantic_audit: dict[str, object] = field(default_factory=dict)
     previous_version_id: str | None = None
+    scope_contract_id: str | None = None
+    execution_unit_id: str | None = None
+    coverage_snapshot_id: str | None = None
+    attempt_no: int | None = None
     created_at: datetime = field(default_factory=utcnow, compare=False)
 
     def __post_init__(self) -> None:
@@ -305,6 +345,12 @@ class ReportFaithfulnessDecision:
             raise ValueError("invalid report faithfulness audit state")
         _unique_nonempty(self.reason_codes, "audit reason codes")
         _unique_nonempty(self.omitted_section_ids, "omitted section ids")
+        _validate_report_lineage(
+            self.scope_contract_id,
+            self.execution_unit_id,
+            self.coverage_snapshot_id,
+            self.attempt_no,
+        )
 
     @property
     def id(self) -> str:
@@ -325,6 +371,10 @@ class ReportFaithfulnessDecision:
             "reason_codes": self.reason_codes,
             "omitted_section_ids": self.omitted_section_ids,
             "semantic_audit": _json_compatible(self.semantic_audit),
+            "scope_contract_id": self.scope_contract_id,
+            "execution_unit_id": self.execution_unit_id,
+            "coverage_snapshot_id": self.coverage_snapshot_id,
+            "attempt_no": self.attempt_no,
             "previous_version_id": self.previous_version_id,
         }
 
@@ -348,6 +398,10 @@ class ReportFaithfulnessDecision:
             policy_version=self.policy_version,
             algorithm_version=self.algorithm_version,
             report_draft_id=self.report_draft_id,
+            scope_contract_id=self.scope_contract_id,
+            execution_unit_id=self.execution_unit_id,
+            coverage_snapshot_id=self.coverage_snapshot_id,
+            attempt_no=self.attempt_no,
             previous_version_id=self.previous_version_id,
             created_at=self.created_at,
         )
@@ -376,6 +430,10 @@ class ReportPublication:
     final_message_count: int = 1
     omitted_section_ids: tuple[str, ...] = ()
     previous_version_id: str | None = None
+    scope_contract_id: str | None = None
+    execution_unit_id: str | None = None
+    coverage_snapshot_id: str | None = None
+    attempt_no: int | None = None
     created_at: datetime = field(default_factory=utcnow, compare=False)
 
     def __post_init__(self) -> None:
@@ -422,6 +480,12 @@ class ReportPublication:
                 raise ValueError("partial or directional report requires omitted prose sections")
         elif self.has_free_prose:
             raise ValueError("evidence-only report cannot contain free prose")
+        _validate_report_lineage(
+            self.scope_contract_id,
+            self.execution_unit_id,
+            self.coverage_snapshot_id,
+            self.attempt_no,
+        )
 
     @property
     def id(self) -> str:
@@ -450,6 +514,10 @@ class ReportPublication:
             "timeline_message_type": self.timeline_message_type,
             "final_message_count": self.final_message_count,
             "omitted_section_ids": self.omitted_section_ids,
+            "scope_contract_id": self.scope_contract_id,
+            "execution_unit_id": self.execution_unit_id,
+            "coverage_snapshot_id": self.coverage_snapshot_id,
+            "attempt_no": self.attempt_no,
             "previous_version_id": self.previous_version_id,
         }
 
@@ -481,6 +549,10 @@ class ReportPublication:
             report_draft_id=self.report_draft_id,
             faithfulness_decision_id=self.faithfulness_decision_id,
             publication_state=self.publication_state,
+            scope_contract_id=self.scope_contract_id,
+            execution_unit_id=self.execution_unit_id,
+            coverage_snapshot_id=self.coverage_snapshot_id,
+            attempt_no=self.attempt_no,
             previous_version_id=self.previous_version_id,
             created_at=self.created_at,
         )

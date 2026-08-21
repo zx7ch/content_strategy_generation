@@ -205,6 +205,10 @@ class ReportPublicationMaterializer:
             "input_fingerprint",
             "policy_version",
             "algorithm_version",
+            "scope_contract_id",
+            "execution_unit_id",
+            "coverage_snapshot_id",
+            "attempt_no",
         )
         if any(getattr(publication, name) != getattr(draft, name) for name in identity):
             raise ValueError("report publication and draft lineage mismatch")
@@ -214,6 +218,16 @@ class ReportPublicationMaterializer:
             raise ValueError("faithfulness decision does not belong to report draft")
         if snapshot.snapshot_version != publication.governed_snapshot_version:
             raise ValueError("report publication and governed snapshot version mismatch")
+        governed = snapshot.metadata.get("governed_snapshot")
+        lineage = governed.get("execution_lineage") if isinstance(governed, dict) else None
+        if publication.execution_unit_id is not None and (
+            not isinstance(lineage, dict)
+            or lineage.get("scope_contract_id") != publication.scope_contract_id
+            or lineage.get("execution_unit_id") != publication.execution_unit_id
+            or lineage.get("coverage_snapshot_id") != publication.coverage_snapshot_id
+            or lineage.get("successful_attempt_no") != publication.attempt_no
+        ):
+            raise ValueError("report publication and governed snapshot execution lineage mismatch")
 
     @staticmethod
     def _artifact_payload(
@@ -244,6 +258,10 @@ class ReportPublicationMaterializer:
             "input_fingerprint": publication.input_fingerprint,
             "policy_version": publication.policy_version,
             "algorithm_version": publication.algorithm_version,
+            "scope_contract_id": publication.scope_contract_id,
+            "execution_unit_id": publication.execution_unit_id,
+            "coverage_snapshot_id": publication.coverage_snapshot_id,
+            "attempt_no": publication.attempt_no,
             "sections": sections,
             "citation_groups": citation_groups,
             "verified_section_ids": publication.payload["verified_section_ids"],

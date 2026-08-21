@@ -69,6 +69,10 @@ class ReportExecutionService:
                 policy_version=evidence_only_draft.policy_version,
                 algorithm_version=evidence_only_draft.algorithm_version,
                 report_draft_id=evidence_only_draft.id,
+                scope_contract_id=evidence_only_draft.scope_contract_id,
+                execution_unit_id=evidence_only_draft.execution_unit_id,
+                coverage_snapshot_id=evidence_only_draft.coverage_snapshot_id,
+                attempt_no=evidence_only_draft.attempt_no,
                 audit_state="failed",
                 reason_codes=("insufficient_admitted_evidence",),
                 omitted_section_ids=omitted,
@@ -105,6 +109,10 @@ class ReportExecutionService:
                 governed_snapshot_id=draft.governed_snapshot_id, governed_snapshot_version=draft.governed_snapshot_version,
                 input_fingerprint=draft.input_fingerprint, policy_version=draft.policy_version,
                 algorithm_version=draft.algorithm_version, report_draft_id=draft.id,
+                scope_contract_id=draft.scope_contract_id,
+                execution_unit_id=draft.execution_unit_id,
+                coverage_snapshot_id=draft.coverage_snapshot_id,
+                attempt_no=draft.attempt_no,
                 audit_state="passed" if evaluation.passed else "failed", reason_codes=evaluation.reason_codes,
                 omitted_section_ids=evaluation.affected_section_ids,
                 semantic_audit={
@@ -215,6 +223,10 @@ class ReportExecutionService:
             audit_recovery_state="all_required_sections_passed" if state == "complete_verified_report" else "audit_rewrite_exhausted",
             has_free_prose=has_prose, omitted_section_ids=omitted,
             compose_mode=compose_mode,
+            scope_contract_id=draft.scope_contract_id,
+            execution_unit_id=draft.execution_unit_id,
+            coverage_snapshot_id=draft.coverage_snapshot_id,
+            attempt_no=draft.attempt_no,
         )
 
     @staticmethod
@@ -231,6 +243,10 @@ class ReportExecutionService:
             structured_card_section_ids=tuple(payload["structured_card_section_ids"]),
             audit_recovery_state=str(payload["audit_recovery_state"]), has_free_prose=bool(payload["has_free_prose"]),
             omitted_section_ids=tuple(payload.get("omitted_section_ids") or ()), compose_mode=str(payload.get("compose_mode") or "prose"), previous_version_id=record.previous_version_id,
+            scope_contract_id=record.scope_contract_id,
+            execution_unit_id=record.execution_unit_id,
+            coverage_snapshot_id=record.coverage_snapshot_id,
+            attempt_no=record.attempt_no,
             created_at=record.created_at,
         )
 
