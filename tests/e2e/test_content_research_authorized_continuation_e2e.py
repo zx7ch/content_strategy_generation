@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta, timezone
 from typing import TypeAlias
 
 import httpx
@@ -13,6 +12,7 @@ from app.api.routes.router import app
 from app.content_research.persistence_models import (
     DirectionalEvidencePacketRecord,
     ReportPublicationRecord,
+    StageCheckpointRecord,
 )
 from app.content_research.presearch.service import PresearchService
 from app.content_research.service import ContentResearchService, WorkflowRunManagerRuntime
@@ -321,6 +321,21 @@ async def test_authorized_collection_continuations_run_through_worker_and_pipeli
         for item in service._store.list_typed_records(DirectionalEvidencePacketRecord)
         if item.id in continuation_snapshot.manifest.packet_ids
     )
+    if resolution == "relax_constraint":
+        marketing_checkpoint = next(
+            item
+            for item in service._store.list_typed_records(StageCheckpointRecord)
+            if item.workflow_run_id == workflow_run_id
+            and item.stage_name == "marketing_conclusion"
+            and item.execution_revision == authorization["execution_revision"]
+        )
+        assert marketing_checkpoint.id not in continuation_snapshot.manifest.checkpoint_ids
+        governed_snapshot = service._store.list_result_snapshots_for_workflow(workflow_run_id)[-1]
+        governed = governed_snapshot.metadata["governed_snapshot"]
+        assert governed["marketing_conclusions"]
+        assert marketing_checkpoint.id in {
+            item["checkpoint_id"] for item in governed["checkpoint_summary"]["stages"]
+        }
     assert (
         service._store.list_scope_execution_continuations(workflow_run_id)[0].state == "completed"
     )
@@ -677,7 +692,7 @@ async def test_real_worker_late_provider_callback_cannot_mutate_after_takeover(
     running_a = asyncio.create_task(worker_a.run_once())
     await asyncio.wait_for(adapter.discover_started.wait(), timeout=5)
 
-    expired = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+    expired = "2000-01-01T00:00:00+00:00"
     with service._store._connect() as conn:
         conn.execute(
             """UPDATE content_research_scope_execution_attempts

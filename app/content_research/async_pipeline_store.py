@@ -147,6 +147,12 @@ class AsyncDirectionalPersistenceSession:
         existing = bucket.get(record.id)
         if existing == record:
             return record
+        if (
+            isinstance(existing, StageCheckpointRecord)
+            and isinstance(record, StageCheckpointRecord)
+            and _checkpoint_ownership(existing) != _checkpoint_ownership(record)
+        ):
+            raise ValueError("stage checkpoint has immutable execution ownership")
         if existing is not None and not (
             isinstance(existing, StageCheckpointRecord)
             and isinstance(record, StageCheckpointRecord)
@@ -253,11 +259,25 @@ class AsyncDirectionalPersistenceSession:
                         "created_at",
                     )
                     if isinstance(record, StageCheckpointRecord):
+                        ownership_columns = {
+                            "workflow_run_id",
+                            "scope_contract_id",
+                            "execution_unit_id",
+                            "attempt_no",
+                            "execution_revision",
+                        }
                         updates = ", ".join(
-                            f"{column}=excluded.{column}" for column in columns if column != "id"
+                            f"{column}=excluded.{column}"
+                            for column in columns
+                            if column != "id" and column not in ownership_columns
                         )
                         conflict_clause = (
-                            f"DO UPDATE SET {updates} WHERE {table}.status='superseded'"
+                            f"DO UPDATE SET {updates} WHERE {table}.status='superseded' "
+                            f"AND {table}.workflow_run_id IS excluded.workflow_run_id "
+                            f"AND {table}.scope_contract_id IS excluded.scope_contract_id "
+                            f"AND {table}.execution_unit_id IS excluded.execution_unit_id "
+                            f"AND {table}.attempt_no IS excluded.attempt_no "
+                            f"AND {table}.execution_revision IS excluded.execution_revision"
                         )
                     else:
                         conflict_clause = "DO NOTHING"
@@ -323,3 +343,13 @@ class AsyncDirectionalPersistenceSession:
             created_at=_parse_dt(row["created_at"]),
             **values,
         )
+
+
+def _checkpoint_ownership(record: StageCheckpointRecord) -> tuple[object, ...]:
+    return (
+        record.workflow_run_id,
+        record.scope_contract_id,
+        record.execution_unit_id,
+        record.attempt_no,
+        record.execution_revision,
+    )

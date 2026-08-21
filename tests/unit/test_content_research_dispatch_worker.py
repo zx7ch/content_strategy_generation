@@ -521,6 +521,89 @@ async def test_async_pipeline_session_replaces_superseded_checkpoint_on_same_run
 
 
 @pytest.mark.asyncio
+async def test_async_pipeline_rejects_superseded_checkpoint_ownership_reassignment(
+    tmp_path: Path,
+) -> None:
+    """A replay may replace checkpoint state, never its execution owner."""
+    db_path = str(tmp_path / "dispatch-immutable-checkpoint.db")
+    store = SQLiteContentResearchStore(db_path)
+    original = StageCheckpointRecord(
+        id="scp-immutable-recovery",
+        schema_version="content_research_stage_checkpoint_v1",
+        payload={"attempt": 1},
+        workflow_run_id="run-recovery",
+        subagent_task_id="task-recovery",
+        stage_name="operation",
+        input_fingerprint="fingerprint-recovery",
+        status="superseded",
+        scope_contract_id="scope-a",
+        execution_unit_id="unit-a",
+        attempt_no=1,
+        execution_revision=2,
+    )
+    store.save_stage_checkpoint(original)
+    session = await AsyncDirectionalPersistenceSession.open(
+        db_path, workflow_run_id="run-recovery"
+    )
+
+    with pytest.raises(ValueError, match="immutable execution ownership"):
+        session.save_stage_checkpoint(
+            replace(
+                original,
+                status="completed",
+                scope_contract_id="scope-b",
+                execution_unit_id="unit-b",
+                attempt_no=7,
+                execution_revision=9,
+            )
+        )
+
+    assert store.get_typed_record(StageCheckpointRecord, original.id) == original
+
+
+@pytest.mark.asyncio
+async def test_async_pipeline_sql_conflict_preserves_checkpoint_ownership(
+    tmp_path: Path,
+) -> None:
+    """A session opened before the checkpoint exists cannot bypass ownership checks."""
+    db_path = str(tmp_path / "dispatch-concurrent-checkpoint.db")
+    store = SQLiteContentResearchStore(db_path)
+    stale_session = await AsyncDirectionalPersistenceSession.open(
+        db_path, workflow_run_id="run-recovery"
+    )
+    original = StageCheckpointRecord(
+        id="scp-concurrent-recovery",
+        schema_version="content_research_stage_checkpoint_v1",
+        payload={"attempt": 1},
+        workflow_run_id="run-recovery",
+        subagent_task_id="task-recovery",
+        stage_name="operation",
+        input_fingerprint="fingerprint-recovery",
+        status="superseded",
+        scope_contract_id="scope-a",
+        execution_unit_id="unit-a",
+        attempt_no=1,
+        execution_revision=2,
+    )
+    store.save_stage_checkpoint(original)
+    stale_session.save_stage_checkpoint(
+        replace(
+            original,
+            status="completed",
+            scope_contract_id="scope-b",
+            execution_unit_id="unit-b",
+            attempt_no=7,
+            execution_revision=9,
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="immutable persistence conflict"):
+        await stale_session.flush()
+
+    assert store.get_typed_record(StageCheckpointRecord, original.id) == original
+
+
+@pytest.mark.asyncio
 async def test_stale_async_session_cannot_overwrite_recovered_checkpoint(tmp_path):
     db_path = str(tmp_path / "dispatch.db")
     store = SQLiteContentResearchStore(db_path)

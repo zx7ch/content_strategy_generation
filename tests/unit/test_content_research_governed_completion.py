@@ -403,19 +403,20 @@ def test_governed_snapshot_uses_only_manifest_owned_claims_governance_and_checkp
                 aggregate_type="cross_direction_corroboration",
             )
         )
-        store.save_stage_checkpoint(
-            StageCheckpointRecord(
-                f"scp_marketing_{suffix}",
-                "v1",
-                {},
-                workflow_run_id="run_manifest",
-                subagent_task_id=f"marketing:{suffix}",
-                stage_name="marketing_conclusion",
-                input_fingerprint=f"fp_{suffix}",
-                status="completed",
-                **record_ownership,
+        if suffix == "old":
+            store.save_stage_checkpoint(
+                StageCheckpointRecord(
+                    "scp_marketing_old",
+                    "v1",
+                    {},
+                    workflow_run_id="run_manifest",
+                    subagent_task_id="marketing:old",
+                    stage_name="marketing_conclusion",
+                    input_fingerprint="fp_old",
+                    status="completed",
+                    **record_ownership,
+                )
             )
-        )
         marketing_candidate = MarketingConclusionCandidateRecord(
             f"mcc_{suffix}",
             "v1",
@@ -454,11 +455,26 @@ def test_governed_snapshot_uses_only_manifest_owned_claims_governance_and_checkp
     manifest = CoverageManifest(
         workflow_run_id="run_manifest",
         packet_ids=("dep_current",),
-        checkpoint_ids=("scp_marketing_current",),
+        checkpoint_ids=(),
         **ownership,
     )
     service = ContentResearchService(
         store=store, presearch=None, workflow_runtime=CapturingRuntime()
+    )
+    generated_checkpoint = StageCheckpointRecord(
+        "scp_marketing_current",
+        "v1",
+        {},
+        workflow_run_id="run_manifest",
+        subagent_task_id="marketing:current",
+        stage_name="marketing_conclusion",
+        input_fingerprint="fp_current",
+        status="completed",
+        **ownership,
+    )
+    store.save_stage_checkpoint(generated_checkpoint)
+    publication_manifest = service._extend_manifest_with_generated_checkpoints(
+        manifest, (generated_checkpoint,)
     )
     direction = ResearchDirectionRecord(
         "rd_manifest",
@@ -475,7 +491,7 @@ def test_governed_snapshot_uses_only_manifest_owned_claims_governance_and_checkp
         workflow_run_id="run_manifest",
         plan_id="rp_manifest",
         direction_records=[direction],
-        manifest=manifest,
+        manifest=publication_manifest,
     )
 
     assert [item["claim_candidate_id"] for item in governed["claim_cards"]] == [

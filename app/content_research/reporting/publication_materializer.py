@@ -5,7 +5,9 @@ from __future__ import annotations
 from typing import Any
 
 from app.content_research.execution_lease import (
+    DispatchLeaseFencedWorkflowRunManager,
     LeaseFencedWorkflowRunManager,
+    workflow_dispatch_guard,
     workflow_execution_guard,
 )
 from app.content_research.models import ResearchResultSnapshotRecord
@@ -14,7 +16,11 @@ from app.content_research.persistence_models import (
     ReportFaithfulnessDecisionRecord,
     ReportPublicationRecord,
 )
-from app.content_research.scope_contract import ExecutionContext, ExecutionLeaseFencedError
+from app.content_research.scope_contract import (
+    DispatchLeaseContext,
+    ExecutionContext,
+    ExecutionLeaseFencedError,
+)
 from app.content_research.stores.base import ContentResearchStore
 from app.memory.thread_store import ThreadStore
 from app.memory.workflow_store import WorkflowStore
@@ -35,10 +41,14 @@ class ReportPublicationMaterializer:
         db_path: str,
         *,
         execution_context: ExecutionContext | None = None,
+        dispatch_context: DispatchLeaseContext | None = None,
     ) -> None:
+        if execution_context is not None and dispatch_context is not None:
+            raise ValueError("report materialization accepts only one lease context")
         self._store = store
         self._db_path = db_path
         self._execution_context = execution_context
+        self._dispatch_context = dispatch_context
 
     async def materialize(self, publication_id: str) -> WorkflowArtifact:
         publication = self._require_publication(publication_id)
@@ -69,15 +79,20 @@ class ReportPublicationMaterializer:
             None,
         )
         if artifact is None:
-            manager = (
-                LeaseFencedWorkflowRunManager(
+            if self._execution_context is not None:
+                manager = LeaseFencedWorkflowRunManager(
                     self._db_path,
                     execution_context=self._execution_context,
                     operation="materialize_report_publication",
                 )
-                if self._execution_context is not None
-                else WorkflowRunManager(self._db_path)
-            )
+            elif self._dispatch_context is not None:
+                manager = DispatchLeaseFencedWorkflowRunManager(
+                    self._db_path,
+                    dispatch_context=self._dispatch_context,
+                    operation="materialize_report_publication",
+                )
+            else:
+                manager = WorkflowRunManager(self._db_path)
             async with manager:
                 artifact = await manager.attach_artifact(
                     run_id=publication.workflow_run_id,
@@ -111,16 +126,29 @@ class ReportPublicationMaterializer:
         if artifact is None:
             raise ValueError("missing materialized report artifact")
         async with ThreadStore(self._db_path) as thread_store:
+            guard = None
+            commit_fence_fact = False
             if self._execution_context is not None:
+                guard = workflow_execution_guard(
+                    self._execution_context,
+                    operation="publish_report_timeline_message",
+                )
+                commit_fence_fact = True
+            elif self._dispatch_context is not None:
+                guard = workflow_dispatch_guard(
+                    self._dispatch_context,
+                    operation="publish_report_timeline_message",
+                )
+            if guard is not None:
                 assert thread_store._conn is not None
                 await thread_store._conn.execute("BEGIN IMMEDIATE")
                 try:
-                    await workflow_execution_guard(
-                        self._execution_context,
-                        operation="publish_report_timeline_message",
-                    )(thread_store._conn)
+                    await guard(thread_store._conn)
                 except ExecutionLeaseFencedError:
-                    await thread_store._conn.commit()
+                    if commit_fence_fact:
+                        await thread_store._conn.commit()
+                    else:
+                        await thread_store._conn.rollback()
                     raise
             await thread_store.append_artifact_result_message(
                 thread_id=run.thread_id,

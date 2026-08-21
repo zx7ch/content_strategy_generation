@@ -1,10 +1,12 @@
+import asyncio
 import sqlite3
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
-from app.content_research.bootstrap import _bootstrap_legacy_content_research_schema
 from app.content_research.admission.candidates import source_text_hash
+from app.content_research.bootstrap import _bootstrap_legacy_content_research_schema
 from app.content_research.contracts import build_default_snapshot
 from app.content_research.evidence.models import EvidenceRecord
 from app.content_research.migrations import apply_content_research_migrations
@@ -20,12 +22,19 @@ from app.content_research.persistence_models import (
     StageCheckpointRecord,
 )
 from app.content_research.reporting.composer import ResearchReportComposer
-from app.content_research.reporting.lite_read_model import LiteReportReader
 from app.content_research.reporting.publication_materializer import ReportPublicationMaterializer
+from app.content_research.scope_contract import (
+    DispatchLeaseContext,
+    ExecutionLeaseFencedError,
+)
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
 from app.memory.thread_store import ThreadStore
 from app.memory.workflow_store import WorkflowStore
-from app.models.workflow import WorkflowArtifactPayloadMode, WorkflowArtifactType
+from app.models.workflow import (
+    WorkflowArtifact,
+    WorkflowArtifactPayloadMode,
+    WorkflowArtifactType,
+)
 from app.services.workflow_run_manager import WorkflowRunManager
 from tests.content_research_test_constants import LEGACY_EVIDENCE_BUNDLE_FRAGMENT
 from tests.integration.test_content_research_report_store import (
@@ -46,6 +55,144 @@ def _legacy_bundle_tables(db_path: str) -> set[str]:
             )
             if LEGACY_EVIDENCE_BUNDLE_FRAGMENT in row[0]
         }
+
+
+def _save_live_dispatch_claim(db_path: str, workflow_run_id: str) -> DispatchLeaseContext:
+    context = DispatchLeaseContext(workflow_run_id, "worker-a", "token-a")
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """INSERT INTO content_research_dispatch_jobs
+               (workflow_run_id, provider, source_kind, limit_per_specialist, status,
+                attempt_count, lease_expires_at, lease_owner, lease_token, created_at, updated_at)
+               VALUES (?, 'xiaohongshu', 'search_result', 20, 'running', 1,
+                       '2099-01-01T00:00:00+00:00', 'worker-a', 'token-a',
+                       '2040-01-01T00:00:00+00:00', '2040-01-01T00:00:00+00:00')""",
+            (workflow_run_id,),
+        )
+    return context
+
+
+def _take_over_dispatch(db_path: str, workflow_run_id: str) -> None:
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """UPDATE content_research_dispatch_jobs
+               SET lease_owner='worker-b', lease_token='token-b'
+               WHERE workflow_run_id=?""",
+            (workflow_run_id,),
+        )
+
+
+@pytest.mark.asyncio
+async def test_stale_normal_dispatch_cannot_materialize_report_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = str(tmp_path / "stale-dispatch-artifact.db")
+    store = SQLiteContentResearchStore(db_path)
+    thread_store = ThreadStore(db_path)
+    await thread_store.connect()
+    thread = await thread_store.create_thread(title="stale report artifact")
+    try:
+        async with WorkflowRunManager(db_path) as manager:
+            run = await manager.start_run(thread_id=thread["id"], user_id="user-1")
+        snapshot = replace(_snapshot(), workflow_run_id=run.run_id)
+        draft = replace(_draft(), workflow_run_id=run.run_id)
+        decision = replace(_decision(draft), workflow_run_id=run.run_id)
+        publication = replace(_publication(draft, decision), workflow_run_id=run.run_id)
+        store.save_result_snapshot(snapshot)
+        store.save_report_draft(draft.to_record())
+        store.save_report_faithfulness_decision(decision.to_record())
+        store.save_report_publication(publication.to_record())
+        async with WorkflowRunManager(db_path) as manager:
+            await manager.begin_report_finalization(run.run_id)
+        context = _save_live_dispatch_claim(db_path, run.run_id)
+        materializer = ReportPublicationMaterializer(
+            store, db_path, dispatch_context=context
+        )
+        read_completed = asyncio.Event()
+        release_read = asyncio.Event()
+        original_list_artifacts = WorkflowStore.list_artifacts
+
+        async def pause_after_artifact_read(
+            workflow_store: WorkflowStore, workflow_run_id: str
+        ) -> list[WorkflowArtifact]:
+            artifacts = await original_list_artifacts(workflow_store, workflow_run_id)
+            read_completed.set()
+            await release_read.wait()
+            return artifacts
+
+        monkeypatch.setattr(WorkflowStore, "list_artifacts", pause_after_artifact_read)
+        stale_materialization = asyncio.create_task(materializer.materialize(publication.id))
+        await asyncio.wait_for(read_completed.wait(), timeout=2)
+        _take_over_dispatch(db_path, run.run_id)
+        release_read.set()
+
+        with pytest.raises(ExecutionLeaseFencedError, match="dispatch lease"):
+            await stale_materialization
+
+        async with WorkflowStore(db_path) as workflow_store:
+            assert await workflow_store.list_artifacts(run.run_id) == []
+        assert await thread_store.get_thread_messages(thread["id"]) == []
+    finally:
+        await thread_store.close()
+
+
+@pytest.mark.asyncio
+async def test_stale_normal_dispatch_cannot_publish_report_timeline_message(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = str(tmp_path / "stale-dispatch-timeline.db")
+    store = SQLiteContentResearchStore(db_path)
+    thread_store = ThreadStore(db_path)
+    await thread_store.connect()
+    thread = await thread_store.create_thread(title="stale report timeline")
+    try:
+        async with WorkflowRunManager(db_path) as manager:
+            run = await manager.start_run(thread_id=thread["id"], user_id="user-1")
+        snapshot = replace(_snapshot(), workflow_run_id=run.run_id)
+        draft = replace(_draft(), workflow_run_id=run.run_id)
+        decision = replace(_decision(draft), workflow_run_id=run.run_id)
+        publication = replace(_publication(draft, decision), workflow_run_id=run.run_id)
+        store.save_result_snapshot(snapshot)
+        store.save_report_draft(draft.to_record())
+        store.save_report_faithfulness_decision(decision.to_record())
+        store.save_report_publication(publication.to_record())
+        async with WorkflowRunManager(db_path) as manager:
+            await manager.begin_report_finalization(run.run_id)
+        context = _save_live_dispatch_claim(db_path, run.run_id)
+        materializer = ReportPublicationMaterializer(
+            store, db_path, dispatch_context=context
+        )
+        await materializer.materialize(publication.id)
+        async with WorkflowRunManager(db_path) as manager:
+            await manager.complete_report_finalization(run.run_id)
+        read_completed = asyncio.Event()
+        release_read = asyncio.Event()
+        original_list_artifacts = WorkflowStore.list_artifacts
+
+        async def pause_after_artifact_read(
+            workflow_store: WorkflowStore, workflow_run_id: str
+        ) -> list[WorkflowArtifact]:
+            artifacts = await original_list_artifacts(workflow_store, workflow_run_id)
+            read_completed.set()
+            await release_read.wait()
+            return artifacts
+
+        monkeypatch.setattr(WorkflowStore, "list_artifacts", pause_after_artifact_read)
+        stale_publication = asyncio.create_task(
+            materializer.publish_timeline_message(publication.id)
+        )
+        await asyncio.wait_for(read_completed.wait(), timeout=2)
+        _take_over_dispatch(db_path, run.run_id)
+        release_read.set()
+
+        with pytest.raises(ExecutionLeaseFencedError, match="dispatch lease"):
+            await stale_publication
+
+        assert await thread_store.get_thread_messages(thread["id"]) == []
+    finally:
+        await thread_store.close()
 
 
 @pytest.mark.asyncio
