@@ -6,6 +6,7 @@ from collections.abc import Iterable
 from typing import Any
 
 from app.content_research.models import ResearchResultSnapshotRecord
+from app.content_research.report_lineage import ReportExecutionLineage
 from app.content_research.reporting.contracts import (
     CitationAnchor,
     ReportDraft,
@@ -278,47 +279,27 @@ def _required_mapping(value: object, field_name: str) -> dict[str, Any]:
 
 
 def _report_lineage(governed: dict[str, Any]) -> dict[str, Any]:
-    value = governed.get("execution_lineage")
-    if value is None:
+    lineage = ReportExecutionLineage.from_governed_snapshot(governed)
+    if lineage is None:
         return {
             "scope_contract_id": None,
             "execution_unit_id": None,
             "coverage_snapshot_id": None,
             "attempt_no": None,
         }
-    lineage = _required_mapping(value, "execution_lineage")
-    scope_contract_id = _required_string(
-        lineage.get("scope_contract_id"), "execution_lineage.scope_contract_id"
-    )
-    execution_unit_id = _required_string(
-        lineage.get("execution_unit_id"), "execution_lineage.execution_unit_id"
-    )
-    coverage_snapshot_id = _required_string(
-        lineage.get("coverage_snapshot_id"), "execution_lineage.coverage_snapshot_id"
-    )
-    attempt_no = lineage.get("successful_attempt_no")
-    if isinstance(attempt_no, bool) or not isinstance(attempt_no, int) or attempt_no < 0:
-        raise ValueError(
-            "governed snapshot requires execution_lineage.successful_attempt_no"
-        )
     scope = _required_mapping(governed.get("scope_contract"), "scope_contract")
     coverage = _required_mapping(governed.get("coverage_snapshot"), "coverage_snapshot")
     trace = _required_mapping(governed.get("execution_trace"), "execution_trace")
-    if scope.get("id") != scope_contract_id:
+    if scope.get("id") != lineage.scope_contract_id:
         raise ValueError("governed snapshot Scope execution lineage mismatch")
-    if coverage.get("id") != coverage_snapshot_id:
+    if coverage.get("id") != lineage.coverage_snapshot_id:
         raise ValueError("governed snapshot Coverage execution lineage mismatch")
     if (
-        trace.get("execution_unit_id") != execution_unit_id
-        or trace.get("attempt_no") != attempt_no
+        trace.get("execution_unit_id") != lineage.execution_unit_id
+        or trace.get("attempt_no") != lineage.attempt_no
     ):
         raise ValueError("governed snapshot trace execution lineage mismatch")
-    return {
-        "scope_contract_id": scope_contract_id,
-        "execution_unit_id": execution_unit_id,
-        "coverage_snapshot_id": coverage_snapshot_id,
-        "attempt_no": attempt_no,
-    }
+    return lineage.as_record_kwargs()
 
 
 def _mapping_list(value: object, field_name: str) -> list[dict[str, Any]]:

@@ -3442,14 +3442,30 @@ class ContentResearchService:
                 f"Content research workflow not found: {workflow_run_id}"
             )
         try:
-            report_artifact_ref = await self._publish_report_after_workflow_completion(
-                workflow_run_id=workflow_run_id,
-                thread_id=brief.thread_id,
+            publications = sorted(
+                (
+                    item
+                    for item in self._store.list_typed_records(ReportPublicationRecord)
+                    if item.workflow_run_id == workflow_run_id
+                    and _publication_lineage_is_materializable(self._store, item)
+                ),
+                key=lambda item: (item.created_at, item.id),
+                reverse=True,
             )
-            if report_artifact_ref is None:
+            if not publications:
                 raise ContentResearchValidationError(
-                    "Report publication retry did not materialize a report"
+                    "Report publication retry requires the persisted failed publication"
                 )
+            publication = publications[0]
+            artifact = await ReportPublicationMaterializer(
+                self._store, self._store._db_path
+            ).materialize(publication.id)
+            report_artifact_ref = {
+                "type": "content_research_report_publication",
+                "id": publication.id,
+                "artifact_id": artifact.artifact_id,
+                "publication_state": publication.publication_state,
+            }
             await self._workflow_runtime.complete_report_publication(
                 workflow_run_id=workflow_run_id
             )

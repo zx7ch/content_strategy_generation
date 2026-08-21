@@ -16,6 +16,7 @@ from app.content_research.persistence_models import (
     ReportFaithfulnessDecisionRecord,
     ReportPublicationRecord,
 )
+from app.content_research.report_lineage import validate_frozen_report_execution_lineage
 from app.content_research.scope_contract import (
     DispatchLeaseContext,
     ExecutionContext,
@@ -219,15 +220,12 @@ class ReportPublicationMaterializer:
         if snapshot.snapshot_version != publication.governed_snapshot_version:
             raise ValueError("report publication and governed snapshot version mismatch")
         governed = snapshot.metadata.get("governed_snapshot")
-        lineage = governed.get("execution_lineage") if isinstance(governed, dict) else None
-        if publication.execution_unit_id is not None and (
-            not isinstance(lineage, dict)
-            or lineage.get("scope_contract_id") != publication.scope_contract_id
-            or lineage.get("execution_unit_id") != publication.execution_unit_id
-            or lineage.get("coverage_snapshot_id") != publication.coverage_snapshot_id
-            or lineage.get("successful_attempt_no") != publication.attempt_no
-        ):
-            raise ValueError("report publication and governed snapshot execution lineage mismatch")
+        try:
+            validate_frozen_report_execution_lineage(publication, governed)
+        except ValueError as exc:
+            raise ValueError(
+                "report publication and governed snapshot execution lineage mismatch"
+            ) from exc
 
     @staticmethod
     def _artifact_payload(

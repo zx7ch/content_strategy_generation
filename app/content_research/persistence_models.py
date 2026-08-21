@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import Any
 
 from app.content_research.models import utcnow
+from app.content_research.report_lineage import ReportExecutionLineage
 
 EXECUTION_FACT_SCHEMA_VERSION = "content_research_execution_fact_v1"
 
@@ -44,25 +45,6 @@ def _validate_execution_ownership(
         raise ValueError("execution ownership revisions are invalid")
     if execution_unit_id and not scope_contract_id:
         raise ValueError("execution unit ownership requires a Scope contract")
-
-
-def _validate_report_lineage(
-    *,
-    scope_contract_id: str | None,
-    execution_unit_id: str | None,
-    coverage_snapshot_id: str | None,
-    attempt_no: int | None,
-) -> None:
-    values = (scope_contract_id, execution_unit_id, coverage_snapshot_id, attempt_no)
-    if all(value is None for value in values):
-        return
-    if any(value is None for value in values):
-        raise ValueError("report execution lineage must be complete")
-    if not all(
-        isinstance(value, str) and value.strip()
-        for value in (scope_contract_id, execution_unit_id, coverage_snapshot_id)
-    ) or not isinstance(attempt_no, int) or isinstance(attempt_no, bool) or attempt_no < 0:
-        raise ValueError("report execution lineage is invalid")
 
 
 @dataclass(frozen=True)
@@ -509,7 +491,7 @@ class ReportDraftRecord(TypedPersistenceRecord):
             self.policy_version,
             self.algorithm_version,
         )
-        _validate_report_lineage(
+        ReportExecutionLineage.optional(
             scope_contract_id=self.scope_contract_id,
             execution_unit_id=self.execution_unit_id,
             coverage_snapshot_id=self.coverage_snapshot_id,
@@ -546,7 +528,7 @@ class ReportFaithfulnessDecisionRecord(TypedPersistenceRecord):
             self.algorithm_version,
             self.report_draft_id,
         )
-        _validate_report_lineage(
+        ReportExecutionLineage.optional(
             scope_contract_id=self.scope_contract_id,
             execution_unit_id=self.execution_unit_id,
             coverage_snapshot_id=self.coverage_snapshot_id,
@@ -594,7 +576,7 @@ class ReportPublicationRecord(TypedPersistenceRecord):
             "evidence_only_report",
         }:
             raise ValueError("invalid report publication state")
-        _validate_report_lineage(
+        ReportExecutionLineage.optional(
             scope_contract_id=self.scope_contract_id,
             execution_unit_id=self.execution_unit_id,
             coverage_snapshot_id=self.coverage_snapshot_id,

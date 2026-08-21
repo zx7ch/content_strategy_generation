@@ -1,3 +1,4 @@
+import sqlite3
 from dataclasses import replace
 
 import httpx
@@ -5,20 +6,32 @@ import pytest
 
 from app.api.routes.router import app
 from app.config import settings
+from app.content_research.api_schemas import ContentResearchSourceCollectionRequest
 from app.content_research.contracts import build_default_snapshot
-from app.content_research.models import ResearchBriefRecord
-from app.content_research.persistence_models import StageCheckpointRecord
+from app.content_research.models import ResearchBriefRecord, ResearchPlanRecord
+from app.content_research.persistence_models import ReportPublicationRecord, StageCheckpointRecord
 from app.content_research.reporting.composer import ResearchReportComposer
 from app.content_research.reporting.lite_read_model import LiteReportReader
 from app.content_research.reporting.publication_materializer import ReportPublicationMaterializer
-from app.content_research.reporting.read_model import PublishedReportReader
+from app.content_research.reporting.read_model import (
+    PublishedReportNotFoundError,
+    PublishedReportReader,
+)
 from app.content_research.scope_contract import (
     CoverageSnapshot,
+    ExecutionContext,
+    ScopeAuditEvent,
     ScopeConstraint,
+    ScopeExecutionAuthorization,
+    ScopeExecutionContinuation,
     ScopeQueryGroupInput,
     build_scope_contract,
 )
-from app.content_research.service import _governed_input_fingerprint
+from app.content_research.service import (
+    ContentResearchService,
+    WorkflowRunManagerRuntime,
+    _governed_input_fingerprint,
+)
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
 from app.memory.thread_store import ThreadStore
 from app.services.workflow_run_manager import WorkflowRunManager
@@ -27,6 +40,365 @@ from tests.integration.test_content_research_report_store import (
     _publication,
 )
 from tests.unit.test_content_research_report_composer import _snapshot as _governed_snapshot
+
+
+@pytest.mark.asyncio
+async def test_publication_dedupe_keeps_identical_nonempty_claims_distinct_across_scopes(
+    tmp_path,
+    monkeypatch,
+):
+    """Removing Scope lineage from publication matching must collapse these reports."""
+    db_path = str(tmp_path / "scope-aware-publication-dedupe.db")
+    store = SQLiteContentResearchStore(db_path)
+    async with ThreadStore(db_path) as threads:
+        thread = await threads.create_thread(title="同声明不同范围")
+    async with WorkflowRunManager(db_path) as manager:
+        run = await manager.start_run(thread_id=thread["id"], user_id="user-1")
+        await manager.begin_report_finalization(run.run_id)
+    brief = ResearchBriefRecord(
+        id="rb_scope_dedupe",
+        workflow_run_id=run.run_id,
+        thread_id=thread["id"],
+        schema_version="content_research_brief_v1",
+        status="confirmed",
+        payload={"schema_version": "content_research_brief_v1"},
+    )
+    plan = ResearchPlanRecord(
+        id="rp_scope_dedupe",
+        brief_id=brief.id,
+        workflow_run_id=run.run_id,
+        thread_id=thread["id"],
+        schema_version="content_research_plan_v1",
+        status="confirmed",
+        payload={"schema_version": "content_research_plan_v1"},
+    )
+    store.save_brief(brief)
+    store.save_plan(plan)
+    service = ContentResearchService(
+        store=store,
+        presearch=None,
+        workflow_runtime=WorkflowRunManagerRuntime(db_path),
+    )
+
+    def authorize(index: int, mode: str):
+        scope = build_scope_contract(
+            workflow_run_id=run.run_id,
+            research_plan_id=plan.id,
+            version=index,
+            constraints=(
+                ScopeConstraint("core_object", "核心对象", "长袖衬衫", "required"),
+                ScopeConstraint("season", "季节", "夏季", mode),
+            ),
+            query_groups=(ScopeQueryGroupInput("夏季 长袖衬衫", "夏季 长袖衬衫"),),
+        )
+        store.save_scope_contract(scope)
+        coverage = CoverageSnapshot(
+            id=f"scv_scope_dedupe_{index}",
+            workflow_run_id=run.run_id,
+            scope_contract_id=scope.id,
+            scope_contract_version=scope.version,
+            state="awaiting_scope_decision",
+            constraint_counts={},
+            unmet_constraint_ids=("season",),
+        )
+        store.save_coverage_snapshot(coverage)
+        authorization = ScopeExecutionAuthorization(
+            id=f"sea_scope_dedupe_{index}",
+            workflow_run_id=run.run_id,
+            scope_contract_id=scope.id,
+            scope_contract_version=scope.version,
+            coverage_snapshot_id=coverage.id,
+            resolution="generate_limited_report",
+            execution_revision=2,
+            state="authorized_limited_report",
+        )
+        continuation = ScopeExecutionContinuation(
+            id=f"sec_scope_dedupe_{index}",
+            authorization_id=authorization.id,
+            workflow_run_id=run.run_id,
+            execution_revision=2,
+            operation="limited_report",
+            supplementary_queries=(),
+            state="pending",
+        )
+        event = ScopeAuditEvent(
+            id=f"sae_scope_dedupe_{index}",
+            workflow_run_id=run.run_id,
+            scope_contract_id=scope.id,
+            scope_contract_version=scope.version,
+            event_name="coverage_resolved",
+            payload={
+                "schema_version": "content_research_scope_audit_event_v1",
+                "coverage_snapshot_id": coverage.id,
+                "resolution": "generate_limited_report",
+                "constraint_id": None,
+            },
+        )
+        _, _, persisted, _, _ = store.resolve_coverage_and_authorize_execution_atomically(
+            snapshot=coverage,
+            authorization=authorization,
+            continuation=continuation,
+            event=event,
+        )
+        assert persisted.execution_unit_id is not None
+        attempt = store.claim_execution_unit(
+            execution_unit_id=persisted.execution_unit_id,
+            owner=f"worker-{index}",
+        )
+        assert attempt is not None and attempt.lease_token is not None
+        return (
+            scope,
+            coverage,
+            persisted,
+            ExecutionContext(
+                execution_unit_id=persisted.execution_unit_id,
+                attempt_no=attempt.attempt_no,
+                lease_token=attempt.lease_token,
+                scope_contract_id=scope.id,
+            ),
+        )
+
+    base = _governed_snapshot().metadata["governed_snapshot"]
+
+    def governed_for_scope(*, coverage_snapshot, execution_context, **_kwargs):
+        scope = next(
+            item
+            for item in store.list_scope_contracts(run.run_id)
+            if item.id == execution_context.scope_contract_id
+        )
+        return {
+            **base,
+            "research_plan_id": plan.id,
+            "direction_results": [],
+            "publication_state": "partial_verified_report",
+            "publication_reason": "admitted_claims_available",
+            "workflow_execution_state": "completed",
+            "executive_summary": "",
+            "policy_scope": {
+                **base["policy_scope"],
+                "direction_set_version": "direction_set_scope_dedupe",
+                "direction_ids": ["product_marketing"],
+                "report_compose_mode": "template_only",
+            },
+            "claim_cards": [
+                {
+                    **base["claim_cards"][0],
+                    "claim_type": "use_context",
+                    "scope": {"sample": "selected_packets"},
+                }
+            ],
+            "citation_groups": [
+                {**base["citation_groups"][0], "admission_decision_id": "cad_1"}
+            ],
+            "execution_lineage": {
+                "scope_contract_id": scope.id,
+                "execution_unit_id": execution_context.execution_unit_id,
+                "coverage_snapshot_id": coverage_snapshot.id,
+                "successful_attempt_no": execution_context.attempt_no,
+            },
+            "scope_contract": {
+                "id": scope.id,
+                "version": scope.version,
+                "constraints": [
+                    {"id": item.id, "value": item.value, "mode": item.mode}
+                    for item in scope.constraints
+                ],
+            },
+            "coverage_snapshot": {
+                "id": coverage_snapshot.id,
+                "state": coverage_snapshot.state,
+            },
+            "execution_trace": {
+                "execution_unit_id": execution_context.execution_unit_id,
+                "attempt_no": execution_context.attempt_no,
+                "outcome_state": "not_requested",
+                "facts": [],
+            },
+        }
+
+    monkeypatch.setattr(service, "_build_governed_snapshot", governed_for_scope)
+    publications = []
+    for index, mode in enumerate(("required", "preferred"), start=1):
+        scope, _coverage, authorization, context = authorize(index, mode)
+        artifact_ref = await service._publish_report_after_workflow_completion(
+            workflow_run_id=run.run_id,
+            thread_id=thread["id"],
+            execution_authorization=authorization,
+            execution_context=context,
+        )
+        assert artifact_ref is not None
+        publications.append((scope, artifact_ref["id"]))
+
+    assert publications[0][1] != publications[1][1]
+    persisted = [
+        item
+        for item in store.list_typed_records(ReportPublicationRecord)
+        if item.workflow_run_id == run.run_id
+    ]
+    assert len(persisted) == 2
+    assert {item.scope_contract_id for item in persisted} == {
+        publications[0][0].id,
+        publications[1][0].id,
+    }
+    snapshots = store.list_result_snapshots_for_workflow(run.run_id)
+    assert [
+        snapshot.metadata["governed_snapshot"]["claim_cards"][0]["statement"]
+        for snapshot in snapshots
+    ] == ["样本直接提到通勤场景。", "样本直接提到通勤场景。"]
+
+
+@pytest.mark.asyncio
+async def test_failed_materialization_retry_reuses_the_exact_persisted_execution_publication(
+    tmp_path,
+):
+    """Recomposing without the original lease context must not create a legacy report."""
+    db_path = str(tmp_path / "failed-materialization-lineage-retry.db")
+    store = SQLiteContentResearchStore(db_path)
+    async with ThreadStore(db_path) as threads:
+        thread = await threads.create_thread(title="发布恢复")
+    async with WorkflowRunManager(db_path) as manager:
+        run = await manager.start_run(thread_id=thread["id"], user_id="user-1")
+        await manager.initialize_steps(
+            run.run_id,
+            [{"step_name": "formal_research", "phase": "retrieval", "max_attempts": 1}],
+        )
+        await manager.start_step(run.run_id, "formal_research")
+        await manager.complete_step(run.run_id, "formal_research")
+        await manager.begin_report_finalization(run.run_id)
+        await manager.fail_run(
+            run.run_id,
+            {"code": "report_publication_failed", "message": "artifact write failed"},
+        )
+    brief = ResearchBriefRecord(
+        id="rb_publication_retry",
+        workflow_run_id=run.run_id,
+        thread_id=thread["id"],
+        schema_version="content_research_brief_v1",
+        status="confirmed",
+        payload={"schema_version": "content_research_brief_v1"},
+    )
+    store.save_brief(brief)
+    scope = build_scope_contract(
+        workflow_run_id=run.run_id,
+        research_plan_id="rp_1",
+        version=1,
+        constraints=(ScopeConstraint("core_object", "核心对象", "长袖衬衫", "required"),),
+        query_groups=(ScopeQueryGroupInput("长袖衬衫", "长袖衬衫"),),
+    )
+    store.save_scope_contract(scope)
+    coverage = CoverageSnapshot(
+        id="scv_publication_retry",
+        workflow_run_id=run.run_id,
+        scope_contract_id=scope.id,
+        scope_contract_version=scope.version,
+        state="awaiting_scope_decision",
+        constraint_counts={},
+        unmet_constraint_ids=("core_object",),
+    )
+    store.save_coverage_snapshot(coverage)
+    unit, _created = store.resolve_coverage_to_execution_unit_atomically(
+        snapshot=coverage,
+        decision={"resolution": "generate_limited_report"},
+    )
+    attempt = store.claim_execution_unit(execution_unit_id=unit.id, owner="worker-1")
+    assert attempt is not None
+    base = _governed_snapshot()
+    governed = {
+        **base.metadata["governed_snapshot"],
+        "research_plan_id": "rp_1",
+        "direction_results": [],
+        "policy_scope": {
+            **base.metadata["governed_snapshot"]["policy_scope"],
+            "report_compose_mode": "template_only",
+            "direction_ids": ["product_marketing"],
+            "direction_set_version": "direction_set_retry",
+        },
+        "claim_cards": [
+            {
+                **base.metadata["governed_snapshot"]["claim_cards"][0],
+                "claim_type": "use_context",
+                "scope": {"sample": "selected_packets"},
+            }
+        ],
+        "citation_groups": [
+            {
+                **base.metadata["governed_snapshot"]["citation_groups"][0],
+                "admission_decision_id": "cad_1",
+            }
+        ],
+        "execution_lineage": {
+            "scope_contract_id": scope.id,
+            "execution_unit_id": unit.id,
+            "coverage_snapshot_id": coverage.id,
+            "successful_attempt_no": attempt.attempt_no,
+        },
+        "scope_contract": {"id": scope.id, "version": scope.version},
+        "coverage_snapshot": {"id": coverage.id, "state": coverage.state},
+        "execution_trace": {
+            "execution_unit_id": unit.id,
+            "attempt_no": attempt.attempt_no,
+            "outcome_state": "not_requested",
+            "facts": [],
+        },
+    }
+    snapshot = replace(
+        base,
+        workflow_run_id=run.run_id,
+        research_brief_id=brief.id,
+        metadata={
+            "governed_snapshot": governed,
+            "governed_input_fingerprint": _governed_input_fingerprint(governed),
+        },
+    )
+    draft = ResearchReportComposer().compose(snapshot)
+    decision = replace(
+        _decision(draft),
+        workflow_run_id=run.run_id,
+        scope_contract_id=draft.scope_contract_id,
+        execution_unit_id=draft.execution_unit_id,
+        coverage_snapshot_id=draft.coverage_snapshot_id,
+        attempt_no=draft.attempt_no,
+    )
+    publication = replace(
+        _publication(draft, decision, compose_mode="template_only"),
+        workflow_run_id=run.run_id,
+        scope_contract_id=draft.scope_contract_id,
+        execution_unit_id=draft.execution_unit_id,
+        coverage_snapshot_id=draft.coverage_snapshot_id,
+        attempt_no=draft.attempt_no,
+    )
+    store.save_result_snapshot(snapshot)
+    store.save_report_draft(draft.to_record())
+    store.save_report_faithfulness_decision(decision.to_record())
+    store.save_report_publication(publication.to_record())
+    service = ContentResearchService(
+        store=store,
+        presearch=None,
+        workflow_runtime=WorkflowRunManagerRuntime(db_path),
+    )
+
+    await service._retry_failed_report_publication(
+        workflow_run_id=run.run_id,
+        request=ContentResearchSourceCollectionRequest(
+            provider="xiaohongshu", source_kind="search_result", limit=20
+        ),
+    )
+
+    persisted = [
+        item
+        for item in store.list_typed_records(ReportPublicationRecord)
+        if item.workflow_run_id == run.run_id
+    ]
+    assert [item.id for item in persisted] == [publication.id]
+    assert (
+        persisted[0].scope_contract_id,
+        persisted[0].execution_unit_id,
+        persisted[0].coverage_snapshot_id,
+        persisted[0].attempt_no,
+    ) == (scope.id, unit.id, coverage.id, attempt.attempt_no)
+    report = await PublishedReportReader(store, db_path).read(workflow_run_id=run.run_id)
+    assert report["publication"]["report_publication_id"] == publication.id
+    assert report["scope_contract_id"] == scope.id
 
 
 @pytest.mark.asyncio
@@ -247,6 +619,29 @@ async def test_selected_historical_publication_freezes_semantic_scope_coverage_a
         "execution_unit_id"
     ]
     assert lite_first["publication"]["attempt_no"] == 0
+
+    with sqlite3.connect(db_path) as connection:
+        for table in (
+            "content_research_report_drafts",
+            "content_research_report_faithfulness_decisions",
+            "content_research_report_publications",
+        ):
+            connection.execute(
+                f"UPDATE {table} SET scope_contract_id=NULL, execution_unit_id=NULL, "
+                "coverage_snapshot_id=NULL, attempt_no=NULL WHERE workflow_run_id=? "
+                "AND governed_snapshot_id=?",
+                (run.run_id, snapshots[0].id),
+            )
+
+    with pytest.raises(
+        PublishedReportNotFoundError, match="frozen execution lineage mismatch"
+    ):
+        await reader.read(
+            workflow_run_id=run.run_id,
+            publication_id=publications[0].id,
+        )
+    with pytest.raises(ValueError, match="governed snapshot execution lineage mismatch"):
+        await materializer.materialize(publications[0].id)
 
 
 @pytest.mark.asyncio

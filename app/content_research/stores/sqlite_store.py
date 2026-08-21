@@ -47,6 +47,7 @@ from app.content_research.persistence_models import (
     TypedPersistenceRecord,
     WeakSignalRecord,
 )
+from app.content_research.report_lineage import validate_frozen_report_execution_lineage
 from app.content_research.scope_contract import (
     CoverageSnapshot,
     DispatchLeaseContext,
@@ -3023,45 +3024,26 @@ class SQLiteContentResearchStore:
     ) -> None:
         frozen = snapshot.metadata.get("governed_snapshot")
         frozen = frozen if isinstance(frozen, dict) else {}
-        frozen_lineage = frozen.get("execution_lineage")
-        fields = (
-            "scope_contract_id",
-            "execution_unit_id",
-            "coverage_snapshot_id",
-            "attempt_no",
-        )
-        record_lineage = tuple(getattr(record, field) for field in fields)
-        if all(value is None for value in record_lineage):
-            if frozen_lineage is not None:
-                raise ValueError("report record is missing frozen execution lineage")
+        record_lineage = validate_frozen_report_execution_lineage(record, frozen)
+        if record_lineage is None:
             return
-        if not isinstance(frozen_lineage, dict):
-            raise ValueError("report record execution lineage lacks a frozen snapshot lineage")
-        expected = (
-            frozen_lineage.get("scope_contract_id"),
-            frozen_lineage.get("execution_unit_id"),
-            frozen_lineage.get("coverage_snapshot_id"),
-            frozen_lineage.get("successful_attempt_no"),
-        )
-        if record_lineage != expected:
-            raise ValueError("report record and frozen snapshot execution lineage mismatch")
         scope = frozen.get("scope_contract")
         coverage_payload = frozen.get("coverage_snapshot")
         trace = frozen.get("execution_trace")
         if (
             not isinstance(scope, dict)
-            or scope.get("id") != record.scope_contract_id
+            or scope.get("id") != record_lineage.scope_contract_id
             or not isinstance(coverage_payload, dict)
-            or coverage_payload.get("id") != record.coverage_snapshot_id
+            or coverage_payload.get("id") != record_lineage.coverage_snapshot_id
             or not isinstance(trace, dict)
-            or trace.get("execution_unit_id") != record.execution_unit_id
-            or trace.get("attempt_no") != record.attempt_no
+            or trace.get("execution_unit_id") != record_lineage.execution_unit_id
+            or trace.get("attempt_no") != record_lineage.attempt_no
         ):
             raise ValueError("report frozen Scope, Coverage, or trace lineage mismatch")
-        unit = self.get_scope_execution_unit(str(record.execution_unit_id))
-        coverage = self.get_coverage_snapshot_by_id(str(record.coverage_snapshot_id))
+        unit = self.get_scope_execution_unit(record_lineage.execution_unit_id)
+        coverage = self.get_coverage_snapshot_by_id(record_lineage.coverage_snapshot_id)
         attempt = self.get_scope_execution_attempt(
-            str(record.execution_unit_id), int(record.attempt_no)
+            record_lineage.execution_unit_id, record_lineage.attempt_no
         )
         coverage_owned = coverage is not None and (
             unit is not None
@@ -3073,10 +3055,10 @@ class SQLiteContentResearchStore:
         if (
             unit is None
             or unit.workflow_run_id != record.workflow_run_id
-            or unit.scope_contract_id != record.scope_contract_id
+            or unit.scope_contract_id != record_lineage.scope_contract_id
             or coverage is None
             or coverage.workflow_run_id != record.workflow_run_id
-            or coverage.scope_contract_id != record.scope_contract_id
+            or coverage.scope_contract_id != record_lineage.scope_contract_id
             or not coverage_owned
             or attempt is None
         ):

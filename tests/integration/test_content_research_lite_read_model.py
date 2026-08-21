@@ -110,6 +110,53 @@ def test_execution_trace_reader_reports_unknown_request_outcome_and_fenced_fact(
     assert "secret-cookie" not in json.dumps(trace)
 
 
+def test_execution_trace_reader_orders_sequence_numbers_within_each_retry_attempt(tmp_path):
+    """Treating sequence numbers as unit-global must not reject a genuine retry."""
+    store = SQLiteContentResearchStore(str(tmp_path / "durable-retry-trace.db"))
+    contract = build_scope_contract(
+        workflow_run_id="run_durable_retry_trace",
+        research_plan_id="rp_durable_retry_trace",
+        version=1,
+        constraints=(
+            ScopeConstraint("core_object", "核心对象", "长袖衬衫", "required"),
+            ScopeConstraint("season", "季节", "夏季", "required"),
+        ),
+        query_groups=(ScopeQueryGroupInput("夏季 长袖衬衫", "夏季 长袖衬衫"),),
+    )
+    store.save_scope_contract(contract)
+    coverage = CoverageSnapshot(
+        id="scv_durable_retry_trace",
+        workflow_run_id=contract.workflow_run_id,
+        scope_contract_id=contract.id,
+        scope_contract_version=contract.version,
+        state="awaiting_scope_decision",
+        constraint_counts={},
+        unmet_constraint_ids=("season",),
+    )
+    store.save_coverage_snapshot(coverage)
+    unit, _created = store.resolve_coverage_to_execution_unit_atomically(
+        snapshot=coverage,
+        decision={"resolution": "generate_limited_report"},
+    )
+    first = store.claim_execution_unit(
+        execution_unit_id=unit.id, owner="worker-a", lease_seconds=0
+    )
+    assert first is not None
+    second = store.claim_execution_unit(execution_unit_id=unit.id, owner="worker-b")
+    assert second is not None and second.attempt_no == first.attempt_no + 1
+
+    trace = report_read_model.ExecutionTraceReader(store).read(unit.id)
+
+    durable_order = [
+        (fact.attempt_no, fact.sequence_no) for fact in store.execution_trace(unit.id)
+    ]
+    assert [(fact["attempt_no"], fact["sequence_no"]) for fact in trace["facts"]] == (
+        durable_order
+    )
+    assert durable_order == sorted(durable_order)
+    assert [sequence for attempt, sequence in durable_order if attempt == 1] == [1]
+
+
 def test_report_composer_carries_frozen_execution_lineage_into_the_draft():
     """Removing any governed lineage field must change the report draft contract."""
     base = _snapshot()

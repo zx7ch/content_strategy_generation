@@ -9,6 +9,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 
 from app.content_research.models import utcnow
+from app.content_research.report_lineage import ReportExecutionLineage
 
 if TYPE_CHECKING:
     from app.content_research.persistence_models import (
@@ -56,24 +57,6 @@ def _unique_nonempty(values: tuple[str, ...], field_name: str) -> None:
         raise ValueError(f"{field_name} cannot contain an empty id")
     if len(values) != len(set(values)):
         raise ValueError(f"{field_name} must be unique")
-
-
-def _validate_report_lineage(
-    scope_contract_id: str | None,
-    execution_unit_id: str | None,
-    coverage_snapshot_id: str | None,
-    attempt_no: int | None,
-) -> None:
-    values = (scope_contract_id, execution_unit_id, coverage_snapshot_id, attempt_no)
-    if all(value is None for value in values):
-        return
-    if any(value is None for value in values):
-        raise ValueError("report execution lineage must be complete")
-    if not all(
-        isinstance(value, str) and value.strip()
-        for value in (scope_contract_id, execution_unit_id, coverage_snapshot_id)
-    ) or not isinstance(attempt_no, int) or isinstance(attempt_no, bool) or attempt_no < 0:
-        raise ValueError("report execution lineage is invalid")
 
 
 @dataclass(frozen=True)
@@ -256,11 +239,11 @@ class ReportDraft:
         _unique_nonempty(section_ids, "report section ids")
         if self.previous_version_id == self.id:
             raise ValueError("report draft cannot point to itself as a predecessor")
-        _validate_report_lineage(
-            self.scope_contract_id,
-            self.execution_unit_id,
-            self.coverage_snapshot_id,
-            self.attempt_no,
+        ReportExecutionLineage.optional(
+            scope_contract_id=self.scope_contract_id,
+            execution_unit_id=self.execution_unit_id,
+            coverage_snapshot_id=self.coverage_snapshot_id,
+            attempt_no=self.attempt_no,
         )
 
     @property
@@ -345,11 +328,11 @@ class ReportFaithfulnessDecision:
             raise ValueError("invalid report faithfulness audit state")
         _unique_nonempty(self.reason_codes, "audit reason codes")
         _unique_nonempty(self.omitted_section_ids, "omitted section ids")
-        _validate_report_lineage(
-            self.scope_contract_id,
-            self.execution_unit_id,
-            self.coverage_snapshot_id,
-            self.attempt_no,
+        ReportExecutionLineage.optional(
+            scope_contract_id=self.scope_contract_id,
+            execution_unit_id=self.execution_unit_id,
+            coverage_snapshot_id=self.coverage_snapshot_id,
+            attempt_no=self.attempt_no,
         )
 
     @property
@@ -480,11 +463,11 @@ class ReportPublication:
                 raise ValueError("partial or directional report requires omitted prose sections")
         elif self.has_free_prose:
             raise ValueError("evidence-only report cannot contain free prose")
-        _validate_report_lineage(
-            self.scope_contract_id,
-            self.execution_unit_id,
-            self.coverage_snapshot_id,
-            self.attempt_no,
+        ReportExecutionLineage.optional(
+            scope_contract_id=self.scope_contract_id,
+            execution_unit_id=self.execution_unit_id,
+            coverage_snapshot_id=self.coverage_snapshot_id,
+            attempt_no=self.attempt_no,
         )
 
     @property

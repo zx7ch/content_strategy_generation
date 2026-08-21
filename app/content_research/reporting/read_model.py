@@ -13,6 +13,7 @@ from app.content_research.persistence_models import (
     ReportPublicationRecord,
     StageCheckpointRecord,
 )
+from app.content_research.report_lineage import validate_frozen_report_execution_lineage
 from app.content_research.scope_contract import thaw_execution_payload
 from app.content_research.stores.base import ContentResearchStore
 from app.memory.workflow_store import WorkflowStore
@@ -54,8 +55,10 @@ class ExecutionTraceReader:
         if unit is None:
             raise PublishedReportNotFoundError("execution unit not found")
         facts = self._store.execution_trace(execution_unit_id)
-        sequence = [fact.sequence_no for fact in facts]
-        if sequence != sorted(sequence) or len(sequence) != len(set(sequence)):
+        durable_order = [(fact.attempt_no, fact.sequence_no) for fact in facts]
+        if durable_order != sorted(durable_order) or len(durable_order) != len(
+            set(durable_order)
+        ):
             raise PublishedReportNotFoundError("execution facts are not monotonic")
 
         outcome_state = "not_requested"
@@ -352,17 +355,12 @@ class PublishedReportReader:
         ):
             raise PublishedReportNotFoundError("published report snapshot lineage mismatch")
         governed = snapshot.metadata.get("governed_snapshot")
-        lineage = governed.get("execution_lineage") if isinstance(governed, dict) else None
-        if publication.execution_unit_id is not None and (
-            not isinstance(lineage, dict)
-            or lineage.get("scope_contract_id") != publication.scope_contract_id
-            or lineage.get("execution_unit_id") != publication.execution_unit_id
-            or lineage.get("coverage_snapshot_id") != publication.coverage_snapshot_id
-            or lineage.get("successful_attempt_no") != publication.attempt_no
-        ):
+        try:
+            validate_frozen_report_execution_lineage(publication, governed)
+        except ValueError as exc:
             raise PublishedReportNotFoundError(
                 "published report frozen execution lineage mismatch"
-            )
+            ) from exc
 
     async def _artifact(self, publication: ReportPublicationRecord) -> tuple[Any, str]:
         async with WorkflowStore(self._db_path) as workflow_store:
