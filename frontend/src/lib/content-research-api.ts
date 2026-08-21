@@ -300,9 +300,62 @@ export interface ContentResearchScopeAuditEvent {
 export interface ContentResearchScopeProjection {
   schema_version: string;
   workflow_run_id: string;
+  state: "awaiting_confirmation" | "confirmed" | "superseded";
   draft: ContentResearchScopeDraft;
-  scope_contract: ContentResearchScopeContract;
+  scope_contract: ContentResearchScopeContract | null;
   audit_events: ContentResearchScopeAuditEvent[];
+  allowed_actions: Array<JsonObject & { action: string; available: boolean }>;
+  coverage_snapshot: (JsonObject & {
+    id: string;
+    state: string;
+    unmet_constraint_ids: string[];
+    constraint_counts: JsonObject;
+  }) | null;
+  allowed_resolutions: Array<JsonObject & {
+    action: ContentResearchCoverageResolution;
+    available: boolean;
+    valid_constraint_ids: string[];
+    supplementary_queries_required: boolean;
+    unavailable_reason?: string | null;
+  }>;
+  decision_recovery: (JsonObject & {
+    state: string;
+    message: string;
+    required_action: string;
+    allowed_resolutions: ContentResearchCoverageResolution[];
+  }) | null;
+  execution_unit: ContentResearchExecutionUnitProjection | null;
+}
+
+export interface ContentResearchExecutionUnitProjection {
+  id: string;
+  state: string;
+  attempt_no: number;
+  recovery_state: "replayable" | "outcome_unknown" | "manual_recovery_required";
+  allowed_actions: Array<JsonObject & { action: string; available: boolean }>;
+  trace_summary: {
+    fact_count: number;
+    attempt_count: number;
+    last_fact_kind?: string | null;
+  };
+}
+
+type UnsafeContentResearchExecutionUnitProjection = ContentResearchExecutionUnitProjection & {
+  lease_token?: unknown;
+  lease_owner?: unknown;
+  lease_expires_at?: unknown;
+};
+
+function safeContentResearchExecutionUnit(
+  executionUnit: UnsafeContentResearchExecutionUnitProjection,
+): ContentResearchExecutionUnitProjection {
+  const {
+    lease_token: _leaseToken,
+    lease_owner: _leaseOwner,
+    lease_expires_at: _leaseExpiresAt,
+    ...safeExecutionUnit
+  } = executionUnit;
+  return safeExecutionUnit;
 }
 
 export interface ContentResearchPrepareScopeRequest {
@@ -338,11 +391,7 @@ export interface ContentResearchResolveCoverageResult {
   scope_contract: ContentResearchScopeContract;
   unmet_constraint_ids: string[];
   audit_event: ContentResearchScopeAuditEvent;
-  execution_unit: {
-    id: string;
-    state: string;
-    recovery_state: "replayable" | "outcome_unknown" | "manual_recovery_required";
-  };
+  execution_unit: ContentResearchExecutionUnitProjection;
 }
 
 export interface XHSQRLoginResponse {
@@ -579,11 +628,16 @@ export async function resolveContentResearchCoverage(
   workflowRunId: string,
   payload: ContentResearchResolveCoverageRequest,
 ): Promise<ContentResearchResolveCoverageResult> {
-  const response = await runContentResearchWorkflowAction<ContentResearchResolveCoverageResult>(workflowRunId, {
+  const response = await runContentResearchWorkflowAction<ContentResearchResolveCoverageResult & {
+    execution_unit: UnsafeContentResearchExecutionUnitProjection;
+  }>(workflowRunId, {
     action: "resolve_coverage",
     payload: payload as unknown as JsonObject,
   });
-  return response.result;
+  return {
+    ...response.result,
+    execution_unit: safeContentResearchExecutionUnit(response.result.execution_unit),
+  };
 }
 
 export async function getContentResearchScope(
@@ -591,9 +645,16 @@ export async function getContentResearchScope(
   version?: number,
 ): Promise<ContentResearchScopeProjection> {
   const suffix = version === undefined ? "" : `?version=${encodeURIComponent(String(version))}`;
-  return contentResearchFetch(
+  const projection = await contentResearchFetch<ContentResearchScopeProjection & {
+    execution_unit?: UnsafeContentResearchExecutionUnitProjection | null;
+  }>(
     `/content-research/workflows/${encodeURIComponent(workflowRunId)}/scope${suffix}`,
   );
+  if (!projection.execution_unit) return { ...projection, execution_unit: null };
+  return {
+    ...projection,
+    execution_unit: safeContentResearchExecutionUnit(projection.execution_unit),
+  };
 }
 
 export async function getContentResearchTrace(workflowRunId: string): Promise<ContentResearchTrace> {

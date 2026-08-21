@@ -1352,9 +1352,115 @@ async def test_confirmed_scope_projection_includes_current_action_metadata(scope
         }
     ]
     assert body["coverage_snapshot"]["id"] == "scv_api_authorized_continuation"
+    execution_unit = body["execution_unit"]
+    assert execution_unit["id"] == continuation["authorization"]["execution_unit_id"]
+    assert execution_unit["state"] == "pending"
+    assert execution_unit["attempt_no"] == 0
+    assert execution_unit["allowed_actions"] == []
+    assert execution_unit["trace_summary"] == {
+        "fact_count": 1,
+        "attempt_count": 1,
+        "last_fact_kind": "decision_accepted",
+    }
+    assert "lease_token" not in execution_unit
+    assert "lease_owner" not in execution_unit
     resolutions = {item["action"]: item for item in body["allowed_resolutions"]}
     assert resolutions["expand_required_constraint"]["valid_constraint_ids"] == ["scenario"]
     assert resolutions["relax_constraint"]["valid_constraint_ids"] == ["scenario"]
+
+
+@pytest.mark.asyncio
+async def test_scope_projection_marks_unknown_outcome_for_manual_recovery_without_replay(
+    scope_client,
+):
+    workflow_run_id, contract = await _confirmed_scope_with_unmet_season(scope_client)
+    continuation = await _authorized_continuation_snapshot(
+        scope_client,
+        workflow_run_id=workflow_run_id,
+        contract=contract,
+        snapshot_id="scv_api_unknown_outcome",
+        constraint_counts={
+            "season": {"required": True},
+            "_summary": {"reason_codes": ["required_constraint_coverage_unmet:season"]},
+        },
+        unmet_constraint_ids=("season",),
+    )
+    store = app.state.content_research_service._store
+    unit_id = continuation["authorization"]["execution_unit_id"]
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE content_research_scope_execution_units SET state='outcome_unknown' WHERE id=?",
+            (unit_id,),
+        )
+        conn.execute(
+            "UPDATE content_research_scope_execution_attempts SET state='outcome_unknown', provider_state='outcome_unknown' WHERE execution_unit_id=? AND attempt_no=0",
+            (unit_id,),
+        )
+
+    response = await scope_client.get(f"/content-research/workflows/{workflow_run_id}/scope")
+
+    assert response.status_code == 200
+    execution_unit = response.json()["execution_unit"]
+    assert execution_unit["state"] == "outcome_unknown"
+    assert execution_unit["recovery_state"] == "outcome_unknown"
+    assert execution_unit["allowed_actions"] == []
+    assert "lease_token" not in execution_unit
+
+
+@pytest.mark.asyncio
+async def test_scope_projection_declares_exact_replay_only_for_known_retryable_failure(
+    scope_client,
+):
+    workflow_run_id, contract = await _confirmed_scope_with_unmet_season(scope_client)
+    continuation = await _authorized_continuation_snapshot(
+        scope_client,
+        workflow_run_id=workflow_run_id,
+        contract=contract,
+        snapshot_id="scv_api_retryable_failure",
+        constraint_counts={
+            "season": {"required": True},
+            "_summary": {"reason_codes": ["required_constraint_coverage_unmet:season"]},
+        },
+        unmet_constraint_ids=("season",),
+    )
+    store = app.state.content_research_service._store
+    unit_id = continuation["authorization"]["execution_unit_id"]
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE content_research_scope_execution_units SET state='failed' WHERE id=?",
+            (unit_id,),
+        )
+        conn.execute(
+            "UPDATE content_research_scope_execution_attempts SET state='failed', provider_state='retryable_failed' WHERE execution_unit_id=? AND attempt_no=0",
+            (unit_id,),
+        )
+
+    response = await scope_client.get(f"/content-research/workflows/{workflow_run_id}/scope")
+
+    assert response.status_code == 200
+    assert response.json()["execution_unit"]["allowed_actions"] == [
+        {
+            "action": "replay_coverage_decision",
+            "available": True,
+            "request": {
+                "scope_contract_version": 1,
+                "coverage_snapshot_id": "scv_api_unmet_season",
+                "resolution": "expand_required_constraint",
+                "constraint_id": "season",
+                "supplementary_queries": ["夏季 防晒 长袖衬衫"],
+            },
+        }
+    ]
+
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE content_research_scope_execution_attempts SET provider_state='succeeded' WHERE execution_unit_id=? AND attempt_no=0",
+            (unit_id,),
+        )
+    downstream_failure = await scope_client.get(
+        f"/content-research/workflows/{workflow_run_id}/scope"
+    )
+    assert downstream_failure.json()["execution_unit"]["allowed_actions"] == []
 
 
 @pytest.mark.asyncio

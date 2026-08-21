@@ -164,6 +164,21 @@ class ContentResearchWorkflowEventsResponse(BaseModel):
     events: list[dict] = Field(default_factory=list)
 
 
+class ContentResearchScopeExecutionUnitProjectionResponse(BaseModel):
+    """Safe browser projection; worker ownership and lease fields are forbidden."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    state: str
+    attempt_no: int = Field(ge=0)
+    recovery_state: Literal[
+        "replayable", "outcome_unknown", "manual_recovery_required"
+    ]
+    allowed_actions: list[dict] = Field(default_factory=list)
+    trace_summary: dict = Field(default_factory=dict)
+
+
 class ContentResearchScopeProjectionResponse(BaseModel):
     """Read-only durable projection of a workflow's Scope authority."""
 
@@ -177,6 +192,7 @@ class ContentResearchScopeProjectionResponse(BaseModel):
     coverage_snapshot: dict | None = None
     allowed_resolutions: list[dict] = Field(default_factory=list)
     decision_recovery: dict | None = None
+    execution_unit: ContentResearchScopeExecutionUnitProjectionResponse | None = None
 
 
 class ContentResearchExecutionFactTraceResponse(BaseModel):

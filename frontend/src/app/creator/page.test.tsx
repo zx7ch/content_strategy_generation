@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import { JSDOM } from "jsdom";
+import type { ContentResearchCoverageResolution, ContentResearchScopeProjection } from "../../lib/content-research-api.ts";
 
 test("Creator always renders the content research entry instead of preview-gating it", () => {
   const source = readFileSync(new URL("./page.tsx", import.meta.url), "utf8");
@@ -343,7 +344,7 @@ test("Creator submits only final-query edits for every server-provided Draft gro
   container.remove();
 });
 
-test("Creator restores exploratory scope and exposes all three pending coverage decisions", async () => {
+test("Creator renders only server-declared Coverage actions and reasons", async () => {
   const dom = new JSDOM("<!doctype html><html><body></body></html>", { url: "http://localhost" });
   Object.assign(globalThis, {
     window: dom.window,
@@ -368,7 +369,9 @@ test("Creator restores exploratory scope and exposes all three pending coverage 
   await act(async () => {
     root.render(React.createElement(ContentResearchScopeCard, {
       draft: null,
-      projection: scopeProjectionFixture(),
+      projection: scopeProjectionFixture({
+        allowedResolutions: ["generate_limited_report"],
+      }),
       busy: false,
       onConfirm: () => undefined,
       onResolve: (payload: unknown) => { resolutions.push(payload); },
@@ -377,36 +380,242 @@ test("Creator restores exploratory scope and exposes all three pending coverage 
 
   assert.match(container.textContent ?? "", /白衬衫通勤穿搭/);
   assert.match(container.textContent ?? "", /探索补充/);
-  assert.match(container.textContent ?? "", /继续补充夏季样本/);
   assert.match(container.textContent ?? "", /基于现有证据生成受限报告/);
-  assert.match(container.textContent ?? "", /放宽夏季约束/);
+  assert.match(container.textContent ?? "", /夏季条件的合格样本不足/);
+  assert.doesNotMatch(container.textContent ?? "", /继续补充夏季样本/);
+  assert.doesNotMatch(container.textContent ?? "", /放宽夏季约束/);
   assert.doesNotMatch(container.textContent ?? "", /研究结论/);
-
-  const supplementary = container.querySelector('input[aria-label="补充检索词 1"]') as HTMLInputElement;
-  await act(async () => {
-    const valueSetter = Object.getOwnPropertyDescriptor(dom.window.HTMLInputElement.prototype, "value")?.set;
-    valueSetter?.call(supplementary, "夏季 防晒 长袖衬衫");
-    supplementary.dispatchEvent(new dom.window.Event("input", { bubbles: true }));
-  });
   const buttonNamed = (name: string) =>
     [...container.querySelectorAll("button")].find((button) => button.textContent === name);
   await act(async () => {
-    buttonNamed("继续补充夏季样本")?.click();
     buttonNamed("基于现有证据生成受限报告")?.click();
-    buttonNamed("放宽夏季约束")?.click();
   });
 
   assert.deepEqual(resolutions, [
-    {
-      scope_contract_version: 1,
-      coverage_snapshot_id: "coverage_1",
-      resolution: "expand_required_constraint",
-      constraint_id: "season",
-      supplementary_queries: ["夏季 防晒 长袖衬衫"],
-    },
     { scope_contract_version: 1, coverage_snapshot_id: "coverage_1", resolution: "generate_limited_report" },
-    { scope_contract_version: 1, coverage_snapshot_id: "coverage_1", resolution: "relax_constraint", constraint_id: "season" },
   ]);
+
+  await act(async () => { root.unmount(); });
+  container.remove();
+});
+
+test("Creator restores a persisted pending Draft after reload", async () => {
+  const dom = new JSDOM("<!doctype html><html><body></body></html>", { url: "http://localhost" });
+  Object.assign(globalThis, {
+    window: dom.window,
+    document: dom.window.document,
+    HTMLElement: dom.window.HTMLElement,
+    HTMLInputElement: dom.window.HTMLInputElement,
+    HTMLButtonElement: dom.window.HTMLButtonElement,
+    Event: dom.window.Event,
+    IS_REACT_ACT_ENVIRONMENT: true,
+  });
+  Object.defineProperty(globalThis, "navigator", { configurable: true, value: dom.window.navigator });
+  const React = await import("react");
+  const { act } = React;
+  const { createRoot } = await import("react-dom/client");
+  const { default: CreatorPage } = await import("./page.tsx");
+  const container = document.createElement("div");
+  document.body.append(container);
+  const root = createRoot(container);
+
+  await act(async () => {
+    root.render(React.createElement(CreatorPage.ContentResearchScopeCard, {
+      draft: null,
+      projection: {
+        ...scopeProjectionFixture(),
+        state: "awaiting_confirmation",
+        scope_contract: null,
+        coverage_snapshot: null,
+        allowed_resolutions: [],
+        decision_recovery: null,
+        execution_unit: null,
+      },
+      busy: false,
+      onConfirm: () => undefined,
+      onResolve: () => undefined,
+    }));
+  });
+
+  assert.equal((container.querySelector('input[aria-label="检索组 1"]') as HTMLInputElement).value, "夏季长袖通勤衬衫");
+  assert.ok([...container.querySelectorAll("button")].some((button) => button.textContent === "确认并开始调研"));
+
+  await act(async () => { root.unmount(); });
+  container.remove();
+});
+
+test("Creator reveals supplementary queries only for a server-allowed expand decision", async () => {
+  const dom = new JSDOM("<!doctype html><html><body></body></html>", { url: "http://localhost" });
+  Object.assign(globalThis, {
+    window: dom.window,
+    document: dom.window.document,
+    HTMLElement: dom.window.HTMLElement,
+    HTMLInputElement: dom.window.HTMLInputElement,
+    HTMLButtonElement: dom.window.HTMLButtonElement,
+    Event: dom.window.Event,
+    IS_REACT_ACT_ENVIRONMENT: true,
+  });
+  Object.defineProperty(globalThis, "navigator", { configurable: true, value: dom.window.navigator });
+  const React = await import("react");
+  const { act } = React;
+  const { createRoot } = await import("react-dom/client");
+  const { default: CreatorPage } = await import("./page.tsx");
+  const container = document.createElement("div");
+  document.body.append(container);
+  const root = createRoot(container);
+
+  await act(async () => {
+    root.render(React.createElement(CreatorPage.ContentResearchScopeCard, {
+      draft: null,
+      projection: scopeProjectionFixture({
+        allowedResolutions: ["expand_required_constraint", "generate_limited_report", "relax_constraint"],
+      }),
+      busy: false,
+      onConfirm: () => undefined,
+      onResolve: () => undefined,
+    }));
+  });
+
+  assert.equal(container.querySelectorAll('input[aria-label^="补充检索词 "]').length, 0);
+  await act(async () => {
+    [...container.querySelectorAll("button")].find((button) => button.textContent === "继续补充夏季样本")?.click();
+  });
+  assert.equal(container.querySelectorAll('input[aria-label^="补充检索词 "]').length, 2);
+
+  await act(async () => { root.unmount(); });
+  container.remove();
+});
+
+test("Creator submits the constraint ids declared for each Coverage action", async () => {
+  const dom = new JSDOM("<!doctype html><html><body></body></html>", { url: "http://localhost" });
+  Object.assign(globalThis, { window: dom.window, document: dom.window.document, HTMLElement: dom.window.HTMLElement, HTMLInputElement: dom.window.HTMLInputElement, HTMLButtonElement: dom.window.HTMLButtonElement, Event: dom.window.Event, IS_REACT_ACT_ENVIRONMENT: true });
+  Object.defineProperty(globalThis, "navigator", { configurable: true, value: dom.window.navigator });
+  const React = await import("react");
+  const { act } = React;
+  const { createRoot } = await import("react-dom/client");
+  const { default: CreatorPage } = await import("./page.tsx");
+  const container = document.createElement("div");
+  document.body.append(container);
+  const root = createRoot(container);
+  const submitted: unknown[] = [];
+  const projection = scopeProjectionFixture({
+    allowedResolutions: ["expand_required_constraint", "relax_constraint"],
+    expandConstraintIds: ["season"],
+    relaxConstraintIds: ["core_object"],
+  });
+
+  await act(async () => {
+    root.render(React.createElement(CreatorPage.ContentResearchScopeCard, {
+      draft: null,
+      projection,
+      busy: false,
+      onConfirm: () => undefined,
+      onResolve: (payload: unknown) => submitted.push(payload),
+    }));
+  });
+
+  await act(async () => { [...container.querySelectorAll("button")].find((button) => button.textContent === "放宽长袖衬衫约束")?.click(); });
+  await act(async () => { [...container.querySelectorAll("button")].find((button) => button.textContent === "继续补充夏季样本")?.click(); });
+  const input = container.querySelector('input[aria-label="补充检索词 1"]') as HTMLInputElement;
+  await act(async () => {
+    const valueSetter = Object.getOwnPropertyDescriptor(dom.window.HTMLInputElement.prototype, "value")?.set;
+    valueSetter?.call(input, "夏季 防晒 长袖");
+    input.dispatchEvent(new dom.window.Event("input", { bubbles: true }));
+  });
+  await act(async () => { [...container.querySelectorAll("button")].find((button) => button.textContent === "提交补搜决定")?.click(); });
+
+  assert.equal((submitted[0] as { constraint_id: string }).constraint_id, "core_object");
+  assert.equal((submitted[1] as { constraint_id: string }).constraint_id, "season");
+  await act(async () => { root.unmount(); });
+  container.remove();
+});
+
+test("Creator shows manual recovery and no automatic replay for an unknown outcome", async () => {
+  const dom = new JSDOM("<!doctype html><html><body></body></html>", { url: "http://localhost" });
+  Object.assign(globalThis, { window: dom.window, document: dom.window.document, HTMLElement: dom.window.HTMLElement, Event: dom.window.Event, IS_REACT_ACT_ENVIRONMENT: true });
+  Object.defineProperty(globalThis, "navigator", { configurable: true, value: dom.window.navigator });
+  const React = await import("react");
+  const { act } = React;
+  const { createRoot } = await import("react-dom/client");
+  const { default: CreatorPage } = await import("./page.tsx");
+  const container = document.createElement("div");
+  document.body.append(container);
+  const root = createRoot(container);
+
+  await act(async () => {
+    root.render(React.createElement(CreatorPage.ContentResearchScopeCard, {
+      draft: null,
+      projection: {
+        ...scopeProjectionFixture({ allowedResolutions: [] }),
+        decision_recovery: null,
+        execution_unit: {
+          id: "seu_unknown",
+          state: "outcome_unknown",
+          attempt_no: 1,
+          recovery_state: "outcome_unknown",
+          allowed_actions: [],
+          trace_summary: { fact_count: 3, attempt_count: 1, last_fact_kind: "outcome_unknown" },
+        },
+      },
+      busy: false,
+      onConfirm: () => undefined,
+      onResolve: () => undefined,
+    }));
+  });
+
+  assert.match(container.textContent ?? "", /需要人工确认执行结果/);
+  assert.match(container.textContent ?? "", /不会自动重放/);
+  assert.equal(container.querySelectorAll('section[aria-label="覆盖不足决策"] button').length, 0);
+
+  await act(async () => { root.unmount(); });
+  container.remove();
+});
+
+test("Creator replays a known retryable failure only through the server-declared command", async () => {
+  const dom = new JSDOM("<!doctype html><html><body></body></html>", { url: "http://localhost" });
+  Object.assign(globalThis, { window: dom.window, document: dom.window.document, HTMLElement: dom.window.HTMLElement, HTMLButtonElement: dom.window.HTMLButtonElement, Event: dom.window.Event, IS_REACT_ACT_ENVIRONMENT: true });
+  Object.defineProperty(globalThis, "navigator", { configurable: true, value: dom.window.navigator });
+  const React = await import("react");
+  const { act } = React;
+  const { createRoot } = await import("react-dom/client");
+  const { default: CreatorPage } = await import("./page.tsx");
+  const container = document.createElement("div");
+  document.body.append(container);
+  const root = createRoot(container);
+  const submitted: unknown[] = [];
+  const replayRequest = {
+    scope_contract_version: 1,
+    coverage_snapshot_id: "coverage_1",
+    resolution: "expand_required_constraint" as const,
+    constraint_id: "season",
+    supplementary_queries: ["夏季 防晒 长袖衬衫"],
+  };
+
+  await act(async () => {
+    root.render(React.createElement(CreatorPage.ContentResearchScopeCard, {
+      draft: null,
+      projection: {
+        ...scopeProjectionFixture({ allowedResolutions: [] }),
+        decision_recovery: null,
+        execution_unit: {
+          id: "seu_retry",
+          state: "failed",
+          attempt_no: 1,
+          recovery_state: "replayable",
+          allowed_actions: [{ action: "replay_coverage_decision", available: true, request: replayRequest }],
+          trace_summary: { fact_count: 4, attempt_count: 1, last_fact_kind: "provider_outcome_recorded" },
+        },
+      },
+      busy: false,
+      onConfirm: () => undefined,
+      onResolve: (payload: unknown) => submitted.push(payload),
+    }));
+  });
+
+  const replay = [...container.querySelectorAll("button")].find((button) => button.textContent === "重试本次已保存决定");
+  assert.ok(replay);
+  await act(async () => { replay.click(); });
+  assert.deepEqual(submitted, [replayRequest]);
 
   await act(async () => { root.unmount(); });
   container.remove();
@@ -417,6 +626,40 @@ test("Creator thread restoration reads persisted Scope instead of browser-owned 
 
   assert.match(source, /getContentResearchScope\(runIdForThread\)/);
   assert.match(source, /scopeProjection/);
+});
+
+test("Creator request epochs reject late responses from a previously selected run", async () => {
+  const { ContentResearchRequestEpoch } = await import("./page-state.ts");
+  const requests = new ContentResearchRequestEpoch();
+  requests.activate("run_a");
+  const oldScope = requests.ticket("run_a");
+  const oldReport = requests.ticket("run_a");
+
+  requests.activate("run_b");
+  const currentScope = requests.ticket("run_b");
+
+  assert.equal(requests.accepts(oldScope), false);
+  assert.equal(requests.accepts(oldReport), false);
+  assert.equal(requests.accepts(currentScope), true);
+
+  const earlierSameRunScope = requests.ticket("run_b", "scope");
+  const newerSameRunScope = requests.ticket("run_b", "scope");
+  assert.equal(requests.accepts(earlierSameRunScope), false);
+  assert.equal(requests.accepts(newerSameRunScope), true);
+});
+
+test("report presentation reads query groups from the server-frozen Scope", async () => {
+  const { frozenReportScopeQueries } = await import("./page-state.ts");
+
+  assert.deepEqual(frozenReportScopeQueries({
+    frozen_scope: {
+      scope_contract_version: 1,
+      query_groups: [
+        { id: "frozen_1", final_query: "夏季 长袖衬衫 通勤" },
+        { id: "frozen_2", final_query: "夏季 防晒 长袖衬衫" },
+      ],
+    },
+  }), ["夏季 长袖衬衫 通勤", "夏季 防晒 长袖衬衫"]);
 });
 
 function scopeDraftFixture() {
@@ -438,10 +681,20 @@ function scopeDraftFixture() {
   };
 }
 
-function scopeProjectionFixture() {
+function scopeProjectionFixture(options: {
+  allowedResolutions?: ContentResearchCoverageResolution[];
+  expandConstraintIds?: string[];
+  relaxConstraintIds?: string[];
+} = {}): ContentResearchScopeProjection {
+  const allowed = new Set<ContentResearchCoverageResolution>(options.allowedResolutions ?? [
+    "expand_required_constraint",
+    "generate_limited_report",
+    "relax_constraint",
+  ]);
   return {
     schema_version: "content_research_api_v1",
     workflow_run_id: "run_1",
+    state: "confirmed" as const,
     draft: scopeDraftFixture(),
     scope_contract: {
       id: "scope_contract_1",
@@ -471,5 +724,38 @@ function scopeProjectionFixture() {
       },
       created_at: "2026-08-18T00:02:00+08:00",
     }],
+    allowed_actions: [
+      { action: "prepare_scope", available: false, unavailable_reason: "coverage_decision_required", recovery_action: "resolve_coverage" },
+      { action: "confirm_scope", available: false, unavailable_reason: "coverage_decision_required", recovery_action: "resolve_coverage" },
+      { action: "resolve_coverage", available: true, scope_contract_version: 1, coverage_snapshot_id: "coverage_1" },
+    ],
+    coverage_snapshot: {
+      id: "coverage_1",
+      workflow_run_id: "run_1",
+      scope_contract_id: "scope_contract_1",
+      scope_contract_version: 1,
+      execution_revision: 1,
+      execution_authorization_id: null,
+      source_coverage_snapshot_id: null,
+      state: "awaiting_scope_decision",
+      constraint_counts: {
+        season: { matched_candidate_count: 1, independent_author_count: 1, required: true },
+        _summary: { reason_codes: ["required_constraint_coverage_unmet:season"] },
+      },
+      unmet_constraint_ids: ["season"],
+      created_at: "2026-08-18T00:02:00+08:00",
+    },
+    allowed_resolutions: [
+      { action: "expand_required_constraint", available: allowed.has("expand_required_constraint"), valid_constraint_ids: allowed.has("expand_required_constraint") ? (options.expandConstraintIds ?? ["season"]) : [], supplementary_queries_required: true, unavailable_reason: allowed.has("expand_required_constraint") ? null : "not_allowed" },
+      { action: "generate_limited_report", available: allowed.has("generate_limited_report"), valid_constraint_ids: [], supplementary_queries_required: false, unavailable_reason: allowed.has("generate_limited_report") ? null : "not_allowed" },
+      { action: "relax_constraint", available: allowed.has("relax_constraint"), valid_constraint_ids: allowed.has("relax_constraint") ? (options.relaxConstraintIds ?? ["season"]) : [], supplementary_queries_required: false, unavailable_reason: allowed.has("relax_constraint") ? null : "not_allowed" },
+    ],
+    decision_recovery: {
+      state: "coverage_decision_required",
+      message: "ordinary Scope confirmation unavailable",
+      required_action: "resolve_coverage",
+      allowed_resolutions: [...allowed],
+    },
+    execution_unit: null,
   };
 }

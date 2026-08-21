@@ -1754,6 +1754,17 @@ class ContentResearchService:
             coverage_snapshot=coverage_snapshot,
             authorizations=authorizations,
         )
+        execution_unit = (
+            self._store.get_scope_execution_unit(current_authorization.execution_unit_id)
+            if current_authorization is not None
+            and current_authorization.execution_unit_id is not None
+            else None
+        )
+        execution_facts = (
+            self._store.execution_trace(execution_unit.id)
+            if execution_unit is not None
+            else []
+        )
         return ContentResearchScopeProjectionResponse(
             workflow_run_id=workflow_run_id,
             state=(
@@ -1780,6 +1791,12 @@ class ContentResearchService:
                 coverage_snapshot=coverage_snapshot,
                 authorizations=authorizations,
                 allowed_resolutions=allowed_resolutions,
+            ),
+            execution_unit=_scope_execution_unit_projection(
+                execution_unit=execution_unit,
+                authorization=current_authorization,
+                audit_events=audit_events,
+                execution_facts=execution_facts,
             ),
         )
 
@@ -3158,15 +3175,21 @@ class ContentResearchService:
             workflow_run_id=workflow_run_id,
             continuation=continuation,
         )
+        execution_unit = (
+            self._store.get_scope_execution_unit(authorization.execution_unit_id)
+            if authorization.execution_unit_id
+            else None
+        )
         return _coverage_resolution_result(
             contract=resulting_contract,
             snapshot=snapshot,
             event=event,
             authorization=authorization,
-            execution_unit=(
-                self._store.get_scope_execution_unit(authorization.execution_unit_id)
-                if authorization.execution_unit_id
-                else None
+            execution_unit=execution_unit,
+            execution_facts=(
+                self._store.execution_trace(execution_unit.id)
+                if execution_unit is not None
+                else []
             ),
         )
 
@@ -6276,6 +6299,78 @@ def _scope_execution_authorization_payload(
     }
 
 
+def _scope_execution_unit_projection(
+    *,
+    execution_unit: ScopeExecutionUnit | None,
+    authorization: ScopeExecutionAuthorization | None,
+    audit_events: list[dict[str, Any]],
+    execution_facts: list[Any],
+) -> dict[str, Any] | None:
+    """Expose recovery authority without leaking an attempt lease to Creator."""
+    if execution_unit is None or authorization is None:
+        return None
+    latest_attempt_no = max(
+        (int(fact.attempt_no) for fact in execution_facts),
+        default=0,
+    )
+    replay_actions: list[dict[str, Any]] = []
+    if (
+        execution_unit.state == "failed"
+        and execution_unit.recovery_state == "replayable"
+        and execution_unit.latest_provider_state == "retryable_failed"
+    ):
+        resolution_event = next(
+            (
+                event
+                for event in reversed(audit_events)
+                if event.get("event_name") == "coverage_resolved"
+                and str((event.get("payload") or {}).get("coverage_snapshot_id") or "")
+                == execution_unit.coverage_snapshot_id
+                and str((event.get("payload") or {}).get("resolution") or "")
+                == execution_unit.resolution
+            ),
+            None,
+        )
+        payload = dict((resolution_event or {}).get("payload") or {})
+        replay_request: dict[str, Any] = {
+            "scope_contract_version": int(
+                payload.get("source_scope_contract_version")
+                or authorization.scope_contract_version
+            ),
+            "coverage_snapshot_id": execution_unit.coverage_snapshot_id,
+            "resolution": execution_unit.resolution,
+        }
+        constraint_id = str(payload.get("constraint_id") or "")
+        if constraint_id:
+            replay_request["constraint_id"] = constraint_id
+        supplementary_queries = [
+            str(query)
+            for query in payload.get("supplementary_queries") or []
+            if str(query).strip()
+        ]
+        if supplementary_queries:
+            replay_request["supplementary_queries"] = supplementary_queries
+        replay_actions.append(
+            {
+                "action": "replay_coverage_decision",
+                "available": True,
+                "request": replay_request,
+            }
+        )
+    return {
+        "id": execution_unit.id,
+        "state": execution_unit.state,
+        "attempt_no": latest_attempt_no,
+        "recovery_state": execution_unit.recovery_state,
+        "allowed_actions": replay_actions,
+        "trace_summary": {
+            "fact_count": len(execution_facts),
+            "attempt_count": len({int(fact.attempt_no) for fact in execution_facts}),
+            "last_fact_kind": execution_facts[-1].kind if execution_facts else None,
+        },
+    }
+
+
 def _coverage_snapshot_payload(snapshot: Any) -> dict[str, Any]:
     return {
         "id": snapshot.id,
@@ -6466,6 +6561,7 @@ def _coverage_resolution_result(
     event: ScopeAuditEvent,
     authorization: ScopeExecutionAuthorization,
     execution_unit: ScopeExecutionUnit | None,
+    execution_facts: list[Any],
 ) -> dict[str, Any]:
     return {
         "report_mode": str(event.payload.get("report_mode") or "withheld"),
@@ -6473,14 +6569,11 @@ def _coverage_resolution_result(
         "unmet_constraint_ids": list(snapshot.unmet_constraint_ids),
         "audit_event": _scope_audit_payload(event),
         "execution_authorization": _scope_execution_authorization_payload(authorization),
-        "execution_unit": (
-            {
-                "id": execution_unit.id,
-                "state": execution_unit.state,
-                "recovery_state": execution_unit.recovery_state,
-            }
-            if execution_unit is not None
-            else None
+        "execution_unit": _scope_execution_unit_projection(
+            execution_unit=execution_unit,
+            authorization=authorization,
+            audit_events=[_scope_audit_payload(event)],
+            execution_facts=execution_facts,
         ),
     }
 

@@ -302,6 +302,15 @@ test("scope actions use the finalized server-owned payload contract", async () =
       scope_contract: scopeContractPayload(),
       unmet_constraint_ids: ["season"],
       audit_event: scopeAuditPayload("coverage_resolved"),
+      execution_unit: {
+        id: "seu_1",
+        state: "pending",
+        attempt_no: 1,
+        recovery_state: "replayable",
+        allowed_actions: [],
+        trace_summary: { fact_count: 1, attempt_count: 1, last_fact_kind: "decision_accepted" },
+        lease_token: "must-never-reach-the-browser",
+      },
     }));
   }) as typeof fetch;
 
@@ -315,7 +324,7 @@ test("scope actions use the finalized server-owned payload contract", async () =
       { final_query: "长袖衬衫 通勤" },
     ],
   });
-  await resolveContentResearchCoverage("run_1", {
+  const resolution = await resolveContentResearchCoverage("run_1", {
     scope_contract_version: 1,
     coverage_snapshot_id: "coverage_1",
     resolution: "expand_required_constraint",
@@ -349,6 +358,9 @@ test("scope actions use the finalized server-owned payload contract", async () =
       supplementary_queries: ["夏季 防晒 长袖衬衫"],
     },
   });
+  assert.equal(resolution.execution_unit.id, "seu_1");
+  assert.equal(resolution.execution_unit.attempt_no, 1);
+  assert.equal("lease_token" in resolution.execution_unit, false);
 });
 
 test("getContentResearchScope reads the persisted Scope projection and optional version", async () => {
@@ -369,10 +381,41 @@ test("getContentResearchScope reads the persisted Scope projection and optional 
 
   assert.ok(requestUrls[0].endsWith("/content-research/workflows/run_1/scope"));
   assert.ok(requestUrls[1].endsWith("/content-research/workflows/run_1/scope?version=1"));
-  assert.equal(latest.scope_contract.query_groups[0].suggested_query, "夏季 长袖衬衫 通勤");
-  assert.equal(latest.scope_contract.query_groups[0].final_query, "白衬衫通勤穿搭");
-  assert.equal(latest.scope_contract.query_groups[0].execution_role, "exploratory");
-  assert.equal(versioned.scope_contract.version, 1);
+  assert.equal(latest.scope_contract?.query_groups[0].suggested_query, "夏季 长袖衬衫 通勤");
+  assert.equal(latest.scope_contract?.query_groups[0].final_query, "白衬衫通勤穿搭");
+  assert.equal(latest.scope_contract?.query_groups[0].execution_role, "exploratory");
+  assert.equal(versioned.scope_contract?.version, 1);
+});
+
+test("scope reads expose a safe execution-unit projection without worker lease data", async () => {
+  globalThis.fetch = (async () => jsonResponse({
+    schema_version: "content_research_api_v1",
+    workflow_run_id: "run_1",
+    state: "confirmed",
+    draft: scopeDraftPayload(),
+    scope_contract: scopeContractPayload(),
+    audit_events: [],
+    allowed_actions: [],
+    coverage_snapshot: null,
+    allowed_resolutions: [],
+    decision_recovery: null,
+    execution_unit: {
+      id: "seu_1",
+      state: "failed",
+      attempt_no: 2,
+      recovery_state: "replayable",
+      allowed_actions: ["replay_coverage_decision"],
+      trace_summary: { fact_count: 4, last_fact_kind: "provider_outcome_recorded" },
+      lease_token: "must-never-reach-the-browser",
+    },
+  })) as typeof fetch;
+
+  const projection = await getContentResearchScope("run_1");
+
+  assert.equal(projection.execution_unit?.id, "seu_1");
+  assert.equal(projection.execution_unit?.attempt_no, 2);
+  assert.deepEqual(projection.execution_unit?.allowed_actions, ["replay_coverage_decision"]);
+  assert.equal("lease_token" in (projection.execution_unit ?? {}), false);
 });
 
 test("formal research dispatch preserves failed specialist state", async () => {

@@ -59,6 +59,7 @@ import { XiaohongshuLoginCard } from "@/components/content-research/XiaohongshuL
 import { traceExecutionDurationText } from "@/lib/content-research-trace";
 import { resolveContentResearchModelRecovery } from "@/lib/content-research-recovery";
 import { contentResearchErrorFeedback } from "@/lib/content-research-error-feedback";
+import { ContentResearchRequestEpoch, frozenReportScopeQueries } from "./page-state";
 
 type TaskStatus = "running" | "paused" | "failed" | "cancelled" | "completed";
 type MessageRole = "assistant" | "user" | "system";
@@ -120,6 +121,7 @@ const WELCOME_MESSAGE: ChatMessage = {
   text: "你好，我是品牌内容增长助手。描述你想生成的内容，直接发送就能开始。",
 };
 const CONTENT_RESEARCH_ACTIVE_RUNS_STORAGE_KEY = "xhs-growth-agent:content-research-active-runs-by-thread";
+
 
 function contentResearchRunsByThread(): Record<string, string> {
   try {
@@ -1025,6 +1027,7 @@ function recordList(value: unknown): Record<string, unknown>[] {
     : [];
 }
 
+
 function selectRequestedDirectionStates(report: ContentResearchLiteReportResponse) {
   const requestedDirectionIds = new Set(arrayField(report.frozen_scope, "direction_ids"));
   return recordList(report.run_direction_states).filter((item) =>
@@ -1094,11 +1097,13 @@ function ContentResearchReportMessage({
   onRecover,
   onRepair,
   onOpenTrace,
+  recoveryAllowed = true,
 }: {
   report: ContentResearchLiteReportResponse;
   onRecover?: () => void;
   onRepair?: () => void;
   onOpenTrace?: () => void;
+  recoveryAllowed?: boolean;
 }) {
   const [selectedCitation, setSelectedCitation] = useState<Record<string, unknown> | null>(null);
   const [candidateAudit, setCandidateAudit] = useState<ContentResearchDirectionEvidence | null>(null);
@@ -1129,7 +1134,7 @@ function ContentResearchReportMessage({
         <p className="mt-2 text-xs text-quiet">
           {completedStages.length ? `已保存阶段：${completedStages.join("、")}` : "尚无已完成阶段。"}
         </p>
-        {actionable && stringField(recovery, "next_action") === "resume_run" && (
+        {recoveryAllowed && actionable && stringField(recovery, "next_action") === "resume_run" && (
           <button
             type="button"
             onClick={authenticationRequired ? onOpenTrace : onRecover}
@@ -1166,6 +1171,7 @@ function ContentResearchReportMessage({
   const observations = evidenceOnly ? [] : allCards.filter((item) => stringField(item, "card_kind") === "observation");
   const leads = evidenceOnly ? [] : recordList(report.sections.weak_signals);
   const limitations = recordList(report.sections.limitations_scope);
+  const frozenScopeQueries = frozenReportScopeQueries(report);
   const directionStates = evidenceOnly
     ? []
     : selectRequestedDirectionStates(report);
@@ -1417,6 +1423,12 @@ function ContentResearchReportMessage({
             <section aria-label="范围与限制" className="border-t border-line pt-4">
               <h4 className="font-semibold">范围与限制</h4>
               <div className="mt-2 space-y-2 text-xs text-quiet">
+                {frozenScopeQueries.length > 0 && (
+                  <div aria-label="报告冻结检索范围">
+                    <p className="font-medium text-ink">报告使用的冻结检索组</p>
+                    {frozenScopeQueries.map((query, index) => <p key={`${query}-${index}`} className="mt-1">{index + 1}. {query}</p>)}
+                  </div>
+                )}
                 {limitations.length
                   ? limitations.map((item, index) => <p key={`limitation-${index}`}>{firstString(item, ["message", "reason", "summary"])}</p>)
                   : <p>请在本次冻结样本与引用范围内理解结果。</p>}
@@ -1634,12 +1646,14 @@ function ContentResearchTraceInspector({
   onExpandedChange,
   onRefresh,
   onRetry,
+  legacyRecoveryAllowed,
 }: {
   run: ContentResearchRunState;
   expanded: boolean;
   onExpandedChange: (expanded: boolean) => void;
   onRefresh: () => Promise<void>;
   onRetry: () => Promise<void>;
+  legacyRecoveryAllowed: boolean;
 }) {
   const [qrLogin, setQrLogin] = useState<{ status: string; image?: string | null } | null>(null);
   const [refreshing, setRefreshing] = useState(false);
@@ -1722,7 +1736,7 @@ function ContentResearchTraceInspector({
       setResuming(false);
     }
   };
-  const authenticationControls = recovery.authRequired && !terminalPublished ? (
+  const authenticationControls = legacyRecoveryAllowed && recovery.authRequired && !terminalPublished ? (
     <div className="mt-3">
       {qrLogin?.status !== "authenticated" && (
         <button
@@ -1930,7 +1944,7 @@ function ContentResearchTraceInspector({
             </section>
           )}
 
-          {recovery.recoverable && !recovery.authRequired && !marketingModelRecoveryRequired && !terminalPublished && (
+          {legacyRecoveryAllowed && recovery.recoverable && !recovery.authRequired && !marketingModelRecoveryRequired && !terminalPublished && (
             <div className="mt-4 flex justify-end">
               <button type="button" onClick={() => void resumeRun()} disabled={resuming} className="rounded-lg bg-ink px-3 py-1.5 text-xs font-medium text-white disabled:opacity-40">
                 {resuming ? "继续中" : "继续本轮调研"}
@@ -2049,22 +2063,27 @@ interface ContentResearchScopeCardProps {
 }
 
 function pendingCoverageDecision(projection: ContentResearchScopeProjection | null) {
-  if (!projection) return null;
-  const evaluated = [...projection.audit_events].reverse().find((event) => (
-    event.event_name === "coverage_evaluated"
-    && stringField(event.payload, "state") === "awaiting_scope_decision"
-  ));
-  if (!evaluated) return null;
-  const coverageSnapshotId = stringField(evaluated.payload, "coverage_snapshot_id");
-  if (!coverageSnapshotId) return null;
-  const resolved = projection.audit_events.some((event) => (
-    event.event_name === "coverage_resolved"
-    && stringField(event.payload, "coverage_snapshot_id") === coverageSnapshotId
-  ));
-  return resolved ? null : {
-    coverageSnapshotId,
-    unmetConstraintIds: arrayField(evaluated.payload, "unmet_constraint_ids"),
+  if (
+    !projection?.coverage_snapshot
+    || projection.decision_recovery?.state !== "coverage_decision_required"
+    || !projection.allowed_actions.some((item) => item.action === "resolve_coverage" && item.available)
+  ) return null;
+  return {
+    coverageSnapshotId: projection.coverage_snapshot.id,
+    unmetConstraintIds: projection.coverage_snapshot.unmet_constraint_ids,
+    allowedResolutions: projection.allowed_resolutions.filter((item) => item.available),
+    reasonCodes: arrayField(
+      projection.coverage_snapshot.constraint_counts._summary as Record<string, unknown> | undefined,
+      "reason_codes",
+    ),
   };
+}
+
+function scopeCoverageReasonLabel(reason: string, constraintLabel: string) {
+  if (reason.startsWith("required_constraint_coverage_unmet:")) return `${constraintLabel}条件的合格样本不足`;
+  if (reason === "minimum_samples_unmet") return "合格样本总数不足";
+  if (reason === "minimum_independent_authors_unmet") return "独立作者数量不足";
+  return reason;
 }
 
 function scopeExecutionRoleLabel(role: string) {
@@ -2083,18 +2102,41 @@ function ContentResearchScopeCard({
 }: ContentResearchScopeCardProps) {
   const [finalQueries, setFinalQueries] = useState<string[]>([]);
   const [supplementaryQueries, setSupplementaryQueries] = useState(["", ""]);
+  const [selectedResolution, setSelectedResolution] = useState<string | null>(null);
+  const effectiveDraft = draft ?? (
+    projection?.state === "awaiting_confirmation" && projection.scope_contract === null
+      ? projection.draft
+      : null
+  );
   useEffect(() => {
-    setFinalQueries(draft?.query_groups.map((group) => group.final_query) ?? []);
-  }, [draft]);
+    setFinalQueries(effectiveDraft?.query_groups.map((group) => group.final_query) ?? []);
+  }, [effectiveDraft]);
+  useEffect(() => {
+    setSelectedResolution(null);
+    setSupplementaryQueries(["", ""]);
+  }, [projection?.coverage_snapshot?.id, projection?.execution_unit?.id]);
 
   const pending = pendingCoverageDecision(projection);
   const contract = projection?.scope_contract ?? null;
-  const unmetConstraintId = pending?.unmetConstraintIds[0] ?? null;
-  const unmetConstraint = contract?.constraints.find((item) => item.id === unmetConstraintId) ?? null;
-  const unmetLabel = unmetConstraint?.value || unmetConstraint?.label || "必要范围";
+  const expandResolution = pending?.allowedResolutions.find((item) => item.action === "expand_required_constraint");
+  const relaxResolution = pending?.allowedResolutions.find((item) => item.action === "relax_constraint");
+  const expandConstraintId = expandResolution?.valid_constraint_ids[0] ?? null;
+  const relaxConstraintId = relaxResolution?.valid_constraint_ids[0] ?? null;
+  const constraintLabel = (constraintId: string | null) => {
+    const constraint = contract?.constraints.find((item) => item.id === constraintId);
+    return constraint?.value || constraint?.label || "必要范围";
+  };
+  const expandLabel = constraintLabel(expandConstraintId);
+  const relaxLabel = constraintLabel(relaxConstraintId);
+  const unknownOutcome = projection?.execution_unit?.recovery_state === "outcome_unknown"
+    || projection?.execution_unit?.recovery_state === "manual_recovery_required";
+  const replayAction = projection?.execution_unit?.allowed_actions.find((item) => (
+    item.action === "replay_coverage_decision" && item.available
+  ));
+  const replayRequest = replayAction?.request as ContentResearchResolveCoverageRequest | undefined;
 
-  if (draft && !projection) {
-    const valid = finalQueries.length === draft.query_groups.length
+  if (effectiveDraft && !projection?.scope_contract) {
+    const valid = finalQueries.length === effectiveDraft.query_groups.length
       && finalQueries.every((query) => query.trim().length > 0);
     return (
       <div className="flex justify-start">
@@ -2103,8 +2145,8 @@ function ContentResearchScopeCard({
           <h2 className="mt-1 text-base font-semibold">确认每组最终检索词</h2>
           <p className="mt-1 text-xs leading-5 text-quiet">这些检索词会冻结为本轮执行范围。可以编辑最终检索词，范围约束仍由服务端管理。</p>
           <div className="mt-4 space-y-3">
-            {draft.query_groups.map((group, index) => (
-              <label key={`${draft.id}-${index}`} className="block rounded-xl border border-line bg-white px-3 py-3">
+            {effectiveDraft.query_groups.map((group, index) => (
+              <label key={`${effectiveDraft.id}-${index}`} className="block rounded-xl border border-line bg-white px-3 py-3">
                 <span className="text-xs font-medium text-ink">检索组 {index + 1}</span>
                 <input
                   aria-label={`检索组 ${index + 1}`}
@@ -2125,8 +2167,8 @@ function ContentResearchScopeCard({
               type="button"
               disabled={busy || !valid}
               onClick={() => onConfirm({
-                scope_draft_id: draft.id,
-                structure_hash: draft.structure_hash,
+                scope_draft_id: effectiveDraft.id,
+                structure_hash: effectiveDraft.structure_hash,
                 query_groups: finalQueries.map((finalQuery) => ({ final_query: finalQuery.trim() })),
               })}
               className="rounded-lg bg-ink px-4 py-2 text-xs font-medium text-white disabled:cursor-not-allowed disabled:opacity-40"
@@ -2166,56 +2208,50 @@ function ContentResearchScopeCard({
           ))}
         </div>
 
-        {pending && (
+        {unknownOutcome && (
+          <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50 px-4 py-4 text-amber-950" aria-label="执行结果需要人工恢复">
+            <p className="text-sm font-semibold">需要人工确认执行结果</p>
+            <p className="mt-1 text-xs leading-5 text-amber-800">外部调用是否完成未知，系统不会自动重放。请检查只读 Trace 后按人工恢复流程处理。</p>
+            <p className="mt-2 text-[11px] text-amber-700">执行单元 {projection.execution_unit?.id} · 尝试 {projection.execution_unit?.attempt_no}</p>
+          </div>
+        )}
+
+        {!unknownOutcome && replayRequest && (
+          <div className="mt-4 rounded-xl border border-blue-200 bg-blue-50 px-4 py-4 text-blue-950" aria-label="执行单元可恢复">
+            <p className="text-sm font-semibold">上次执行已明确失败，可以安全重试</p>
+            <p className="mt-1 text-xs leading-5 text-blue-800">将重放同一份已保存决定，不会创建新的 Scope 含义。</p>
+            <button type="button" disabled={busy} onClick={() => onResolve(replayRequest)} className="mt-3 rounded-lg bg-blue-900 px-3 py-2 text-xs font-medium text-white disabled:opacity-40">重试本次已保存决定</button>
+          </div>
+        )}
+
+        {projection.execution_unit && ["pending", "running"].includes(projection.execution_unit.state) && (
+          <p className="mt-4 rounded-xl border border-line bg-white px-4 py-3 text-xs text-quiet">执行单元处理中 · 尝试 {projection.execution_unit.attempt_no}</p>
+        )}
+
+        {pending && !unknownOutcome && (
           <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50 px-4 py-4 text-amber-950" aria-label="覆盖不足决策">
-            <p className="text-sm font-semibold">{unmetLabel}覆盖不足，需要你决定下一步</p>
-            <p className="mt-1 text-xs leading-5 text-amber-800">正常报告会保持隐藏，直到你选择补充样本、生成受限报告或放宽约束。</p>
-            <div className="mt-3 grid gap-2 sm:grid-cols-2">
-              {supplementaryQueries.map((query, index) => (
-                <input
-                  key={index}
-                  aria-label={`补充检索词 ${index + 1}`}
-                  value={query}
-                  onChange={(event) => setSupplementaryQueries((current) => current.map((item, queryIndex) => (
-                    queryIndex === index ? event.target.value : item
-                  )))}
-                  placeholder={`补充检索词 ${index + 1}${index === 1 ? "（可选）" : ""}`}
-                  className="rounded-lg border border-amber-200 bg-white px-3 py-2 text-xs text-ink outline-none focus:border-amber-500"
-                />
-              ))}
-            </div>
+            <p className="text-sm font-semibold">样本覆盖不足，需要你决定下一步</p>
+            <p className="mt-1 text-xs leading-5 text-amber-800">范围已锁定，普通范围确认不可用。这里只显示服务端允许的处理方式。</p>
+            {pending.reasonCodes.map((reason) => {
+              const reasonConstraintId = reason.startsWith("required_constraint_coverage_unmet:")
+                ? reason.slice("required_constraint_coverage_unmet:".length)
+                : null;
+              return <p key={reason} className="mt-1 text-xs leading-5 text-amber-800">{scopeCoverageReasonLabel(reason, constraintLabel(reasonConstraintId))}</p>;
+            })}
             <div className="mt-3 flex flex-wrap gap-2">
-              <button
-                type="button"
-                disabled={busy || !supplementaryQueries.some((query) => query.trim())}
-                onClick={() => onResolve({
-                  scope_contract_version: contract.version,
-                  coverage_snapshot_id: pending.coverageSnapshotId,
-                  resolution: "expand_required_constraint",
-                  ...(unmetConstraintId ? { constraint_id: unmetConstraintId } : {}),
-                  supplementary_queries: supplementaryQueries.map((query) => query.trim()).filter(Boolean),
-                })}
-                className="rounded-lg bg-amber-900 px-3 py-2 text-xs font-medium text-white disabled:cursor-not-allowed disabled:opacity-40"
-              >
-                继续补充{unmetLabel}样本
-              </button>
-              <button type="button" disabled={busy} onClick={() => onResolve({ scope_contract_version: contract.version, coverage_snapshot_id: pending.coverageSnapshotId, resolution: "generate_limited_report" })} className="rounded-lg border border-amber-300 bg-white px-3 py-2 text-xs font-medium">
-                基于现有证据生成受限报告
-              </button>
-              <button
-                type="button"
-                disabled={busy || !unmetConstraintId}
-                onClick={() => onResolve({
-                  scope_contract_version: contract.version,
-                  coverage_snapshot_id: pending.coverageSnapshotId,
-                  resolution: "relax_constraint",
-                  ...(unmetConstraintId ? { constraint_id: unmetConstraintId } : {}),
-                })}
-                className="rounded-lg border border-amber-300 bg-white px-3 py-2 text-xs font-medium"
-              >
-                放宽{unmetLabel}约束
-              </button>
+              {expandResolution && <button type="button" disabled={busy || !expandConstraintId} onClick={() => setSelectedResolution("expand_required_constraint")} className="rounded-lg bg-amber-900 px-3 py-2 text-xs font-medium text-white">继续补充{expandLabel}样本</button>}
+              {pending.allowedResolutions.some((item) => item.action === "generate_limited_report") && <button type="button" disabled={busy} onClick={() => onResolve({ scope_contract_version: contract.version, coverage_snapshot_id: pending.coverageSnapshotId, resolution: "generate_limited_report" })} className="rounded-lg border border-amber-300 bg-white px-3 py-2 text-xs font-medium">基于现有证据生成受限报告</button>}
+              {relaxResolution && <button type="button" disabled={busy || !relaxConstraintId} onClick={() => onResolve({ scope_contract_version: contract.version, coverage_snapshot_id: pending.coverageSnapshotId, resolution: "relax_constraint", ...(relaxConstraintId ? { constraint_id: relaxConstraintId } : {}) })} className="rounded-lg border border-amber-300 bg-white px-3 py-2 text-xs font-medium">放宽{relaxLabel}约束</button>}
             </div>
+            {selectedResolution === "expand_required_constraint" && (
+              <div className="mt-3 rounded-lg border border-amber-200 bg-amber-100/40 p-3">
+                <p className="mb-2 text-xs text-amber-800">补搜只针对服务端声明的未满足条件，不会修改已确认 Scope。</p>
+                <div className="grid gap-2 sm:grid-cols-2">
+                  {supplementaryQueries.map((query, index) => <input key={index} aria-label={`补充检索词 ${index + 1}`} value={query} onChange={(event) => setSupplementaryQueries((current) => current.map((item, queryIndex) => queryIndex === index ? event.target.value : item))} placeholder={`补充检索词 ${index + 1}${index === 1 ? "（可选）" : ""}`} className="rounded-lg border border-amber-200 bg-white px-3 py-2 text-xs text-ink outline-none focus:border-amber-500" />)}
+                </div>
+                <button type="button" disabled={busy || !expandConstraintId || !supplementaryQueries.some((query) => query.trim())} onClick={() => onResolve({ scope_contract_version: contract.version, coverage_snapshot_id: pending.coverageSnapshotId, resolution: "expand_required_constraint", ...(expandConstraintId ? { constraint_id: expandConstraintId } : {}), supplementary_queries: supplementaryQueries.map((query) => query.trim()).filter(Boolean) })} className="mt-3 rounded-lg bg-amber-900 px-3 py-2 text-xs font-medium text-white disabled:cursor-not-allowed disabled:opacity-40">提交补搜决定</button>
+              </div>
+            )}
           </div>
         )}
       </section>
@@ -2233,7 +2269,7 @@ function CreatorPage() {
   const [contentResearchIntent, setContentResearchIntent] = useState<ContentResearchIntentState | null>(null);
   const [contentResearchRun, setContentResearchRun] = useState<ContentResearchRunState | null>(null);
   const [preparedScope, setPreparedScope] = useState<ContentResearchScopeDraft | null>(null);
-  const [scopeProjection, setScopeProjection] = useState<ContentResearchScopeProjection | null>(null);
+  const [scopeProjectionsByRun, setScopeProjectionsByRun] = useState<Record<string, ContentResearchScopeProjection>>({});
   const [scopeActionBusy, setScopeActionBusy] = useState(false);
   const [traceExpanded, setTraceExpanded] = useState(false);
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
@@ -2255,8 +2291,12 @@ function CreatorPage() {
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const snapshotRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const snapshotRefreshInFlightRef = useRef(false);
+  const contentResearchRequestEpochRef = useRef(new ContentResearchRequestEpoch());
   // Tracks the most recently *requested* thread load to discard stale responses
   const loadingThreadRef = useRef<string | null>(null);
+  const scopeProjection = contentResearchRun
+    ? scopeProjectionsByRun[contentResearchRun.workflowRunId] ?? null
+    : null;
 
   const activeThread = threads.find((t) => t.thread_id === activeThreadId) ?? null;
   const activeTopicPoolUrl = activeThread
@@ -2476,11 +2516,11 @@ function CreatorPage() {
 
   function resetConversation() {
     // Switching conversations must not erase another thread's resumable research run.
+    contentResearchRequestEpochRef.current.activate(null);
     setMessages([WELCOME_MESSAGE]);
     setContentResearchIntent(null);
     setContentResearchRun(null);
     setPreparedScope(null);
-    setScopeProjection(null);
     setScopeActionBusy(false);
     setTraceExpanded(false);
     setTask(null);
@@ -2490,7 +2530,9 @@ function CreatorPage() {
   }
 
   async function refreshContentResearchTrace(workflowRunId: string) {
+    const ticket = contentResearchRequestEpochRef.current.ticket(workflowRunId, "trace");
     const trace = await getContentResearchTrace(workflowRunId);
+    if (!contentResearchRequestEpochRef.current.accepts(ticket)) return null;
     setContentResearchRun((current) =>
       current && current.workflowRunId === workflowRunId
         ? { ...current, trace }
@@ -2500,8 +2542,10 @@ function CreatorPage() {
   }
 
   async function refreshContentResearchScope(workflowRunId: string) {
+    const ticket = contentResearchRequestEpochRef.current.ticket(workflowRunId, "scope");
     const projection = await getContentResearchScope(workflowRunId);
-    setScopeProjection(projection);
+    if (!contentResearchRequestEpochRef.current.accepts(ticket)) return null;
+    setScopeProjectionsByRun((current) => ({ ...current, [workflowRunId]: projection }));
     setPreparedScope(null);
     return projection;
   }
@@ -2511,7 +2555,10 @@ function CreatorPage() {
       const { thread } = await getThreadTimeline(threadId);
       const workflowRunId = thread.active_run_id ?? contentResearchRunForThread(threadId);
       if (!workflowRunId) return false;
+      contentResearchRequestEpochRef.current.activate(workflowRunId);
+      const ticket = contentResearchRequestEpochRef.current.ticket(workflowRunId, "hydrate");
       const trace = await getContentResearchTrace(workflowRunId);
+      if (!contentResearchRequestEpochRef.current.accepts(ticket)) return false;
       setContentResearchIntent(null);
       setContentResearchRun(contentResearchRunWithReport(
         workflowRunId,
@@ -2528,6 +2575,7 @@ function CreatorPage() {
   }
 
   async function refreshContentResearchReport(workflowRunId: string): Promise<ContentResearchLiteReportResponse | null> {
+    const ticket = contentResearchRequestEpochRef.current.ticket(workflowRunId, "report");
     setContentResearchRun((current) =>
       current && current.workflowRunId === workflowRunId
         ? { ...current, reportStatus: "loading", reportError: null }
@@ -2535,6 +2583,7 @@ function CreatorPage() {
     );
     try {
       const report = await getContentResearchLiteReportWithRetry(workflowRunId);
+      if (!contentResearchRequestEpochRef.current.accepts(ticket)) return null;
       appendLiteReportMessage(report);
       setContentResearchRun((current) =>
         current && current.workflowRunId === workflowRunId
@@ -2548,6 +2597,7 @@ function CreatorPage() {
       );
       return report;
     } catch (error) {
+      if (!contentResearchRequestEpochRef.current.accepts(ticket)) return null;
       const unavailable = isExpectedLiteReportAbsence(error);
       setContentResearchRun((current) =>
         current && current.workflowRunId === workflowRunId
@@ -2590,6 +2640,7 @@ function CreatorPage() {
   }
 
   async function startContentResearchForRun(workflowRunId: string) {
+    const ticket = contentResearchRequestEpochRef.current.ticket(workflowRunId);
     setContentResearchRun((current) =>
       current && current.workflowRunId === workflowRunId ? { ...current, formalResearchStatus: "collecting" } : current
     );
@@ -2601,6 +2652,7 @@ function CreatorPage() {
         provider: "xiaohongshu",
       });
     } catch (error) {
+      if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
       const detail = error instanceof Error && error.message.trim() ? error.message.trim() : "未知运行时错误";
       if (isUncertainContentResearchDispatchFailure(detail)) {
         appendMessage({
@@ -2616,6 +2668,7 @@ function CreatorPage() {
         return;
       }
     }
+    if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
     if (formalResearch) {
       setContentResearchRun((current) =>
         current && current.workflowRunId === workflowRunId
@@ -2634,6 +2687,7 @@ function CreatorPage() {
     }
     try {
       const projection = await pollContentResearchReport(workflowRunId);
+      if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
       if (projection && litePublicationState(projection)) {
         setContentResearchRun((current) =>
           current && current.workflowRunId === workflowRunId
@@ -2647,6 +2701,7 @@ function CreatorPage() {
         setStatusLog((log) => [...log, `已提交 ${formalResearch.task_count} 个专家的独立采集与分析。`].slice(-6));
       }
     } catch (error) {
+      if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
       appendMessage({
         role: "system",
         text: `调研已启动，但正式报告读取失败：${error instanceof Error ? error.message : "未知错误"}`,
@@ -2655,6 +2710,7 @@ function CreatorPage() {
   }
 
   async function resumeContentResearchForRun(workflowRunId: string) {
+    const ticket = contentResearchRequestEpochRef.current.ticket(workflowRunId);
     setContentResearchRun((current) =>
       current && current.workflowRunId === workflowRunId
         ? { ...current, formalResearchStatus: "collecting", reportError: null }
@@ -2677,6 +2733,7 @@ function CreatorPage() {
         // Resume succeeded; a transient read must not trigger another action.
       }
       const report = await pollContentResearchReport(workflowRunId, { requirePublication: true });
+      if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
       if (report && litePublicationState(report)) {
         setContentResearchRun((current) =>
           current && current.workflowRunId === workflowRunId
@@ -2685,18 +2742,23 @@ function CreatorPage() {
         );
       }
     } catch (error) {
+      if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
       const detail = error instanceof Error ? error.message : "未知错误";
       appendMessage({ role: "system", text: `继续调研失败：${detail}` });
     }
   }
 
   async function repairContentResearchForRun(workflowRunId: string) {
+    const ticket = contentResearchRequestEpochRef.current.ticket(workflowRunId);
     try {
       await repairContentResearchFromPersistedPackets(workflowRunId);
+      if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
       const report = await pollContentResearchReport(workflowRunId, { requirePublication: true });
+      if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
       if (report) appendLiteReportMessage(report);
       await refreshContentResearchTrace(workflowRunId);
     } catch (error) {
+      if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
       appendMessage({ role: "system", text: `已有笔记重新处理失败：${error instanceof Error ? error.message : "未知错误"}` });
     }
   }
@@ -2724,7 +2786,7 @@ function CreatorPage() {
       setContentResearchIntent({ seed: subject, presearch: { ...presearch, competitor_tags: [...new Set([...presearch.competitor_tags, ...competitors])], research_directions: directions.length ? directions : presearch.research_directions } });
       setContentResearchRun(null);
       setPreparedScope(null);
-      setScopeProjection(null);
+      contentResearchRequestEpochRef.current.activate(presearch.workflow_run_id);
       setTraceExpanded(false);
       appendMessage({ role: "assistant", text: "已新建一轮调研 checklist，可以修改主体、竞品或调研方向后重新确认。" });
     } catch {
@@ -2741,7 +2803,12 @@ function CreatorPage() {
       setContentResearchRun(null);
       setContentResearchIntent(null);
       setPreparedScope(null);
-      setScopeProjection(null);
+      contentResearchRequestEpochRef.current.activate(null);
+      setScopeProjectionsByRun((current) => {
+        const next = { ...current };
+        delete next[run.workflowRunId];
+        return next;
+      });
       setTraceExpanded(false);
       appendMessage({ role: "assistant", text: "已结束本次内容调研，并清除当前线程的调研恢复入口。" });
     } catch (error) {
@@ -2753,6 +2820,8 @@ function CreatorPage() {
   }
 
   async function handleContentResearchConfirmed(summary: ContentResearchWorkflowSummary) {
+    contentResearchRequestEpochRef.current.activate(summary.workflow_run_id);
+    const ticket = contentResearchRequestEpochRef.current.ticket(summary.workflow_run_id, "hydrate");
     setContentResearchIntent(null);
     saveContentResearchRunForThread(summary.brief.thread_id, summary.workflow_run_id);
     setContentResearchRun({
@@ -2766,7 +2835,6 @@ function CreatorPage() {
       reportError: null,
     });
     setPreparedScope(null);
-    setScopeProjection(null);
     setTraceExpanded(false);
     appendMessage({
       role: "assistant",
@@ -2775,8 +2843,10 @@ function CreatorPage() {
     try {
       await refreshContentResearchTrace(summary.workflow_run_id);
     } catch {
+      if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
       appendMessage({ role: "system", text: "调研过程暂时不可用，稍后可在 Trace 中刷新。" });
     }
+    if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
     const directionId = arrayField(summary.brief.payload, "selected_directions")[0]
       || stringField(summary.directions[0]?.payload, "direction_id");
     if (!directionId) {
@@ -2784,8 +2854,11 @@ function CreatorPage() {
       return;
     }
     try {
-      setPreparedScope(await prepareContentResearchScope(summary.workflow_run_id, { direction_id: directionId }));
+      const scope = await prepareContentResearchScope(summary.workflow_run_id, { direction_id: directionId });
+      if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
+      setPreparedScope(scope);
     } catch (error) {
+      if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
       appendMessage({
         role: "system",
         text: `检索范围准备失败：${error instanceof Error ? error.message : "请稍后重试。"}`,
@@ -2796,41 +2869,51 @@ function CreatorPage() {
   async function confirmPreparedContentResearchScope(payload: ContentResearchConfirmScopeRequest) {
     const run = contentResearchRun;
     if (!run || scopeActionBusy) return;
+    const ticket = contentResearchRequestEpochRef.current.ticket(run.workflowRunId);
     setScopeActionBusy(true);
     try {
       await confirmContentResearchScope(run.workflowRunId, payload);
+      if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
       await refreshContentResearchScope(run.workflowRunId);
+      if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
       appendMessage({ role: "assistant", text: "检索范围已冻结，正在开始内容调研。" });
       void startContentResearchForRun(run.workflowRunId);
     } catch (error) {
+      if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
       appendMessage({
         role: "system",
         text: `确认检索范围失败：${error instanceof Error ? error.message : "请刷新后重试。"}`,
       });
     } finally {
-      setScopeActionBusy(false);
+      if (contentResearchRequestEpochRef.current.accepts(ticket)) setScopeActionBusy(false);
     }
   }
 
   async function resolvePendingContentResearchCoverage(payload: ContentResearchResolveCoverageRequest) {
     const run = contentResearchRun;
     if (!run || scopeActionBusy) return;
+    const ticket = contentResearchRequestEpochRef.current.ticket(run.workflowRunId);
     setScopeActionBusy(true);
     try {
       await resolveContentResearchCoverage(run.workflowRunId, payload);
+      if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
       await refreshContentResearchScope(run.workflowRunId);
-      if (payload.resolution === "generate_limited_report") {
-        await refreshContentResearchReport(run.workflowRunId);
-      } else {
-        void startContentResearchForRun(run.workflowRunId);
+      try {
+        await refreshContentResearchTrace(run.workflowRunId);
+      } catch {
+        // The decision is durable; a transient Trace read must not replay it.
       }
+      void pollContentResearchReport(run.workflowRunId, {
+        requirePublication: payload.resolution === "generate_limited_report",
+      });
     } catch (error) {
+      if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
       appendMessage({
         role: "system",
         text: `覆盖范围决策失败：${error instanceof Error ? error.message : "请稍后重试。"}`,
       });
     } finally {
-      setScopeActionBusy(false);
+      if (contentResearchRequestEpochRef.current.accepts(ticket)) setScopeActionBusy(false);
     }
   }
 
@@ -2853,7 +2936,7 @@ function CreatorPage() {
     setContentResearchIntent({ seed, presearch });
     setContentResearchRun(null);
     setPreparedScope(null);
-    setScopeProjection(null);
+    contentResearchRequestEpochRef.current.activate(presearch.workflow_run_id);
     setTraceExpanded(false);
   }
 
@@ -2909,6 +2992,8 @@ function CreatorPage() {
         try {
           const workflow = await getContentResearchWorkflow(runIdForThread);
           if (loadingThreadRef.current !== threadId || workflow.brief.thread_id !== threadId) return;
+          contentResearchRequestEpochRef.current.activate(runIdForThread);
+          const requestTicket = contentResearchRequestEpochRef.current.ticket(runIdForThread, "hydrate");
           saveContentResearchRunForThread(threadId, runIdForThread);
           let restoredScopeProjection: ContentResearchScopeProjection | null = null;
           try {
@@ -2916,8 +3001,16 @@ function CreatorPage() {
           } catch {
             // Runs created before Scope confirmation have no persisted projection.
           }
-          if (loadingThreadRef.current !== threadId) return;
-          setScopeProjection(restoredScopeProjection);
+          if (
+            loadingThreadRef.current !== threadId
+            || !contentResearchRequestEpochRef.current.accepts(requestTicket)
+          ) return;
+          if (restoredScopeProjection) {
+            setScopeProjectionsByRun((current) => ({
+              ...current,
+              [runIdForThread]: restoredScopeProjection!,
+            }));
+          }
           setPreparedScope(null);
           let trace: ContentResearchTrace | null = null;
           try {
@@ -2925,6 +3018,7 @@ function CreatorPage() {
           } catch {
             // Workflow/report restoration remains usable when Trace is temporarily unavailable.
           }
+          if (!contentResearchRequestEpochRef.current.accepts(requestTicket)) return;
           if (!latestReport && !latestFailure) {
             try {
               const projection = await getContentResearchLiteReportWithRetry(runIdForThread);
@@ -2932,10 +3026,12 @@ function CreatorPage() {
                 litePublicationState(projection)
                 || (projection.publication.state === null && projection.recovery_projection)
               ) {
+                if (!contentResearchRequestEpochRef.current.accepts(requestTicket)) return;
                 latestReport = projection;
                 appendLiteReportMessage(projection);
               }
             } catch (error) {
+              if (!contentResearchRequestEpochRef.current.accepts(requestTicket)) return;
               if (!isExpectedLiteReportAbsence(error)) {
                 const detail = error instanceof Error ? error.message : "报告读取失败";
                 latestFailure = {
@@ -2947,6 +3043,7 @@ function CreatorPage() {
               }
             }
           }
+          if (!contentResearchRequestEpochRef.current.accepts(requestTicket)) return;
           const restoredRun = contentResearchRunWithReport(runIdForThread, workflow, trace, null, latestReport);
           // A historical artifact can outlive its readable publication. Keep
           // the restored workflow visible and expose the report failure; do
@@ -3343,6 +3440,10 @@ function CreatorPage() {
                       onRecover={() => void resumeContentResearchForRun(message.report!.workflow_run_id)}
                       onRepair={() => void repairContentResearchForRun(message.report!.workflow_run_id)}
                       onOpenTrace={() => setTraceExpanded(true)}
+                      recoveryAllowed={!(
+                        message.report.workflow_run_id === scopeProjection?.workflow_run_id
+                        && (pendingCoverageDecision(scopeProjection) || scopeProjection.execution_unit)
+                      )}
                     />
                   ) : (
                   <div
@@ -3697,6 +3798,7 @@ function CreatorPage() {
         onExpandedChange={setTraceExpanded}
         onRefresh={async () => { await refreshContentResearchTrace(contentResearchRun.workflowRunId); }}
         onRetry={() => resumeContentResearchForRun(contentResearchRun.workflowRunId)}
+        legacyRecoveryAllowed={!pendingCoverageDecision(scopeProjection) && !scopeProjection?.execution_unit}
       />}
     </div>
   );

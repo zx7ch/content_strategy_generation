@@ -258,6 +258,338 @@ def test_creator_brief_uses_fixed_catalog_and_submits_selected_subset(
         assert plan_count == 1
 
 
+def test_creator_restores_persisted_scope_draft_after_reload(browser_page):
+    page, stack = browser_page
+    page.goto(stack["frontend_url"] + "/creator", wait_until="domcontentloaded")
+    page.get_by_role("button", name=re.compile("内容调研")).click(timeout=15000)
+    research_input = page.get_by_role(
+        "textbox", name="输入品类、品牌或 SKU，发送后开始内容调研"
+    )
+    expect(research_input).to_be_enabled(timeout=15000)
+    research_input.fill("夏季通勤长袖")
+    with page.expect_response(
+        lambda response: response.url.endswith("/content-research/presearch")
+        and response.status == 201,
+        timeout=30000,
+    ):
+        research_input.press("Enter")
+    expect(page.get_by_text("还需要你确认调研主体", exact=True)).to_be_visible(
+        timeout=30000
+    )
+    page.get_by_role("button", name="确认调研主体", exact=True).click()
+    page.get_by_role("heading", name="在开始前，请确认几个关键点").wait_for(
+        timeout=30000
+    )
+    page.get_by_role("button", name="准确，继续").click()
+    page.get_by_role("button", name="产品营销", exact=True).click()
+    page.get_by_label("产品营销目标", exact=True).select_option("content_seeding")
+    with page.expect_response(
+        lambda response: response.url.endswith("/actions")
+        and '"action":"confirm_brief"' in (response.request.post_data or "")
+        and response.status == 200,
+        timeout=15000,
+    ):
+        page.get_by_role("button", name=re.compile("确认并开始调研")).click()
+
+    scope = page.locator('section[aria-label="确认检索范围"]')
+    expect(scope).to_be_visible(timeout=30000)
+    first_query = scope.get_by_label("检索组 1")
+    persisted_query = first_query.input_value()
+
+    page.reload(wait_until="domcontentloaded")
+
+    restored = page.locator('section[aria-label="确认检索范围"]')
+    expect(restored).to_be_visible(timeout=30000)
+    expect(restored.get_by_label("检索组 1")).to_have_value(persisted_query)
+    expect(restored.get_by_role("button", name="确认并开始调研")).to_be_enabled()
+
+
+def test_creator_unknown_execution_outcome_requires_manual_recovery_without_replay(
+    browser_page,
+):
+    page, stack = browser_page
+    brand_id = default_brand_id(stack["backend_url"])
+    seeded = run_async_in_thread(
+        seed_recovery(
+            stack["db_path"],
+            brand_id=brand_id,
+            title="执行结果未知",
+        )
+    )
+    run_id = seeded["run_id"]
+    scope_projection = {
+        "schema_version": "content_research_api_v1",
+        "workflow_run_id": run_id,
+        "state": "confirmed",
+        "draft": {
+            "id": "scope_draft_browser_unknown",
+            "workflow_run_id": run_id,
+            "research_plan_id": f"plan_{run_id}",
+            "structure_hash": "structure_browser_unknown",
+            "constraints": [
+                {
+                    "id": "season",
+                    "label": "季节",
+                    "value": "夏季",
+                    "mode": "required",
+                    "allowed_aliases": [],
+                }
+            ],
+            "query_groups": [
+                {
+                    "suggested_query": "夏季 长袖衬衫 通勤",
+                    "final_query": "夏季 长袖衬衫 通勤",
+                    "targeted_required_terms": ["夏季"],
+                }
+            ],
+            "created_at": "2026-08-21T00:00:00+08:00",
+        },
+        "scope_contract": {
+            "id": "scope_contract_browser_unknown",
+            "workflow_run_id": run_id,
+            "research_plan_id": f"plan_{run_id}",
+            "version": 1,
+            "schema_version": "content_research_scope_contract_v1",
+            "constraints": [
+                {
+                    "id": "season",
+                    "label": "季节",
+                    "value": "夏季",
+                    "mode": "required",
+                    "allowed_aliases": [],
+                }
+            ],
+            "query_groups": [
+                {
+                    "id": "group_browser_unknown",
+                    "suggested_query": "夏季 长袖衬衫 通勤",
+                    "final_query": "夏季 长袖衬衫 通勤",
+                    "origin": "system_suggested",
+                    "execution_role": "coverage",
+                }
+            ],
+            "created_at": "2026-08-21T00:01:00+08:00",
+        },
+        "audit_events": [],
+        "allowed_actions": [],
+        "coverage_snapshot": None,
+        "allowed_resolutions": [],
+        "decision_recovery": None,
+        "execution_unit": {
+            "id": "seu_browser_unknown",
+            "state": "outcome_unknown",
+            "attempt_no": 1,
+            "recovery_state": "outcome_unknown",
+            "allowed_actions": [],
+            "trace_summary": {
+                "fact_count": 3,
+                "attempt_count": 1,
+                "last_fact_kind": "outcome_unknown",
+            },
+        },
+    }
+    page.route(
+        f"**/content-research/workflows/{run_id}/scope",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps(scope_projection, ensure_ascii=False),
+        ),
+    )
+
+    open_creator_with_restored_run(page, stack["frontend_url"], run_id)
+
+    manual = page.locator('div[aria-label="执行结果需要人工恢复"]')
+    expect(manual).to_be_visible(timeout=20000)
+    expect(manual.get_by_text("需要人工确认执行结果", exact=True)).to_be_visible()
+    expect(manual.get_by_text(re.compile("不会自动重放"))).to_be_visible()
+    expect(page.get_by_role("button", name="重试本次已保存决定")).to_have_count(0)
+
+
+def test_creator_coverage_decision_uses_only_server_declared_actions_and_exact_expand_payload(
+    browser_page,
+):
+    page, stack = browser_page
+    brand_id = default_brand_id(stack["backend_url"])
+    seeded = run_async_in_thread(
+        seed_recovery(stack["db_path"], brand_id=brand_id, title="服务端覆盖决策")
+    )
+    run_id = seeded["run_id"]
+    projection = browser_scope_projection(
+        run_id,
+        coverage=True,
+        allowed_resolutions=("expand_required_constraint", "generate_limited_report"),
+    )
+    action_payloads: list[dict] = []
+
+    page.route(
+        f"**/content-research/workflows/{run_id}/scope",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps(projection, ensure_ascii=False),
+        ),
+    )
+
+    def resolve_action(route):
+        request = route.request.post_data_json
+        action_payloads.append(request)
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps(
+                browser_action_response(run_id, projection, request["payload"]),
+                ensure_ascii=False,
+            ),
+        )
+
+    page.route(f"**/content-research/workflows/{run_id}/actions", resolve_action)
+    open_creator_with_restored_run(page, stack["frontend_url"], run_id)
+
+    coverage = page.locator('div[aria-label="覆盖不足决策"]')
+    expect(coverage).to_be_visible(timeout=20000)
+    expect(coverage.get_by_text("夏季条件的合格样本不足", exact=True)).to_be_visible()
+    expect(coverage.get_by_role("button", name="继续补充夏季样本")).to_be_visible()
+    expect(coverage.get_by_role("button", name="基于现有证据生成受限报告")).to_be_visible()
+    expect(coverage.get_by_role("button", name=re.compile("放宽"))).to_have_count(0)
+    expect(page.locator('section[aria-label="确认检索范围"]')).to_have_count(0)
+
+    coverage.get_by_role("button", name="继续补充夏季样本").click()
+    coverage.get_by_label("补充检索词 1").fill("夏季 防晒 长袖衬衫")
+    with page.expect_request(
+        lambda request: request.url.endswith(f"/content-research/workflows/{run_id}/actions")
+        and '"action":"resolve_coverage"' in (request.post_data or ""),
+        timeout=15000,
+    ):
+        coverage.get_by_role("button", name="提交补搜决定").click()
+
+    assert action_payloads == [
+        {
+            "action": "resolve_coverage",
+            "payload": {
+                "scope_contract_version": 1,
+                "coverage_snapshot_id": "coverage_browser",
+                "resolution": "expand_required_constraint",
+                "constraint_id": "season",
+                "supplementary_queries": ["夏季 防晒 长袖衬衫"],
+            },
+        }
+    ]
+
+
+def test_creator_known_retry_replays_once_and_keeps_one_frozen_report(browser_page):
+    page, stack = browser_page
+    brand_id = default_brand_id(stack["backend_url"])
+    seeded = run_async_in_thread(
+        seed_publication(
+            stack["db_path"],
+            brand_id=brand_id,
+            title="安全重试后报告",
+            publication_state="complete_verified_report",
+            requested_directions=("product_marketing",),
+            direction_results={
+                "product_marketing": {
+                    "state": "formal_directional_result",
+                    "limitations": [],
+                    "recovery_actions": [],
+                }
+            },
+            evidence_refs=all_navigation_evidence_refs()[:1],
+        )
+    )
+    run_id = seeded["run_id"]
+    replay_request = {
+        "scope_contract_version": 1,
+        "coverage_snapshot_id": "coverage_browser",
+        "resolution": "expand_required_constraint",
+        "constraint_id": "season",
+        "supplementary_queries": ["夏季 防晒 长袖衬衫"],
+    }
+    projection = browser_scope_projection(run_id, replay_request=replay_request)
+    action_payloads: list[dict] = []
+    page.route(
+        f"**/content-research/workflows/{run_id}/scope",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps(projection, ensure_ascii=False),
+        ),
+    )
+
+    def replay_action(route):
+        request = route.request.post_data_json
+        action_payloads.append(request)
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps(
+                browser_action_response(run_id, projection, request["payload"]),
+                ensure_ascii=False,
+            ),
+        )
+
+    page.route(f"**/content-research/workflows/{run_id}/actions", replay_action)
+    open_creator_with_restored_run(page, stack["frontend_url"], run_id)
+
+    retry = page.get_by_role("button", name="重试本次已保存决定")
+    expect(retry).to_be_visible(timeout=20000)
+    retry.click()
+    expect(published_report(page)).to_have_count(1, timeout=20000)
+    page.wait_for_timeout(750)
+    assert action_payloads == [{"action": "resolve_coverage", "payload": replay_request}]
+    expect(published_report(page)).to_have_count(1)
+
+
+def test_creator_discards_a_late_scope_response_after_switching_runs(browser_page):
+    page, stack = browser_page
+    brand_id = default_brand_id(stack["backend_url"])
+    old_run = run_async_in_thread(
+        seed_recovery(stack["db_path"], brand_id=brand_id, title="旧调研任务")
+    )
+    current_run = run_async_in_thread(
+        seed_recovery(stack["db_path"], brand_id=brand_id, title="当前调研任务")
+    )
+    old_projection = browser_scope_projection(old_run["run_id"])
+    old_projection["scope_contract"]["query_groups"][0]["final_query"] = "旧任务过期范围"
+    current_projection = browser_scope_projection(current_run["run_id"])
+    current_projection["scope_contract"]["query_groups"][0]["final_query"] = "当前任务服务端范围"
+    held_old_scope_routes = []
+
+    page.route(
+        f"**/content-research/workflows/{old_run['run_id']}/scope",
+        lambda route: held_old_scope_routes.append(route),
+    )
+    page.route(
+        f"**/content-research/workflows/{current_run['run_id']}/scope",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps(current_projection, ensure_ascii=False),
+        ),
+    )
+    open_creator_with_restored_run(page, stack["frontend_url"], old_run["run_id"])
+    for _ in range(40):
+        if held_old_scope_routes:
+            break
+        page.wait_for_timeout(50)
+    assert len(held_old_scope_routes) == 1
+
+    page.get_by_text("当前调研任务", exact=True).click()
+    current_scope = page.locator('section[aria-label="已确认检索范围"]')
+    expect(current_scope.get_by_text("当前任务服务端范围", exact=True)).to_be_visible(
+        timeout=20000
+    )
+    held_old_scope_routes[0].fulfill(
+        status=200,
+        content_type="application/json",
+        body=json.dumps(old_projection, ensure_ascii=False),
+    )
+    page.wait_for_timeout(500)
+
+    expect(current_scope.get_by_text("当前任务服务端范围", exact=True)).to_be_visible()
+    expect(page.get_by_text("旧任务过期范围", exact=True)).to_have_count(0)
+
+
 @pytest.mark.parametrize(
     "real_creator_stack",
     [{"preview_enabled": False}],
@@ -1330,6 +1662,189 @@ def test_creator_surfaces_non_not_found_lite_report_error(browser_page):
             f"Lite error was not visible; direct={direct_status} {direct_body}; "
             f"browser_responses={lite_responses}; body={page.locator('body').inner_text()}"
         ) from error
+
+
+def browser_scope_projection(
+    run_id: str,
+    *,
+    coverage: bool = False,
+    allowed_resolutions: tuple[str, ...] = (),
+    replay_request: dict | None = None,
+) -> dict:
+    draft = {
+        "id": "scope_draft_browser",
+        "workflow_run_id": run_id,
+        "research_plan_id": f"plan_{run_id}",
+        "structure_hash": "structure_browser",
+        "constraints": [
+            {
+                "id": "season",
+                "label": "季节",
+                "value": "夏季",
+                "mode": "required",
+                "allowed_aliases": [],
+            }
+        ],
+        "query_groups": [
+            {
+                "suggested_query": "夏季 长袖衬衫 通勤",
+                "final_query": "夏季 长袖衬衫 通勤",
+                "targeted_required_terms": ["夏季"],
+            }
+        ],
+        "created_at": "2026-08-21T00:00:00+08:00",
+    }
+    contract = {
+        "id": "scope_contract_browser",
+        "workflow_run_id": run_id,
+        "research_plan_id": f"plan_{run_id}",
+        "version": 1,
+        "schema_version": "content_research_scope_contract_v1",
+        "constraints": draft["constraints"],
+        "query_groups": [
+            {
+                "id": "group_browser",
+                "suggested_query": "夏季 长袖衬衫 通勤",
+                "final_query": "夏季 长袖衬衫 通勤",
+                "origin": "system_suggested",
+                "execution_role": "coverage",
+            }
+        ],
+        "created_at": "2026-08-21T00:01:00+08:00",
+    }
+    resolution_rows = [
+        {
+            "action": action,
+            "available": action in allowed_resolutions,
+            "valid_constraint_ids": (
+                ["season"]
+                if action in allowed_resolutions
+                and action in {"expand_required_constraint", "relax_constraint"}
+                else []
+            ),
+            "supplementary_queries_required": action == "expand_required_constraint",
+            "unavailable_reason": None if action in allowed_resolutions else "not_allowed",
+        }
+        for action in (
+            "expand_required_constraint",
+            "generate_limited_report",
+            "relax_constraint",
+        )
+    ]
+    coverage_snapshot = (
+        {
+            "id": "coverage_browser",
+            "workflow_run_id": run_id,
+            "scope_contract_id": contract["id"],
+            "scope_contract_version": 1,
+            "execution_revision": 0,
+            "execution_authorization_id": None,
+            "source_coverage_snapshot_id": None,
+            "state": "awaiting_scope_decision",
+            "constraint_counts": {
+                "season": {"required": True, "matched_candidate_count": 1},
+                "_summary": {
+                    "reason_codes": ["required_constraint_coverage_unmet:season"]
+                },
+            },
+            "unmet_constraint_ids": ["season"],
+            "created_at": "2026-08-21T00:02:00+08:00",
+        }
+        if coverage
+        else None
+    )
+    return {
+        "schema_version": "content_research_api_v1",
+        "workflow_run_id": run_id,
+        "state": "confirmed",
+        "draft": draft,
+        "scope_contract": contract,
+        "audit_events": [],
+        "allowed_actions": (
+            [
+                {
+                    "action": "confirm_scope",
+                    "available": False,
+                    "unavailable_reason": "coverage_decision_required",
+                },
+                {
+                    "action": "resolve_coverage",
+                    "available": True,
+                    "scope_contract_version": 1,
+                    "coverage_snapshot_id": "coverage_browser",
+                },
+            ]
+            if coverage
+            else []
+        ),
+        "coverage_snapshot": coverage_snapshot,
+        "allowed_resolutions": resolution_rows if coverage else [],
+        "decision_recovery": (
+            {
+                "state": "coverage_decision_required",
+                "message": "Coverage decision required",
+                "required_action": "resolve_coverage",
+                "allowed_resolutions": list(allowed_resolutions),
+            }
+            if coverage
+            else None
+        ),
+        "execution_unit": (
+            {
+                "id": "seu_browser_retry",
+                "state": "failed",
+                "attempt_no": 1,
+                "recovery_state": "replayable",
+                "allowed_actions": [
+                    {
+                        "action": "replay_coverage_decision",
+                        "available": True,
+                        "request": replay_request,
+                    }
+                ],
+                "trace_summary": {
+                    "fact_count": 4,
+                    "attempt_count": 1,
+                    "last_fact_kind": "provider_outcome_recorded",
+                },
+            }
+            if replay_request
+            else None
+        ),
+    }
+
+
+def browser_action_response(run_id: str, projection: dict, payload: dict) -> dict:
+    return {
+        "workflow_run_id": run_id,
+        "action": "resolve_coverage",
+        "result": {
+            "report_mode": "continue_research",
+            "scope_contract": projection["scope_contract"],
+            "unmet_constraint_ids": ["season"],
+            "audit_event": {
+                "id": "audit_browser_resolution",
+                "workflow_run_id": run_id,
+                "scope_contract_id": projection["scope_contract"]["id"],
+                "scope_contract_version": 1,
+                "event_name": "coverage_resolved",
+                "payload": payload,
+                "created_at": "2026-08-21T00:03:00+08:00",
+            },
+            "execution_unit": {
+                "id": "seu_browser_action",
+                "state": "pending",
+                "attempt_no": 0,
+                "recovery_state": "replayable",
+                "allowed_actions": [],
+                "trace_summary": {
+                    "fact_count": 1,
+                    "attempt_count": 1,
+                    "last_fact_kind": "authorization_consumed",
+                },
+            },
+        },
+    }
 
 
 def open_creator_with_restored_run(
