@@ -18,6 +18,7 @@ from app.content_research.persistence_models import (
     DirectionalEvidencePacketRecord,
     ReportDraftRecord,
     ReportFaithfulnessDecisionRecord,
+    ReportIntegrityEventRecord,
     ReportPublicationRecord,
     StageCheckpointRecord,
 )
@@ -80,6 +81,63 @@ def _take_over_dispatch(db_path: str, workflow_run_id: str) -> None:
                WHERE workflow_run_id=?""",
             (workflow_run_id,),
         )
+
+
+@pytest.mark.asyncio
+async def test_integrity_flag_committed_during_materialization_prevents_artifact_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = str(tmp_path / "integrity-flag-materialization-race.db")
+    store = SQLiteContentResearchStore(db_path)
+    async with ThreadStore(db_path) as threads:
+        thread = await threads.create_thread(title="integrity race")
+    async with WorkflowRunManager(db_path) as manager:
+        run = await manager.start_run(thread_id=thread["id"], user_id="user-1")
+    snapshot = replace(_snapshot(), workflow_run_id=run.run_id)
+    draft = replace(_draft(), workflow_run_id=run.run_id)
+    decision = replace(_decision(draft), workflow_run_id=run.run_id)
+    publication = replace(_publication(draft, decision), workflow_run_id=run.run_id)
+    store.save_result_snapshot(snapshot)
+    store.save_report_draft(draft.to_record())
+    store.save_report_faithfulness_decision(decision.to_record())
+    store.save_report_publication(publication.to_record())
+    async with WorkflowRunManager(db_path) as manager:
+        await manager.begin_report_finalization(run.run_id)
+
+    read_completed = asyncio.Event()
+    release_read = asyncio.Event()
+    original_list_artifacts = WorkflowStore.list_artifacts
+
+    async def pause_after_artifact_read(
+        workflow_store: WorkflowStore, workflow_run_id: str
+    ) -> list[WorkflowArtifact]:
+        artifacts = await original_list_artifacts(workflow_store, workflow_run_id)
+        read_completed.set()
+        await release_read.wait()
+        return artifacts
+
+    monkeypatch.setattr(WorkflowStore, "list_artifacts", pause_after_artifact_read)
+    materialization = asyncio.create_task(
+        ReportPublicationMaterializer(store, db_path).materialize(publication.id)
+    )
+    await asyncio.wait_for(read_completed.wait(), timeout=2)
+    store.append_report_integrity_event(
+        ReportIntegrityEventRecord(
+            id="rie_materialization_race",
+            publication_id=publication.id,
+            workflow_run_id=run.run_id,
+            event_type="integrity_flagged",
+            reason_code="frozen_execution_attempt_failed",
+            recovery_guidance="publish_successor_report",
+        )
+    )
+    release_read.set()
+
+    with pytest.raises(ValueError, match="integrity-flagged"):
+        await materialization
+    async with WorkflowStore(db_path) as workflow_store:
+        assert await workflow_store.list_artifacts(run.run_id) == []
 
 
 @pytest.mark.asyncio

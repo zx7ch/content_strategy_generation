@@ -53,6 +53,58 @@ def test_migration_0015_creates_scoped_configuration_table(tmp_path):
     assert "0015" in versions
 
 
+def test_migration_0031_creates_append_only_report_integrity_events(tmp_path):
+    db_path = str(tmp_path / "report-integrity-events.db")
+    bootstrap_content_research_schema(db_path)
+    with sqlite3.connect(db_path) as conn:
+        columns = {
+            row[1]
+            for row in conn.execute(
+                "PRAGMA table_info(content_research_report_integrity_events)"
+            )
+        }
+        migration = conn.execute(
+            "SELECT name FROM content_research_schema_migrations WHERE version='0031'"
+        ).fetchone()
+    assert columns == {
+        "id",
+        "publication_id",
+        "workflow_run_id",
+        "event_type",
+        "reason_code",
+        "recovery_guidance",
+        "created_at",
+    }
+    assert migration == ("report_publication_integrity_events",)
+
+
+def test_migration_0031_rolls_back_partial_integrity_schema_on_failure(
+    tmp_path,
+):
+    db_path = str(tmp_path / "report-integrity-events-rollback.db")
+    bootstrap_content_research_schema(db_path)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("DROP TABLE content_research_report_integrity_events")
+        conn.execute("DELETE FROM content_research_schema_migrations WHERE version='0031'")
+        conn.execute("CREATE TABLE integrity_index_collision (id TEXT)")
+        conn.execute(
+            "CREATE INDEX idx_cr_report_integrity_publication_created "
+            "ON integrity_index_collision(id)"
+        )
+
+    with pytest.raises(sqlite3.OperationalError, match="already exists"):
+        apply_content_research_migrations(db_path, bootstrap_content_research_schema)
+
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='content_research_report_integrity_events'"
+        ).fetchone() is None
+        assert conn.execute(
+            "SELECT 1 FROM content_research_schema_migrations WHERE version='0031'"
+        ).fetchone() is None
+
+
 def test_migration_0029_leaves_legacy_execution_evidence_unowned_and_manifest_fenced(
     tmp_path,
 ) -> None:

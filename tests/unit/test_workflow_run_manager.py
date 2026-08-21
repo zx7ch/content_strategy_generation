@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from datetime import timedelta
 
 import pytest
@@ -451,7 +452,124 @@ async def test_report_publication_retry_rejects_other_terminal_failures(manager)
         WorkflowTransitionError,
         match="requires a report publication failure",
     ):
-        await manager.retry_failed_report_finalization(run.run_id)
+        await manager.retry_failed_report_finalization(
+            run.run_id, publication_id="rpp_not_retryable"
+        )
+
+
+@pytest.mark.asyncio
+async def test_report_publication_retry_rejects_a_different_publication_than_failure(
+    manager,
+):
+    run = await manager.start_run(thread_id="thread-retry-target", user_id="user-1")
+    await manager.initialize_steps(
+        run.run_id,
+        [{"step_name": "formal_research", "phase": "retrieval", "max_attempts": 1}],
+    )
+    await manager.start_step(run.run_id, "formal_research")
+    await manager.complete_step(run.run_id, "formal_research")
+    await manager.begin_report_finalization(run.run_id)
+    await manager.fail_run(
+        run.run_id,
+        {
+            "code": "report_publication_failed",
+            "message": "artifact write failed",
+            "publication_id": "rpp_failed_exact",
+        },
+    )
+
+    with pytest.raises(WorkflowTransitionError, match="exact failed publication"):
+        await manager.retry_failed_report_finalization(
+            run.run_id, publication_id="rpp_different"
+        )
+
+    async with WorkflowStore(manager.db_path) as store:
+        failed = await store.get_run(run.run_id)
+    assert failed is not None and failed.status == WorkflowRunStatus.FAILED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("timing", "table", "predicate"),
+    (
+        ("BEFORE", "workflow_runs", "WHEN NEW.status = 'finalizing_report'"),
+        ("AFTER", "workflow_runs", "WHEN NEW.status = 'finalizing_report'"),
+        (
+            "BEFORE",
+            "workflow_events",
+            "WHEN NEW.event_type = 'run_report_publication_retry_started'",
+        ),
+        (
+            "AFTER",
+            "workflow_events",
+            "WHEN NEW.event_type = 'run_report_publication_retry_started'",
+        ),
+    ),
+)
+async def test_report_publication_retry_intent_is_atomic_at_every_write_boundary(
+    tmp_path, timing, table, predicate
+):
+    db_path = str(tmp_path / f"retry-{timing.lower()}-{table}.db")
+    publication_id = "rpp_exact_retry_target"
+    async with WorkflowRunManager(db_path) as manager:
+        run = await manager.start_run(thread_id="thread-retry-atomic", user_id="user-1")
+        await manager.initialize_steps(
+            run.run_id,
+            [{"step_name": "formal_research", "phase": "retrieval", "max_attempts": 1}],
+        )
+        await manager.start_step(run.run_id, "formal_research")
+        await manager.complete_step(run.run_id, "formal_research")
+        await manager.begin_report_finalization(run.run_id)
+        await manager.fail_run(
+            run.run_id,
+            {
+                "code": "report_publication_failed",
+                "message": "artifact write failed",
+                "publication_id": publication_id,
+            },
+        )
+
+    trigger_name = f"inject_retry_crash_{timing.lower()}_{table}"
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            f"CREATE TRIGGER {trigger_name} {timing} UPDATE ON {table} "
+            f"{predicate} BEGIN SELECT RAISE(ABORT, 'injected retry crash'); END"
+            if table == "workflow_runs"
+            else f"CREATE TRIGGER {trigger_name} {timing} INSERT ON {table} "
+            f"{predicate} BEGIN SELECT RAISE(ABORT, 'injected retry crash'); END"
+        )
+
+    async with WorkflowRunManager(db_path) as manager:
+        with pytest.raises(sqlite3.IntegrityError, match="injected retry crash"):
+            await manager.retry_failed_report_finalization(
+                run.run_id, publication_id=publication_id
+            )
+
+    async with WorkflowStore(db_path) as store:
+        failed = await store.get_run(run.run_id)
+        events = await store.list_events(run.run_id)
+    assert failed is not None and failed.status == WorkflowRunStatus.FAILED
+    assert failed.error_code == "report_publication_failed"
+    assert [
+        event.payload_json.get("publication_id")
+        for event in events
+        if event.event_type == "run_report_publication_retry_started"
+    ] == []
+
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(f"DROP TRIGGER {trigger_name}")
+
+    async with WorkflowRunManager(db_path) as manager:
+        resumed = await manager.retry_failed_report_finalization(
+            run.run_id, publication_id=publication_id
+        )
+        events = await manager.list_events(run.run_id)
+    assert resumed.status == WorkflowRunStatus.FINALIZING_REPORT
+    assert events[-1].event_type == "run_report_publication_retry_started"
+    assert events[-1].payload_json == {
+        "reason": "report_publication_failed",
+        "publication_id": publication_id,
+    }
 
 
 @pytest.mark.asyncio

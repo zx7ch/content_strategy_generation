@@ -444,6 +444,9 @@ class ContentResearchLiteReportResponse(BaseModel):
     frozen_scope: dict = Field(default_factory=dict)
     collected_at: str | None = None
     publication: dict = Field(default_factory=dict)
+    integrity_state: str | None = None
+    integrity_reason: str | None = None
+    integrity_recovery: dict | None = None
     sections: ContentResearchLiteSectionsResponse = Field(
         default_factory=ContentResearchLiteSectionsResponse
     )

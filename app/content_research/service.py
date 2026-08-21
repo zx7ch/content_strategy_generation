@@ -199,7 +199,7 @@ class ContentResearchReportIntegrityError(RuntimeError):
     """Raised when an existing published report cannot be safely projected."""
 
 
-class _ReportPublicationMaterializationError(RuntimeError):
+class ReportPublicationMaterializationError(RuntimeError):
     """Carry the exact persisted publication across the materialization boundary."""
 
     def __init__(self, publication_id: str, cause: Exception) -> None:
@@ -285,7 +285,9 @@ class WorkflowRuntime(Protocol):
 
     async def complete_report_publication(self, *, workflow_run_id: str) -> bool: ...
 
-    async def retry_failed_report_publication(self, *, workflow_run_id: str) -> bool: ...
+    async def retry_failed_report_publication(
+        self, *, workflow_run_id: str, publication_id: str
+    ) -> bool: ...
 
     async def wait_for_user_recovery(self, *, workflow_run_id: str, reason: dict) -> dict: ...
 
@@ -531,9 +533,13 @@ class WorkflowRunManagerRuntime:
             await manager.complete_report_finalization(workflow_run_id)
         return True
 
-    async def retry_failed_report_publication(self, *, workflow_run_id: str) -> bool:
+    async def retry_failed_report_publication(
+        self, *, workflow_run_id: str, publication_id: str
+    ) -> bool:
         async with self._manager("retry_failed_report_publication") as manager:
-            await manager.retry_failed_report_finalization(workflow_run_id)
+            await manager.retry_failed_report_finalization(
+                workflow_run_id, publication_id=publication_id
+            )
         return True
 
     async def wait_for_user_recovery(
@@ -3362,10 +3368,16 @@ class ContentResearchService:
                     raise ContentResearchValidationError(
                         "Completed Content Research runs cannot be retried."
                     )
+                events = await self._workflow_runtime.list_events(workflow_run_id)
+                active_retry = _latest_report_publication_id(
+                    events,
+                    event_type="run_report_publication_retry_started",
+                    error_code=None,
+                )
                 if (
                     runtime_status == "failed"
                     and str(runtime_run.get("error_code") or "") == "report_publication_failed"
-                ):
+                ) or (runtime_status == "finalizing_report" and active_retry is not None):
                     formal_result = await self._retry_failed_report_publication(
                         workflow_run_id=workflow_run_id,
                         request=source_request,
@@ -3441,19 +3453,26 @@ class ContentResearchService:
         request: ContentResearchSourceCollectionRequest,
     ) -> ContentResearchFormalResearchResponse:
         """Re-materialize a report after a safe, terminal publication failure."""
+        runtime_snapshot = await self._workflow_runtime.get_runtime_snapshot(
+            workflow_run_id
+        )
+        runtime_run = runtime_snapshot.get("run") or {}
+        runtime_status = str(runtime_run.get("status") or "")
         events = await self._workflow_runtime.list_events(workflow_run_id)
-        latest_failure = next(
-            (event for event in reversed(events) if event.get("event_type") == "run_failed"),
-            {},
-        )
-        failure_payload = latest_failure.get("payload_json") or {}
-        failed_publication_id = (
-            failure_payload.get("publication_id")
-            if failure_payload.get("error_code") == "report_publication_failed"
-            and isinstance(failure_payload.get("publication_id"), str)
-            and failure_payload.get("publication_id")
-            else None
-        )
+        if runtime_status == "failed":
+            failed_publication_id = _latest_report_publication_id(
+                events,
+                event_type="run_failed",
+                error_code="report_publication_failed",
+            )
+        elif runtime_status == "finalizing_report":
+            failed_publication_id = _latest_report_publication_id(
+                events,
+                event_type="run_report_publication_retry_started",
+                error_code=None,
+            )
+        else:
+            failed_publication_id = None
         brief = self._store.get_brief_by_workflow(workflow_run_id)
         if brief is None:
             raise ContentResearchNotFoundError(
@@ -3472,9 +3491,11 @@ class ContentResearchService:
             raise ContentResearchValidationError(
                 "Report publication retry requires the exact persisted failed publication"
             )
-        await self._workflow_runtime.retry_failed_report_publication(
-            workflow_run_id=workflow_run_id
-        )
+        if runtime_status == "failed":
+            await self._workflow_runtime.retry_failed_report_publication(
+                workflow_run_id=workflow_run_id,
+                publication_id=publication.id,
+            )
         try:
             artifact = await ReportPublicationMaterializer(
                 self._store, self._store._db_path
@@ -5422,7 +5443,7 @@ class ContentResearchService:
                     dispatch_context=dispatch_context,
                 ).materialize(existing_publication.id)
             except Exception as exc:
-                raise _ReportPublicationMaterializationError(
+                raise ReportPublicationMaterializationError(
                     existing_publication.id, exc
                 ) from exc
             return {
@@ -5452,7 +5473,7 @@ class ContentResearchService:
                 dispatch_context=dispatch_context,
             ).materialize(publication.id)
         except Exception as exc:
-            raise _ReportPublicationMaterializationError(publication.id, exc) from exc
+            raise ReportPublicationMaterializationError(publication.id, exc) from exc
         return {
             "type": "content_research_report_publication",
             "id": publication.id,
@@ -6471,7 +6492,34 @@ def _publication_lineage_is_materializable(
     decision = store.get_typed_record(
         ReportFaithfulnessDecisionRecord, publication.faithfulness_decision_id
     )
-    return draft is not None and decision is not None and decision.report_draft_id == draft.id
+    return (
+        draft is not None
+        and decision is not None
+        and decision.report_draft_id == draft.id
+        and not any(
+            event.event_type == "integrity_flagged"
+            for event in store.list_report_integrity_events(publication.id)
+        )
+    )
+
+
+def _latest_report_publication_id(
+    events: list[dict[str, Any]],
+    *,
+    event_type: str,
+    error_code: str | None,
+) -> str | None:
+    for event in reversed(events):
+        if event.get("event_type") != event_type:
+            continue
+        payload = event.get("payload_json") or {}
+        if error_code is not None and payload.get("error_code") != error_code:
+            continue
+        publication_id = payload.get("publication_id")
+        if isinstance(publication_id, str) and publication_id:
+            return publication_id
+        return None
+    return None
 
 
 def _admitted_claim_ids_for_run(

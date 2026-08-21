@@ -53,6 +53,11 @@ class ReportPublicationMaterializer:
 
     async def materialize(self, publication_id: str) -> WorkflowArtifact:
         publication = self._require_publication(publication_id)
+        if any(
+            event.event_type == "integrity_flagged"
+            for event in self._store.list_report_integrity_events(publication.id)
+        ):
+            raise ValueError("cannot materialize an integrity-flagged report publication")
         draft = self._require_parent(ReportDraftRecord, publication.report_draft_id, "report draft")
         decision = self._require_parent(
             ReportFaithfulnessDecisionRecord,
@@ -94,6 +99,19 @@ class ReportPublicationMaterializer:
                 )
             else:
                 manager = WorkflowRunManager(self._db_path)
+
+            async def require_current_integrity(conn: Any) -> None:
+                cursor = await conn.execute(
+                    """SELECT 1 FROM content_research_report_integrity_events
+                       WHERE publication_id=? AND event_type='integrity_flagged'
+                       LIMIT 1""",
+                    (publication.id,),
+                )
+                if await cursor.fetchone() is not None:
+                    raise ValueError(
+                        "cannot materialize an integrity-flagged report publication"
+                    )
+
             async with manager:
                 artifact = await manager.attach_artifact(
                     run_id=publication.workflow_run_id,
@@ -101,6 +119,7 @@ class ReportPublicationMaterializer:
                     payload=self._artifact_payload(publication, draft, decision, snapshot),
                     payload_mode=WorkflowArtifactPayloadMode.SNAPSHOT,
                     summary_text="内容调研报告已发布",
+                    transaction_guard=require_current_integrity,
                 )
 
         return artifact

@@ -392,6 +392,9 @@ class LiteReportReader:
         return {
             "workflow_run_id": report["workflow_run_id"],
             "workflow_execution_state": report.get("workflow_terminal_state"),
+            "integrity_state": report.get("integrity_state"),
+            "integrity_reason": report.get("integrity_reason"),
+            "integrity_recovery": report.get("integrity_recovery"),
             "subject": _subject(self._store, report["workflow_run_id"]),
             "frozen_scope": _frozen_scope(report),
             "collected_at": _collected_at(citations),

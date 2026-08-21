@@ -582,3 +582,35 @@ class ReportPublicationRecord(TypedPersistenceRecord):
             coverage_snapshot_id=self.coverage_snapshot_id,
             attempt_no=self.attempt_no,
         )
+
+
+@dataclass(frozen=True)
+class ReportIntegrityEventRecord:
+    """Append-only safety state for an immutable report publication."""
+
+    id: str
+    publication_id: str
+    workflow_run_id: str
+    event_type: str
+    reason_code: str
+    recovery_guidance: str
+    created_at: datetime = field(default_factory=utcnow)
+
+    def __post_init__(self) -> None:
+        _required(
+            self.id,
+            self.publication_id,
+            self.workflow_run_id,
+            self.event_type,
+            self.reason_code,
+            self.recovery_guidance,
+        )
+        if self.event_type != "integrity_flagged":
+            raise ValueError("invalid report integrity event type")
+        if self.reason_code not in {
+            "frozen_execution_attempt_failed",
+            "frozen_execution_attempt_outcome_unknown",
+        }:
+            raise ValueError("invalid report integrity reason")
+        if self.recovery_guidance != "publish_successor_report":
+            raise ValueError("invalid report integrity recovery guidance")

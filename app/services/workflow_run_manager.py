@@ -953,8 +953,15 @@ class WorkflowRunManager:
 
         return await self._transaction(op)
 
-    async def retry_failed_report_finalization(self, run_id: str) -> WorkflowRun:
+    async def retry_failed_report_finalization(
+        self, run_id: str, *, publication_id: str
+    ) -> WorkflowRun:
         """Reopen only a report-publication failure with completed research."""
+
+        if not publication_id:
+            raise WorkflowTransitionError(
+                "retry_failed_report_finalization requires an exact publication"
+            )
 
         async def op() -> WorkflowRun:
             assert self._conn is not None
@@ -965,6 +972,25 @@ class WorkflowRunManager:
             ):
                 raise WorkflowTransitionError(
                     "retry_failed_report_finalization requires a report publication failure"
+                )
+            async with self._conn.execute(
+                """SELECT payload_json FROM workflow_events
+                   WHERE run_id=? AND event_type='run_failed'
+                   ORDER BY event_id DESC LIMIT 1""",
+                (run_id,),
+            ) as cursor:
+                failure_event = await cursor.fetchone()
+            try:
+                failure_payload = (
+                    json.loads(failure_event["payload_json"])
+                    if failure_event is not None
+                    else {}
+                )
+            except (TypeError, json.JSONDecodeError):
+                failure_payload = {}
+            if failure_payload.get("publication_id") != publication_id:
+                raise WorkflowTransitionError(
+                    "retry_failed_report_finalization requires the exact failed publication"
                 )
             step = await self._fetch_step_row(run_id, "formal_research")
             if step["status"] != WorkflowStepStatus.SUCCEEDED.value:
@@ -992,7 +1018,10 @@ class WorkflowRunManager:
                 run_id=run_id,
                 thread_id=row["thread_id"],
                 event_type="run_report_publication_retry_started",
-                payload={"reason": "report_publication_failed"},
+                payload={
+                    "reason": "report_publication_failed",
+                    "publication_id": publication_id,
+                },
             )
             return self._run(await self._fetch_run_row(run_id))
 
@@ -1852,6 +1881,9 @@ class WorkflowRunManager:
         parent_artifact_id: Optional[str] = None,
         artifact_version: Optional[int] = None,
         payload_mode: WorkflowArtifactPayloadMode | str | None = None,
+        transaction_guard: Callable[
+            [aiosqlite.Connection], Awaitable[None]
+        ] | None = None,
     ) -> WorkflowArtifact:
         async def op() -> WorkflowArtifact:
             assert self._conn is not None
@@ -1872,6 +1904,8 @@ class WorkflowRunManager:
                 run["status"] in self.TERMINAL_RUN_STATUSES or run["status"] == "cancelling"
             ) and not terminal_final_result:
                 raise WorkflowTransitionError(f"attach_artifact not allowed from {run['status']}")
+            if transaction_guard is not None:
+                await transaction_guard(self._conn)
             mode_value = (
                 payload_mode.value
                 if isinstance(payload_mode, WorkflowArtifactPayloadMode)

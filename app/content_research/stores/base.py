@@ -33,6 +33,7 @@ from app.content_research.persistence_models import (
     MarketingConclusionDecisionRecord,
     ReportDraftRecord,
     ReportFaithfulnessDecisionRecord,
+    ReportIntegrityEventRecord,
     ReportPublicationRecord,
     StageCheckpointRecord,
     WeakSignalRecord,
@@ -266,6 +267,12 @@ class ContentResearchStore(Protocol):
     def save_report_publication(
         self, record: ReportPublicationRecord
     ) -> ReportPublicationRecord: ...
+    def append_report_integrity_event(
+        self, event: ReportIntegrityEventRecord
+    ) -> ReportIntegrityEventRecord: ...
+    def list_report_integrity_events(
+        self, publication_id: str
+    ) -> list[ReportIntegrityEventRecord]: ...
     def save_brief(self, brief: ResearchBriefRecord) -> ResearchBriefRecord: ...
 
     def get_brief(self, brief_id: str) -> ResearchBriefRecord | None: ...

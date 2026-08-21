@@ -42,6 +42,7 @@ from app.content_research.persistence_models import (
     MarketingConclusionDecisionRecord,
     ReportDraftRecord,
     ReportFaithfulnessDecisionRecord,
+    ReportIntegrityEventRecord,
     ReportPublicationRecord,
     StageCheckpointRecord,
     TypedPersistenceRecord,
@@ -1953,6 +1954,13 @@ class SQLiteContentResearchStore:
                 "UPDATE content_research_scope_execution_units SET state=? WHERE id=?",
                 (state, execution_unit_id),
             )
+            if state in {"failed", "outcome_unknown"}:
+                self._flag_published_reports_for_attempt_in_transaction(
+                    conn,
+                    execution_unit_id=execution_unit_id,
+                    attempt_no=attempt_no,
+                    state=state,
+                )
             if state == "outcome_unknown":
                 self._append_execution_fact_in_transaction(
                     conn,
@@ -1968,6 +1976,60 @@ class SQLiteContentResearchStore:
             raise
         finally:
             conn.close()
+
+    @staticmethod
+    def _flag_published_reports_for_attempt_in_transaction(
+        conn: sqlite3.Connection,
+        *,
+        execution_unit_id: str,
+        attempt_no: int,
+        state: str,
+    ) -> None:
+        reason_code = (
+            "frozen_execution_attempt_outcome_unknown"
+            if state == "outcome_unknown"
+            else "frozen_execution_attempt_failed"
+        )
+        publications = conn.execute(
+            """SELECT publication.id, publication.workflow_run_id
+               FROM content_research_report_publications AS publication
+               JOIN workflow_runs AS run
+                 ON run.run_id=publication.workflow_run_id
+               WHERE publication.execution_unit_id=?
+                 AND publication.attempt_no=?
+                 AND run.status='succeeded'
+                 AND EXISTS(
+                   SELECT 1 FROM workflow_artifacts AS artifact
+                   WHERE artifact.run_id=publication.workflow_run_id
+                     AND artifact.artifact_type='final_result'
+                     AND json_extract(
+                           artifact.payload_json, '$.report_publication_id'
+                         )=publication.id
+                 )""",
+            (execution_unit_id, attempt_no),
+        ).fetchall()
+        for publication in publications:
+            existing = conn.execute(
+                """SELECT 1 FROM content_research_report_integrity_events
+                   WHERE publication_id=? AND event_type='integrity_flagged'""",
+                (publication["id"],),
+            ).fetchone()
+            if existing is not None:
+                continue
+            conn.execute(
+                """INSERT INTO content_research_report_integrity_events
+                   (id, publication_id, workflow_run_id, event_type, reason_code,
+                    recovery_guidance, created_at)
+                   VALUES (?, ?, ?, 'integrity_flagged', ?,
+                           'publish_successor_report', ?)""",
+                (
+                    f"rie_{uuid.uuid4().hex}",
+                    publication["id"],
+                    publication["workflow_run_id"],
+                    reason_code,
+                    _fmt_dt(datetime.now(timezone.utc)),
+                ),
+            )
 
     def _record_execution_provider_fact(
         self,
@@ -3695,6 +3757,54 @@ class SQLiteContentResearchStore:
                 "attempt_no": record.attempt_no,
             },
         )  # type: ignore[return-value]
+
+    def append_report_integrity_event(
+        self, event: ReportIntegrityEventRecord
+    ) -> ReportIntegrityEventRecord:
+        publication = self.get_typed_record(
+            ReportPublicationRecord, event.publication_id
+        )
+        if publication is None or publication.workflow_run_id != event.workflow_run_id:
+            raise ValueError("report integrity event publication mismatch")
+        with self._connect() as conn:
+            conn.execute(
+                """INSERT INTO content_research_report_integrity_events
+                   (id, publication_id, workflow_run_id, event_type, reason_code,
+                    recovery_guidance, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    event.id,
+                    event.publication_id,
+                    event.workflow_run_id,
+                    event.event_type,
+                    event.reason_code,
+                    event.recovery_guidance,
+                    _fmt_dt(event.created_at),
+                ),
+            )
+        return event
+
+    def list_report_integrity_events(
+        self, publication_id: str
+    ) -> list[ReportIntegrityEventRecord]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """SELECT * FROM content_research_report_integrity_events
+                   WHERE publication_id=? ORDER BY created_at ASC, id ASC""",
+                (publication_id,),
+            ).fetchall()
+        return [
+            ReportIntegrityEventRecord(
+                id=row["id"],
+                publication_id=row["publication_id"],
+                workflow_run_id=row["workflow_run_id"],
+                event_type=row["event_type"],
+                reason_code=row["reason_code"],
+                recovery_guidance=row["recovery_guidance"],
+                created_at=_parse_dt(row["created_at"]),
+            )
+            for row in rows
+        ]
 
     @staticmethod
     def _row_to_snapshot(row: sqlite3.Row) -> RunPolicySnapshot:

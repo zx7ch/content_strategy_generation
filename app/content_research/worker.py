@@ -16,7 +16,10 @@ from app.content_research.async_dispatch import (
 )
 from app.content_research.models import utcnow
 from app.content_research.scope_contract import DispatchLeaseContext
-from app.content_research.service import ContentResearchService
+from app.content_research.service import (
+    ContentResearchService,
+    ReportPublicationMaterializationError,
+)
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
 
 logger = logging.getLogger(__name__)
@@ -186,7 +189,11 @@ class ContentResearchDispatchWorker:
                 await service.execute_scope_continuation(continuation)
         except Exception as exc:
             error = exc
-            terminal_state = "failed"
+            terminal_state = (
+                "completed"
+                if isinstance(exc, ReportPublicationMaterializationError)
+                else "failed"
+            )
             if unit_claim is not None:
                 attempt = self._store.get_scope_execution_attempt(
                     unit_claim.execution_unit_id, unit_claim.attempt_no

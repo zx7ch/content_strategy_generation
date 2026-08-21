@@ -461,6 +461,13 @@ async def test_failed_materialization_retry_reuses_the_exact_persisted_execution
         workflow_runtime=WorkflowRunManagerRuntime(db_path),
     )
 
+    # Simulate a process exit after the atomic retry command commits but
+    # before materialization starts. Recovery must use that command's ID.
+    async with WorkflowRunManager(db_path) as manager:
+        await manager.retry_failed_report_finalization(
+            run.run_id, publication_id=publication.id
+        )
+
     await service._retry_failed_report_publication(
         workflow_run_id=run.run_id,
         request=ContentResearchSourceCollectionRequest(
@@ -496,6 +503,249 @@ async def test_failed_materialization_retry_reuses_the_exact_persisted_execution
         for artifact in runtime_snapshot["artifacts"]
         if (artifact.get("payload_json") or {}).get("report_publication_id") is not None
     ] == [publication.id]
+
+
+@pytest.mark.asyncio
+async def test_published_report_is_flagged_when_its_frozen_attempt_later_fails(
+    tmp_path,
+):
+    db_path = str(tmp_path / "published-report-integrity-flag.db")
+    store = SQLiteContentResearchStore(db_path)
+    async with ThreadStore(db_path) as threads:
+        thread = await threads.create_thread(title="报告完整性")
+    async with WorkflowRunManager(db_path) as manager:
+        run = await manager.start_run(thread_id=thread["id"], user_id="user-1")
+
+    scope = build_scope_contract(
+        workflow_run_id=run.run_id,
+        research_plan_id="rp_integrity",
+        version=1,
+        constraints=(ScopeConstraint("core_object", "核心对象", "衬衫", "required"),),
+        query_groups=(ScopeQueryGroupInput("衬衫", "衬衫"),),
+    )
+    store.save_scope_contract(scope)
+    coverage = CoverageSnapshot(
+        id="scv_integrity",
+        workflow_run_id=run.run_id,
+        scope_contract_id=scope.id,
+        scope_contract_version=scope.version,
+        state="awaiting_scope_decision",
+        constraint_counts={},
+        unmet_constraint_ids=("core_object",),
+    )
+    store.save_coverage_snapshot(coverage)
+    unit, _created = store.resolve_coverage_to_execution_unit_atomically(
+        snapshot=coverage,
+        decision={"resolution": "generate_limited_report"},
+    )
+    claim = store.claim_execution_unit(execution_unit_id=unit.id, owner="worker-integrity")
+    assert claim is not None and claim.lease_token is not None
+
+    base = _governed_snapshot()
+    governed = {
+        **base.metadata["governed_snapshot"],
+        "research_plan_id": "rp_integrity",
+        "direction_results": [],
+        "policy_scope": {
+            **base.metadata["governed_snapshot"]["policy_scope"],
+            "report_compose_mode": "template_only",
+            "direction_ids": ["product_marketing"],
+        },
+        "execution_lineage": {
+            "scope_contract_id": scope.id,
+            "execution_unit_id": unit.id,
+            "coverage_snapshot_id": coverage.id,
+            "successful_attempt_no": claim.attempt_no,
+        },
+        "scope_contract": {"id": scope.id, "version": scope.version},
+        "coverage_snapshot": {"id": coverage.id, "state": coverage.state},
+        "execution_trace": {
+            "execution_unit_id": unit.id,
+            "attempt_no": claim.attempt_no,
+            "outcome_state": "not_requested",
+            "facts": [],
+        },
+    }
+    snapshot = replace(
+        base,
+        id="rrs_integrity",
+        workflow_run_id=run.run_id,
+        research_plan_id="rp_integrity",
+        metadata={
+            "governed_snapshot": governed,
+            "governed_input_fingerprint": _governed_input_fingerprint(governed),
+        },
+    )
+    draft = ResearchReportComposer().compose(snapshot)
+    decision = replace(
+        _decision(draft),
+        workflow_run_id=run.run_id,
+        scope_contract_id=draft.scope_contract_id,
+        execution_unit_id=draft.execution_unit_id,
+        coverage_snapshot_id=draft.coverage_snapshot_id,
+        attempt_no=draft.attempt_no,
+    )
+    publication = replace(
+        _publication(draft, decision, compose_mode="template_only"),
+        workflow_run_id=run.run_id,
+        scope_contract_id=draft.scope_contract_id,
+        execution_unit_id=draft.execution_unit_id,
+        coverage_snapshot_id=draft.coverage_snapshot_id,
+        attempt_no=draft.attempt_no,
+    )
+    publication = replace(publication, publication_state="evidence_only_report")
+    successor_scope = build_scope_contract(
+        workflow_run_id=run.run_id,
+        research_plan_id="rp_integrity",
+        version=2,
+        constraints=(ScopeConstraint("core_object", "核心对象", "外套", "required"),),
+        query_groups=(ScopeQueryGroupInput("外套", "外套"),),
+    )
+    store.save_scope_contract(successor_scope)
+    successor_coverage = CoverageSnapshot(
+        id="scv_integrity_successor",
+        workflow_run_id=run.run_id,
+        scope_contract_id=successor_scope.id,
+        scope_contract_version=successor_scope.version,
+        state="awaiting_scope_decision",
+        constraint_counts={},
+        unmet_constraint_ids=("core_object",),
+    )
+    store.save_coverage_snapshot(successor_coverage)
+    successor_unit, _created = store.resolve_coverage_to_execution_unit_atomically(
+        snapshot=successor_coverage,
+        decision={"resolution": "generate_limited_report"},
+    )
+    successor_claim = store.claim_execution_unit(
+        execution_unit_id=successor_unit.id, owner="worker-successor"
+    )
+    assert successor_claim is not None and successor_claim.lease_token is not None
+    assert store.complete_execution_unit(
+        execution_unit_id=successor_unit.id,
+        attempt_no=successor_claim.attempt_no,
+        owner="worker-successor",
+        lease_token=successor_claim.lease_token,
+        state="completed",
+    )
+    successor_governed = {
+        **governed,
+        "execution_lineage": {
+            "scope_contract_id": successor_scope.id,
+            "execution_unit_id": successor_unit.id,
+            "coverage_snapshot_id": successor_coverage.id,
+            "successful_attempt_no": successor_claim.attempt_no,
+        },
+        "scope_contract": {
+            "id": successor_scope.id,
+            "version": successor_scope.version,
+        },
+        "coverage_snapshot": {
+            "id": successor_coverage.id,
+            "state": successor_coverage.state,
+        },
+        "execution_trace": {
+            "execution_unit_id": successor_unit.id,
+            "attempt_no": successor_claim.attempt_no,
+            "outcome_state": "not_requested",
+            "facts": [],
+        },
+    }
+    successor_snapshot = replace(
+        snapshot,
+        id="rrs_integrity_successor",
+        snapshot_version="2",
+        metadata={
+            "governed_snapshot": successor_governed,
+            "governed_input_fingerprint": _governed_input_fingerprint(
+                successor_governed
+            ),
+        },
+    )
+    successor_draft = ResearchReportComposer().compose(successor_snapshot)
+    successor_decision = replace(
+        _decision(successor_draft),
+        workflow_run_id=run.run_id,
+        scope_contract_id=successor_draft.scope_contract_id,
+        execution_unit_id=successor_draft.execution_unit_id,
+        coverage_snapshot_id=successor_draft.coverage_snapshot_id,
+        attempt_no=successor_draft.attempt_no,
+    )
+    successor = replace(
+        _publication(successor_draft, successor_decision, compose_mode="template_only"),
+        workflow_run_id=run.run_id,
+        publication_state="evidence_only_report",
+        previous_version_id=publication.id,
+        scope_contract_id=successor_draft.scope_contract_id,
+        execution_unit_id=successor_draft.execution_unit_id,
+        coverage_snapshot_id=successor_draft.coverage_snapshot_id,
+        attempt_no=successor_draft.attempt_no,
+    )
+    store.save_result_snapshot(snapshot)
+    store.save_result_snapshot(successor_snapshot)
+    for item in (draft, successor_draft):
+        store.save_report_draft(item.to_record())
+    for item in (decision, successor_decision):
+        store.save_report_faithfulness_decision(item.to_record())
+    for item in (publication, successor):
+        store.save_report_publication(item.to_record())
+
+    async with WorkflowRunManager(db_path) as manager:
+        await manager.begin_report_finalization(run.run_id)
+    materializer = ReportPublicationMaterializer(store, db_path)
+    await materializer.materialize(publication.id)
+    await materializer.materialize(successor.id)
+    async with WorkflowRunManager(db_path) as manager:
+        await manager.complete_report_finalization(run.run_id)
+
+    assert store.complete_execution_unit(
+        execution_unit_id=unit.id,
+        attempt_no=claim.attempt_no,
+        owner="worker-integrity",
+        lease_token=claim.lease_token,
+        state="failed",
+    )
+
+    reader = PublishedReportReader(store, db_path)
+    flagged = await reader.read(
+        workflow_run_id=run.run_id,
+        publication_id=publication.id,
+    )
+    lite_flagged = (
+        await ContentResearchService(
+            store=store,
+            presearch=None,
+            workflow_runtime=WorkflowRunManagerRuntime(db_path),
+        ).get_lite_report(
+            workflow_run_id=run.run_id,
+            publication_id=publication.id,
+        )
+    ).model_dump(mode="json")
+    current = await reader.read(workflow_run_id=run.run_id)
+    assert flagged["integrity_state"] == "integrity_flagged"
+    assert flagged["integrity_reason"] == "frozen_execution_attempt_failed"
+    assert flagged["integrity_recovery"] == {
+        "required_action": "use_successor_publication",
+        "successor_publication_id": successor.id,
+    }
+    assert flagged["publication"]["report_publication_id"] == publication.id
+    assert lite_flagged["publication"]["integrity_state"] == "integrity_flagged"
+    assert lite_flagged["publication"]["integrity_reason"] == (
+        "frozen_execution_attempt_failed"
+    )
+    assert lite_flagged["publication"]["integrity_recovery"] == (
+        flagged["integrity_recovery"]
+    )
+    assert lite_flagged["integrity_state"] == "integrity_flagged"
+    assert lite_flagged["integrity_reason"] == "frozen_execution_attempt_failed"
+    assert lite_flagged["integrity_recovery"] == flagged["integrity_recovery"]
+    assert current["integrity_state"] == "healthy"
+    assert current["publication"]["report_publication_id"] == successor.id
+    assert current["publication"]["previous_version_id"] == publication.id
+    assert store.get_typed_record(ReportPublicationRecord, publication.id) == (
+        publication.to_record()
+    )
+    with pytest.raises(ValueError, match="integrity-flagged"):
+        await materializer.materialize(publication.id)
 
 
 @pytest.mark.asyncio

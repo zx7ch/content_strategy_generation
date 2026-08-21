@@ -1400,6 +1400,24 @@ _V30_REPORT_LINEAGE_INDEXES = (
     "CREATE INDEX idx_cr_report_publication_execution_lineage ON content_research_report_publications(workflow_run_id, scope_contract_id, execution_unit_id, attempt_no)",
 )
 
+_V31_REPORT_INTEGRITY_EVENT_STATEMENTS = (
+    """CREATE TABLE content_research_report_integrity_events (
+           id TEXT PRIMARY KEY,
+           publication_id TEXT NOT NULL,
+           workflow_run_id TEXT NOT NULL,
+           event_type TEXT NOT NULL,
+           reason_code TEXT NOT NULL,
+           recovery_guidance TEXT NOT NULL,
+           created_at TEXT NOT NULL,
+           FOREIGN KEY(publication_id)
+               REFERENCES content_research_report_publications(id)
+       )""",
+    """CREATE INDEX idx_cr_report_integrity_publication_created
+       ON content_research_report_integrity_events(publication_id, created_at, id)""",
+    """CREATE INDEX idx_cr_report_integrity_attempt
+       ON content_research_report_integrity_events(workflow_run_id, event_type)""",
+)
+
 
 def _apply_0029(conn: sqlite3.Connection) -> None:
     _add_columns(conn, _V29_EXECUTION_LINEAGE_COLUMNS)
@@ -1410,6 +1428,11 @@ def _apply_0029(conn: sqlite3.Connection) -> None:
 def _apply_0030(conn: sqlite3.Connection) -> None:
     _add_columns(conn, _V30_REPORT_LINEAGE_COLUMNS)
     for statement in _V30_REPORT_LINEAGE_INDEXES:
+        conn.execute(statement)
+
+
+def _apply_0031(conn: sqlite3.Connection) -> None:
+    for statement in _V31_REPORT_INTEGRITY_EVENT_STATEMENTS:
         conn.execute(statement)
 
 
@@ -1482,6 +1505,7 @@ def _expected_checksums(migration_0002_sql: str, legacy_checksum: str) -> dict[s
         "0030": _checksum(
             (_V30_REPORT_LINEAGE_COLUMNS, _V30_REPORT_LINEAGE_INDEXES)
         ),
+        "0031": _checksum(_V31_REPORT_INTEGRITY_EVENT_STATEMENTS),
     }
 
 
@@ -1771,6 +1795,13 @@ def apply_content_research_migrations(
                 name="report_execution_lineage",
                 checksum=expected_checksums["0030"],
                 apply=lambda: _apply_0030(conn),
+            )
+            _apply_migration(
+                conn,
+                version="0031",
+                name="report_publication_integrity_events",
+                checksum=expected_checksums["0031"],
+                apply=lambda: _apply_0031(conn),
             )
         except Exception:
             conn.rollback()

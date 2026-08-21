@@ -190,6 +190,7 @@ class PublishedReportReader:
             for item in governed.get("direction_results") or []
             if isinstance(item, dict) and item.get("direction_id")
         }
+        integrity = self._integrity_projection(publication)
         return {
             "workflow_run_id": workflow_run_id,
             "scope_contract_id": execution_lineage.get("scope_contract_id"),
@@ -199,6 +200,7 @@ class PublishedReportReader:
             ),
             "workflow_terminal_state": terminal_state,
             "publication_state": publication.publication_state,
+            **integrity,
             "artifact": {
                 "artifact_id": artifact.artifact_id,
                 "artifact_version": artifact.artifact_version,
@@ -220,6 +222,8 @@ class PublishedReportReader:
                 "execution_unit_id": publication.execution_unit_id,
                 "coverage_snapshot_id": publication.coverage_snapshot_id,
                 "attempt_no": publication.attempt_no,
+                "previous_version_id": publication.previous_version_id,
+                **integrity,
             },
             "sections": safe_public_projection(sections),
             "citation_groups": [_citation_group(group) for group in page],
@@ -303,9 +307,60 @@ class PublishedReportReader:
         ]
         if not matches:
             raise PublishedReportNotFoundError("published report not found")
-        if publication_id is None and len(matches) > 1:
-            matches.sort(key=lambda item: (item.created_at, item.id), reverse=True)
+        if publication_id is None:
+            matches.sort(
+                key=lambda item: (
+                    self._integrity_projection(item)["integrity_state"] == "healthy",
+                    item.created_at,
+                    item.id,
+                ),
+                reverse=True,
+            )
         return matches[0]
+
+    def _integrity_projection(
+        self, publication: ReportPublicationRecord
+    ) -> dict[str, Any]:
+        flagged = next(
+            (
+                event
+                for event in reversed(
+                    self._store.list_report_integrity_events(publication.id)
+                )
+                if event.event_type == "integrity_flagged"
+            ),
+            None,
+        )
+        if flagged is None:
+            return {
+                "integrity_state": "healthy",
+                "integrity_reason": None,
+                "integrity_recovery": None,
+            }
+        successors = [
+            item
+            for item in self._store.list_typed_records(ReportPublicationRecord)
+            if item.workflow_run_id == publication.workflow_run_id
+            and item.previous_version_id == publication.id
+            and not any(
+                event.event_type == "integrity_flagged"
+                for event in self._store.list_report_integrity_events(item.id)
+            )
+        ]
+        successors.sort(key=lambda item: (item.created_at, item.id), reverse=True)
+        successor_id = successors[0].id if successors else None
+        return {
+            "integrity_state": "integrity_flagged",
+            "integrity_reason": flagged.reason_code,
+            "integrity_recovery": {
+                "required_action": (
+                    "use_successor_publication"
+                    if successor_id is not None
+                    else "publish_successor_report"
+                ),
+                "successor_publication_id": successor_id,
+            },
+        }
 
     def _record(self, record_type: type[Any], record_id: str, name: str) -> Any:
         record = self._store.get_typed_record(record_type, record_id)

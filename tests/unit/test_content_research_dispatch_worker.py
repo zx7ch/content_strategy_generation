@@ -28,7 +28,10 @@ from app.content_research.scope_contract import (
     ScopeQueryGroupInput,
     build_scope_contract,
 )
-from app.content_research.service import ContentResearchService
+from app.content_research.service import (
+    ContentResearchService,
+    ReportPublicationMaterializationError,
+)
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
 from app.content_research.worker import ContentResearchDispatchWorker
 
@@ -76,6 +79,16 @@ class ExecutionUnitContinuationService(FakeFormalResearchService):
     ) -> str:
         self.executions.append((claim, continuation))
         return "completed"
+
+
+class PublicationFailureExecutionService(ExecutionUnitContinuationService):
+    async def execute_execution_unit(
+        self, claim: ScopeExecutionAttempt, continuation: ScopeExecutionContinuation
+    ) -> str:
+        self.executions.append((claim, continuation))
+        raise ReportPublicationMaterializationError(
+            "rpp_failed_materialization", ValueError("artifact write failed")
+        )
 
 
 def _save_execution_unit_continuation(
@@ -252,6 +265,38 @@ async def test_worker_passes_the_claimed_execution_attempt_to_the_service(tmp_pa
     assert claim.lease_owner
     assert claim.lease_token
     assert executed.authorization_id == continuation.authorization_id
+
+
+@pytest.mark.asyncio
+async def test_publication_only_failure_keeps_successful_execution_attempt_truthful(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteContentResearchStore(str(tmp_path / "publication-only-failure.db"))
+    authorization, _continuation = _save_execution_unit_continuation(store)
+    service = PublicationFailureExecutionService()
+    worker = ContentResearchDispatchWorker(
+        store=store,
+        service_factory=lambda: cast(ContentResearchService, service),
+    )
+
+    assert await worker.run_once() is True
+
+    attempt = store.get_scope_execution_attempt(
+        str(authorization.execution_unit_id), 0
+    )
+    assert attempt is not None
+    assert attempt.state == "completed"
+    persisted_continuation = store.list_scope_execution_continuations(
+        authorization.workflow_run_id
+    )[0]
+    assert persisted_continuation.state == "failed"
+    with store._connect() as connection:
+        last_error = connection.execute(
+            "SELECT last_error FROM content_research_scope_execution_continuations "
+            "WHERE authorization_id=?",
+            (authorization.id,),
+        ).fetchone()[0]
+    assert "artifact write failed" in str(last_error)
 
 
 @pytest.mark.asyncio
