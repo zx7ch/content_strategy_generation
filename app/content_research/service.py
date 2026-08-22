@@ -53,12 +53,7 @@ from app.content_research.contracts import (
     DIRECTION_CATALOG_V1,
     LOCKED_QUERY_PLAN_SCHEMA_VERSION,
     PRIMARY_MARKETING_GOAL_CATALOG,
-    QUERY_RELEVANCE_ALGORITHM_VERSION,
-    DirectionContract,
-    RunPolicySnapshot,
     build_default_snapshot,
-    build_query_relevance_contract,
-    policy_hash,
 )
 from app.content_research.decisions import ResearchDecisionService
 from app.content_research.evidence import EvidenceService
@@ -87,6 +82,7 @@ from app.content_research.models import (
     utcnow,
 )
 from app.content_research.observation import ContentResearchTraceService
+from app.content_research.persisted_packet_replay import PersistedPacketReplayInput
 from app.content_research.persistence_models import (
     ClaimAdmissionDecisionRecord,
     ClaimCandidateRecord,
@@ -169,8 +165,8 @@ from app.content_research.workflow.query_planner import (
 )
 from app.content_research.workflow_mutation_authority import (
     LegacyRecoveryActionUnavailableError,
+    LegacyRecoveryAuthority,
     legacy_recovery_ownership_unavailable,
-    persisted_packet_replay_unavailable_reason,
     project_legacy_recovery_authority,
 )
 from app.memory.thread_store import ThreadStore
@@ -1998,39 +1994,12 @@ class ContentResearchService:
         return ContentResearchLiteReportResponse(**payload)
 
     async def replay_downstream_from_persisted_packets(
-        self, workflow_run_id: str
+        self, replay_input: PersistedPacketReplayInput
     ) -> dict[str, Any]:
         """Replay admission through publication without any collection capability."""
-        replay_error = persisted_packet_replay_unavailable_reason(
-            self._store, workflow_run_id
-        )
-        if replay_error is not None:
-            raise ContentResearchValidationError(replay_error)
-        brief = self._store.get_brief_by_workflow(workflow_run_id)
-        if brief is None:
-            raise ContentResearchNotFoundError(
-                f"Content research workflow not found: {workflow_run_id}"
-            )
-        snapshot = self._store.get_run_policy_snapshot_for_workflow(workflow_run_id)
-        if snapshot is None:
-            raise ContentResearchValidationError(
-                "Packet-only replay requires the frozen run policy snapshot"
-            )
-        tasks = self._store.list_subagent_tasks_for_workflow(workflow_run_id)
-        if not tasks or any(
-            task.status not in {"completed", "partial_completed"} for task in tasks
-        ):
-            raise ContentResearchValidationError(
-                "Packet-only replay requires terminal successful or partial specialist tasks"
-            )
-        contracts = {
-            item.direction_id: item for item in self._store.list_direction_contracts(snapshot.id)
-        }
-        snapshot, contracts = await self._replay_relevance_context(
-            brief=brief,
-            snapshot=snapshot,
-            contracts=contracts,
-        )
+        workflow_run_id = replay_input.workflow_run_id
+        brief = replay_input.brief
+        snapshot = replay_input.snapshot
         operation_ids_before = {
             item.id
             for item in self._store.list_typed_records(StageCheckpointRecord)
@@ -2043,25 +2012,10 @@ class ContentResearchService:
         }
         packet_ids_by_direction: dict[str, list[str]] = {}
         pipeline = DirectionalExecutionPipeline(self._store)
-        for task in tasks:
-            direction_id = str(task.direction_id or "")
-            contract = contracts.get(direction_id)
-            if contract is None:
-                raise ContentResearchValidationError(
-                    f"Direction contract not found for packet-only replay: {direction_id}"
-                )
-            policy = self._store.get_sample_policy(contract.sample_policy_id)
-            if policy is None:
-                raise ContentResearchValidationError(
-                    f"Sample policy not found for packet-only replay: {contract.sample_policy_id}"
-                )
-            packet_ids_by_direction[direction_id] = list(
+        for direction in replay_input.directions:
+            packet_ids_by_direction[direction.direction_id] = list(
                 pipeline.replay_admission_from_persisted_packets(
-                    workflow_run_id=workflow_run_id,
-                    subagent_task_id=task.id,
-                    direction_id=direction_id,
-                    contract=contract,
-                    policy=policy,
+                    replay_input=direction,
                     snapshot=snapshot,
                 )
             )
@@ -2113,7 +2067,7 @@ class ContentResearchService:
         if ownership_error is not None:
             raise ContentResearchValidationError(ownership_error)
         report = await self.get_lite_report(workflow_run_id=workflow_run_id)
-        await self._require_legacy_recovery_authority(
+        authority = await self._require_legacy_recovery_authority(
             workflow_run_id=workflow_run_id,
             action="repair_from_persisted_packets",
             published_report=report.model_dump(mode="json"),
@@ -2126,184 +2080,25 @@ class ContentResearchService:
             raise ContentResearchValidationError(
                 "Persisted-packet repair is not available for this report"
             )
-        tasks = self._store.list_subagent_tasks_for_workflow(workflow_run_id)
-        packets = [
-            item
-            for item in self._store.list_typed_records(DirectionalEvidencePacketRecord)
-            if item.workflow_run_id == workflow_run_id
-        ]
-        if not tasks or not packets:
-            raise ContentResearchValidationError(
-                "Persisted-packet repair requires completed selection and evidence packets"
-            )
         recovery_lock = self._recovery_locks.setdefault(workflow_run_id, asyncio.Lock())
         async with recovery_lock:
-            replay = await self.replay_downstream_from_persisted_packets(workflow_run_id)
+            replay_input = authority.replay_input
+            if replay_input is None:
+                raise ContentResearchValidationError(
+                    "persisted_packet_replay_input_unavailable"
+                )
+            replay = await self.replay_downstream_from_persisted_packets(
+                replay_input
+            )
         return {
             **replay,
             "status": "completed",
-            "packet_count": len(packets),
+            "packet_count": sum(
+                len(direction.packets)
+                for direction in replay_input.directions
+            ),
             "new_collection_count": 0,
         }
-
-    async def _replay_relevance_context(
-        self,
-        *,
-        brief: ResearchBriefRecord,
-        snapshot: RunPolicySnapshot,
-        contracts: dict[str, DirectionContract],
-    ) -> tuple[RunPolicySnapshot, dict[str, DirectionContract]]:
-        relevance_by_direction = dict(snapshot.effective_policy.get("query_relevance") or {})
-        if relevance_by_direction and all(
-            str(value.get("algorithm_version") or "") == QUERY_RELEVANCE_ALGORITHM_VERSION
-            for value in relevance_by_direction.values()
-            if isinstance(value, dict)
-        ):
-            return snapshot, contracts
-
-        locked_directions = dict(
-            snapshot.effective_policy.get("locked_query_plan", {}).get("directions", {}) or {}
-        )
-        if set(locked_directions) != set(contracts):
-            raise ContentResearchValidationError(
-                "Historical relevance revision does not match locked directions"
-            )
-        existing_revision = next(
-            (
-                item
-                for item in reversed(self._store.list_typed_records(StageCheckpointRecord))
-                if item.workflow_run_id == brief.workflow_run_id
-                and item.stage_name == "relevance_revision"
-                and item.status == "completed"
-                and item.payload.get("base_snapshot_id") == snapshot.id
-                and item.payload.get("base_snapshot_hash") == snapshot.effective_policy_hash
-            ),
-            None,
-        )
-        subject_structure = (
-            dict(existing_revision.payload.get("subject_structure") or {})
-            if existing_revision
-            else dict(brief.payload.get("subject_structure") or {})
-        )
-        subject = str(
-            brief.payload.get("confirmed_subject")
-            or brief.payload.get("seed_text")
-            or brief.payload.get("subject_confirmation")
-            or ""
-        ).strip()
-        structure_decision = parse_subject_structure(
-            subject_structure,
-            normalized_input=" ".join(
-                item
-                for item in (
-                    str(brief.payload.get("seed_text") or "").strip(),
-                    str(brief.payload.get("user_note") or "").strip(),
-                    subject,
-                )
-                if item
-            ),
-        )
-        if structure_decision.state != "confirmed" or structure_decision.structure is None:
-            task = await self._presearch.create_llm_task(
-                PresearchInput(
-                    seed_text=subject,
-                    user_note="历史任务相关性修订；仅生成主题结构，不采集来源。",
-                    thread_id=brief.thread_id,
-                    workflow_run_id=brief.workflow_run_id,
-                    user_id=str(brief.payload.get("user_id") or "local"),
-                    workspace_id=str(brief.payload.get("workspace_id") or "default"),
-                )
-            )
-            if task is None:
-                raise ContentResearchValidationError(
-                    "Historical relevance revision requires a configured Pre-research model"
-                )
-            outcome = await task
-            if (
-                outcome.checklist.subject_structure_state != "confirmed"
-                or outcome.checklist.subject_structure is None
-            ):
-                raise ContentResearchValidationError(
-                    "Historical relevance revision produced an invalid subject structure"
-                )
-            subject_structure = subject_structure_payload(outcome.checklist.subject_structure)
-
-        revised_relevance: dict[str, dict[str, Any]] = {}
-        revised_contracts: dict[str, DirectionContract] = {}
-        for direction_id, contract in contracts.items():
-            locked_group_ids = tuple(
-                str(item.get("id") or "")
-                for item in locked_directions[direction_id].get("query_groups") or ()
-                if str(item.get("id") or "")
-            )
-            original_ids = tuple(
-                str(item)
-                for item in (contract.metadata.get("query_relevance") or {}).get(
-                    "query_group_ids", ()
-                )
-            )
-            if not locked_group_ids or set(original_ids) != set(locked_group_ids):
-                raise ContentResearchValidationError(
-                    "Historical relevance revision query groups do not match"
-                )
-            relevance = build_query_relevance_contract(
-                direction_id=direction_id,
-                confirmed_subject=subject,
-                query_group_ids=locked_group_ids,
-                subject_structure=subject_structure,
-            )
-            revised_relevance[direction_id] = relevance
-            revised_contracts[direction_id] = replace(
-                contract,
-                metadata={**contract.metadata, "query_relevance": relevance},
-            )
-        revised_policy = {
-            **snapshot.effective_policy,
-            "query_relevance": revised_relevance,
-        }
-        revision_hash = canonical_fingerprint(
-            {
-                "base_snapshot_id": snapshot.id,
-                "base_snapshot_hash": snapshot.effective_policy_hash,
-                "subject_structure": subject_structure,
-                "query_relevance": revised_relevance,
-            }
-        )
-        revised_snapshot = replace(
-            snapshot,
-            effective_policy=revised_policy,
-            effective_policy_hash=policy_hash(revised_policy),
-            metadata={
-                **snapshot.metadata,
-                "relevance_revision_hash": revision_hash,
-            },
-        )
-        if existing_revision is None:
-            now = utcnow()
-            self._store.save_stage_checkpoint(
-                StageCheckpointRecord(
-                    id=f"scp_{revision_hash[:24]}",
-                    schema_version="content_research_stage_checkpoint_v1",
-                    payload={
-                        "schema_version": "content_research_relevance_revision_v1",
-                        "base_snapshot_id": snapshot.id,
-                        "base_snapshot_hash": snapshot.effective_policy_hash,
-                        "revision_hash": revision_hash,
-                        "algorithm_version": QUERY_RELEVANCE_ALGORITHM_VERSION,
-                        "reason": "structured_subject_anchor_repair",
-                        "subject_structure": subject_structure,
-                        "direction_ids": sorted(revised_relevance),
-                    },
-                    workflow_run_id=brief.workflow_run_id,
-                    subagent_task_id="historical-relevance-replay",
-                    stage_name="relevance_revision",
-                    input_fingerprint=revision_hash,
-                    status="completed",
-                    started_at=now,
-                    finished_at=now,
-                )
-            )
-        return revised_snapshot, revised_contracts
 
     def _build_governed_snapshot(
         self,
@@ -3716,7 +3511,7 @@ class ContentResearchService:
         workflow_run_id: str,
         action: str,
         published_report: dict[str, Any] | None = None,
-    ) -> None:
+    ) -> LegacyRecoveryAuthority:
         ownership_error = legacy_recovery_ownership_unavailable(
             self._store, workflow_run_id
         )
@@ -3734,6 +3529,7 @@ class ContentResearchService:
             raise ContentResearchValidationError(
                 str(exc)
             ) from exc
+        return authority
 
     def _require_frozen_product_marketing_dispatch_contract(
         self, brief: ResearchBriefRecord

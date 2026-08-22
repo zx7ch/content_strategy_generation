@@ -9,6 +9,10 @@ import httpx
 import pytest
 
 from app.api.routes.router import app
+from app.content_research.persisted_packet_replay import (
+    PersistedPacketReplayInput,
+    build_persisted_packet_replay_input,
+)
 from app.content_research.persistence_models import (
     DirectionalEvidencePacketRecord,
     ReportPublicationRecord,
@@ -389,8 +393,17 @@ async def test_formal_workflow_public_api_e2e_is_packet_only_safe_and_replayable
         for item in store.list_typed_records(DirectionalEvidencePacketRecord)
         if item.workflow_run_id == workflow["workflow_run_id"]
     }
+    replay_input = build_persisted_packet_replay_input(
+        store,
+        workflow["workflow_run_id"],
+        publication={
+            "state": "evidence_only_report",
+            "publication_reason": "query_subject_not_supported",
+        },
+    )
+    assert isinstance(replay_input, PersistedPacketReplayInput)
     await app.state.content_research_service.replay_downstream_from_persisted_packets(
-        workflow["workflow_run_id"]
+        replay_input
     )
     replay_messages = await thread_store.get_thread_messages(creator_thread["id"])
     assert len(

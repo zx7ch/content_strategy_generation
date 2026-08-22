@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from app.content_research.admission.candidates import build_claim_candidate, extract_facts
 from app.content_research.admission.evaluator import (
@@ -56,6 +56,11 @@ from app.content_research.scope_contract import (
 from app.content_research.sources.base import SourceOperationResult
 from app.content_research.sources.canonical_registry import CanonicalSourceRegistry
 from app.content_research.stores.base import ContentResearchStore
+
+if TYPE_CHECKING:
+    from app.content_research.persisted_packet_replay import (
+        PersistedPacketDirectionReplayInput,
+    )
 
 PACKET_FIELD_NAMES = frozenset(
     {
@@ -939,6 +944,7 @@ class DirectionalExecutionPipeline:
         self._active_scope_query_groups: tuple[QueryGroup, ...] = ()
         self._scope_execution_authorization_id: str | None = None
         self._scope_execution_revision = 1
+        self._execution_ownership_override: dict[str, Any] | None = None
         self._scope_audit_event_ids: set[str] = set()
         self._canonical_sources = CanonicalSourceRegistry(store)
         self._checkpoint_started_at: dict[tuple[str, str], datetime] = {}
@@ -1013,9 +1019,16 @@ class DirectionalExecutionPipeline:
         )
 
     def _execution_ownership(self) -> dict[str, Any]:
+        if self._execution_ownership_override is not None:
+            return dict(self._execution_ownership_override)
         return self._execution_owner().as_record_kwargs()
 
     def _owns_current_execution(self, record: Any) -> bool:
+        if self._execution_ownership_override is not None:
+            return all(
+                getattr(record, field) == value
+                for field, value in self._execution_ownership_override.items()
+            )
         return self._execution_owner().matches(record)
 
     def _queue_scope_audit_event(self, event: ScopeAuditEvent) -> None:
@@ -1223,7 +1236,7 @@ class DirectionalExecutionPipeline:
         selection_record = self._checkpoint(subagent_task_id, "selection", selection_fp)
         replayed_selection = selection_record is not None
         if selection_record:
-            selection = _selection_from_payload(selection_record.payload["selection"])
+            selection = direction_selection_from_payload(selection_record.payload["selection"])
         else:
             self._save_checkpoint(
                 subagent_task_id,
@@ -1247,14 +1260,14 @@ class DirectionalExecutionPipeline:
         detail_record = self._checkpoint(subagent_task_id, "detail", selection_fp)
         if detail_record:
             candidate_by_id = _candidate_map(detail_record.payload["candidates"])
-            selection = _selection_from_payload(detail_record.payload["selection"])
+            selection = direction_selection_from_payload(detail_record.payload["selection"])
         elif collect_detail is not None:
             self._start_checkpoint(subagent_task_id, "detail")
             revisions = self._selection_revisions(subagent_task_id, selection_fp)
             if revisions:
                 latest = revisions[-1].payload
                 candidate_by_id = _candidate_map(latest["candidates"])
-                selection = _selection_from_payload(latest["selection"])
+                selection = direction_selection_from_payload(latest["selection"])
             revision_no = len(revisions)
             for candidate_id, candidate in sorted(
                 candidate_by_id.items(), key=lambda pair: _sort_key(pair[1])
@@ -1611,57 +1624,13 @@ class DirectionalExecutionPipeline:
     def replay_admission_from_persisted_packets(
         self,
         *,
-        workflow_run_id: str,
-        subagent_task_id: str,
-        direction_id: str,
-        contract: DirectionContract,
-        policy: SamplePolicy,
+        replay_input: PersistedPacketDirectionReplayInput,
         snapshot: RunPolicySnapshot,
     ) -> tuple[str, ...]:
-        """Replay admission only; this boundary has no provider-call capability."""
-        checkpoints = [
-            item
-            for item in self._store.list_typed_records(StageCheckpointRecord)
-            if item.workflow_run_id == workflow_run_id
-            and item.subagent_task_id == subagent_task_id
-            and item.status == "completed"
-        ]
-        packet_checkpoint = next(
-            (item for item in reversed(checkpoints) if item.stage_name == "packet"),
-            None,
-        )
-        selection_checkpoint = next(
-            (
-                item
-                for item in reversed(checkpoints)
-                if item.stage_name == "detail" and item.payload.get("selection")
-            ),
-            None,
-        ) or next(
-            (
-                item
-                for item in reversed(checkpoints)
-                if item.stage_name == "selection" and item.payload.get("selection")
-            ),
-            None,
-        )
-        if packet_checkpoint is None or selection_checkpoint is None:
-            raise ValueError(
-                "packet-only admission replay requires completed selection and packet checkpoints"
-            )
-        if str(packet_checkpoint.payload.get("direction_id") or "") != direction_id:
-            raise ValueError("packet checkpoint direction does not match replay direction")
-        comment_checkpoint = next(
-            (item for item in reversed(checkpoints) if item.stage_name == "comments"),
-            None,
-        )
-        packet_ids = tuple(packet_checkpoint.payload.get("packet_ids") or ())
-        comment_packet_ids = (
-            tuple(comment_checkpoint.payload.get("packet_ids") or ()) if comment_checkpoint else ()
-        )
-        if not packet_ids and not comment_packet_ids:
-            raise ValueError("packet-only admission replay requires persisted packets")
-        selection = _selection_from_payload(selection_checkpoint.payload["selection"])
+        """Replay admission from the one previously validated immutable input."""
+        workflow_run_id = replay_input.task.workflow_run_id
+        subagent_task_id = replay_input.task.id
+        direction_id = replay_input.direction_id
         self._workflow_run_id = workflow_run_id
         self._checkpoint_started_at = {}
         self._load_scope_contract(workflow_run_id)
@@ -1677,16 +1646,21 @@ class DirectionalExecutionPipeline:
                     candidate_limit=frozen_groups[0].candidate_limit,
                 )
             )
-        self._run_admission(
-            subagent_task_id,
-            direction_id,
-            selection,
-            (*packet_ids, *comment_packet_ids),
-            contract,
-            policy,
-            snapshot,
-        )
-        return packet_ids
+        self._execution_ownership_override = replay_input.execution_ownership
+        try:
+            self._run_admission(
+                subagent_task_id,
+                direction_id,
+                replay_input.selection,
+                (*replay_input.packet_ids, *replay_input.comment_packet_ids),
+                replay_input.contract,
+                replay_input.sample_policy,
+                snapshot,
+                packet_records=replay_input.packets,
+            )
+        finally:
+            self._execution_ownership_override = None
+        return replay_input.packet_ids
 
     def _run_admission(
         self,
@@ -1697,10 +1671,12 @@ class DirectionalExecutionPipeline:
         contract: DirectionContract,
         policy: SamplePolicy,
         snapshot: RunPolicySnapshot,
+        *,
+        packet_records: tuple[DirectionalEvidencePacketRecord, ...] | None = None,
     ) -> dict[str, Any]:
         relevance_contract = frozen_query_relevance(contract, snapshot)
         strategy = DEFAULT_ADMISSION_STRATEGIES.get(direction_id)
-        packets = [
+        packets = list(packet_records) if packet_records is not None else [
             packet
             for packet_id in packet_ids
             if (packet := self._store.get_typed_record(DirectionalEvidencePacketRecord, packet_id))
@@ -3108,24 +3084,90 @@ def _selection_payload(selection: DirectionSelection) -> dict[str, Any]:
     return {**asdict(selection), "decisions": [asdict(item) for item in selection.decisions]}
 
 
-def _selection_from_payload(payload: dict[str, Any]) -> DirectionSelection:
+def direction_selection_from_payload(payload: Mapping[str, Any]) -> DirectionSelection:
+    """Decode one persisted selection without accepting partial or loose shapes."""
+    if not isinstance(payload, Mapping):
+        raise ValueError("direction selection must be a mapping")
+    required = {
+        "query_plan_hash",
+        "candidate_manifest_hash",
+        "decisions",
+        "selected_source_count",
+        "eligible_source_count",
+        "independent_source_count",
+        "status",
+    }
+    if not required <= set(payload):
+        raise ValueError("direction selection is missing required fields")
+    decisions_payload = payload["decisions"]
+    if not isinstance(decisions_payload, list | tuple):
+        raise ValueError("direction selection decisions must be a sequence")
+    decisions: list[CandidateDecision] = []
+    for item in decisions_payload:
+        if not isinstance(item, Mapping):
+            raise ValueError("direction selection decision must be a mapping")
+        if not {
+            "canonical_source_id",
+            "selected",
+            "reasons",
+            "query_group_ids",
+        } <= set(item):
+            raise ValueError("direction selection decision is missing required fields")
+        canonical_source_id = str(item["canonical_source_id"] or "").strip()
+        reasons = item["reasons"]
+        query_group_ids = item["query_group_ids"]
+        query_hits = item.get("query_hits", ())
+        if (
+            not canonical_source_id
+            or not isinstance(item["selected"], bool)
+            or not isinstance(reasons, list | tuple)
+            or not all(isinstance(value, str) and value for value in reasons)
+            or not isinstance(query_group_ids, list | tuple)
+            or not all(isinstance(value, str) and value for value in query_group_ids)
+            or not isinstance(query_hits, list | tuple)
+            or not all(isinstance(value, Mapping) for value in query_hits)
+        ):
+            raise ValueError("direction selection decision is invalid")
+        decisions.append(
+            CandidateDecision(
+                canonical_source_id=canonical_source_id,
+                selected=item["selected"],
+                reasons=tuple(reasons),
+                query_group_ids=tuple(query_group_ids),
+                query_hits=tuple(dict(value) for value in query_hits),
+            )
+        )
+    counts = (
+        payload["selected_source_count"],
+        payload["eligible_source_count"],
+        payload["independent_source_count"],
+    )
+    if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in counts):
+        raise ValueError("direction selection counts must be non-negative integers")
+    if counts[0] != sum(item.selected for item in decisions):
+        raise ValueError("direction selection selected count does not match decisions")
+    query_plan_hash = str(payload["query_plan_hash"] or "").strip()
+    candidate_manifest_hash = str(payload["candidate_manifest_hash"] or "").strip()
+    status = str(payload["status"] or "").strip()
+    coverage_unmet = payload.get("coverage_unmet_query_group_ids", ())
+    if (
+        not query_plan_hash
+        or not candidate_manifest_hash
+        or not status
+        or not isinstance(coverage_unmet, list | tuple)
+        or not all(isinstance(value, str) and value for value in coverage_unmet)
+    ):
+        raise ValueError("direction selection identity or status is invalid")
     return DirectionSelection(
         **{
-            **payload,
-            "decisions": tuple(
-                CandidateDecision(
-                    **{
-                        **item,
-                        "reasons": tuple(item["reasons"]),
-                        "query_group_ids": tuple(item["query_group_ids"]),
-                        "query_hits": tuple(item.get("query_hits", ())),
-                    }
-                )
-                for item in payload["decisions"]
-            ),
-            "coverage_unmet_query_group_ids": tuple(
-                payload.get("coverage_unmet_query_group_ids", ())
-            ),
+            "query_plan_hash": query_plan_hash,
+            "candidate_manifest_hash": candidate_manifest_hash,
+            "decisions": tuple(decisions),
+            "selected_source_count": counts[0],
+            "eligible_source_count": counts[1],
+            "independent_source_count": counts[2],
+            "status": status,
+            "coverage_unmet_query_group_ids": tuple(coverage_unmet),
         }
     )
 

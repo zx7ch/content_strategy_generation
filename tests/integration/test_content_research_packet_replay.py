@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import json
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -10,6 +9,10 @@ import pytest
 from app.content_research.admission.candidates import source_text_hash
 from app.content_research.contracts import build_default_snapshot, policy_hash
 from app.content_research.models import ResearchBriefRecord, SubagentTaskRecord
+from app.content_research.persisted_packet_replay import (
+    PersistedPacketReplayInput,
+    build_persisted_packet_replay_input,
+)
 from app.content_research.persistence_models import (
     CanonicalSourceRecord,
     ClaimAdmissionDecisionRecord,
@@ -17,112 +20,23 @@ from app.content_research.persistence_models import (
     DirectionalEvidencePacketRecord,
     StageCheckpointRecord,
 )
-from app.content_research.presearch.service import (
-    PresearchChecklist,
-    PresearchOutcome,
-    PresearchService,
-)
+from app.content_research.presearch.service import PresearchService
 from app.content_research.service import (
     ContentResearchService,
     ContentResearchValidationError,
     WorkflowRunManagerRuntime,
 )
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
-from app.content_research.subject_structure import parse_subject_structure
-from app.content_research.workflow.directional_pipeline import compile_query_groups
+from app.content_research.workflow.directional_pipeline import (
+    DirectionalExecutionPipeline,
+    compile_query_groups,
+)
 from app.content_research.workflow_mutation_authority import (
+    persisted_packet_replay_unavailable_reason,
     project_legacy_recovery_authority,
 )
 from app.services.llm.failures import LLMProviderFailure
 from app.services.llm.types import LLMResponse, TokenUsage
-
-
-def _legacy_context(tmp_path):
-    db_path = str(tmp_path / "legacy-replay.db")
-    store = SQLiteContentResearchStore(db_path)
-    frozen_at = datetime(2026, 8, 3, tzinfo=timezone.utc)
-    groups = compile_query_groups(
-        direction_id="product_marketing",
-        subject="夏季防晒穿搭",
-        questions=["穿搭"],
-        competitors=[],
-        run_as_of_at=frozen_at,
-    )
-    structure = {
-        "schema_version": "content_research_subject_structure_v1",
-        "canonical_subject": "夏季防晒穿搭",
-        "subject_type": "category",
-        "core_entities": [{"canonical_name": "防晒服饰", "raw_mentions": ["防晒"]}],
-        "research_intents": ["穿搭"],
-        "context_modifiers": ["夏季"],
-        "synonym_groups": {"防晒服饰": ["防晒衣", "防晒服"]},
-        "ambiguities": [],
-        "resolution_state": "resolved",
-    }
-    snapshot, _policies, contracts = build_default_snapshot(
-        snapshot_id="rps-legacy",
-        workflow_run_id="run-legacy",
-        brief_id="rb-legacy",
-        plan_id="rp-legacy",
-        run_as_of_at=frozen_at,
-        direction_ids=("product_marketing",),
-        confirmed_subject="夏季防晒穿搭",
-        query_groups_by_direction={
-            "product_marketing": tuple(
-                {
-                    "id": group.id,
-                    "direction_id": group.direction_id,
-                    "normalized_query": group.query,
-                    "priority": group.priority,
-                    "sort": group.sort,
-                    "time_window": dict(group.time_window or {}),
-                    "candidate_cap": group.candidate_limit,
-                }
-                for group in groups
-            )
-        },
-        subject_structure=structure,
-        subject_structure_hash="structure-hash",
-    )
-    legacy_relevance = {
-        **snapshot.effective_policy["query_relevance"]["product_marketing"],
-        "schema_version": "content_research_query_relevance_v1",
-        "algorithm_version": "query_relevance_v1",
-        "subject_anchors": ["夏季防晒穿搭"],
-        "category_anchors": [],
-    }
-    legacy_relevance.pop("core_entity_anchors", None)
-    legacy_policy = {
-        **snapshot.effective_policy,
-        "query_relevance": {"product_marketing": legacy_relevance},
-    }
-    legacy_snapshot = replace(
-        snapshot,
-        effective_policy=legacy_policy,
-        effective_policy_hash=policy_hash(legacy_policy),
-    )
-    legacy_contract = replace(
-        contracts[0],
-        metadata={**contracts[0].metadata, "query_relevance": legacy_relevance},
-    )
-    brief = ResearchBriefRecord(
-        id="rb-legacy",
-        workflow_run_id="run-legacy",
-        thread_id="thread-legacy",
-        schema_version="content_research_brief_v1",
-        status="confirmed",
-        payload={
-            "seed_text": "夏季防晒穿搭",
-            "confirmed_subject": "夏季防晒穿搭",
-            "subject_structure": structure,
-        },
-    )
-    service = ContentResearchService(
-        store=store,
-        presearch=PresearchService(None),
-        workflow_runtime=WorkflowRunManagerRuntime(db_path),
-    )
-    return service, store, brief, legacy_snapshot, legacy_contract
 
 
 def _repair_authority_context(tmp_path):
@@ -218,8 +132,23 @@ def _repair_authority_context(tmp_path):
             "dep-repair-authority",
             "content_research_directional_evidence_packet_v1",
             {
-                "field_projection": {"content_text": "防晒服饰样本"},
-                "field_availability": {"content_text": "present"},
+                "field_projection": {
+                    "author": "样本作者",
+                    "title": "防晒服饰产品营销样本",
+                    "content_text": "防晒服饰产品营销样本",
+                    "tags": ["防晒服饰"],
+                    "source_url": "https://example.test/note-repair-authority",
+                },
+                "field_availability": {
+                    "author": "present",
+                    "title": "present",
+                    "content_text": "present",
+                    "tags": "present",
+                },
+                "retrieval_context": {
+                    "source_kind": "note_detail",
+                    "query_group_id": groups[0].id,
+                },
             },
             workflow_run_id=workflow_run_id,
             research_direction_id="product_marketing",
@@ -232,9 +161,27 @@ def _repair_authority_context(tmp_path):
             id="scp-repair-authority-selection",
             schema_version="content_research_stage_checkpoint_v1",
             payload={
+                "direction_id": "product_marketing",
                 "selection": {
-                    "status": "completed",
-                    "selected_candidate_ids": ["source-repair-authority"],
+                    "query_plan_hash": snapshot.effective_policy["locked_query_plan"]
+                    ["directions"]["product_marketing"]["query_plan_hash"],
+                    "candidate_manifest_hash": "manifest-repair-authority",
+                    "decisions": [
+                        {
+                            "canonical_source_id": "source-repair-authority",
+                            "selected": True,
+                            "reasons": ["selected_deterministically"],
+                            "query_group_ids": [groups[0].id],
+                            "query_hits": [
+                                {"query_group_id": groups[0].id, "rank": 1}
+                            ],
+                        }
+                    ],
+                    "selected_source_count": 1,
+                    "eligible_source_count": 1,
+                    "independent_source_count": 1,
+                    "status": "complete",
+                    "coverage_unmet_query_group_ids": [],
                 }
             },
             workflow_run_id=workflow_run_id,
@@ -271,6 +218,159 @@ def _repair_authority_context(tmp_path):
         }
     }
     return service, store, task, report
+
+
+def _checkpoint(store, checkpoint_id):
+    record = store.get_typed_record(StageCheckpointRecord, checkpoint_id)
+    assert record is not None
+    return record
+
+
+def test_repair_preflight_rejects_malformed_typed_selection(tmp_path):
+    """Dropping DirectionSelection decisions must not leave Repair available."""
+    _service, store, task, report = _repair_authority_context(tmp_path)
+    checkpoint = _checkpoint(store, "scp-repair-authority-selection")
+    malformed = dict(checkpoint.payload["selection"])
+    malformed.pop("decisions")
+    store.save_stage_checkpoint(
+        replace(checkpoint, payload={**checkpoint.payload, "selection": malformed})
+    )
+
+    assert persisted_packet_replay_unavailable_reason(
+        store, task.workflow_run_id, publication=report["publication"]
+    ) == "persisted_packet_selection_invalid"
+
+
+@pytest.mark.parametrize(
+    "mutation", ["extra_direction", "non_mapping", "contract_copy"]
+)
+def test_repair_preflight_requires_exact_frozen_relevance_copies(tmp_path, mutation):
+    """Accepting incomplete or unequal relevance copies must expose false Repair."""
+    _service, store, task, report = _repair_authority_context(tmp_path)
+    snapshot = store.get_run_policy_snapshot_for_workflow(task.workflow_run_id)
+    assert snapshot is not None
+    contract = store.list_direction_contracts(snapshot.id)[0]
+    if mutation == "extra_direction":
+        policy = {
+            **snapshot.effective_policy,
+            "query_relevance": {
+                **snapshot.effective_policy["query_relevance"],
+                "not-a-frozen-direction": snapshot.effective_policy["query_relevance"]
+                ["product_marketing"],
+            },
+        }
+        with store._connect() as connection:
+            connection.execute(
+                "UPDATE content_research_run_policy_snapshots "
+                "SET effective_policy_json=?, effective_policy_hash=? WHERE id=?",
+                (json.dumps(policy), policy_hash(policy), snapshot.id),
+            )
+        expected = "persisted_packet_relevance_directions_mismatch"
+    elif mutation == "non_mapping":
+        policy = {
+            **snapshot.effective_policy,
+            "query_relevance": {"product_marketing": "invalid"},
+        }
+        with store._connect() as connection:
+            connection.execute(
+                "UPDATE content_research_run_policy_snapshots "
+                "SET effective_policy_json=?, effective_policy_hash=? WHERE id=?",
+                (json.dumps(policy), policy_hash(policy), snapshot.id),
+            )
+        expected = "persisted_packet_relevance_invalid"
+    else:
+        relevance = {
+            **contract.metadata["query_relevance"],
+            "subject_anchors": ["不一致主题"],
+        }
+        with store._connect() as connection:
+            connection.execute(
+                "UPDATE content_research_direction_contracts SET metadata_json=? WHERE id=?",
+                (json.dumps({**contract.metadata, "query_relevance": relevance}), contract.id),
+            )
+        expected = "persisted_packet_relevance_contract_mismatch"
+
+    assert persisted_packet_replay_unavailable_reason(
+        store, task.workflow_run_id, publication=report["publication"]
+    ) == expected
+
+
+@pytest.mark.parametrize(
+    ("foreign_workflow_run_id", "foreign_direction_id"),
+    [
+        ("run-foreign", "product_marketing"),
+        ("run-repair-authority", "competitor_discovery"),
+    ],
+)
+def test_repair_preflight_rejects_packet_outside_task_ownership(
+    tmp_path,
+    foreign_workflow_run_id,
+    foreign_direction_id,
+):
+    """Referencing an existing foreign packet must not make it replayable."""
+    _service, store, task, report = _repair_authority_context(tmp_path)
+    store.save_directional_evidence_packet(
+        DirectionalEvidencePacketRecord(
+            "dep-foreign",
+            "content_research_directional_evidence_packet_v1",
+            {"field_projection": {"content_text": "foreign"}},
+            workflow_run_id=foreign_workflow_run_id,
+            research_direction_id=foreign_direction_id,
+            canonical_source_id="source-repair-authority",
+            field_projection_hash="projection-foreign",
+        )
+    )
+    checkpoint = _checkpoint(store, "scp-repair-authority-packet")
+    store.save_stage_checkpoint(
+        replace(
+            checkpoint,
+            payload={**checkpoint.payload, "packet_ids": ["dep-foreign"]},
+        )
+    )
+
+    assert persisted_packet_replay_unavailable_reason(
+        store, task.workflow_run_id, publication=report["publication"]
+    ) == "persisted_packet_record_ownership_mismatch"
+
+
+def test_repair_preflight_accepts_complete_typed_owned_replay_input(tmp_path):
+    """Rejecting the complete frozen bundle would remove valid legacy recovery."""
+    _service, store, task, report = _repair_authority_context(tmp_path)
+
+    assert (
+        persisted_packet_replay_unavailable_reason(
+            store, task.workflow_run_id, publication=report["publication"]
+        )
+        is None
+    )
+
+
+def test_complete_replay_input_executes_real_admission_without_raw_reparse(tmp_path):
+    """A Ready bundle that cannot cross real admission is a false Repair action."""
+    _service, store, task, report = _repair_authority_context(tmp_path)
+    replay_input = build_persisted_packet_replay_input(
+        store,
+        task.workflow_run_id,
+        publication=report["publication"],
+    )
+    assert isinstance(replay_input, PersistedPacketReplayInput)
+
+    packet_ids = DirectionalExecutionPipeline(
+        store
+    ).replay_admission_from_persisted_packets(
+        replay_input=replay_input.directions[0],
+        snapshot=replay_input.snapshot,
+    )
+
+    assert packet_ids == ("dep-repair-authority",)
+    decisions = store.list_typed_records(ClaimAdmissionDecisionRecord)
+    assert decisions
+    assert {item.research_direction_id for item in decisions} == {
+        "product_marketing"
+    }
+    assert {item.policy_snapshot_id for item in decisions} == {
+        replay_input.snapshot.id
+    }
 
 
 @pytest.mark.asyncio
@@ -402,117 +502,6 @@ async def test_repair_projection_and_guard_reject_each_missing_durable_parent(
             action="repair_from_persisted_packets",
             published_report=report,
         )
-
-@pytest.mark.asyncio
-async def test_legacy_relevance_revision_is_append_only_and_provider_free(tmp_path):
-    service, store, brief, snapshot, contract = _legacy_context(tmp_path)
-    operations_before = {
-        item.id
-        for item in store.list_typed_records(StageCheckpointRecord)
-        if item.stage_name == "operation"
-    }
-
-    revised_snapshot, revised_contracts = await service._replay_relevance_context(
-        brief=brief,
-        snapshot=snapshot,
-        contracts={"product_marketing": contract},
-    )
-
-    relevance = revised_contracts["product_marketing"].metadata["query_relevance"]
-    assert relevance["algorithm_version"] == "query_relevance_v2"
-    assert relevance["core_entity_anchors"] == ["防晒服饰"]
-    assert relevance["allowed_synonyms"] == {"防晒服饰": ["防晒服", "防晒衣"]}
-    assert revised_snapshot.id == snapshot.id
-    revisions = [
-        item
-        for item in store.list_typed_records(StageCheckpointRecord)
-        if item.stage_name == "relevance_revision"
-    ]
-    assert len(revisions) == 1
-    assert revisions[0].payload["base_snapshot_hash"] == snapshot.effective_policy_hash
-    assert {
-        item.id
-        for item in store.list_typed_records(StageCheckpointRecord)
-        if item.stage_name == "operation"
-    } == operations_before
-
-
-@pytest.mark.asyncio
-async def test_legacy_revision_serializes_model_generated_synonym_groups(tmp_path):
-    service, _store, brief, snapshot, contract = _legacy_context(tmp_path)
-    structure_payload = {
-        "schema_version": "content_research_subject_structure_v1",
-        "canonical_subject": "夏季防晒穿搭",
-        "subject_type": "category",
-        "core_entities": [{"canonical_name": "防晒服饰", "raw_mentions": ["防晒"]}],
-        "research_intents": ["穿搭"],
-        "context_modifiers": ["夏季"],
-        "synonym_groups": {"防晒服饰": ["防晒衣", "防晒服"]},
-        "ambiguities": [],
-        "resolution_state": "resolved",
-    }
-    structure = parse_subject_structure(
-        structure_payload,
-        normalized_input="夏季防晒穿搭",
-    ).structure
-    assert structure is not None
-
-    class GeneratedStructurePresearch:
-        async def create_llm_task(self, _request):
-            async def complete():
-                return PresearchOutcome(
-                    status="completed",
-                    checklist=PresearchChecklist(
-                        subject_confirmation="夏季防晒穿搭",
-                        competitor_tags=[],
-                        research_directions=["product_marketing"],
-                        subject_structure=structure,
-                        subject_structure_state="confirmed",
-                    ),
-                )
-
-            return asyncio.create_task(complete())
-
-    service._presearch = GeneratedStructurePresearch()
-    legacy_brief = replace(
-        brief,
-        payload={key: value for key, value in brief.payload.items() if key != "subject_structure"},
-    )
-
-    _revised_snapshot, revised_contracts = await service._replay_relevance_context(
-        brief=legacy_brief,
-        snapshot=snapshot,
-        contracts={"product_marketing": contract},
-    )
-
-    relevance = revised_contracts["product_marketing"].metadata["query_relevance"]
-    assert relevance["allowed_synonyms"] == {"防晒服饰": ["防晒服", "防晒衣"]}
-
-
-@pytest.mark.asyncio
-async def test_legacy_revision_rejects_mismatched_query_groups(tmp_path):
-    service, _store, brief, snapshot, contract = _legacy_context(tmp_path)
-    malformed = replace(
-        contract,
-        metadata={
-            **contract.metadata,
-            "query_relevance": {
-                **contract.metadata["query_relevance"],
-                "query_group_ids": ["qg-wrong"],
-            },
-        },
-    )
-
-    with pytest.raises(
-        ContentResearchValidationError,
-        match="query groups do not match",
-    ):
-        await service._replay_relevance_context(
-            brief=brief,
-            snapshot=snapshot,
-            contracts={"product_marketing": malformed},
-        )
-
 
 class _ConclusionLLM:
     def __init__(self, *, failures_remaining: int = 0) -> None:

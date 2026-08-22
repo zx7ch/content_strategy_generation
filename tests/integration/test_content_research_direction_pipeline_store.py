@@ -6,7 +6,11 @@ from datetime import datetime, timezone
 import pytest
 
 from app.content_research.contracts import SamplePolicy, build_default_snapshot
-from app.content_research.models import SubagentTaskRecord
+from app.content_research.models import ResearchBriefRecord, SubagentTaskRecord
+from app.content_research.persisted_packet_replay import (
+    PersistedPacketReplayInput,
+    build_persisted_packet_replay_input,
+)
 from app.content_research.persistence_models import (
     ClaimAdmissionDecisionRecord,
     DirectionalEvidencePacketRecord,
@@ -1326,12 +1330,40 @@ async def test_packet_only_admission_replay_never_invokes_a_provider(tmp_path):
     ]
     assert not store.list_typed_records(ClaimAdmissionDecisionRecord)
 
+    store.save_brief(
+        ResearchBriefRecord(
+            id=snapshot.research_brief_id,
+            workflow_run_id=snapshot.workflow_run_id,
+            thread_id="thread-packet-only-replay",
+            schema_version="content_research_brief_v1",
+            status="confirmed",
+            payload={"confirmed_subject": "速干徒步短裤"},
+        )
+    )
+    store.save_subagent_task(
+        SubagentTaskRecord(
+            id="sat-packet-only-replay",
+            workflow_run_id=snapshot.workflow_run_id,
+            thread_id="thread-packet-only-replay",
+            schema_version="content_research_subagent_task_v1",
+            status="completed",
+            plan_id=snapshot.research_plan_id,
+            direction_id="product_marketing",
+            payload={},
+        )
+    )
+    replay_input = build_persisted_packet_replay_input(
+        store,
+        snapshot.workflow_run_id,
+        publication={
+            "state": "evidence_only_report",
+            "publication_reason": "query_subject_not_supported",
+        },
+    )
+    assert isinstance(replay_input, PersistedPacketReplayInput)
+
     replayed_packet_ids = pipeline.replay_admission_from_persisted_packets(
-        workflow_run_id="run-packet-only-replay",
-        subagent_task_id="sat-packet-only-replay",
-        direction_id="product_marketing",
-        contract=contract,
-        policy=policy,
+        replay_input=replay_input.directions[0],
         snapshot=snapshot,
     )
 
