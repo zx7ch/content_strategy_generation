@@ -25,7 +25,6 @@ import {
   startContentResearchFormalResearch,
   confirmContentResearchScope,
   confirmContentResearchSubjectStructure,
-  repairContentResearchFromPersistedPackets,
   confirmContentResearchBrief,
   createContentResearchPresearch,
   endContentResearchWorkflow,
@@ -38,10 +37,9 @@ import {
   getContentResearchScope,
   getContentResearchWorkflow,
   prepareContentResearchScope,
-  retryContentResearchFormalResearch,
   retryContentResearchPresearch,
   resolveContentResearchCoverage,
-  resumeContentResearchFormalResearch,
+  runContentResearchWorkflowAction,
   startXHSQRLogin,
   type ContentResearchFormalResearchResponse,
   type ContentResearchDirectionEvidence,
@@ -59,7 +57,12 @@ import { XiaohongshuLoginCard } from "@/components/content-research/XiaohongshuL
 import { traceExecutionDurationText } from "@/lib/content-research-trace";
 import { resolveContentResearchModelRecovery } from "@/lib/content-research-recovery";
 import { contentResearchErrorFeedback } from "@/lib/content-research-error-feedback";
-import { ContentResearchRequestEpoch, frozenReportScopeQueries } from "./page-state";
+import {
+  ContentResearchRequestEpoch,
+  frozenReportScopeQueries,
+  projectedRecoveryAction,
+  type ProjectedRecoveryAction,
+} from "./page-state";
 
 type TaskStatus = "running" | "paused" | "failed" | "cancelled" | "completed";
 type MessageRole = "assistant" | "user" | "system";
@@ -101,7 +104,6 @@ interface ContentResearchRunState {
   reportStatus: "idle" | "loading" | "ready" | "unavailable" | "failed";
   reportError: string | null;
 }
-
 type LitePublicationState = "complete_verified_report" | "partial_verified_report" | "directional_report" | "evidence_only_report";
 
 function litePublicationState(report: ContentResearchLiteReportResponse): LitePublicationState | null {
@@ -1026,8 +1028,6 @@ function recordList(value: unknown): Record<string, unknown>[] {
     ? value.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object" && !Array.isArray(item))
     : [];
 }
-
-
 function selectRequestedDirectionStates(report: ContentResearchLiteReportResponse) {
   const requestedDirectionIds = new Set(arrayField(report.frozen_scope, "direction_ids"));
   return recordList(report.run_direction_states).filter((item) =>
@@ -1100,8 +1100,8 @@ function ContentResearchReportMessage({
   recoveryAllowed = true,
 }: {
   report: ContentResearchLiteReportResponse;
-  onRecover?: () => void;
-  onRepair?: () => void;
+  onRecover?: (action: ProjectedRecoveryAction) => void;
+  onRepair?: (action: ProjectedRecoveryAction) => void;
   onOpenTrace?: () => void;
   recoveryAllowed?: boolean;
 }) {
@@ -1113,6 +1113,7 @@ function ContentResearchReportMessage({
     ? report.recovery_projection
     : null;
   const publicationIsNone = report.publication.state === null;
+  const recoveryAction = projectedRecoveryAction(report);
 
   useEffect(() => {
     setSelectedCitation(null);
@@ -1134,10 +1135,10 @@ function ContentResearchReportMessage({
         <p className="mt-2 text-xs text-quiet">
           {completedStages.length ? `已保存阶段：${completedStages.join("、")}` : "尚无已完成阶段。"}
         </p>
-        {recoveryAllowed && actionable && stringField(recovery, "next_action") === "resume_run" && (
+        {recoveryAllowed && actionable && recoveryAction && recoveryAction.action !== "repair_from_persisted_packets" && (
           <button
             type="button"
-            onClick={authenticationRequired ? onOpenTrace : onRecover}
+            onClick={authenticationRequired ? onOpenTrace : () => onRecover?.(recoveryAction)}
             className="mt-4 rounded-lg bg-ink px-3 py-2 text-xs font-medium text-white"
           >
             {authenticationRequired
@@ -1292,10 +1293,10 @@ function ContentResearchReportMessage({
               {stringField(report.publication, "publication_reason")}
             </p>
           )}
-          {evidenceOnly && stringField(report.publication, "publication_reason") === "query_subject_not_supported" && onRepair && (
+          {evidenceOnly && recoveryAllowed && recoveryAction?.action === "repair_from_persisted_packets" && onRepair && (
             <section className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-3" aria-label="已有笔记重新处理">
               <p className="text-xs text-amber-900">可复用已保存的笔记重新评估相关性，不会新增采集。</p>
-              <button type="button" onClick={onRepair} className="mt-2 rounded-lg bg-ink px-3 py-2 text-xs font-medium text-white">使用已有笔记重新处理</button>
+              <button type="button" onClick={() => onRepair(recoveryAction)} className="mt-2 rounded-lg bg-ink px-3 py-2 text-xs font-medium text-white">使用已有笔记重新处理</button>
             </section>
           )}
           {evidenceOnly && (
@@ -2103,11 +2104,26 @@ function ContentResearchScopeCard({
   const [finalQueries, setFinalQueries] = useState<string[]>([]);
   const [supplementaryQueries, setSupplementaryQueries] = useState(["", ""]);
   const [selectedResolution, setSelectedResolution] = useState<string | null>(null);
-  const effectiveDraft = draft ?? (
-    projection?.state === "awaiting_confirmation" && projection.scope_contract === null
-      ? projection.draft
-      : null
-  );
+  const projectedConfirmAction = projection?.allowed_actions.find((item) => (
+    item.action === "confirm_scope"
+      && item.available === true
+      && item.scope_draft_id === projection.draft.id
+      && item.structure_hash === projection.draft.structure_hash
+  ));
+  const restoredDraft = (
+    projection?.state === "awaiting_confirmation"
+      && projection.scope_contract === null
+      && projectedConfirmAction
+  ) ? projection.draft : null;
+  const effectiveDraft = draft ?? restoredDraft;
+  const confirmAuthority = draft
+    ? { scopeDraftId: draft.id, structureHash: draft.structure_hash }
+    : projectedConfirmAction
+      ? {
+          scopeDraftId: stringField(projectedConfirmAction, "scope_draft_id"),
+          structureHash: stringField(projectedConfirmAction, "structure_hash"),
+        }
+      : null;
   useEffect(() => {
     setFinalQueries(effectiveDraft?.query_groups.map((group) => group.final_query) ?? []);
   }, [effectiveDraft]);
@@ -2135,7 +2151,7 @@ function ContentResearchScopeCard({
   ));
   const replayRequest = replayAction?.request as ContentResearchResolveCoverageRequest | undefined;
 
-  if (effectiveDraft && !projection?.scope_contract) {
+  if (effectiveDraft && confirmAuthority && !projection?.scope_contract) {
     const valid = finalQueries.length === effectiveDraft.query_groups.length
       && finalQueries.every((query) => query.trim().length > 0);
     return (
@@ -2167,8 +2183,8 @@ function ContentResearchScopeCard({
               type="button"
               disabled={busy || !valid}
               onClick={() => onConfirm({
-                scope_draft_id: effectiveDraft.id,
-                structure_hash: effectiveDraft.structure_hash,
+                scope_draft_id: confirmAuthority.scopeDraftId,
+                structure_hash: confirmAuthority.structureHash,
                 query_groups: finalQueries.map((finalQuery) => ({ final_query: finalQuery.trim() })),
               })}
               className="rounded-lg bg-ink px-4 py-2 text-xs font-medium text-white disabled:cursor-not-allowed disabled:opacity-40"
@@ -2324,6 +2340,10 @@ function CreatorPage() {
         }
       : null,
   });
+  const durableRecoveryAction = projectedRecoveryAction(contentResearchRun?.report ?? null);
+  const projectedModelRecoveryPending = modelRecovery.recoveryPending && (
+    !contentResearchRun || durableRecoveryAction !== null
+  );
 
   useEffect(() => { taskRef.current = task; }, [task]);
   useEffect(() => { activeThreadIdRef.current = activeThreadId; }, [activeThreadId]);
@@ -2709,24 +2729,21 @@ function CreatorPage() {
     }
   }
 
-  async function resumeContentResearchForRun(workflowRunId: string) {
-    const ticket = contentResearchRequestEpochRef.current.ticket(workflowRunId);
+  async function executeProjectedRecovery(
+    workflowRunId: string,
+    recoveryAction: ProjectedRecoveryAction,
+  ) {
+    const ticket = contentResearchRequestEpochRef.current.ticket(workflowRunId, "recovery-command");
     setContentResearchRun((current) =>
       current && current.workflowRunId === workflowRunId
         ? { ...current, formalResearchStatus: "collecting", reportError: null }
         : current
     );
     try {
-      if (contentResearchRun?.trace?.run_status === "waiting_user") {
-        const source = contentResearchRun.summary.plan?.payload ?? {};
-        await retryContentResearchFormalResearch(workflowRunId, {
-          provider: stringField(source, "provider", "xiaohongshu"),
-          source_kind: stringField(source, "source_kind", "search_result"),
-          limit: numberField(source, "limit") || 20,
-        });
-      } else {
-        await resumeContentResearchFormalResearch(workflowRunId);
-      }
+      await runContentResearchWorkflowAction(workflowRunId, {
+        action: recoveryAction.action,
+        payload: recoveryAction.request,
+      });
       try {
         await refreshContentResearchTrace(workflowRunId);
       } catch {
@@ -2745,21 +2762,6 @@ function CreatorPage() {
       if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
       const detail = error instanceof Error ? error.message : "未知错误";
       appendMessage({ role: "system", text: `继续调研失败：${detail}` });
-    }
-  }
-
-  async function repairContentResearchForRun(workflowRunId: string) {
-    const ticket = contentResearchRequestEpochRef.current.ticket(workflowRunId);
-    try {
-      await repairContentResearchFromPersistedPackets(workflowRunId);
-      if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
-      const report = await pollContentResearchReport(workflowRunId, { requirePublication: true });
-      if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
-      if (report) appendLiteReportMessage(report);
-      await refreshContentResearchTrace(workflowRunId);
-    } catch (error) {
-      if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
-      appendMessage({ role: "system", text: `已有笔记重新处理失败：${error instanceof Error ? error.message : "未知错误"}` });
     }
   }
 
@@ -2924,7 +2926,8 @@ function CreatorPage() {
       contentResearchRun?.workflowRunId === workflowRunId
       && marketingConclusionRecoveryRequired(contentResearchRun.trace)
     ) {
-      await resumeContentResearchForRun(workflowRunId);
+      const action = projectedRecoveryAction(contentResearchRun.report);
+      if (action) await executeProjectedRecovery(workflowRunId, action);
       return;
     }
     const presearch = await retryContentResearchPresearch(workflowRunId);
@@ -3437,8 +3440,8 @@ function CreatorPage() {
                   {message.report ? (
                     <ContentResearchReportMessage
                       report={message.report}
-                      onRecover={() => void resumeContentResearchForRun(message.report!.workflow_run_id)}
-                      onRepair={() => void repairContentResearchForRun(message.report!.workflow_run_id)}
+                      onRecover={(action) => void executeProjectedRecovery(message.report!.workflow_run_id, action)}
+                      onRepair={(action) => void executeProjectedRecovery(message.report!.workflow_run_id, action)}
                       onOpenTrace={() => setTraceExpanded(true)}
                       recoveryAllowed={!(
                         message.report.workflow_run_id === scopeProjection?.workflow_run_id
@@ -3776,7 +3779,7 @@ function CreatorPage() {
         run={contentResearchRun}
         onExpandedChange={setTraceExpanded}
         onModifyDirections={() => void modifyContentResearchDirections()}
-        recoveryPending={modelRecovery.recoveryPending}
+        recoveryPending={projectedModelRecoveryPending}
         recoveryRequiredSince={modelRecovery.requiredSince}
         onContinuePresearch={continueModelRecovery}
       />}
@@ -3789,7 +3792,7 @@ function CreatorPage() {
               : "暂无进行中的内容调研。发起调研后，此处会显示冻结范围与研究摘要。"}
           </p>
         </section>
-        <ModelServiceCard recoveryPending={modelRecovery.recoveryPending} recoveryRequiredSince={modelRecovery.requiredSince} onContinue={continueModelRecovery} onConfigurationChanged={() => undefined} />
+        <ModelServiceCard recoveryPending={projectedModelRecoveryPending} recoveryRequiredSince={modelRecovery.requiredSince} onContinue={continueModelRecovery} onConfigurationChanged={() => undefined} />
         <XiaohongshuLoginCard />
       </aside>}
       {contentResearchRun && <ContentResearchTraceInspector
@@ -3797,8 +3800,10 @@ function CreatorPage() {
         expanded={traceExpanded}
         onExpandedChange={setTraceExpanded}
         onRefresh={async () => { await refreshContentResearchTrace(contentResearchRun.workflowRunId); }}
-        onRetry={() => resumeContentResearchForRun(contentResearchRun.workflowRunId)}
-        legacyRecoveryAllowed={!pendingCoverageDecision(scopeProjection) && !scopeProjection?.execution_unit}
+        onRetry={() => durableRecoveryAction
+          ? executeProjectedRecovery(contentResearchRun.workflowRunId, durableRecoveryAction)
+          : Promise.resolve()}
+        legacyRecoveryAllowed={Boolean(durableRecoveryAction) && !pendingCoverageDecision(scopeProjection) && !scopeProjection?.execution_unit}
       />}
     </div>
   );

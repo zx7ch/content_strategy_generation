@@ -419,26 +419,63 @@ test("Creator restores a persisted pending Draft after reload", async () => {
   document.body.append(container);
   const root = createRoot(container);
 
+  const pendingProjection = {
+    ...scopeProjectionFixture(),
+    state: "awaiting_confirmation" as const,
+    scope_contract: null,
+    coverage_snapshot: null,
+    allowed_actions: [],
+    allowed_resolutions: [],
+    decision_recovery: null,
+    execution_unit: null,
+  };
+  let submitted: unknown = null;
+
+  await act(async () => {
+    root.render(React.createElement(CreatorPage.ContentResearchScopeCard, {
+      draft: null,
+      projection: pendingProjection,
+      busy: false,
+      onConfirm: (payload: unknown) => { submitted = payload; },
+      onResolve: () => undefined,
+    }));
+  });
+
+  assert.equal(container.querySelector('input[aria-label="检索组 1"]'), null);
+  assert.equal([...container.querySelectorAll("button")].some((button) => button.textContent === "确认并开始调研"), false);
+
   await act(async () => {
     root.render(React.createElement(CreatorPage.ContentResearchScopeCard, {
       draft: null,
       projection: {
-        ...scopeProjectionFixture(),
-        state: "awaiting_confirmation",
-        scope_contract: null,
-        coverage_snapshot: null,
-        allowed_resolutions: [],
-        decision_recovery: null,
-        execution_unit: null,
+        ...pendingProjection,
+        allowed_actions: [{
+          action: "confirm_scope",
+          available: true,
+          scope_draft_id: "scope_draft_1",
+          structure_hash: "structure_hash_1",
+          query_groups: scopeDraftFixture().query_groups,
+        }],
       },
       busy: false,
-      onConfirm: () => undefined,
+      onConfirm: (payload: unknown) => { submitted = payload; },
       onResolve: () => undefined,
     }));
   });
 
   assert.equal((container.querySelector('input[aria-label="检索组 1"]') as HTMLInputElement).value, "夏季长袖通勤衬衫");
-  assert.ok([...container.querySelectorAll("button")].some((button) => button.textContent === "确认并开始调研"));
+  const confirm = [...container.querySelectorAll("button")].find((button) => button.textContent === "确认并开始调研");
+  assert.ok(confirm);
+  await act(async () => { confirm?.click(); });
+  assert.deepEqual(submitted, {
+    scope_draft_id: "scope_draft_1",
+    structure_hash: "structure_hash_1",
+    query_groups: [
+      { final_query: "夏季长袖通勤衬衫" },
+      { final_query: "长袖衬衫" },
+      { final_query: "长袖衬衫 通勤" },
+    ],
+  });
 
   await act(async () => { root.unmount(); });
   container.remove();
@@ -643,9 +680,40 @@ test("Creator request epochs reject late responses from a previously selected ru
   assert.equal(requests.accepts(currentScope), true);
 
   const earlierSameRunScope = requests.ticket("run_b", "scope");
+  const sameRunReport = requests.ticket("run_b", "report");
   const newerSameRunScope = requests.ticket("run_b", "scope");
   assert.equal(requests.accepts(earlierSameRunScope), false);
   assert.equal(requests.accepts(newerSameRunScope), true);
+  assert.equal(requests.accepts(sameRunReport), true);
+
+  const earlierRecovery = requests.ticket("run_b", "recovery-command");
+  const newerRecovery = requests.ticket("run_b", "recovery-command");
+  assert.equal(requests.accepts(earlierRecovery), false);
+  assert.equal(requests.accepts(newerRecovery), true);
+  assert.equal(requests.accepts(sameRunReport), true);
+});
+
+test("Creator recovery accepts only an exact server-projected workflow action", async () => {
+  const { projectedRecoveryAction } = await import("./page-state.ts");
+
+  assert.equal(projectedRecoveryAction({
+    recovery_projection: {
+      next_action: "resume_run",
+      actionability: "available",
+    },
+  }), null);
+  assert.deepEqual(projectedRecoveryAction({
+    recovery_projection: {
+      allowed_actions: [{
+        action: "retry_formal_research",
+        available: true,
+        request: {},
+      }],
+    },
+  }), {
+    action: "retry_formal_research",
+    request: {},
+  });
 });
 
 test("report presentation reads query groups from the server-frozen Scope", async () => {

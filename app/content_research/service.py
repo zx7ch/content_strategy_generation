@@ -2096,6 +2096,7 @@ class ContentResearchService:
 
     async def repair_from_persisted_packets(self, workflow_run_id: str) -> dict[str, Any]:
         """Offer packet-only recovery only for the eligible evidence-only report."""
+        self._require_scope_execution_authority(workflow_run_id=workflow_run_id)
         report = await self.get_lite_report(workflow_run_id=workflow_run_id)
         publication = report.publication
         if (
@@ -3315,6 +3316,13 @@ class ContentResearchService:
                 local_cache_id=brief.id,
             )
 
+        if action in {
+            "repair_from_persisted_packets",
+            "retry_formal_research",
+            "resume_formal_research",
+        }:
+            self._require_scope_execution_authority(workflow_run_id=workflow_run_id)
+
         if action == "repair_from_persisted_packets":
             result = await self.repair_from_persisted_packets(workflow_run_id)
             return self._action_response(
@@ -3338,11 +3346,7 @@ class ContentResearchService:
                 local_cache_id=brief.id,
             )
 
-        if action in {
-            "start_formal_research",
-            "retry_formal_research",
-            "resume_formal_research",
-        }:
+        if action == "start_formal_research":
             self._require_scope_execution_authority(workflow_run_id=workflow_run_id)
 
         if action == "pause_formal_research":

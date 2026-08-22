@@ -1183,6 +1183,13 @@ async def test_lite_reader_returns_non_report_recovery_projection_without_artifa
             "completed_stages": [],
             "next_action": "resume_run",
             "actionability": "available",
+            "allowed_actions": [
+                {
+                    "action": "retry_formal_research",
+                    "available": True,
+                    "request": {},
+                }
+            ],
         }
         assert payload["frozen_scope"] == {
             "direction_set_version": "direction_set_v1",

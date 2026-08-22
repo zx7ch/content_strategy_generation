@@ -425,7 +425,24 @@ class LiteReportReader:
             ),
             "citations": citations,
             "run_direction_states": direction_states,
-            "recovery_projection": None,
+            "recovery_projection": (
+                {
+                    "reason_code": "query_subject_not_supported",
+                    "completed_stages": [],
+                    "next_action": "repair_from_persisted_packets",
+                    "actionability": "available",
+                    "allowed_actions": [
+                        {
+                            "action": "repair_from_persisted_packets",
+                            "available": True,
+                            "request": {},
+                        }
+                    ],
+                }
+                if is_evidence_only
+                and _publication_reason(report) == "query_subject_not_supported"
+                else None
+            ),
         }
 
     async def _recoverable_projection(self, workflow_run_id: str) -> dict[str, Any]:
@@ -472,6 +489,17 @@ class LiteReportReader:
                 "completed_stages": completed_stages,
                 "next_action": "resume_run",
                 "actionability": "available",
+                "allowed_actions": [
+                    {
+                        "action": (
+                            "resume_formal_research"
+                            if state == "paused"
+                            else "retry_formal_research"
+                        ),
+                        "available": True,
+                        "request": {},
+                    }
+                ],
             },
         }
 

@@ -256,6 +256,7 @@ async def test_awaiting_scope_decision_rejects_legacy_execution_entrypoints(scop
         ("start_formal_research", formal_payload),
         ("retry_formal_research", formal_payload),
         ("resume_formal_research", {}),
+        ("repair_from_persisted_packets", {}),
     ):
         response = await scope_client.post(
             f"/content-research/workflows/{workflow_run_id}/actions",
@@ -270,6 +271,8 @@ async def test_awaiting_scope_decision_rejects_legacy_execution_entrypoints(scop
             workflow_run_id=workflow_run_id,
             request=ContentResearchSourceCollectionRequest(**formal_payload),
         )
+    with pytest.raises(ContentResearchValidationError, match="scope_execution_authorization_required"):
+        await service.repair_from_persisted_packets(workflow_run_id)
 
     report = await scope_client.get(
         f"/content-research/workflows/{workflow_run_id}/lite-report"
