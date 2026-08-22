@@ -21,7 +21,7 @@ from app.content_research.contracts import (
     DIRECTION_CATALOG_V1,
     build_default_snapshot,
 )
-from app.content_research.models import ResearchBriefRecord
+from app.content_research.models import ResearchBriefRecord, SubagentTaskRecord
 from app.content_research.persistence_models import StageCheckpointRecord
 from app.content_research.reporting.composer import ResearchReportComposer
 from app.content_research.reporting.publication_materializer import (
@@ -68,6 +68,7 @@ def real_creator_stack(tmp_path, request):
     request.addfinalizer(lambda: tsconfig_path.write_bytes(tsconfig_before))
     db_path = tmp_path / "creator-lite.db"
     chroma_dir = tmp_path / "chroma"
+    source_call_log = tmp_path / "creator-source-calls.jsonl"
     backend_port = reserve_port()
     frontend_port = reserve_port()
     backend_url = f"http://127.0.0.1:{backend_port}"
@@ -102,6 +103,10 @@ def real_creator_stack(tmp_path, request):
             if parameters.get("fail_workflow_restore")
             else "0"
         ),
+        "CREATOR_E2E_SOURCE_SCENARIO": str(
+            parameters.get("source_scenario") or "auth_required"
+        ),
+        "CREATOR_E2E_SOURCE_CALL_LOG": str(source_call_log),
     }
     frontend_env = {
         **os.environ,
@@ -151,6 +156,7 @@ def real_creator_stack(tmp_path, request):
                 "frontend_url": frontend_url,
                 "backend_url": backend_url,
                 "db_path": str(db_path),
+                "source_call_log": source_call_log,
                 "scope_coverage_seed": scope_coverage_seed,
             }
 
@@ -649,41 +655,11 @@ def test_creator_discards_a_late_scope_response_after_switching_runs(browser_pag
 
 
 @pytest.mark.parametrize(
-    ("resolution", "expected_payload", "button_name"),
-    [
-        (
-            "generate_limited_report",
-            {"resolution": "generate_limited_report"},
-            "基于现有证据生成受限报告",
-        ),
-        (
-            "expand_required_constraint",
-            {
-                "resolution": "expand_required_constraint",
-                "constraint_id": "core_object",
-                "supplementary_queries": ["夏季 防晒 长袖衬衫"],
-            },
-            "提交补搜决定",
-        ),
-        (
-            "relax_constraint",
-            {"resolution": "relax_constraint", "constraint_id": "core_object"},
-            "放宽长袖衬衫约束",
-        ),
-    ],
-    ids=["limited", "expand", "relax"],
-)
-@pytest.mark.parametrize(
     "real_creator_stack",
-    [{"scope_coverage_seed": True}],
+    [{"scope_coverage_seed": True, "source_scenario": "success"}],
     indirect=True,
 )
-def test_creator_executes_only_real_server_projected_coverage_decisions(
-    browser_page,
-    resolution,
-    expected_payload,
-    button_name,
-):
+def test_creator_expand_reaches_worker_and_refreshes_real_result(browser_page):
     page, stack = browser_page
     seeded = stack["scope_coverage_seed"]
     scope_responses: list[dict] = []
@@ -760,9 +736,9 @@ def test_creator_executes_only_real_server_projected_coverage_decisions(
         },
     ]
 
-    if resolution == "expand_required_constraint":
-        coverage.get_by_role("button", name="继续补充长袖衬衫样本").click()
-        coverage.get_by_label("补充检索词 1").fill("夏季 防晒 长袖衬衫")
+    coverage.get_by_role("button", name="继续补充长袖衬衫样本").click()
+    supplementary_query = "夏季 防晒 长袖衬衫"
+    coverage.get_by_label("补充检索词 1").fill(supplementary_query)
 
     action_path = f"/content-research/workflows/{seeded['run_id']}/actions"
     scope_path = f"/content-research/workflows/{seeded['run_id']}/scope"
@@ -775,13 +751,15 @@ def test_creator_executes_only_real_server_projected_coverage_decisions(
             and '"action":"resolve_coverage"' in (response.request.post_data or ""),
             timeout=30000,
         ) as action_info:
-            coverage.get_by_role("button", name=button_name).click()
+            coverage.get_by_role("button", name="提交补搜决定").click()
 
     assert action_info.value.status == 200
     expected_request = {
         "scope_contract_version": 1,
         "coverage_snapshot_id": seeded["coverage_snapshot_id"],
-        **expected_payload,
+        "resolution": "expand_required_constraint",
+        "constraint_id": "core_object",
+        "supplementary_queries": [supplementary_query],
     }
     assert action_info.value.request.post_data_json == {
         "action": "resolve_coverage",
@@ -795,10 +773,84 @@ def test_creator_executes_only_real_server_projected_coverage_decisions(
         for item in post_projection["allowed_actions"]
     )
     assert post_projection["execution_unit"]["id"] == action_result["execution_unit"]["id"]
-    assert post_projection["scope_contract"]["version"] == (
-        2 if resolution == "relax_constraint" else 1
-    )
+    assert post_projection["scope_contract"]["version"] == 1
     expect(coverage).to_have_count(0)
+
+    for _ in range(160):
+        if stack["source_call_log"].exists():
+            with sqlite3.connect(stack["db_path"]) as connection:
+                continuation = connection.execute(
+                    "SELECT supplementary_queries_json, state "
+                    "FROM content_research_scope_execution_continuations "
+                    "WHERE workflow_run_id=?",
+                    (seeded["run_id"],),
+                ).fetchone()
+                terminal_coverage = connection.execute(
+                    "SELECT id, state, source_coverage_snapshot_id "
+                    "FROM content_research_scope_coverage_snapshots "
+                    "WHERE workflow_run_id=? AND execution_revision=2",
+                    (seeded["run_id"],),
+                ).fetchone()
+                attempt = connection.execute(
+                    "SELECT state, provider_state "
+                    "FROM content_research_scope_execution_attempts "
+                    "WHERE execution_unit_id=? AND attempt_no=0",
+                    (action_result["execution_unit"]["id"],),
+                ).fetchone()
+                continuation_task = connection.execute(
+                    "SELECT status, metadata_json "
+                    "FROM content_research_subagent_tasks "
+                    "WHERE workflow_run_id=? AND json_extract(metadata_json, '$.execution_unit_id')=?",
+                    (seeded["run_id"], action_result["execution_unit"]["id"]),
+                ).fetchone()
+                execution_facts = connection.execute(
+                    "SELECT kind, payload_json FROM content_research_execution_facts "
+                    "WHERE execution_unit_id=? ORDER BY sequence_no",
+                    (action_result["execution_unit"]["id"],),
+                ).fetchall()
+            if continuation is not None and continuation[1] == "completed" and terminal_coverage:
+                break
+        page.wait_for_timeout(250)
+    else:
+        pytest.fail("Expand worker did not persist a terminal continuation/Coverage state")
+
+    source_calls = [
+        json.loads(line)
+        for line in stack["source_call_log"].read_text(encoding="utf-8").splitlines()
+    ]
+    assert supplementary_query in [
+        item["query"] for item in source_calls if item["operation"] == "discover_candidates"
+    ]
+    assert json.loads(continuation[0]) == [supplementary_query]
+    assert tuple(attempt) == ("completed", "succeeded")
+    assert continuation_task[0] == "completed"
+    assert json.loads(continuation_task[1])["execution_unit_id"] == action_result[
+        "execution_unit"
+    ]["id"]
+    assert any(
+        kind == "provider_request_recorded"
+        and json.loads(payload).get("operation") == "discover"
+        and json.loads(payload).get("request", {}).get("query") == supplementary_query
+        for kind, payload in execution_facts
+    )
+    assert execution_facts[-1][0] == "coverage_persisted"
+    assert terminal_coverage[2] == seeded["coverage_snapshot_id"]
+
+    with page.expect_response(
+        lambda response: response.url.endswith(scope_path) and response.status == 200,
+        timeout=30000,
+    ) as refreshed_scope_info:
+        page.reload(wait_until="domcontentloaded")
+    refreshed_scope = refreshed_scope_info.value.json()
+    assert refreshed_scope["execution_unit"]["state"] == "completed"
+    assert refreshed_scope["coverage_snapshot"]["id"] == terminal_coverage[0]
+    assert refreshed_scope["coverage_snapshot"]["state"] == terminal_coverage[1]
+    if terminal_coverage[1] == "awaiting_scope_decision":
+        expect(page.locator('div[aria-label="覆盖不足决策"]')).to_be_visible(
+            timeout=30000
+        )
+    else:
+        expect(published_report(page)).to_be_visible(timeout=30000)
 
 
 @pytest.mark.parametrize(
@@ -2094,7 +2146,31 @@ async def seed_scope_awaiting_coverage_offline(
             brand_id=None,
         )
     async with WorkflowRunManager(db_path) as manager:
-        run = await manager.start_run(thread_id=thread["id"], user_id="browser-e2e")
+        run = await manager.start_run(
+            thread_id=thread["id"],
+            user_id="browser-e2e",
+            initial_request="夏季通勤长袖",
+        )
+        await manager.initialize_steps(
+            run.run_id,
+            [
+                {"step_name": "presearch", "phase": WorkflowPhase.INTAKE, "max_attempts": 3},
+                {"step_name": "brief_confirm", "phase": WorkflowPhase.INTAKE, "max_attempts": 1},
+                {"step_name": "plan_build", "phase": WorkflowPhase.INTAKE, "max_attempts": 1},
+                {
+                    "step_name": "formal_research",
+                    "phase": WorkflowPhase.RETRIEVAL,
+                    "max_attempts": 1,
+                },
+            ],
+        )
+        await manager.start_step(run.run_id, "presearch")
+        await manager.complete_step(
+            run.run_id,
+            "presearch",
+            artifact_refs=[{"type": "content_research_brief_draft"}],
+        )
+        await manager.advance_to_next_step(run.run_id)
 
     structure_hash = "structure_browser_scope_decision"
     plan_id = f"plan_{run.run_id}"
@@ -2115,6 +2191,81 @@ async def seed_scope_awaiting_coverage_offline(
     )
     store = SQLiteContentResearchStore(db_path)
     store.save_brief(brief)
+
+    async def preserve_owned_stack_prerequisite(_connection, _child_ids) -> None:
+        return None
+
+    task_payload = {
+        "schema_version": "content_research_subagent_task_v1",
+        "workflow_run_id": run.run_id,
+        "research_brief_id": brief.id,
+        "research_plan_id": plan_id,
+        "research_direction_id": "product_marketing",
+        "agent_name": "DirectionalExecutionPipeline",
+        "agent_version": "p0_spec_v1",
+        "task_type": "product_marketing_research",
+        "llm_scope": {"workspace_id": WORKSPACE_ID, "user_id": "browser-e2e"},
+        "input_payload": {
+            "schema_version": "content_research_subagent_input_v1",
+            "confirmed_subject": "夏季通勤长袖",
+            "subject_structure": {
+                "core_object": "长袖衬衫",
+                "research_intent": "通勤",
+                "context_modifiers": ["夏季"],
+            },
+            "subject_structure_hash": structure_hash,
+            "competitors": [],
+            "custom_research_question": "",
+            "direction": {
+                "id": "product_marketing",
+                "label": "产品营销",
+                "direction_type": "content_pattern",
+                "questions": ["提炼小红书产品卖点表达"],
+                "source_scope": ["search_result"],
+            },
+        },
+        "expected_output_schema": {
+            "schema_version": "content_research_subagent_output_schema_v1",
+            "required": ["finding", "evidence_refs", "missing_evidence"],
+        },
+        "status": "completed",
+        "sequence_no": 1,
+        "output_payload": {
+            "schema_version": "content_research_subagent_output_v1",
+            "findings": [],
+            "evidence_refs": [],
+            "missing_evidence": [{"reason": "required_scope_coverage_unmet"}],
+            "metadata": {},
+        },
+    }
+    async with WorkflowRunManager(db_path) as manager:
+        child_ids = await manager.complete_brief_and_plan_atomically(
+            workflow_run_id=run.run_id,
+            task_specs=[task_payload],
+            confirmation_writer=preserve_owned_stack_prerequisite,
+        )
+        await manager.start_child_task(child_ids[0])
+        await manager.complete_child_task(child_ids[0], artifact_refs=[])
+        await manager.wait_for_user_recovery(
+            run.run_id,
+            step_name="formal_research",
+            reason={
+                "code": "awaiting_scope_decision",
+                "message": "Required Scope Contract coverage is unmet.",
+            },
+        )
+    store.save_subagent_task(
+        SubagentTaskRecord(
+            id=f"sat_initial_{run.run_id}",
+            workflow_run_id=run.run_id,
+            thread_id=thread["id"],
+            schema_version="content_research_subagent_task_v1",
+            status="completed",
+            plan_id=plan_id,
+            direction_id="product_marketing",
+            payload={**task_payload, "workflow_child_task_id": child_ids[0]},
+        )
+    )
     policy, sample_policies, direction_contracts = build_default_snapshot(
         snapshot_id=f"policy_{run.run_id}",
         workflow_run_id=run.run_id,
@@ -2124,6 +2275,52 @@ async def seed_scope_awaiting_coverage_offline(
         direction_ids=("product_marketing",),
         direction_catalog=DIRECTION_CATALOG_V1,
         report_compose_mode="template_only",
+        confirmed_subject="夏季通勤长袖",
+        subject_structure={
+            "core_object": "长袖衬衫",
+            "research_intent": "通勤",
+            "context_modifiers": ["夏季"],
+        },
+        subject_structure_hash=structure_hash,
+        query_groups_by_direction={
+            "product_marketing": (
+                {
+                    "id": f"qg_initial_{run.run_id}",
+                    "direction_id": "product_marketing",
+                    "normalized_query": "长袖衬衫 夏季 通勤",
+                    "priority": 1,
+                    "sort": "likes",
+                    "time_window": {"end_at": datetime.now(timezone.utc).isoformat()},
+                    "candidate_cap": 20,
+                    "roles": ["primary"],
+                    "activation": "primary",
+                },
+            )
+        },
+        provider_capabilities={
+            "xiaohongshu": {
+                "adapter_version": "creator_e2e_success_v1",
+                "discover_candidates": {
+                    "status": "supported",
+                    "fields": ["title", "author", "metrics"],
+                },
+                "collect_note_detail": {
+                    "status": "supported",
+                    "fields": [
+                        "title",
+                        "content_text",
+                        "tags",
+                        "note_type",
+                        "metrics",
+                        "metrics_observed_at",
+                        "source_published_at",
+                        "ip_location",
+                        "media",
+                    ],
+                },
+                "collect_comments": {"status": "supported", "fields": []},
+            }
+        },
     )
     store.save_run_policy_snapshot(policy)
     for sample_policy in sample_policies:

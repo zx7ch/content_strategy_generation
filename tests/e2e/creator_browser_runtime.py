@@ -6,15 +6,17 @@ import json
 import os
 import re
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import app.main as production
 from app.content_research.presearch.service import PresearchService
 from app.content_research.sources import SourceAdapterRegistry
 from app.content_research.sources.base import ProviderCapability, SourceOperationResult
-from app.services.llm.types import LLMResponse, TokenUsage
 from app.services.llm.configuration_service import LiteLLMConfigurationService
 from app.services.llm.configuration_store import SQLiteLLMConfigurationStore
 from app.services.llm.failures import LLMProviderFailure
+from app.services.llm.types import LLMResponse, TokenUsage
+from tests.e2e.test_content_research_formal_workflow_e2e import CapableFakeAdapter
 
 
 class DeterministicPresearchLLM:
@@ -125,6 +127,29 @@ class DeterministicAuthRequiredSource:
         raise AssertionError("comment collection must not follow auth-required discovery")
 
 
+class DeterministicSuccessfulSource(CapableFakeAdapter):
+    """Successful source whose process boundary is observable to browser E2E."""
+
+    def __init__(self, call_log_path: str) -> None:
+        super().__init__()
+        self._call_log_path = Path(call_log_path)
+
+    async def discover_candidates(self, request):
+        with self._call_log_path.open("a", encoding="utf-8") as call_log:
+            call_log.write(
+                json.dumps(
+                    {
+                        "operation": "discover_candidates",
+                        "query": request.query,
+                        "context": dict(request.context),
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+        return await super().discover_candidates(request)
+
+
 class DeterministicWorkflowRestoreFailure:
     def __init__(self, delegate) -> None:
         self._delegate = delegate
@@ -172,15 +197,29 @@ class DeterministicQRLoginSession:
 _production_lifespan = production.app.router.lifespan_context
 
 
+async def _idle_unrelated_job_worker(_worker, *, stop_event) -> None:
+    """Keep the generic job queue out of the Content Research worker gate."""
+    await stop_event.wait()
+
+
 @asynccontextmanager
 async def deterministic_lifespan(application):
     production.schedule_embedding_prewarm = lambda: None
+    source_scenario = os.getenv("CREATOR_E2E_SOURCE_SCENARIO", "auth_required")
+    original_job_worker_loop = production.JobWorker.run_loop
+    if source_scenario == "success":
+        production.JobWorker.run_loop = _idle_unrelated_job_worker
     async with _production_lifespan(application):
+        production.JobWorker.run_loop = original_job_worker_loop
         service = application.state.content_research_service
         configuration_store = SQLiteLLMConfigurationStore(os.environ["SQLITE_DB_PATH"])
-        registry = SourceAdapterRegistry(
-            {"xiaohongshu": DeterministicAuthRequiredSource()}
-        )
+        if source_scenario == "success":
+            source = DeterministicSuccessfulSource(
+                os.environ["CREATOR_E2E_SOURCE_CALL_LOG"]
+            )
+        else:
+            source = DeterministicAuthRequiredSource()
+        registry = SourceAdapterRegistry({"xiaohongshu": source})
         service._presearch = PresearchService(
             DeterministicPresearchLLM(configuration_store),
             first_feedback_timeout_seconds=0.05,
