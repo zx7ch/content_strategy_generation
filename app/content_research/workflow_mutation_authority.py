@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from app.content_research.contracts import QUERY_RELEVANCE_ALGORITHM_VERSION
 from app.content_research.persistence_models import (
     DirectionalEvidencePacketRecord,
     ReportPublicationRecord,
@@ -33,6 +34,16 @@ _FAILURE_CHECKPOINT_STATUSES = {
 
 
 class ScopeAuthorityStore(Protocol):
+    def get_brief_by_workflow(self, workflow_run_id: str): ...
+
+    def get_run_policy_snapshot_for_workflow(self, workflow_run_id: str): ...
+
+    def list_direction_contracts(self, snapshot_id: str) -> list: ...
+
+    def get_sample_policy(self, sample_policy_id: str): ...
+
+    def get_typed_record(self, record_type: type, record_id: str): ...
+
     def get_unresolved_coverage_snapshot(self, workflow_run_id: str): ...
 
     def list_scope_execution_authorizations(self, workflow_run_id: str) -> list: ...
@@ -105,21 +116,25 @@ async def project_legacy_recovery_authority(
         if (
             publication.get("state") == "evidence_only_report"
             and publication.get("publication_reason") == "query_subject_not_supported"
-            and store.list_subagent_tasks_for_workflow(workflow_run_id)
-            and any(
-                packet.workflow_run_id == workflow_run_id
-                for packet in store.list_typed_records(DirectionalEvidencePacketRecord)
-            )
         ):
-            candidate = LegacyRecoveryAuthority(
-                actions=(
-                    WorkflowMutationAction(
-                        action="repair_from_persisted_packets",
-                        request={},
-                    ),
-                ),
-                reason_code="query_subject_not_supported",
+            repair_error = persisted_packet_replay_unavailable_reason(
+                store, workflow_run_id
             )
+            if repair_error is None:
+                candidate = LegacyRecoveryAuthority(
+                    actions=(
+                        WorkflowMutationAction(
+                            action="repair_from_persisted_packets",
+                            request={},
+                        ),
+                    ),
+                    reason_code="query_subject_not_supported",
+                )
+            else:
+                candidate = LegacyRecoveryAuthority(
+                    reason_code="query_subject_not_supported",
+                    unavailable_reason=repair_error,
+                )
         else:
             candidate = LegacyRecoveryAuthority(
                 unavailable_reason="legacy_recovery_action_not_available"
@@ -191,6 +206,138 @@ async def project_legacy_recovery_authority(
             unavailable_reason=ownership_error,
         )
     return candidate
+
+
+def persisted_packet_replay_unavailable_reason(
+    store: ScopeAuthorityStore,
+    workflow_run_id: str,
+) -> str | None:
+    """Return the first durable fact that makes packet replay non-executable.
+
+    The check is intentionally pure: projection, mutation admission, and the
+    replay boundary can use the same answer before admission/report writes.
+    Remote/model outcomes remain execution failures rather than authority
+    facts.
+    """
+    if store.get_brief_by_workflow(workflow_run_id) is None:
+        return "persisted_packet_brief_missing"
+    snapshot = store.get_run_policy_snapshot_for_workflow(workflow_run_id)
+    if snapshot is None:
+        return "persisted_packet_policy_missing"
+    tasks = store.list_subagent_tasks_for_workflow(workflow_run_id)
+    if not tasks:
+        return "persisted_packet_tasks_missing"
+    if any(task.status not in {"completed", "partial_completed"} for task in tasks):
+        return "persisted_packet_tasks_not_terminal"
+    if any(not str(task.direction_id or "") for task in tasks):
+        return "persisted_packet_task_direction_missing"
+
+    contracts = {
+        contract.direction_id: contract
+        for contract in store.list_direction_contracts(snapshot.id)
+    }
+    for task in tasks:
+        direction_id = str(task.direction_id)
+        contract = contracts.get(direction_id)
+        if contract is None:
+            return "persisted_packet_direction_contract_missing"
+        if store.get_sample_policy(contract.sample_policy_id) is None:
+            return "persisted_packet_sample_policy_missing"
+
+    relevance_by_direction = dict(snapshot.effective_policy.get("query_relevance") or {})
+    has_current_relevance = bool(relevance_by_direction) and all(
+        str(value.get("algorithm_version") or "")
+        == QUERY_RELEVANCE_ALGORITHM_VERSION
+        for value in relevance_by_direction.values()
+        if isinstance(value, dict)
+    )
+    if not has_current_relevance:
+        locked_directions = dict(
+            snapshot.effective_policy.get("locked_query_plan", {}).get(
+                "directions", {}
+            )
+            or {}
+        )
+        if set(locked_directions) != set(contracts):
+            return "persisted_packet_relevance_directions_mismatch"
+        for direction_id, contract in contracts.items():
+            locked_group_ids = {
+                str(item.get("id") or "")
+                for item in locked_directions[direction_id].get("query_groups") or ()
+                if str(item.get("id") or "")
+            }
+            original_ids = {
+                str(item)
+                for item in (contract.metadata.get("query_relevance") or {}).get(
+                    "query_group_ids", ()
+                )
+            }
+            if not locked_group_ids or original_ids != locked_group_ids:
+                return "persisted_packet_relevance_query_groups_mismatch"
+
+    checkpoints = [
+        item
+        for item in store.list_typed_records(StageCheckpointRecord)
+        if item.workflow_run_id == workflow_run_id and item.status == "completed"
+    ]
+    for task in tasks:
+        task_checkpoints = [
+            item for item in checkpoints if item.subagent_task_id == task.id
+        ]
+        packet_checkpoint = next(
+            (
+                item
+                for item in reversed(task_checkpoints)
+                if item.stage_name == "packet"
+            ),
+            None,
+        )
+        selection_checkpoint = next(
+            (
+                item
+                for item in reversed(task_checkpoints)
+                if item.stage_name == "detail" and item.payload.get("selection")
+            ),
+            None,
+        ) or next(
+            (
+                item
+                for item in reversed(task_checkpoints)
+                if item.stage_name == "selection" and item.payload.get("selection")
+            ),
+            None,
+        )
+        if selection_checkpoint is None:
+            return "persisted_packet_selection_checkpoint_missing"
+        if packet_checkpoint is None:
+            return "persisted_packet_packet_checkpoint_missing"
+        if str(packet_checkpoint.payload.get("direction_id") or "") != str(
+            task.direction_id
+        ):
+            return "persisted_packet_checkpoint_direction_mismatch"
+        comment_checkpoint = next(
+            (
+                item
+                for item in reversed(task_checkpoints)
+                if item.stage_name == "comments"
+            ),
+            None,
+        )
+        packet_ids = tuple(packet_checkpoint.payload.get("packet_ids") or ())
+        comment_packet_ids = (
+            tuple(comment_checkpoint.payload.get("packet_ids") or ())
+            if comment_checkpoint is not None
+            else ()
+        )
+        if not packet_ids and not comment_packet_ids:
+            return "persisted_packet_packets_missing"
+        if any(
+            store.get_typed_record(DirectionalEvidencePacketRecord, str(packet_id))
+            is None
+            for packet_id in (*packet_ids, *comment_packet_ids)
+        ):
+            return "persisted_packet_record_missing"
+    return None
 
 
 def _recovery_reason(failures: list[StageCheckpointRecord]) -> str:

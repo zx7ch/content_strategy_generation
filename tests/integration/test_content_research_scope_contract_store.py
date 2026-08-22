@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 import threading
 from dataclasses import replace
+from datetime import timedelta
 
 import pytest
 
@@ -785,6 +786,10 @@ def test_unresolved_coverage_atomically_blocks_new_draft_and_confirmation(tmp_pa
         constraints=template.constraints,
         query_groups=(ScopeQueryGroupInput("长袖衬衫 通勤", "长袖衬衫 通勤"),),
     )
+    first_draft = replace(
+        first_draft,
+        created_at=pending_draft.created_at + timedelta(microseconds=1),
+    )
     for draft, event_id in (
         (first_draft, "sda_exclusion_first"),
         (pending_draft, "sda_exclusion_pending"),
@@ -820,7 +825,7 @@ def test_unresolved_coverage_atomically_blocks_new_draft_and_confirmation(tmp_pa
     )
 
     with pytest.raises(ValueError, match="coverage_decision_required"):
-        _confirm_scope(store, draft=pending_draft, event_id="sca_exclusion_pending")
+        _confirm_scope(store, draft=first_draft, event_id="sca_exclusion_repeat")
 
     later_draft = replace(
         pending_draft,
@@ -1059,7 +1064,7 @@ def test_two_connections_racing_to_confirm_one_draft_create_one_contract(tmp_pat
     assert _confirmation_rows(db_path) == [(draft.id, contract.id, contract.workflow_run_id)]
 
 
-def test_two_connections_confirming_distinct_drafts_allocate_distinct_versions(tmp_path) -> None:
+def test_two_connections_can_confirm_only_the_latest_projected_draft(tmp_path) -> None:
     db_path = tmp_path / "scope-confirmation-distinct-drafts-race.db"
     first_store = SQLiteContentResearchStore(str(db_path))
     second_store = SQLiteContentResearchStore(str(db_path))
@@ -1126,11 +1131,14 @@ def test_two_connections_confirming_distinct_drafts_allocate_distinct_versions(t
 
     assert not first.is_alive()
     assert not second.is_alive()
-    assert errors == []
-    assert sorted(contract.version for contract, _, _ in results) == [1, 2]
-    assert len({contract.id for contract, _, _ in results}) == 2
-    assert all(created for _, _, created in results)
+    assert len(errors) == 1
+    assert "latest projected draft" in str(errors[0])
+    assert len(results) == 1
+    assert results[0][0].version == 1
+    assert results[0][2]
+    latest = first_store.get_latest_scope_draft(base_contract.workflow_run_id)
+    assert latest is not None
+    assert results[0][0].research_plan_id == latest.research_plan_id
     persisted = first_store.list_scope_contracts(base_contract.workflow_run_id)
-    assert [contract.version for contract in persisted] == [1, 2]
-    assert {contract.id for contract in persisted} == {contract.id for contract, _, _ in results}
-    assert len(_confirmation_rows(db_path)) == 2
+    assert persisted == [results[0][0]]
+    assert len(_confirmation_rows(db_path)) == 1

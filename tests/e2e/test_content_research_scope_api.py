@@ -4,6 +4,7 @@ import asyncio
 import json
 import sqlite3
 from dataclasses import replace
+from datetime import timedelta
 
 import httpx
 import pytest
@@ -22,6 +23,7 @@ from app.content_research.presearch.service import PresearchService
 from app.content_research.scope_contract import (
     CoverageSnapshot,
     ScopeAuditEvent,
+    ScopeDraftAuditEvent,
 )
 from app.content_research.service import (
     ContentResearchService,
@@ -291,6 +293,17 @@ def _workflow_row_counts(db_path: str, workflow_run_id: str) -> dict[str, int]:
     return counts
 
 
+def _assert_no_legacy_authorization_fields(payload) -> None:
+    if isinstance(payload, dict):
+        assert "execution_authorization" not in payload
+        assert "execution_authorization_id" not in payload
+        for value in payload.values():
+            _assert_no_legacy_authorization_fields(value)
+    elif isinstance(payload, list):
+        for value in payload:
+            _assert_no_legacy_authorization_fields(value)
+
+
 async def _seed_paused_legacy_recovery(db_path: str) -> str:
     async with ThreadStore(db_path) as thread_store:
         thread = await thread_store.create_thread(title="legacy recovery")
@@ -427,11 +440,16 @@ async def test_public_coverage_resolution_omits_legacy_execution_authorization(s
 
     assert response.status_code == 200, response.text
     result = response.json()["result"]
-    assert "execution_authorization" not in result
+    _assert_no_legacy_authorization_fields(result)
     assert result["execution_unit"]["id"]
     assert app.state.content_research_service._store.list_scope_execution_authorizations(
         workflow_run_id
     )
+    projection = await scope_client.get(
+        f"/content-research/workflows/{workflow_run_id}/scope"
+    )
+    assert projection.status_code == 200, projection.text
+    _assert_no_legacy_authorization_fields(projection.json())
 
 
 @pytest.mark.asyncio
@@ -1242,6 +1260,99 @@ async def test_confirm_scope_keeps_arbitrary_user_query_and_persists_matching_au
 
 
 @pytest.mark.asyncio
+async def test_confirm_scope_rejects_an_older_non_projected_draft_without_writes(
+    scope_client,
+):
+    """Removing the latest-Draft fence must let this stale raw command write."""
+    workflow = await _scope_ready_workflow(scope_client)
+    workflow_run_id = workflow["presearch"]["workflow_run_id"]
+    endpoint = f"/content-research/workflows/{workflow_run_id}/actions"
+    first = await scope_client.post(
+        endpoint,
+        json={"action": "prepare_scope", "payload": {"direction_id": "product_marketing"}},
+    )
+    assert first.status_code == 200
+    older = first.json()["result"]["scope"]
+    store = app.state.content_research_service._store
+    older_record = store.get_scope_draft(older["id"])
+    assert older_record is not None
+    current_record = replace(
+        older_record,
+        id="rsd_api_current_projected",
+        created_at=older_record.created_at + timedelta(microseconds=1),
+    )
+    store.save_scope_draft_with_audit_event(
+        current_record,
+        ScopeDraftAuditEvent(
+            id="sae_api_current_projected",
+            workflow_run_id=workflow_run_id,
+            scope_draft_id=current_record.id,
+            event_name="scope_suggested",
+            payload={
+                "schema_version": "content_research_scope_audit_event_v1",
+                "scope_draft_id": current_record.id,
+            },
+            created_at=current_record.created_at,
+        ),
+    )
+    current = {
+        "id": current_record.id,
+        "structure_hash": current_record.structure_hash,
+        "query_groups": [
+            {"final_query": group.final_query} for group in current_record.query_groups
+        ],
+    }
+    assert older["id"] != current["id"]
+
+    projection = await scope_client.get(
+        f"/content-research/workflows/{workflow_run_id}/scope"
+    )
+    assert projection.status_code == 200
+    projected_confirm = next(
+        item
+        for item in projection.json()["allowed_actions"]
+        if item["action"] == "confirm_scope" and item["available"]
+    )
+    assert projected_confirm["scope_draft_id"] == current["id"]
+
+    before = _workflow_row_counts(store._db_path, workflow_run_id)
+    stale = await scope_client.post(
+        endpoint,
+        json={
+            "action": "confirm_scope",
+            "payload": {
+                "scope_draft_id": older["id"],
+                "structure_hash": older["structure_hash"],
+                "query_groups": [
+                    {"final_query": group["final_query"]}
+                    for group in older["query_groups"]
+                ],
+            },
+        },
+    )
+    assert stale.status_code == 422, stale.text
+    assert "latest projected draft" in stale.text
+    assert _workflow_row_counts(store._db_path, workflow_run_id) == before
+
+    confirmed = await scope_client.post(
+        endpoint,
+        json={
+            "action": "confirm_scope",
+            "payload": {
+                "scope_draft_id": current["id"],
+                "structure_hash": current["structure_hash"],
+                "query_groups": [
+                    {"final_query": group["final_query"]}
+                    for group in current["query_groups"]
+                ],
+            },
+        },
+    )
+    assert confirmed.status_code == 200, confirmed.text
+    assert len(store.list_scope_contracts(workflow_run_id)) == 1
+
+
+@pytest.mark.asyncio
 async def test_confirm_scope_rejects_stale_structure_hash(scope_client):
     workflow = await _scope_ready_workflow(scope_client)
     workflow_run_id = workflow["presearch"]["workflow_run_id"]
@@ -1719,7 +1830,7 @@ async def test_scope_projection_exposes_initial_unresolved_coverage_without_auth
     body = response.json()
     assert body["coverage_snapshot"]["id"] == "scv_api_unmet_season"
     assert body["coverage_snapshot"]["execution_revision"] == 1
-    assert body["coverage_snapshot"]["execution_authorization_id"] is None
+    _assert_no_legacy_authorization_fields(body)
     assert body["allowed_actions"] == [
         {
             "action": "prepare_scope",

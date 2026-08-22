@@ -170,6 +170,7 @@ from app.content_research.workflow.query_planner import (
 from app.content_research.workflow_mutation_authority import (
     LegacyRecoveryActionUnavailableError,
     legacy_recovery_ownership_unavailable,
+    persisted_packet_replay_unavailable_reason,
     project_legacy_recovery_authority,
 )
 from app.memory.thread_store import ThreadStore
@@ -2000,6 +2001,11 @@ class ContentResearchService:
         self, workflow_run_id: str
     ) -> dict[str, Any]:
         """Replay admission through publication without any collection capability."""
+        replay_error = persisted_packet_replay_unavailable_reason(
+            self._store, workflow_run_id
+        )
+        if replay_error is not None:
+            raise ContentResearchValidationError(replay_error)
         brief = self._store.get_brief_by_workflow(workflow_run_id)
         if brief is None:
             raise ContentResearchNotFoundError(
@@ -6420,7 +6426,6 @@ def _coverage_snapshot_payload(snapshot: Any) -> dict[str, Any]:
         "scope_contract_id": snapshot.scope_contract_id,
         "scope_contract_version": snapshot.scope_contract_version,
         "execution_revision": snapshot.execution_revision,
-        "execution_authorization_id": snapshot.execution_authorization_id,
         "source_coverage_snapshot_id": snapshot.source_coverage_snapshot_id,
         "state": snapshot.state,
         "constraint_counts": snapshot.constraint_counts,

@@ -829,6 +829,16 @@ class SQLiteContentResearchStore:
             if draft_row is None:
                 raise ValueError(f"scope draft does not exist: {draft_id}")
             draft = self._row_to_scope_draft(draft_row)
+            latest_draft_row = conn.execute(
+                """SELECT id FROM content_research_scope_drafts
+                   WHERE workflow_run_id = ?
+                   ORDER BY created_at DESC, id DESC LIMIT 1""",
+                (draft.workflow_run_id,),
+            ).fetchone()
+            if latest_draft_row is None or str(latest_draft_row["id"]) != draft.id:
+                raise ValueError(
+                    "Scope confirmation requires the latest projected draft"
+                )
             brief_row = conn.execute(
                 """SELECT payload_json FROM content_research_briefs
                    WHERE workflow_run_id = ? ORDER BY updated_at DESC LIMIT 1""",

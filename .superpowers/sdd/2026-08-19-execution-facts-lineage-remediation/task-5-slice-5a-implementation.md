@@ -50,3 +50,34 @@ Both failures were observed before the implementation change.
 No Slice 5B–5D behavior was implemented. The existing Task 4
 report-publication finalizing-crash integrity risk remains explicitly deferred
 and was not changed by this slice.
+
+## Independent-review remediation
+
+The first independent review found three additional implementation defects.
+They are now closed without changing the accepted local single-user contract:
+
+- Scope confirmation checks the workflow's latest projected Draft inside the
+  existing `BEGIN IMMEDIATE` transaction. A raw older Draft receives 422 and
+  creates no Contract, confirmation, or audit row; the current Draft remains
+  confirmable.
+- Persisted-packet Repair now runs one pure durable preflight shared by action
+  projection, mutation admission, and the replay boundary. It covers the
+  brief, frozen policy, terminal successful/partial tasks, direction
+  contracts, sample policies, relevance-plan structure, completed selection
+  and packet checkpoints, and referenced packet rows.
+- Public Coverage POST results and subsequent GET Scope projections omit both
+  `execution_authorization` and `execution_authorization_id`; internal
+  authorization rows remain unchanged for workers.
+
+### Remediation proof
+
+- Four narrow RED-to-GREEN acceptance tests passed for stale Draft rejection,
+  public response filtering, and eligible/ineligible Repair.
+- 67 focused Router/SQLite, packet-replay, and Scope-store tests passed (one
+  unrelated pre-existing Task 4 integrity test was excluded because its
+  isolated fixture lacks the `workflow_runs` table).
+- Focused Ruff and `git diff --check` passed.
+
+`DEBT-5-1` remains deliberately out of scope: a future multi-user or external
+workflow-action deployment needs a durable mutation claim/lease. No such
+parallel actor exists in the current local single-user Creator boundary.
