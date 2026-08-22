@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 from dataclasses import replace
 
 import httpx
@@ -10,20 +11,30 @@ import pytest
 from app.api.routes.router import app
 from app.content_research.api_schemas import ContentResearchSourceCollectionRequest
 from app.content_research.async_dispatch import AsyncScopeExecutionContinuationRepository
+from app.content_research.contracts import build_default_snapshot
+from app.content_research.models import ResearchBriefRecord
 from app.content_research.persistence_models import (
     DirectionalEvidencePacketRecord,
     ReportPublicationRecord,
+    StageCheckpointRecord,
 )
 from app.content_research.presearch.service import PresearchService
 from app.content_research.scope_contract import (
     CoverageSnapshot,
     ScopeAuditEvent,
 )
-from app.content_research.service import ContentResearchService, ContentResearchValidationError
+from app.content_research.service import (
+    ContentResearchService,
+    ContentResearchValidationError,
+    WorkflowRunManagerRuntime,
+)
 from app.content_research.sources import SourceAdapterRegistry
 from app.content_research.sources.base import SourceOperationResult
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
+from app.memory.thread_store import ThreadStore
+from app.memory.workflow_store import WorkflowStore
 from app.services.llm.types import LLMResponse, TokenUsage
+from app.services.workflow_run_manager import WorkflowRunManager
 from tests.e2e.test_content_research_brief_confirm_api import WORKSPACE_HEADERS, FakeRuntime
 
 
@@ -101,6 +112,31 @@ async def scope_client(tmp_path):
         headers=WORKSPACE_HEADERS,
     ) as client:
         yield client
+    if original is None:
+        delattr(app.state, "content_research_service")
+    else:
+        app.state.content_research_service = original
+
+
+@pytest.fixture()
+async def legacy_recovery_client(tmp_path):
+    original = getattr(app.state, "content_research_service", None)
+    db_path = str(tmp_path / "legacy-recovery.db")
+    app.state.content_research_service = ContentResearchService(
+        store=SQLiteContentResearchStore(db_path),
+        presearch=PresearchService(
+            SummerCommuteFakeLLM(), first_feedback_timeout_seconds=0.05, hard_cutoff_seconds=0.1
+        ),
+        workflow_runtime=WorkflowRunManagerRuntime(db_path),
+        source_registry=SourceAdapterRegistry({"xiaohongshu": ScopeDiagnosticSourceAdapter()}),
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://testserver",
+        headers=WORKSPACE_HEADERS,
+    ) as client:
+        yield client, db_path
     if original is None:
         delattr(app.state, "content_research_service")
     else:
@@ -221,6 +257,89 @@ async def _confirm_initial_scope(client: httpx.AsyncClient, workflow_run_id: str
     return confirmed.json()["result"]["scope_contract"]
 
 
+def _workflow_row_counts(db_path: str, workflow_run_id: str) -> dict[str, int]:
+    """Snapshot every workflow-owned table so a blocked command proves zero writes."""
+    counts: dict[str, int] = {}
+    with sqlite3.connect(db_path) as connection:
+        table_names = [
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND (name LIKE 'content_research_%' OR name LIKE 'workflow_%')"
+            )
+        ]
+        for table_name in table_names:
+            columns = {
+                str(row[1])
+                for row in connection.execute(f'PRAGMA table_info("{table_name}")')
+            }
+            owner_column = (
+                "workflow_run_id"
+                if "workflow_run_id" in columns
+                else "run_id"
+                if "run_id" in columns
+                else None
+            )
+            if owner_column is None:
+                continue
+            counts[table_name] = int(
+                connection.execute(
+                    f'SELECT COUNT(*) FROM "{table_name}" WHERE "{owner_column}"=?',
+                    (workflow_run_id,),
+                ).fetchone()[0]
+            )
+    return counts
+
+
+async def _seed_paused_legacy_recovery(db_path: str) -> str:
+    async with ThreadStore(db_path) as thread_store:
+        thread = await thread_store.create_thread(title="legacy recovery")
+    async with WorkflowRunManager(db_path) as manager:
+        run = await manager.start_run(thread_id=thread["id"], user_id="user-1")
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "UPDATE workflow_runs SET status='paused' WHERE run_id=?",
+            (run.run_id,),
+        )
+    store = SQLiteContentResearchStore(db_path)
+    brief = ResearchBriefRecord(
+        id=f"brief_{run.run_id}",
+        workflow_run_id=run.run_id,
+        thread_id=thread["id"],
+        schema_version="content_research_brief_v1",
+        status="ready",
+        payload={
+            "schema_version": "content_research_brief_payload_v1",
+            "confirmed_subject": "历史暂停调研",
+            "selected_directions": ["product_marketing"],
+        },
+    )
+    store.save_brief(brief)
+    policy, _, _ = build_default_snapshot(
+        snapshot_id=f"policy_{run.run_id}",
+        workflow_run_id=run.run_id,
+        brief_id=brief.id,
+        plan_id=f"plan_{run.run_id}",
+        direction_set_version="direction_set_v1",
+        direction_ids=("product_marketing",),
+        report_compose_mode="template_only",
+    )
+    store.save_run_policy_snapshot(policy)
+    store.save_stage_checkpoint(
+        StageCheckpointRecord(
+            id=f"checkpoint_{run.run_id}",
+            schema_version="content_research_stage_checkpoint_v1",
+            payload={"reason_code": "auth_expired"},
+            workflow_run_id=run.run_id,
+            subagent_task_id=f"task_{run.run_id}",
+            stage_name="collect",
+            input_fingerprint="legacy-recovery",
+            status="failed",
+        )
+    )
+    return run.run_id
+
+
 @pytest.mark.asyncio
 async def test_initial_confirmed_scope_can_dispatch_its_first_collection(scope_client):
     workflow = await _scope_ready_workflow(scope_client)
@@ -244,6 +363,78 @@ async def test_initial_confirmed_scope_can_dispatch_its_first_collection(scope_c
 
 
 @pytest.mark.asyncio
+async def test_legacy_recovery_requires_the_exact_server_projected_action(
+    legacy_recovery_client,
+):
+    client, db_path = legacy_recovery_client
+    workflow_run_id = await _seed_paused_legacy_recovery(db_path)
+
+    projection = await client.get(
+        f"/content-research/workflows/{workflow_run_id}/lite-report"
+    )
+    assert projection.status_code == 200, projection.text
+    assert projection.json()["recovery_projection"]["allowed_actions"] == [
+        {
+            "action": "resume_formal_research",
+            "available": True,
+            "request": {},
+        }
+    ]
+
+    before = _workflow_row_counts(db_path, workflow_run_id)
+    wrong_action = await client.post(
+        f"/content-research/workflows/{workflow_run_id}/actions",
+        json={
+            "action": "retry_formal_research",
+            "payload": {
+                "provider": "xiaohongshu",
+                "source_kind": "search_result",
+                "limit": 20,
+            },
+        },
+    )
+    assert wrong_action.status_code == 422, wrong_action.text
+    assert "legacy_recovery_action_not_available" in wrong_action.text
+    assert _workflow_row_counts(db_path, workflow_run_id) == before
+
+    resumed = await client.post(
+        f"/content-research/workflows/{workflow_run_id}/actions",
+        json={"action": "resume_formal_research", "payload": {}},
+    )
+    assert resumed.status_code == 200, resumed.text
+    async with WorkflowStore(db_path) as workflow_store:
+        run = await workflow_store.get_run(workflow_run_id)
+    assert run is not None and run.status.value == "running"
+
+
+@pytest.mark.asyncio
+async def test_public_coverage_resolution_omits_legacy_execution_authorization(scope_client):
+    workflow_run_id, _contract = await _confirmed_scope_with_unmet_season(scope_client)
+
+    response = await scope_client.post(
+        f"/content-research/workflows/{workflow_run_id}/actions",
+        json={
+            "action": "resolve_coverage",
+            "payload": {
+                "scope_contract_version": 1,
+                "coverage_snapshot_id": "scv_api_unmet_season",
+                "resolution": "expand_required_constraint",
+                "constraint_id": "season",
+                "supplementary_queries": ["夏季 防晒 长袖衬衫"],
+            },
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    result = response.json()["result"]
+    assert "execution_authorization" not in result
+    assert result["execution_unit"]["id"]
+    assert app.state.content_research_service._store.list_scope_execution_authorizations(
+        workflow_run_id
+    )
+
+
+@pytest.mark.asyncio
 async def test_awaiting_scope_decision_rejects_legacy_execution_entrypoints(scope_client):
     workflow_run_id, _contract = await _confirmed_scope_with_unmet_season(scope_client)
     formal_payload = {
@@ -252,6 +443,10 @@ async def test_awaiting_scope_decision_rejects_legacy_execution_entrypoints(scop
         "limit": 20,
     }
 
+    store = app.state.content_research_service._store
+    async with WorkflowStore(store._db_path):
+        pass
+    before = _workflow_row_counts(store._db_path, workflow_run_id)
     for action, payload in (
         ("start_formal_research", formal_payload),
         ("retry_formal_research", formal_payload),
@@ -264,6 +459,7 @@ async def test_awaiting_scope_decision_rejects_legacy_execution_entrypoints(scop
         )
         assert response.status_code == 422, response.text
         assert "scope_execution_authorization_required" in response.text
+        assert _workflow_row_counts(store._db_path, workflow_run_id) == before
 
     service = app.state.content_research_service
     with pytest.raises(ContentResearchValidationError, match="scope_execution_authorization_required"):
@@ -278,6 +474,50 @@ async def test_awaiting_scope_decision_rejects_legacy_execution_entrypoints(scop
         f"/content-research/workflows/{workflow_run_id}/lite-report"
     )
     assert report.status_code == 404, report.text
+
+
+@pytest.mark.asyncio
+async def test_execution_unit_owned_workflow_rejects_all_legacy_recovery_without_writes(
+    scope_client,
+):
+    workflow_run_id, _contract = await _confirmed_scope_with_unmet_season(scope_client)
+    resolution = await scope_client.post(
+        f"/content-research/workflows/{workflow_run_id}/actions",
+        json={
+            "action": "resolve_coverage",
+            "payload": {
+                "scope_contract_version": 1,
+                "coverage_snapshot_id": "scv_api_unmet_season",
+                "resolution": "expand_required_constraint",
+                "constraint_id": "season",
+                "supplementary_queries": ["夏季 防晒 长袖衬衫"],
+            },
+        },
+    )
+    assert resolution.status_code == 200, resolution.text
+    store = app.state.content_research_service._store
+    assert store.list_scope_execution_units(workflow_run_id)
+    async with WorkflowStore(store._db_path):
+        pass
+    before = _workflow_row_counts(store._db_path, workflow_run_id)
+
+    formal_payload = {
+        "provider": "xiaohongshu",
+        "source_kind": "search_result",
+        "limit": 20,
+    }
+    for action, payload in (
+        ("repair_from_persisted_packets", {}),
+        ("retry_formal_research", formal_payload),
+        ("resume_formal_research", {}),
+    ):
+        response = await scope_client.post(
+            f"/content-research/workflows/{workflow_run_id}/actions",
+            json={"action": action, "payload": payload},
+        )
+        assert response.status_code == 422, response.text
+        assert "scope_execution_authorization_required" in response.text
+        assert _workflow_row_counts(store._db_path, workflow_run_id) == before
 
 
 @pytest.mark.asyncio
@@ -467,8 +707,8 @@ async def _authorized_continuation_snapshot(
         },
     )
     assert resolution.status_code == 200
-    authorization = resolution.json()["result"]["execution_authorization"]
     store = app.state.content_research_service._store
+    authorization = store.list_scope_execution_authorizations(workflow_run_id)[-1]
     snapshot = CoverageSnapshot(
         id=snapshot_id,
         workflow_run_id=workflow_run_id,
@@ -477,9 +717,9 @@ async def _authorized_continuation_snapshot(
         state="awaiting_scope_decision",
         constraint_counts=constraint_counts,
         unmet_constraint_ids=unmet_constraint_ids,
-        execution_revision=authorization["execution_revision"],
-        execution_authorization_id=authorization["id"],
-        source_coverage_snapshot_id=authorization["coverage_snapshot_id"],
+        execution_revision=authorization.execution_revision,
+        execution_authorization_id=authorization.id,
+        source_coverage_snapshot_id=authorization.coverage_snapshot_id,
     )
     store.save_coverage_snapshot(snapshot)
     return {"authorization": authorization, "snapshot": snapshot}
@@ -540,15 +780,15 @@ async def test_generate_limited_report_resolution_preserves_v1_and_exact_season_
     assert result["audit_event"]["event_name"] == "coverage_resolved"
     assert result["audit_event"]["payload"]["resolution"] == "generate_limited_report"
     store = app.state.content_research_service._store
-    authorization = result["execution_authorization"]
-    assert authorization["resolution"] == "generate_limited_report"
-    assert authorization["state"] == "authorized_limited_report"
+    authorization = store.list_scope_execution_authorizations(workflow_run_id)[0]
+    assert authorization.resolution == "generate_limited_report"
+    assert authorization.state == "authorized_limited_report"
     assert store.list_scope_execution_authorizations(workflow_run_id)[0].state == (
         "authorized_limited_report"
     )
     continuation = store.list_scope_execution_continuations(workflow_run_id)[0]
-    assert continuation.authorization_id == authorization["id"]
-    assert continuation.execution_revision == authorization["execution_revision"] == 2
+    assert continuation.authorization_id == authorization.id
+    assert continuation.execution_revision == authorization.execution_revision == 2
     assert continuation.operation == "limited_report"
     assert continuation.supplementary_queries == ()
     assert continuation.state == "pending"
@@ -614,7 +854,6 @@ async def test_expand_required_constraint_retains_v1_and_authorizes_collection(
     assert result["audit_event"]["payload"]["resolution"] == "expand_required_constraint"
     assert result["audit_event"]["payload"]["source_scope_contract_version"] == 1
     assert result["audit_event"]["payload"]["resulting_scope_contract_version"] == 1
-    assert result["execution_authorization"]["state"] == "authorized_collection"
     store = app.state.content_research_service._store
     persisted_v1 = store.get_scope_contract(workflow_run_id, version=1)
     assert persisted_v1 is not None
@@ -623,6 +862,7 @@ async def test_expand_required_constraint_retains_v1_and_authorizes_collection(
     ]
     authorizations = store.list_scope_execution_authorizations(workflow_run_id)
     assert len(authorizations) == 1
+    assert authorizations[0].state == "authorized_collection"
     assert authorizations[0].scope_contract_version == 1
     assert authorizations[0].execution_revision == 2
     continuation = store.list_scope_execution_continuations(workflow_run_id)[0]
@@ -1356,7 +1596,7 @@ async def test_confirmed_scope_projection_includes_current_action_metadata(scope
     ]
     assert body["coverage_snapshot"]["id"] == "scv_api_authorized_continuation"
     execution_unit = body["execution_unit"]
-    assert execution_unit["id"] == continuation["authorization"]["execution_unit_id"]
+    assert execution_unit["id"] == continuation["authorization"].execution_unit_id
     assert execution_unit["state"] == "pending"
     assert execution_unit["attempt_no"] == 0
     assert execution_unit["allowed_actions"] == []
@@ -1389,7 +1629,7 @@ async def test_scope_projection_marks_unknown_outcome_for_manual_recovery_withou
         unmet_constraint_ids=("season",),
     )
     store = app.state.content_research_service._store
-    unit_id = continuation["authorization"]["execution_unit_id"]
+    unit_id = continuation["authorization"].execution_unit_id
     with store._connect() as conn:
         conn.execute(
             "UPDATE content_research_scope_execution_units SET state='outcome_unknown' WHERE id=?",
@@ -1427,7 +1667,7 @@ async def test_scope_projection_declares_exact_replay_only_for_known_retryable_f
         unmet_constraint_ids=("season",),
     )
     store = app.state.content_research_service._store
-    unit_id = continuation["authorization"]["execution_unit_id"]
+    unit_id = continuation["authorization"].execution_unit_id
     with store._connect() as conn:
         conn.execute(
             "UPDATE content_research_scope_execution_units SET state='failed' WHERE id=?",

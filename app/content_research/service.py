@@ -167,6 +167,11 @@ from app.content_research.workflow.query_planner import (
     CompiledQueryPlan,
     compile_structured_query_plan,
 )
+from app.content_research.workflow_mutation_authority import (
+    LegacyRecoveryActionUnavailableError,
+    legacy_recovery_ownership_unavailable,
+    project_legacy_recovery_authority,
+)
 from app.memory.thread_store import ThreadStore
 from app.memory.workflow_store import WorkflowStore
 from app.models.workflow import WorkflowPhase
@@ -2096,8 +2101,17 @@ class ContentResearchService:
 
     async def repair_from_persisted_packets(self, workflow_run_id: str) -> dict[str, Any]:
         """Offer packet-only recovery only for the eligible evidence-only report."""
-        self._require_scope_execution_authority(workflow_run_id=workflow_run_id)
+        ownership_error = legacy_recovery_ownership_unavailable(
+            self._store, workflow_run_id
+        )
+        if ownership_error is not None:
+            raise ContentResearchValidationError(ownership_error)
         report = await self.get_lite_report(workflow_run_id=workflow_run_id)
+        await self._require_legacy_recovery_authority(
+            workflow_run_id=workflow_run_id,
+            action="repair_from_persisted_packets",
+            published_report=report.model_dump(mode="json"),
+        )
         publication = report.publication
         if (
             publication.get("state") != "evidence_only_report"
@@ -3316,12 +3330,11 @@ class ContentResearchService:
                 local_cache_id=brief.id,
             )
 
-        if action in {
-            "repair_from_persisted_packets",
-            "retry_formal_research",
-            "resume_formal_research",
-        }:
-            self._require_scope_execution_authority(workflow_run_id=workflow_run_id)
+        if action in {"retry_formal_research", "resume_formal_research"}:
+            await self._require_legacy_recovery_authority(
+                workflow_run_id=workflow_run_id,
+                action=action,
+            )
 
         if action == "repair_from_persisted_packets":
             result = await self.repair_from_persisted_packets(workflow_run_id)
@@ -3690,6 +3703,31 @@ class ContentResearchService:
             return
         if execution_authorization is None:
             raise ContentResearchValidationError("scope_execution_authorization_required")
+
+    async def _require_legacy_recovery_authority(
+        self,
+        *,
+        workflow_run_id: str,
+        action: str,
+        published_report: dict[str, Any] | None = None,
+    ) -> None:
+        ownership_error = legacy_recovery_ownership_unavailable(
+            self._store, workflow_run_id
+        )
+        if ownership_error is not None:
+            raise ContentResearchValidationError(ownership_error)
+        authority = await project_legacy_recovery_authority(
+            self._store,
+            self._store._db_path,
+            workflow_run_id,
+            published_report=published_report,
+        )
+        try:
+            authority.require(action)
+        except LegacyRecoveryActionUnavailableError as exc:
+            raise ContentResearchValidationError(
+                str(exc)
+            ) from exc
 
     def _require_frozen_product_marketing_dispatch_contract(
         self, brief: ResearchBriefRecord
@@ -6572,7 +6610,6 @@ def _coverage_resolution_result(
         "scope_contract": _scope_contract_payload(contract),
         "unmet_constraint_ids": list(snapshot.unmet_constraint_ids),
         "audit_event": _scope_audit_payload(event),
-        "execution_authorization": _scope_execution_authorization_payload(authorization),
         "execution_unit": _scope_execution_unit_projection(
             execution_unit=execution_unit,
             authorization=authorization,

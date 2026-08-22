@@ -295,7 +295,7 @@ async def test_authorized_collection_continuations_run_through_worker_and_pipeli
     )
     assert resolved.status_code == 200, resolved.text
     result = resolved.json()["result"]
-    authorization = result["execution_authorization"]
+    authorization = service._store.list_scope_execution_authorizations(workflow_run_id)[-1]
     if resolution == "expand_required_constraint":
         assert result["scope_contract"] == original_scope
     else:
@@ -308,10 +308,10 @@ async def test_authorized_collection_continuations_run_through_worker_and_pipeli
     continuation_snapshot = service._store.get_coverage_snapshot(
         workflow_run_id,
         version=expected_scope_version,
-        execution_revision=authorization["execution_revision"],
+        execution_revision=authorization.execution_revision,
     )
     assert continuation_snapshot is not None
-    assert continuation_snapshot.execution_authorization_id == authorization["id"]
+    assert continuation_snapshot.execution_authorization_id == authorization.id
     assert continuation_snapshot.scope_contract_version == expected_scope_version
     assert continuation_snapshot.source_coverage_snapshot_id
     assert continuation_snapshot.manifest is not None
@@ -327,7 +327,7 @@ async def test_authorized_collection_continuations_run_through_worker_and_pipeli
             for item in service._store.list_typed_records(StageCheckpointRecord)
             if item.workflow_run_id == workflow_run_id
             and item.stage_name == "marketing_conclusion"
-            and item.execution_revision == authorization["execution_revision"]
+            and item.execution_revision == authorization.execution_revision
         )
         assert marketing_checkpoint.id not in continuation_snapshot.manifest.checkpoint_ids
         governed_snapshot = service._store.list_result_snapshots_for_workflow(workflow_run_id)[-1]
@@ -362,18 +362,19 @@ async def test_limited_continuation_replays_then_publishes_through_real_worker(
     replay = await client.post(endpoint, json=request)
     assert first.status_code == replay.status_code == 200
     assert replay.json()["result"] == first.json()["result"]
-    authorization = first.json()["result"]["execution_authorization"]
-    assert len(service._store.list_scope_execution_authorizations(workflow_run_id)) == 1
+    authorizations = service._store.list_scope_execution_authorizations(workflow_run_id)
+    assert len(authorizations) == 1
+    authorization = authorizations[0]
     assert await worker.run_once()
     await _wait_for_workflow_status(client, workflow_run_id, "succeeded")
     assert (
         service._store.list_scope_execution_continuations(workflow_run_id)[0].state == "completed"
     )
-    assert authorization["state"] == "authorized_limited_report"
+    assert authorization.state == "authorized_limited_report"
     report = await client.get(f"/content-research/workflows/{workflow_run_id}/lite-report")
     assert report.status_code == 200, report.text
     assert report.json()["publication"]["state"] == "evidence_only_report"
-    execution_unit_id = authorization["execution_unit_id"]
+    execution_unit_id = authorization.execution_unit_id
     publication_facts = [
         fact
         for fact in service._store.execution_trace(execution_unit_id)
@@ -411,7 +412,7 @@ async def test_failed_expand_replay_uses_a_new_worker_attempt_and_reaches_covera
 
     first = await client.post(endpoint, json=request)
     assert first.status_code == 200, first.text
-    authorization = first.json()["result"]["execution_authorization"]
+    authorization = service._store.list_scope_execution_authorizations(workflow_run_id)[-1]
     assert first.json()["result"]["scope_contract"] == original_scope
     assert await worker.run_once()
     assert len(adapter.discover_queries) == 1
@@ -420,7 +421,7 @@ async def test_failed_expand_replay_uses_a_new_worker_attempt_and_reaches_covera
     adapter.discover_failure_reason = None
     replay = await client.post(endpoint, json=request)
     assert replay.status_code == 200, replay.text
-    assert replay.json()["result"]["execution_authorization"] == authorization
+    assert len(service._store.list_scope_execution_authorizations(workflow_run_id)) == 1
     assert await worker.run_once()
     assert len(adapter.discover_queries) == 2
     continuation = service._store.list_scope_execution_continuations(workflow_run_id)[0]
@@ -428,19 +429,19 @@ async def test_failed_expand_replay_uses_a_new_worker_attempt_and_reaches_covera
     continuation_tasks = [
         task
         for task in service._store.list_subagent_tasks_for_workflow(workflow_run_id)
-        if task.metadata.get("scope_execution_authorization_id") == authorization["id"]
+        if task.metadata.get("scope_execution_authorization_id") == authorization.id
     ]
     assert [task.metadata["scope_execution_attempt"] for task in continuation_tasks] == [1, 2]
     assert {task.status for task in continuation_tasks} == {"failed", "completed"}
     snapshot = service._store.get_coverage_snapshot(
         workflow_run_id,
         version=1,
-        execution_revision=authorization["execution_revision"],
+        execution_revision=authorization.execution_revision,
     )
     assert snapshot is not None
-    assert snapshot.execution_authorization_id == authorization["id"]
+    assert snapshot.execution_authorization_id == authorization.id
     assert [scope.version for scope in service._store.list_scope_contracts(workflow_run_id)] == [1]
-    execution_unit_id = authorization["execution_unit_id"]
+    execution_unit_id = authorization.execution_unit_id
     with service._store._connect() as conn:
         attempts = conn.execute(
             """SELECT attempt_no, state, provider_state
@@ -506,11 +507,11 @@ async def test_unknown_provider_outcome_is_durable_and_exact_replay_does_not_cal
 
     replay = await client.post(endpoint, json=request)
     assert replay.status_code == 200, replay.text
-    assert replay.json()["result"]["execution_unit"] == {
-        "id": unit["id"],
-        "state": "outcome_unknown",
-        "recovery_state": "outcome_unknown",
-    }
+    replay_unit = replay.json()["result"]["execution_unit"]
+    assert replay_unit["id"] == unit["id"]
+    assert replay_unit["state"] == "outcome_unknown"
+    assert replay_unit["recovery_state"] == "outcome_unknown"
+    assert replay_unit["allowed_actions"] == []
     assert await worker.run_once() is False
     assert len(adapter.discover_queries) == 1
     trace = await client.get(f"/content-research/workflows/{workflow_run_id}/trace")
@@ -635,8 +636,8 @@ async def test_stale_execution_claim_is_fenced_before_any_continuation_artifact(
         },
     )
     assert response.status_code == 200, response.text
-    authorization = response.json()["result"]["execution_authorization"]
-    unit_id = authorization["execution_unit_id"]
+    authorization = service._store.list_scope_execution_authorizations(workflow_run_id)[-1]
+    unit_id = authorization.execution_unit_id
     continuation = service._store.list_scope_execution_continuations(workflow_run_id)[0]
     claim_a = service._store.claim_execution_unit(
         execution_unit_id=unit_id, owner="worker-a", lease_seconds=0

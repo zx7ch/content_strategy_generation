@@ -1127,7 +1127,11 @@ async def test_lite_reader_retains_only_weak_signals_with_matching_frozen_identi
 
 
 @pytest.mark.asyncio
-async def test_lite_reader_returns_non_report_recovery_projection_without_artifact(tmp_path):
+@pytest.mark.parametrize("execution_unit_owns_recovery", [False, True])
+async def test_lite_reader_projects_only_recovery_allowed_by_scope_authority(
+    tmp_path,
+    execution_unit_owns_recovery,
+):
     db_path = str(tmp_path / "lite-recovery.db")
     store = SQLiteContentResearchStore(db_path)
     threads = ThreadStore(db_path)
@@ -1174,23 +1178,36 @@ async def test_lite_reader_returns_non_report_recovery_projection_without_artifa
                 status="failed",
             )
         )
+        if execution_unit_owns_recovery:
+            _persist_unmet_season_scope(store, run.run_id, authorize_limited=True)
 
         payload = await LiteReportReader(store, db_path).read(workflow_run_id=run.run_id)
 
         assert payload["publication"] == {"state": None}
-        assert payload["recovery_projection"] == {
-            "reason_code": "auth_expired",
-            "completed_stages": [],
-            "next_action": "resume_run",
-            "actionability": "available",
-            "allowed_actions": [
-                {
-                    "action": "retry_formal_research",
-                    "available": True,
-                    "request": {},
-                }
-            ],
-        }
+        assert payload["recovery_projection"] == (
+            {
+                "reason_code": "auth_expired",
+                "completed_stages": [],
+                "next_action": None,
+                "actionability": "unavailable",
+                "unavailable_reason": "scope_execution_authorization_required",
+                "allowed_actions": [],
+            }
+            if execution_unit_owns_recovery
+            else {
+                "reason_code": "auth_expired",
+                "completed_stages": [],
+                "next_action": "resume_run",
+                "actionability": "available",
+                "allowed_actions": [
+                    {
+                        "action": "retry_formal_research",
+                        "available": True,
+                        "request": {},
+                    }
+                ],
+            }
+        )
         assert payload["frozen_scope"] == {
             "direction_set_version": "direction_set_v1",
             "direction_ids": ["product_marketing", "competitor_discovery", "content_performance"],

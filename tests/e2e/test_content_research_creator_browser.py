@@ -288,20 +288,59 @@ def test_creator_restores_persisted_scope_draft_after_reload(browser_page):
         and '"action":"confirm_brief"' in (response.request.post_data or "")
         and response.status == 200,
         timeout=15000,
-    ):
+    ) as brief_response:
         page.get_by_role("button", name=re.compile("确认并开始调研")).click()
+    workflow_run_id = brief_response.value.json()["workflow_run_id"]
 
     scope = page.locator('section[aria-label="确认检索范围"]')
     expect(scope).to_be_visible(timeout=30000)
     first_query = scope.get_by_label("检索组 1")
     persisted_query = first_query.input_value()
 
+    scope_projections = []
+
+    def capture_scope_projection(response):
+        if response.url.endswith(
+            f"/content-research/workflows/{workflow_run_id}/scope"
+        ) and response.status == 200:
+            scope_projections.append(response.json())
+
+    page.on("response", capture_scope_projection)
     page.reload(wait_until="domcontentloaded")
 
     restored = page.locator('section[aria-label="确认检索范围"]')
     expect(restored).to_be_visible(timeout=30000)
     expect(restored.get_by_label("检索组 1")).to_have_value(persisted_query)
-    expect(restored.get_by_role("button", name="确认并开始调研")).to_be_enabled()
+    confirm = restored.get_by_role("button", name="确认并开始调研")
+    expect(confirm).to_be_enabled()
+    projected = scope_projections[-1]
+    projected_command = next(
+        item
+        for item in projected["allowed_actions"]
+        if item["action"] == "confirm_scope" and item["available"]
+    )
+    with page.expect_response(
+        lambda response: response.url.endswith(
+            f"/content-research/workflows/{workflow_run_id}/actions"
+        )
+        and '"action":"confirm_scope"' in (response.request.post_data or ""),
+        timeout=15000,
+    ) as confirm_response:
+        confirm.click()
+    assert confirm_response.value.status == 200
+    submitted = confirm_response.value.request.post_data_json["payload"]
+    assert submitted["scope_draft_id"] == projected_command["scope_draft_id"]
+    assert submitted["structure_hash"] == projected_command["structure_hash"]
+    assert submitted["query_groups"] == [
+        {"final_query": item["final_query"]}
+        for item in projected_command["query_groups"]
+    ]
+    with sqlite3.connect(stack["db_path"]) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM content_research_scope_contracts "
+            "WHERE workflow_run_id=?",
+            (workflow_run_id,),
+        ).fetchone()[0] == 1
 
 
 def test_creator_unknown_execution_outcome_requires_manual_recovery_without_replay(

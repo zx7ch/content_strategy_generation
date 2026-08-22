@@ -17,6 +17,10 @@ from app.content_research.reporting.read_model import (
 )
 from app.content_research.scope_contract import ScopeAuditEvent
 from app.content_research.stores.base import ContentResearchStore
+from app.content_research.workflow_mutation_authority import (
+    LegacyRecoveryAuthority,
+    project_legacy_recovery_authority,
+)
 from app.memory.workflow_store import WorkflowStore
 
 _LITE_FIELDS = {"content_text", "title"}
@@ -38,23 +42,6 @@ _PUBLICATION_STATES = {
     "partial_verified_report",
     "directional_report",
     "evidence_only_report",
-}
-_RECOVERABLE_RUN_STATES = {"failed", "paused", "waiting_user", "running"}
-_RECOVERABLE_FAILURE_CODES = {
-    "auth_required",
-    "auth_expired",
-    "timeout",
-    "transient_error",
-    "rate_limited",
-    "unavailable",
-}
-_FAILURE_CHECKPOINT_STATUSES = {
-    "failed",
-    "failed_recoverable",
-    "outcome_unknown",
-    "auth_required",
-    "rate_limited",
-    "timed_out",
 }
 
 
@@ -107,8 +94,21 @@ class LiteReportReader:
                 raise
             return await self._recoverable_projection(workflow_run_id)
         report.update(self._governed_marketing_fields(report))
+        recovery_authority = await project_legacy_recovery_authority(
+            self._store,
+            self._db_path,
+            str(report["workflow_run_id"]),
+            published_report={
+                "publication": {
+                    "state": str(report.get("publication_state") or ""),
+                    "publication_reason": _publication_reason(report),
+                }
+            },
+        )
         projection = self._published_projection(
-            report, citation_group_ids=citation_group_ids
+            report,
+            citation_group_ids=citation_group_ids,
+            recovery_authority=recovery_authority,
         )
         if report.get("scope_contract_id"):
             coverage = report.get("coverage_snapshot")
@@ -321,6 +321,7 @@ class LiteReportReader:
         report: dict[str, Any],
         *,
         citation_group_ids: list[str] | None,
+        recovery_authority: LegacyRecoveryAuthority | None = None,
     ) -> dict[str, Any]:
         publication_state = str(report.get("publication_state") or "")
         if publication_state not in _PUBLICATION_STATES:
@@ -389,6 +390,9 @@ class LiteReportReader:
             claim_cards=claim_cards,
             citations_by_claim=citations_by_claim,
         )
+        recovery_authority = recovery_authority or LegacyRecoveryAuthority(
+            unavailable_reason="legacy_recovery_action_not_available"
+        )
         return {
             "workflow_run_id": report["workflow_run_id"],
             "workflow_execution_state": report.get("workflow_terminal_state"),
@@ -426,19 +430,7 @@ class LiteReportReader:
             "citations": citations,
             "run_direction_states": direction_states,
             "recovery_projection": (
-                {
-                    "reason_code": "query_subject_not_supported",
-                    "completed_stages": [],
-                    "next_action": "repair_from_persisted_packets",
-                    "actionability": "available",
-                    "allowed_actions": [
-                        {
-                            "action": "repair_from_persisted_packets",
-                            "available": True,
-                            "request": {},
-                        }
-                    ],
-                }
+                _legacy_recovery_projection(authority=recovery_authority)
                 if is_evidence_only
                 and _publication_reason(report) == "query_subject_not_supported"
                 else None
@@ -447,23 +439,22 @@ class LiteReportReader:
 
     async def _recoverable_projection(self, workflow_run_id: str) -> dict[str, Any]:
         brief = self._store.get_brief_by_workflow(workflow_run_id)
-        async with WorkflowStore(self._db_path) as workflow_store:
-            run = await workflow_store.get_run(workflow_run_id)
-        state = getattr(getattr(run, "status", None), "value", None) or str(
-            getattr(run, "status", "unknown")
+        authority = await project_legacy_recovery_authority(
+            self._store,
+            self._db_path,
+            workflow_run_id,
         )
-        checkpoints = self._checkpoints(workflow_run_id)
-        recovery_reason = _recovery_reason(self._store, workflow_run_id)
-        if (
-            brief is None
-            or state not in _RECOVERABLE_RUN_STATES
-            or not _has_persisted_failure(checkpoints)
-            or recovery_reason not in _RECOVERABLE_FAILURE_CODES
+        if brief is None or (
+            not authority.available
+            and authority.unavailable_reason != "scope_execution_authorization_required"
         ):
             raise PublishedReportNotFoundError("published report not found")
-        completed_stages = sorted(
-            {item.stage_name for item in checkpoints if item.status == "completed"}
-        )
+        action = authority.actions[0].action if authority.actions else None
+        state = "paused" if action == "resume_formal_research" else "failed"
+        async with WorkflowStore(self._db_path) as workflow_store:
+            run = await workflow_store.get_run(workflow_run_id)
+        if run is not None:
+            state = run.status.value
         policy = self._store.get_run_policy_snapshot_for_workflow(workflow_run_id)
         return {
             "workflow_run_id": workflow_run_id,
@@ -484,23 +475,7 @@ class LiteReportReader:
             "run_direction_states": _unavailable_direction_states(
                 policy.effective_policy if policy else {}
             ),
-            "recovery_projection": {
-                "reason_code": recovery_reason,
-                "completed_stages": completed_stages,
-                "next_action": "resume_run",
-                "actionability": "available",
-                "allowed_actions": [
-                    {
-                        "action": (
-                            "resume_formal_research"
-                            if state == "paused"
-                            else "retry_formal_research"
-                        ),
-                        "available": True,
-                        "request": {},
-                    }
-                ],
-            },
+            "recovery_projection": _legacy_recovery_projection(authority=authority),
         }
 
     def _checkpoints(self, workflow_run_id: str) -> list[StageCheckpointRecord]:
@@ -519,6 +494,40 @@ class LiteReportReader:
             item.workflow_run_id == workflow_run_id
             for item in self._store.list_typed_records(ReportPublicationRecord)
         )
+
+
+def _legacy_recovery_projection(
+    *,
+    authority: LegacyRecoveryAuthority,
+) -> dict[str, Any]:
+    if not authority.available:
+        return {
+            "reason_code": authority.reason_code,
+            "completed_stages": list(authority.completed_stages),
+            "next_action": None,
+            "actionability": "unavailable",
+            "unavailable_reason": authority.unavailable_reason,
+            "allowed_actions": [],
+        }
+    return {
+        "reason_code": authority.reason_code,
+        "completed_stages": list(authority.completed_stages),
+        "next_action": (
+            "resume_run"
+            if authority.actions[0].action
+            in {"resume_formal_research", "retry_formal_research"}
+            else authority.actions[0].action
+        ),
+        "actionability": "available",
+        "allowed_actions": [
+            {
+                "action": item.action,
+                "available": True,
+                "request": dict(item.request),
+            }
+            for item in authority.actions
+        ],
+    }
 
 
 def _frozen_scope(report: dict[str, Any]) -> dict[str, Any]:
@@ -1213,25 +1222,3 @@ def _publication_reason(report: dict[str, Any]) -> str | None:
             return reason
     recovery_state = publication.get("audit_recovery_state")
     return str(recovery_state) if recovery_state else None
-
-
-def _has_persisted_failure(checkpoints: list[StageCheckpointRecord]) -> bool:
-    return any(item.status in _FAILURE_CHECKPOINT_STATUSES for item in checkpoints)
-
-
-def _recovery_reason(store: ContentResearchStore, workflow_run_id: str) -> str:
-    failures = [
-        item
-        for item in store.list_typed_records(StageCheckpointRecord)
-        if item.workflow_run_id == workflow_run_id
-        and item.status in _FAILURE_CHECKPOINT_STATUSES
-    ]
-    if not failures:
-        return "temporary_error"
-    payload = failures[-1].payload
-    return str(
-        payload.get("reason_code")
-        or (payload.get("completion") or {}).get("failure_code")
-        or payload.get("failure_reason")
-        or "temporary_error"
-    )
