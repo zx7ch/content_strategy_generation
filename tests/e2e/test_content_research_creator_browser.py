@@ -27,6 +27,14 @@ from app.content_research.reporting.composer import ResearchReportComposer
 from app.content_research.reporting.publication_materializer import (
     ReportPublicationMaterializer,
 )
+from app.content_research.scope_contract import (
+    CoverageSnapshot,
+    ScopeAuditEvent,
+    ScopeConstraint,
+    ScopeDraftAuditEvent,
+    ScopeQueryGroupInput,
+    build_scope_draft,
+)
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
 from app.memory.thread_store import ThreadStore
 from app.models.workflow import WorkflowPhase
@@ -65,6 +73,16 @@ def real_creator_stack(tmp_path, request):
     backend_url = f"http://127.0.0.1:{backend_port}"
     frontend_url = f"http://127.0.0.1:{frontend_port}"
     parameters = getattr(request, "param", {})
+    scope_coverage_seed = (
+        run_async_in_thread(
+            seed_scope_awaiting_coverage_offline(
+                str(db_path),
+                title="真实范围决策",
+            )
+        )
+        if parameters.get("scope_coverage_seed")
+        else None
+    )
     preview_enabled = parameters.get("preview_enabled", True)
     preview_value = "true" if preview_enabled else "false"
     backend_env = {
@@ -133,6 +151,7 @@ def real_creator_stack(tmp_path, request):
                 "frontend_url": frontend_url,
                 "backend_url": backend_url,
                 "db_path": str(db_path),
+                "scope_coverage_seed": scope_coverage_seed,
             }
 
 
@@ -627,6 +646,159 @@ def test_creator_discards_a_late_scope_response_after_switching_runs(browser_pag
 
     expect(current_scope.get_by_text("当前任务服务端范围", exact=True)).to_be_visible()
     expect(page.get_by_text("旧任务过期范围", exact=True)).to_have_count(0)
+
+
+@pytest.mark.parametrize(
+    ("resolution", "expected_payload", "button_name"),
+    [
+        (
+            "generate_limited_report",
+            {"resolution": "generate_limited_report"},
+            "基于现有证据生成受限报告",
+        ),
+        (
+            "expand_required_constraint",
+            {
+                "resolution": "expand_required_constraint",
+                "constraint_id": "core_object",
+                "supplementary_queries": ["夏季 防晒 长袖衬衫"],
+            },
+            "提交补搜决定",
+        ),
+        (
+            "relax_constraint",
+            {"resolution": "relax_constraint", "constraint_id": "core_object"},
+            "放宽长袖衬衫约束",
+        ),
+    ],
+    ids=["limited", "expand", "relax"],
+)
+@pytest.mark.parametrize(
+    "real_creator_stack",
+    [{"scope_coverage_seed": True}],
+    indirect=True,
+)
+def test_creator_executes_only_real_server_projected_coverage_decisions(
+    browser_page,
+    resolution,
+    expected_payload,
+    button_name,
+):
+    page, stack = browser_page
+    seeded = stack["scope_coverage_seed"]
+    scope_responses: list[dict] = []
+
+    def capture_scope(response) -> None:
+        if (
+            response.url.endswith(
+                f"/content-research/workflows/{seeded['run_id']}/scope"
+            )
+            and response.status == 200
+        ):
+            scope_responses.append(response.json())
+
+    page.on(
+        "response",
+        capture_scope,
+    )
+
+    open_creator_with_restored_run(page, stack["frontend_url"], seeded["run_id"])
+
+    coverage = page.locator('div[aria-label="覆盖不足决策"]')
+    expect(coverage).to_be_visible(timeout=30000)
+    expect(coverage.get_by_role("button", name="继续补充长袖衬衫样本")).to_be_visible()
+    expect(coverage.get_by_role("button", name="基于现有证据生成受限报告")).to_be_visible()
+    expect(coverage.get_by_role("button", name="放宽长袖衬衫约束")).to_be_visible()
+    expect(page.locator('section[aria-label="确认检索范围"]')).to_have_count(0)
+
+    initial_projection = scope_responses[-1]
+    assert initial_projection["coverage_snapshot"]["unmet_constraint_ids"] == [
+        "not_a_contract_constraint",
+        "core_object",
+    ]
+    assert initial_projection["allowed_actions"] == [
+        {
+            "action": "prepare_scope",
+            "available": False,
+            "unavailable_reason": "coverage_decision_required",
+            "recovery_action": "resolve_coverage",
+        },
+        {
+            "action": "confirm_scope",
+            "available": False,
+            "unavailable_reason": "coverage_decision_required",
+            "recovery_action": "resolve_coverage",
+        },
+        {
+            "action": "resolve_coverage",
+            "available": True,
+            "scope_contract_version": 1,
+            "coverage_snapshot_id": seeded["coverage_snapshot_id"],
+        },
+    ]
+    assert initial_projection["allowed_resolutions"] == [
+        {
+            "action": "expand_required_constraint",
+            "available": True,
+            "valid_constraint_ids": ["core_object"],
+            "supplementary_queries_required": True,
+            "unavailable_reason": None,
+        },
+        {
+            "action": "generate_limited_report",
+            "available": True,
+            "valid_constraint_ids": [],
+            "supplementary_queries_required": False,
+            "unavailable_reason": None,
+        },
+        {
+            "action": "relax_constraint",
+            "available": True,
+            "valid_constraint_ids": ["core_object"],
+            "supplementary_queries_required": False,
+            "unavailable_reason": None,
+        },
+    ]
+
+    if resolution == "expand_required_constraint":
+        coverage.get_by_role("button", name="继续补充长袖衬衫样本").click()
+        coverage.get_by_label("补充检索词 1").fill("夏季 防晒 长袖衬衫")
+
+    action_path = f"/content-research/workflows/{seeded['run_id']}/actions"
+    scope_path = f"/content-research/workflows/{seeded['run_id']}/scope"
+    with page.expect_response(
+        lambda response: response.url.endswith(scope_path) and response.status == 200,
+        timeout=30000,
+    ) as post_projection_info:
+        with page.expect_response(
+            lambda response: response.url.endswith(action_path)
+            and '"action":"resolve_coverage"' in (response.request.post_data or ""),
+            timeout=30000,
+        ) as action_info:
+            coverage.get_by_role("button", name=button_name).click()
+
+    assert action_info.value.status == 200
+    expected_request = {
+        "scope_contract_version": 1,
+        "coverage_snapshot_id": seeded["coverage_snapshot_id"],
+        **expected_payload,
+    }
+    assert action_info.value.request.post_data_json == {
+        "action": "resolve_coverage",
+        "payload": expected_request,
+    }
+    action_result = action_info.value.json()["result"]
+    post_projection = post_projection_info.value.json()
+    assert post_projection["decision_recovery"] is None
+    assert not any(
+        item["action"] == "resolve_coverage" and item["available"]
+        for item in post_projection["allowed_actions"]
+    )
+    assert post_projection["execution_unit"]["id"] == action_result["execution_unit"]["id"]
+    assert post_projection["scope_contract"]["version"] == (
+        2 if resolution == "relax_constraint" else 1
+    )
+    expect(coverage).to_have_count(0)
 
 
 @pytest.mark.parametrize(
@@ -1906,6 +2078,142 @@ def published_report(page: Page):
 def default_brand_id(backend_url: str) -> str:
     with urlopen(Request(f"{backend_url}/brands", headers=USER_HEADERS)) as response:
         return str(json.load(response)["items"][0]["id"])
+
+
+async def seed_scope_awaiting_coverage_offline(
+    db_path: str,
+    *,
+    title: str,
+) -> dict[str, str]:
+    """Persist the 5B prerequisite before the owned server and worker start."""
+
+    async with ThreadStore(db_path) as thread_store:
+        thread = await thread_store.create_thread(
+            title=title,
+            workspace_id=WORKSPACE_ID,
+            brand_id=None,
+        )
+    async with WorkflowRunManager(db_path) as manager:
+        run = await manager.start_run(thread_id=thread["id"], user_id="browser-e2e")
+
+    structure_hash = "structure_browser_scope_decision"
+    plan_id = f"plan_{run.run_id}"
+    brief = ResearchBriefRecord(
+        id=f"brief_{run.run_id}",
+        workflow_run_id=run.run_id,
+        thread_id=thread["id"],
+        schema_version="content_research_brief_v1",
+        status="ready",
+        payload={
+            "schema_version": "content_research_brief_payload_v1",
+            "confirmed_subject": "夏季通勤长袖",
+            "subject_structure_hash": structure_hash,
+            "selected_directions": ["product_marketing"],
+            "requested_direction_ids": ["product_marketing"],
+            "direction_catalog": list(DIRECTION_CATALOG_V1),
+        },
+    )
+    store = SQLiteContentResearchStore(db_path)
+    store.save_brief(brief)
+    policy, sample_policies, direction_contracts = build_default_snapshot(
+        snapshot_id=f"policy_{run.run_id}",
+        workflow_run_id=run.run_id,
+        brief_id=brief.id,
+        plan_id=plan_id,
+        direction_set_version="direction_set_v1",
+        direction_ids=("product_marketing",),
+        direction_catalog=DIRECTION_CATALOG_V1,
+        report_compose_mode="template_only",
+    )
+    store.save_run_policy_snapshot(policy)
+    for sample_policy in sample_policies:
+        store.save_sample_policy(sample_policy)
+    for direction_contract in direction_contracts:
+        store.save_direction_contract(direction_contract)
+
+    constraints = (
+        ScopeConstraint("core_object", "核心对象", "长袖衬衫", "required"),
+        ScopeConstraint("season", "季节", "夏季", "required"),
+        ScopeConstraint("scenario", "研究场景", "通勤", "required"),
+    )
+    query_groups = (
+        ScopeQueryGroupInput(
+            "长袖衬衫 夏季 通勤",
+            "长袖衬衫 夏季 通勤",
+            ("长袖衬衫", "夏季", "通勤"),
+        ),
+    )
+    draft = build_scope_draft(
+        workflow_run_id=run.run_id,
+        research_plan_id=plan_id,
+        structure_hash=structure_hash,
+        constraints=constraints,
+        query_groups=query_groups,
+    )
+    store.save_scope_draft_with_audit_event(
+        draft,
+        ScopeDraftAuditEvent(
+            id=f"draft_event_{run.run_id}",
+            workflow_run_id=run.run_id,
+            scope_draft_id=draft.id,
+            event_name="scope_suggested",
+            payload={
+                "schema_version": "content_research_scope_audit_event_v1",
+                "scope_draft_id": draft.id,
+                "structure_hash": structure_hash,
+            },
+        ),
+    )
+    contract, _event, _created = store.confirm_scope_atomically(
+        draft.id,
+        final_queries=tuple(group.final_query for group in query_groups),
+        event_id=f"confirm_event_{run.run_id}",
+    )
+    snapshot = CoverageSnapshot(
+        id=f"coverage_browser_{run.run_id}",
+        workflow_run_id=run.run_id,
+        scope_contract_id=contract.id,
+        scope_contract_version=contract.version,
+        state="awaiting_scope_decision",
+        constraint_counts={
+            "core_object": {
+                "matched_candidate_count": 0,
+                "independent_author_count": 0,
+                "required": True,
+            },
+            "_summary": {
+                "minimum_samples": 2,
+                "minimum_independent_authors": 2,
+                "reason_codes": ["required_constraint_coverage_unmet:core_object"],
+            },
+        },
+        # An invalid first item catches browser inference from unmet order.
+        unmet_constraint_ids=("not_a_contract_constraint", "core_object"),
+    )
+    store.save_coverage_snapshot_with_audit_event(
+        snapshot,
+        ScopeAuditEvent(
+            id=f"coverage_event_{run.run_id}",
+            workflow_run_id=run.run_id,
+            scope_contract_id=contract.id,
+            scope_contract_version=contract.version,
+            event_name="coverage_evaluated",
+            payload={
+                "schema_version": "content_research_scope_audit_event_v1",
+                "coverage_snapshot_id": snapshot.id,
+                "state": snapshot.state,
+                "constraint_counts": snapshot.constraint_counts,
+                "unmet_constraint_ids": list(snapshot.unmet_constraint_ids),
+                "reason_codes": snapshot.constraint_counts["_summary"]["reason_codes"],
+            },
+        ),
+    )
+    return {
+        "run_id": run.run_id,
+        "thread_id": thread["id"],
+        "coverage_snapshot_id": snapshot.id,
+        "constraint_id": "core_object",
+    }
 
 
 async def seed_publication(
