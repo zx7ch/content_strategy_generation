@@ -61,3 +61,25 @@ that unrelated queue rather than changing either production worker.
 
 Request an independent re-review of the single Expand gate. Slice 5C/5D,
 legacy no-Scope Repair, and Task 4 remain unchanged.
+
+## Final-review P1 closure
+
+The final review found that the golden path still accepted either a follow-up
+Coverage decision or a published report. That branch was too permissive for
+this fixture: its confirmed required core object is `长袖衬衫`, while the
+deterministic adapter evidence is about `徒步短裤`.
+
+The test now requires all of the fixture-specific outcomes:
+
+- the persisted revision-2 Coverage state is `awaiting_scope_decision`;
+- no report publication exists for the workflow;
+- reload receives the same follow-up Coverage state and shows the Coverage
+  decision card;
+- no published report is visible in Creator.
+
+RED was demonstrated by mutating the observed revision-2 state to
+`satisfied`; the strict assertion failed at the intended boundary. After
+removing the mutation, the exact golden path passed twice (`12.71s`,
+`12.75s`); focused Ruff and Python compile checks also passed. No production
+or harness behavior changed. The three final-review P2 test-quality debts
+remain deferred as instructed.

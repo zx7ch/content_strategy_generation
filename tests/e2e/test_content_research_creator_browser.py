@@ -786,7 +786,7 @@ def test_creator_expand_reaches_worker_and_refreshes_real_result(browser_page):
                     (seeded["run_id"],),
                 ).fetchone()
                 terminal_coverage = connection.execute(
-                    "SELECT id, state, source_coverage_snapshot_id "
+                    "SELECT id, state, source_coverage_snapshot_id, execution_revision "
                     "FROM content_research_scope_coverage_snapshots "
                     "WHERE workflow_run_id=? AND execution_revision=2",
                     (seeded["run_id"],),
@@ -835,6 +835,15 @@ def test_creator_expand_reaches_worker_and_refreshes_real_result(browser_page):
     )
     assert execution_facts[-1][0] == "coverage_persisted"
     assert terminal_coverage[2] == seeded["coverage_snapshot_id"]
+    assert terminal_coverage[3] == 2
+    assert terminal_coverage[1] == "awaiting_scope_decision"
+    with sqlite3.connect(stack["db_path"]) as connection:
+        publication_count = connection.execute(
+            "SELECT COUNT(*) FROM content_research_report_publications "
+            "WHERE workflow_run_id=?",
+            (seeded["run_id"],),
+        ).fetchone()[0]
+    assert publication_count == 0
 
     with page.expect_response(
         lambda response: response.url.endswith(scope_path) and response.status == 200,
@@ -844,13 +853,9 @@ def test_creator_expand_reaches_worker_and_refreshes_real_result(browser_page):
     refreshed_scope = refreshed_scope_info.value.json()
     assert refreshed_scope["execution_unit"]["state"] == "completed"
     assert refreshed_scope["coverage_snapshot"]["id"] == terminal_coverage[0]
-    assert refreshed_scope["coverage_snapshot"]["state"] == terminal_coverage[1]
-    if terminal_coverage[1] == "awaiting_scope_decision":
-        expect(page.locator('div[aria-label="覆盖不足决策"]')).to_be_visible(
-            timeout=30000
-        )
-    else:
-        expect(published_report(page)).to_be_visible(timeout=30000)
+    assert refreshed_scope["coverage_snapshot"]["state"] == "awaiting_scope_decision"
+    expect(page.locator('div[aria-label="覆盖不足决策"]')).to_be_visible(timeout=30000)
+    expect(published_report(page)).to_have_count(0)
 
 
 @pytest.mark.parametrize(
