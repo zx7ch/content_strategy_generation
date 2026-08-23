@@ -1,5 +1,10 @@
 # Lite Content Research Final Vertical Slices Implementation Plan
 
+> **Superseded on 2026-08-23:** New-Run lifecycle, SQLite coordination, Trace,
+> and old-spec cleanup are now governed by
+> [`2026-08-23-content-research-mainline-reliability-vertical-slices.md`](./2026-08-23-content-research-mainline-reliability-vertical-slices.md).
+> Do not execute this older plan for those areas.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Finish the real Creator Content Research journey so the durable current run remains truthful across history/reload and a confirmed product-marketing query portfolio is executed, admitted, recovered, and reported without regressing Trace, LLM configuration, or Xiaohongshu login.
