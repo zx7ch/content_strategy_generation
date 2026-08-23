@@ -92,6 +92,8 @@ class ContentResearchPresearchResponse(BaseModel):
     model: str | None = None
     subject_structure: dict = Field(default_factory=dict)
     subject_structure_hash: str | None = None
+    subject_structure_analysis_state: str = "unresolved"
+    subject_structure_analysis_reason_codes: tuple[str, ...] = ()
     run: ContentResearchRunProjectionResponse
 
 
@@ -198,6 +200,8 @@ class ContentResearchScopeProjectionResponse(BaseModel):
     allowed_resolutions: list[dict] = Field(default_factory=list)
     decision_recovery: dict | None = None
     execution_unit: ContentResearchScopeExecutionUnitProjectionResponse | None = None
+    subject_structure_analysis_state: str = "unresolved"
+    subject_structure_analysis_reason_codes: tuple[str, ...] = ()
 
 
 class ContentResearchExecutionFactTraceResponse(BaseModel):
@@ -374,9 +378,9 @@ class ReplaceScopeDraftRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
     scope_draft_id: str = Field(min_length=1)
+    core_object: str = Field(min_length=1, max_length=200)
     product_experience_aspect: str | None = Field(default=None, max_length=200)
     context_audience_aspect: str | None = Field(default=None, max_length=200)
-    final_queries: list[str] = Field(min_length=1, max_length=3)
 
 
 class ResolveCoverageRequest(BaseModel):

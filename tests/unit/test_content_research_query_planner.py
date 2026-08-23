@@ -62,6 +62,15 @@ def test_product_marketing_portfolio_omits_missing_or_abstract_aspects() -> None
     ) == ("长袖衬衫",)
 
 
+def test_product_marketing_portfolio_preserves_user_confirmed_aspects() -> None:
+    assert compile_product_marketing_query_portfolio(
+        core_object="长袖衬衫",
+        product_experience_aspect="产品卖点分析",
+        context_audience_aspect="夏季通勤",
+        preserve_explicit_aspects=True,
+    ) == ("长袖衬衫", "长袖衬衫 产品卖点分析", "长袖衬衫 夏季通勤")
+
+
 def test_equivalent_non_product_primary_queries_merge_and_retain_roles() -> None:
     run_as_of = datetime(2026, 8, 4, tzinfo=timezone.utc)
 

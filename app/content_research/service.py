@@ -1270,6 +1270,12 @@ class ContentResearchService:
             workflow_run_id=workflow_run_id,
             state=run_projection.state.value,
             state_revision=run_projection.state_revision,
+            subject_structure_analysis_state=str(
+                brief.payload.get("subject_structure_analysis_state") or "unresolved"
+            ),
+            subject_structure_analysis_reason_codes=tuple(
+                brief.payload.get("subject_structure_analysis_reason_codes") or ()
+            ),
             run=ContentResearchRunProjectionResponse(
                 **self._run_projection_payload(run_projection)
             ),
@@ -2674,9 +2680,10 @@ class ContentResearchService:
         replacement: ReplaceScopeDraftRequest,
         command_id: str,
     ) -> dict[str, Any]:
-        product_aspect = concrete_product_marketing_aspect(
-            replacement.product_experience_aspect
-        )
+        core_object = " ".join(replacement.core_object.split())
+        product_aspect = " ".join(
+            str(replacement.product_experience_aspect or "").split()
+        ) or None
         context_aspect = " ".join(
             str(replacement.context_audience_aspect or "").split()
         ) or None
@@ -2686,13 +2693,12 @@ class ContentResearchService:
                 workflow_run_id=latest.workflow_run_id,
                 plan_id=latest.research_plan_id,
                 structure_hash=latest.structure_hash,
-                core_object=latest.core_object,
+                core_object=core_object,
                 product_aspect=product_aspect,
                 context_aspect=context_aspect,
                 command_id=command_id,
-                final_queries=tuple(replacement.final_queries),
                 replaces_scope_draft_id=latest.id,
-                predecessor_groups=latest.query_groups,
+                origin="user_edited",
             ),
         }
 
@@ -2706,40 +2712,25 @@ class ContentResearchService:
         product_aspect: str | None,
         context_aspect: str | None,
         command_id: str,
-        final_queries: tuple[str, ...] | None = None,
         replaces_scope_draft_id: str | None = None,
-        predecessor_groups: tuple[ScopeQueryGroupInput, ...] | None = None,
+        origin: str = "system_suggested",
     ) -> dict[str, Any]:
         suggestions = compile_product_marketing_query_portfolio(
             core_object=core_object,
             product_experience_aspect=product_aspect,
             context_audience_aspect=context_aspect,
+            preserve_explicit_aspects=origin == "user_edited",
         )
-        final_values = final_queries or suggestions
-        if not 1 <= len(final_values) <= 3 or any(not str(item).strip() for item in final_values):
+        if not 1 <= len(suggestions) <= 3 or any(not item for item in suggestions):
             raise ContentResearchValidationError("Scope Draft requires one to three non-empty queries")
-        predecessor_origins = {
-            item.suggested_query: item.origin or "system_suggested"
-            for item in predecessor_groups or ()
-        }
         groups = tuple(
             ScopeQueryGroupInput(
-                suggested_query=(suggestions[index] if index < len(suggestions) else str(query).strip()),
-                final_query=str(query).strip(),
+                suggested_query=query,
+                final_query=query,
                 targeted_required_terms=(core_object,),
-                origin=(
-                    predecessor_origins.get(suggestions[index], "user_edited")
-                    if index < len(suggestions)
-                    and str(query).strip() == suggestions[index]
-                    and predecessor_groups is not None
-                    else "system_suggested"
-                    if index < len(suggestions)
-                    and str(query).strip() == suggestions[index]
-                    and predecessor_groups is None
-                    else "user_edited"
-                ),
+                origin=origin,
             )
-            for index, query in enumerate(final_values)
+            for query in suggestions
         )
         draft = build_scope_draft(
             workflow_run_id=workflow_run_id,
@@ -4940,6 +4931,12 @@ class ContentResearchService:
             model=payload.get("model"),
             subject_structure=dict(payload.get("subject_structure") or {}),
             subject_structure_hash=payload.get("subject_structure_hash"),
+            subject_structure_analysis_state=str(
+                payload.get("subject_structure_analysis_state") or "unresolved"
+            ),
+            subject_structure_analysis_reason_codes=tuple(
+                payload.get("subject_structure_analysis_reason_codes") or ()
+            ),
             run=ContentResearchService._run_projection_payload(run_projection),
             local_cache_id=brief.id,
         )

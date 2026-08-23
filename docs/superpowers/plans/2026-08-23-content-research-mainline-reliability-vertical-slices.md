@@ -364,7 +364,7 @@ constraint, targeted terms, and every derived query together.
 `test_invalid_complete_input_reaches_one_editable_server_compiled_scope_without_collection` and
 `test_creator_corrects_search_structure_and_reads_only_the_backend_query_preview`.
 
-- [ ] **Step 1: Write the PreResearch and owned-stack REDs**
+- [x] **Step 1: Write the PreResearch and owned-stack REDs**
 
   Use an LLM response with `core=夏季凉感T恤`, `product=凉感`, and `context=夏季` whose
   analysis contains `core_entity_is_complete_input`. Assert the diagnosis remains projected.
@@ -372,13 +372,13 @@ constraint, targeted terms, and every derived query together.
   targeted terms, and final queries are exactly `T恤 / T恤 凉感 / T恤 夏季`, with zero contracts,
   dispatches, subtasks, and provider requests.
 
-- [ ] **Step 2: Write the Creator and API REDs**
+- [x] **Step 2: Write the Creator and API REDs**
 
   Assert the card contains no visible `A/B/C`, final-query inputs are read-only, structured edits
   send no `final_queries`, and only the latest response updates the preview. Assert there is no
   “确认并开始调研” button in this slice.
 
-- [ ] **Step 3: Run REDs and record the expected failures**
+- [x] **Step 3: Run REDs and record the expected failures**
 
 ```bash
 pytest -q \
@@ -390,20 +390,20 @@ pytest -q \
 cd frontend && npm test -- --runInBand
 ```
 
-- [ ] **Step 4: Implement the single backend compiler path**
+- [x] **Step 4: Implement the single backend compiler path**
 
   Preserve analysis diagnostics, add one bounded reason-directed repair opportunity without a new
   state, accept structured replacement fields, and remove client-owned `final_queries`. Recompile
   constraints, targeted terms, and all groups from the submitted structured fields before the
   coordinator persists the successor Draft.
 
-- [ ] **Step 5: Implement the current Scope UI**
+- [x] **Step 5: Implement the current Scope UI**
 
   Rename the three fields, make core editable, remove A/B/C labels and per-query editors, render
   server-returned query groups as read-only, and fence late replacement responses. Keep the card in
   `scope_confirmation_required` with no Task 3 button.
 
-- [ ] **Step 6: Verify the closed slice and foundations**
+- [x] **Step 6: Verify the closed slice and foundations**
 
 ```bash
 pytest -q \
@@ -423,7 +423,7 @@ pytest -q \
 cd frontend && npm test -- --runInBand && npm run build
 ```
 
-- [ ] **Step 7: Commit and stop before Task 3**
+- [x] **Step 7: Commit and stop before Task 3**
 
 ```bash
 git add app/content_research frontend/src tests docs/superpowers

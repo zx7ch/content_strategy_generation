@@ -28,10 +28,13 @@ class ScopeDraftLLM:
                         "canonical_subject": "夏季凉感T恤",
                         "subject_type": "category",
                         "core_entities": [
-                            {"canonical_name": "T恤", "raw_mentions": ["凉感T恤"]}
+                            {
+                                "canonical_name": "夏季凉感T恤",
+                                "raw_mentions": ["夏季凉感T恤"],
+                            }
                         ],
-                        "research_intents": ["产品卖点分析"],
-                        "context_modifiers": ["夏季通勤"],
+                        "research_intents": ["凉感"],
+                        "context_modifiers": ["夏季"],
                         "synonym_groups": {},
                         "ambiguities": [],
                         "resolution_state": "resolved",
@@ -100,7 +103,7 @@ def _rows(db_path: str, table: str) -> int:
 
 
 @pytest.mark.asyncio
-async def test_confirm_brief_atomically_creates_editable_scope_draft_without_collection(
+async def test_invalid_complete_input_reaches_one_editable_server_compiled_scope_without_collection(
     scope_client,
 ):
     client, db_path, thread_id = scope_client
@@ -146,12 +149,17 @@ async def test_confirm_brief_atomically_creates_editable_scope_draft_without_col
     assert [action["action"] for action in scope["allowed_actions"]] == [
         "replace_scope_draft"
     ]
-    assert scope["draft"]["core_object"] == "T恤"
-    assert scope["draft"]["product_experience_aspect"] is None
-    assert scope["draft"]["context_audience_aspect"] == "夏季通勤"
+    assert scope["subject_structure_analysis_state"] == "needs_confirmation"
+    assert scope["subject_structure_analysis_reason_codes"] == [
+        "core_entity_is_complete_input"
+    ]
+    assert scope["draft"]["core_object"] == "夏季凉感T恤"
+    assert scope["draft"]["product_experience_aspect"] == "凉感"
+    assert scope["draft"]["context_audience_aspect"] == "夏季"
     assert [group["final_query"] for group in scope["draft"]["query_groups"]] == [
-        "T恤",
-        "T恤 夏季通勤",
+        "夏季凉感T恤",
+        "夏季凉感T恤 凉感",
+        "夏季凉感T恤 夏季",
     ]
     assert _rows(db_path, "content_research_plans") == 1
     assert _rows(db_path, "content_research_scope_drafts") == 1
@@ -208,9 +216,9 @@ async def test_missing_bc_can_replace_only_latest_scope_draft(scope_client):
         "action": "replace_scope_draft",
         "payload": {
             "scope_draft_id": original["id"],
+            "core_object": "T恤",
             "product_experience_aspect": "凉感",
-            "context_audience_aspect": "夏季通勤",
-            "final_queries": ["T恤", "T恤 凉感", "T恤 夏季通勤"],
+            "context_audience_aspect": "夏季",
         },
     }
 
@@ -237,13 +245,22 @@ async def test_missing_bc_can_replace_only_latest_scope_draft(scope_client):
     assert [group["final_query"] for group in latest["query_groups"]] == [
         "T恤",
         "T恤 凉感",
-        "T恤 夏季通勤",
+        "T恤 夏季",
     ]
-    assert [group["origin"] for group in latest["query_groups"]] == [
-        "system_suggested",
-        "user_edited",
-        "system_suggested",
+    assert latest["constraints"] == [
+        {
+            "id": "core_object",
+            "label": "核心对象",
+            "value": "T恤",
+            "mode": "required",
+            "allowed_aliases": [],
+        }
     ]
+    assert all(
+        group["targeted_required_terms"] == ["T恤"]
+        for group in latest["query_groups"]
+    )
+    assert all(group["origin"] == "user_edited" for group in latest["query_groups"])
     assert _rows(db_path, "content_research_scope_drafts") == 2
     assert _rows(db_path, "content_research_scope_contracts") == 0
     assert _rows(db_path, "content_research_dispatch_jobs") == 0

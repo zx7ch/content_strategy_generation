@@ -83,6 +83,8 @@ export interface ContentResearchPresearchResponse {
     [key: string]: unknown;
   };
   subject_structure_hash?: string | null;
+  subject_structure_analysis_state: string;
+  subject_structure_analysis_reason_codes: string[];
   run: ContentResearchRunProjection;
 }
 
@@ -358,6 +360,8 @@ export interface ContentResearchScopeProjection {
     allowed_resolutions: ContentResearchCoverageResolution[];
   }) | null;
   execution_unit: ContentResearchExecutionUnitProjection | null;
+  subject_structure_analysis_state: string;
+  subject_structure_analysis_reason_codes: string[];
 }
 
 export interface ContentResearchExecutionUnitProjection {
@@ -400,9 +404,9 @@ export interface ContentResearchBriefConfirmationInput {
 
 export interface ContentResearchScopeDraftReplacementInput {
   scope_draft_id: string;
+  core_object: string;
   product_experience_aspect?: string | null;
   context_audience_aspect?: string | null;
-  final_queries: string[];
 }
 
 export interface ContentResearchScopeDraftActionResult {

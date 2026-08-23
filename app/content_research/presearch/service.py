@@ -7,7 +7,10 @@ import json
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from app.content_research.presearch.prompts import build_presearch_messages
+from app.content_research.presearch.prompts import (
+    build_presearch_messages,
+    build_presearch_repair_messages,
+)
 from app.content_research.subject_structure import (
     SubjectStructure,
     parse_subject_structure,
@@ -126,6 +129,8 @@ class PresearchService:
 
     async def _run_llm(self, request: PresearchInput) -> PresearchOutcome:
         assert self._llm is not None
+        loop = asyncio.get_running_loop()
+        started_at = loop.time()
         try:
             # Provider SDK defaults can wait for minutes; presearch is an
             # interactive UI boundary and must fall back within its hard cutoff.
@@ -163,9 +168,61 @@ class PresearchService:
                     model=response.model,
                     configuration_source=response.configuration_source,
                 )
-            return PresearchOutcome(status="completed", checklist=checklist, fallback_used=False,
-                provider=response.provider, model=response.model,
-                configuration_source=response.configuration_source)
+            if checklist.subject_structure_analysis_state != "confirmed":
+                try:
+                    remaining_seconds = max(
+                        0.001,
+                        self.hard_cutoff_seconds - (loop.time() - started_at),
+                    )
+                    repaired_response = await asyncio.wait_for(
+                        self._llm.generate(
+                            LLMRequest(
+                                messages=build_presearch_repair_messages(
+                                    request.seed_text,
+                                    request.user_note,
+                                    invalid_response=response.content,
+                                    reason_codes=(
+                                        checklist.subject_structure_analysis_reason_codes
+                                    ),
+                                ),
+                                task_type="content_research.presearch.repair",
+                                model_policy="balanced",
+                                temperature=0.2,
+                                max_tokens=700,
+                                context=LLMCallContext(
+                                    session_id=request.thread_id,
+                                    step_name="presearch_structure_repair",
+                                    agent_name="content_research_presearch",
+                                    tenant_id=request.workspace_id,
+                                    user_id=request.user_id,
+                                ),
+                            )
+                        ),
+                        timeout=remaining_seconds,
+                    )
+                    repaired_checklist = self._parse_checklist(
+                        repaired_response.content,
+                        request.seed_text,
+                        request.user_note,
+                    )
+                    if (
+                        repaired_checklist.subject_structure_analysis_state
+                        == "confirmed"
+                    ):
+                        checklist = repaired_checklist
+                        response = repaired_response
+                except Exception:  # noqa: BLE001
+                    # Repair is best-effort and never creates another lifecycle
+                    # stage. The original diagnosis remains visible for manual edit.
+                    pass
+            return PresearchOutcome(
+                status="completed",
+                checklist=checklist,
+                fallback_used=False,
+                provider=response.provider,
+                model=response.model,
+                configuration_source=response.configuration_source,
+            )
         except asyncio.TimeoutError:
             # The caller owns the final-timeout state transition.
             raise

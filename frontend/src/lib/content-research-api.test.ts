@@ -245,9 +245,9 @@ test("Brief confirmation and Scope replacement use authoritative command envelop
     { ...testRun, state: "scope_confirmation_required", state_revision: 3 },
     {
       scope_draft_id: "draft_1",
+      core_object: "T恤",
       product_experience_aspect: "凉感",
       context_audience_aspect: "夏季通勤",
-      final_queries: ["T恤", "T恤 凉感", "T恤 夏季通勤"],
     },
   );
 
@@ -257,6 +257,12 @@ test("Brief confirmation and Scope replacement use authoritative command envelop
   assert.equal(bodies[1].action, "replace_scope_draft");
   assert.equal(bodies[1].expected_state, "scope_confirmation_required");
   assert.equal(bodies[1].expected_revision, 3);
+  assert.deepEqual(bodies[1].payload, {
+    scope_draft_id: "draft_1",
+    core_object: "T恤",
+    product_experience_aspect: "凉感",
+    context_audience_aspect: "夏季通勤",
+  });
 });
 
 test("getContentResearchScope reads the persisted Scope projection and optional version", async () => {

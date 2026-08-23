@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 from app.services.llm.types import Message
 
 PRESEARCH_SYSTEM_PROMPT = (
@@ -47,4 +49,32 @@ def build_presearch_messages(seed_text: str, user_note: str | None = None) -> li
     return [
         Message(role="system", content=PRESEARCH_SYSTEM_PROMPT),
         Message(role="user", content=user_prompt),
+    ]
+
+
+def build_presearch_repair_messages(
+    seed_text: str,
+    user_note: str | None,
+    *,
+    invalid_response: str,
+    reason_codes: tuple[str, ...],
+) -> list[Message]:
+    """Request one bounded, reason-directed repair of a parseable structure."""
+
+    note = user_note or "无"
+    repair_prompt = f"""
+上一次输出可以解析，但 subject_structure 未通过结构质量检查。
+请只修正 subject_structure 的拆分，并返回完整 JSON；不要增加解释文字。
+
+用户输入: {seed_text}
+用户补充: {note}
+质量问题: {json.dumps(list(reason_codes), ensure_ascii=False)}
+上一次输出: {invalid_response}
+
+特别注意：核心对象只保留品牌、品类、产品或型号；产品属性或体验短词放入
+research_intents；季节、人群、地点和场合放入 context_modifiers。
+"""
+    return [
+        Message(role="system", content=PRESEARCH_SYSTEM_PROMPT),
+        Message(role="user", content=repair_prompt),
     ]

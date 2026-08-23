@@ -246,6 +246,15 @@ function presearchFromWorkflowSummary(
     model: stringField(payload, "model") || null,
     subject_structure: subjectStructure,
     subject_structure_hash: stringField(payload, "subject_structure_hash") || null,
+    subject_structure_analysis_state: stringField(
+      payload,
+      "subject_structure_analysis_state",
+      "unresolved",
+    ),
+    subject_structure_analysis_reason_codes: arrayField(
+      payload,
+      "subject_structure_analysis_reason_codes",
+    ),
     run: summary.run,
   };
 }
@@ -896,39 +905,33 @@ function ContentResearchScopeDraftCard({
   busy: boolean;
   onReplace: (input: {
     scope_draft_id: string;
+    core_object: string;
     product_experience_aspect: string | null;
     context_audience_aspect: string | null;
-    final_queries: string[];
   }) => void;
 }) {
   const draft = projection.draft;
+  const [coreObject, setCoreObject] = useState(draft.core_object);
   const [productAspect, setProductAspect] = useState(draft.product_experience_aspect ?? "");
   const [contextAspect, setContextAspect] = useState(draft.context_audience_aspect ?? "");
-  const [finalQueries, setFinalQueries] = useState(
-    draft.query_groups.map((group) => group.final_query),
-  );
 
   useEffect(() => {
+    setCoreObject(draft.core_object);
     setProductAspect(draft.product_experience_aspect ?? "");
     setContextAspect(draft.context_audience_aspect ?? "");
-    setFinalQueries(draft.query_groups.map((group) => group.final_query));
   }, [draft]);
 
-  function suggestedQueries(nextProduct = productAspect, nextContext = contextAspect) {
-    return [
-      draft.core_object,
-      ...(nextProduct.trim() ? [`${draft.core_object} ${nextProduct.trim()}`] : []),
-      ...(nextContext.trim() ? [`${draft.core_object} ${nextContext.trim()}`] : []),
-    ];
-  }
-
-  function persist(nextQueries: string[], nextProduct = productAspect, nextContext = contextAspect) {
-    if (busy || nextQueries.some((query) => !query.trim())) return;
+  function persist(
+    nextCore = coreObject,
+    nextProduct = productAspect,
+    nextContext = contextAspect,
+  ) {
+    if (busy || !nextCore.trim()) return;
     onReplace({
       scope_draft_id: draft.id,
+      core_object: nextCore.trim(),
       product_experience_aspect: nextProduct.trim() || null,
       context_audience_aspect: nextContext.trim() || null,
-      final_queries: nextQueries.map((query) => query.trim()),
     });
   }
 
@@ -938,41 +941,44 @@ function ContentResearchScopeDraftCard({
         <p className="text-xs font-semibold uppercase tracking-wider text-slate-400">检索范围确认</p>
         <h2 className="mt-2 text-2xl font-semibold text-ink">确认本轮实际搜索词</h2>
         <p className="mt-2 text-sm leading-6 text-quiet">
-          下方“最终搜索词”会按原文发送给小红书。现在仍是可编辑草稿，尚未冻结，也没有开始采集。
+          修改上方结构化搜索词后，后端会同步生成下方预览。现在仍是可编辑草稿，尚未冻结，也没有开始采集。
         </p>
+        {projection.subject_structure_analysis_state === "needs_confirmation" ? (
+          <p className="mt-3 rounded-xl bg-amber-50 px-3 py-2 text-sm leading-6 text-amber-900">
+            系统未能可靠拆解完整输入，请确认或修改以下搜索词。
+          </p>
+        ) : null}
 
         <div className="mt-5 grid gap-3 md:grid-cols-3">
           <label className="rounded-xl bg-[#f4f7f5] p-3 text-sm">
-            <span className="font-semibold text-ink">核心对象 A</span>
+            <span className="font-semibold text-ink">核心搜索词</span>
             <span className="mt-1 block text-xs leading-5 text-quiet">每组检索都围绕它展开，也是候选笔记唯一的硬性对象条件。</span>
-            <input readOnly value={draft.core_object} className="mt-3 h-10 w-full rounded-lg border border-line bg-white px-3 text-sm text-ink" />
+            <input
+              value={coreObject}
+              onChange={(event) => setCoreObject(event.target.value)}
+              onBlur={() => persist(coreObject, productAspect, contextAspect)}
+              placeholder="例如：T恤"
+              className="mt-3 h-10 w-full rounded-lg border border-line bg-white px-3 text-sm text-ink outline-none focus:border-[#789180]"
+            />
           </label>
           <label className="rounded-xl bg-[#f4f7f5] p-3 text-sm">
-            <span className="font-semibold text-ink">产品／体验词 B（可选）</span>
+            <span className="font-semibold text-ink">产品或体验补充词（可选）</span>
             <span className="mt-1 block text-xs leading-5 text-quiet">填写真实会搜索的具体词，例如“凉感”“显瘦”；不是分析目标。</span>
             <input
               value={productAspect}
               onChange={(event) => setProductAspect(event.target.value)}
-              onBlur={() => {
-                const next = suggestedQueries(productAspect, contextAspect);
-                setFinalQueries(next);
-                persist(next, productAspect, contextAspect);
-              }}
+              onBlur={() => persist(coreObject, productAspect, contextAspect)}
               placeholder="例如：凉感"
               className="mt-3 h-10 w-full rounded-lg border border-line bg-white px-3 text-sm outline-none focus:border-[#789180]"
             />
           </label>
           <label className="rounded-xl bg-[#f4f7f5] p-3 text-sm">
-            <span className="font-semibold text-ink">场景／人群词 C（可选）</span>
+            <span className="font-semibold text-ink">场景或人群补充词（可选）</span>
             <span className="mt-1 block text-xs leading-5 text-quiet">填写具体使用语境、场景或人群，例如“夏季通勤”。</span>
             <input
               value={contextAspect}
               onChange={(event) => setContextAspect(event.target.value)}
-              onBlur={() => {
-                const next = suggestedQueries(productAspect, contextAspect);
-                setFinalQueries(next);
-                persist(next, productAspect, contextAspect);
-              }}
+              onBlur={() => persist(coreObject, productAspect, contextAspect)}
               placeholder="例如：夏季通勤"
               className="mt-3 h-10 w-full rounded-lg border border-line bg-white px-3 text-sm outline-none focus:border-[#789180]"
             />
@@ -980,19 +986,16 @@ function ContentResearchScopeDraftCard({
         </div>
 
         <div className="mt-5 space-y-3">
-          {finalQueries.map((query, index) => (
-            <label key={`${draft.id}-${index}`} className="block rounded-xl border border-line bg-white p-3">
+          {draft.query_groups.map((group, index) => (
+            <div key={`${draft.id}-${index}`} className="rounded-xl border border-line bg-white p-3">
               <span className="text-xs font-semibold text-slate-400">最终搜索词 {index + 1}</span>
-              <input
-                value={query}
-                onChange={(event) => setFinalQueries((current) => current.map((item, itemIndex) => itemIndex === index ? event.target.value : item))}
-                onBlur={() => persist(finalQueries)}
-                className="mt-2 h-11 w-full rounded-lg border border-line bg-slate-50 px-3 text-sm text-ink outline-none focus:border-[#789180] focus:bg-white"
-              />
-            </label>
+              <p data-testid="scope-final-query" className="mt-2 min-h-11 rounded-lg border border-line bg-slate-50 px-3 py-3 text-sm text-ink">
+                {group.final_query}
+              </p>
+            </div>
           ))}
         </div>
-        <p className="mt-4 text-xs text-quiet">{busy ? "正在保存最新检索词…" : "修改后会自动保存；B/C 留空也可以继续。"}</p>
+        <p className="mt-4 text-xs text-quiet">{busy ? "正在由后端生成最新搜索词…" : "修改后会自动保存并刷新预览；补充词留空也可以继续。"}</p>
       </section>
     </div>
   );
@@ -2267,9 +2270,9 @@ function ContentResearchContextSidebar({
 
   async function replaceCurrentScopeDraft(input: {
     scope_draft_id: string;
+    core_object: string;
     product_experience_aspect: string | null;
     context_audience_aspect: string | null;
-    final_queries: string[];
   }) {
     const run = contentResearchRun?.summary.run;
     if (!run || scopeActionBusy) return;

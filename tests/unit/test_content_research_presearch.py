@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
-import asyncio
 
 import pytest
 
@@ -57,6 +57,22 @@ class RecordingLLM:
             raise self.error
         return LLMResponse(
             content=self.content,
+            provider="fake",
+            model="fake-model",
+            usage=TokenUsage(total_tokens=10),
+            latency_ms=1,
+        )
+
+
+class SequenceLLM(RecordingLLM):
+    def __init__(self, contents: list[str]) -> None:
+        super().__init__(content=contents[0])
+        self.contents = list(contents)
+
+    async def generate(self, request):
+        self.requests.append(request)
+        return LLMResponse(
+            content=self.contents.pop(0),
             provider="fake",
             model="fake-model",
             usage=TokenUsage(total_tokens=10),
@@ -161,7 +177,19 @@ async def test_presearch_success_uses_the_owned_lifecycle_and_returns_only_brief
 async def test_ambiguous_model_interpretation_does_not_create_a_user_confirmation_stage(
     tmp_path,
 ):
-    llm = RecordingLLM(content=_presearch_payload(resolution_state="needs_confirmation"))
+    ambiguous = json.loads(_presearch_payload(resolution_state="needs_confirmation"))
+    ambiguous["subject_structure"].update(
+        {
+            "canonical_subject": "苹果",
+            "core_entities": [
+                {"canonical_name": "苹果", "raw_mentions": ["苹果"]}
+            ],
+            "research_intents": ["适合"],
+            "context_modifiers": ["年轻人"],
+            "synonym_groups": {},
+        }
+    )
+    llm = RecordingLLM(content=json.dumps(ambiguous, ensure_ascii=False))
     service, _db_path, thread = await _owned_service(tmp_path, llm)
 
     response = await service.submit_presearch(
@@ -177,6 +205,86 @@ async def test_ambiguous_model_interpretation_does_not_create_a_user_confirmatio
     assert response.run.state == "brief_confirmation_required"
     assert "confirm_subject_structure" not in response.run.allowed_actions
     assert response.subject_structure["resolution_state"] == "needs_confirmation"
+    assert response.subject_structure_analysis_state == "needs_confirmation"
+    assert response.subject_structure_analysis_reason_codes == (
+        "unresolved_ambiguity",
+    )
+
+
+@pytest.mark.asyncio
+async def test_complete_input_core_keeps_its_analysis_diagnosis_without_old_stage(
+    tmp_path,
+):
+    invalid = json.loads(_presearch_payload())
+    invalid["subject_structure"]["core_entities"] = [
+        {
+            "canonical_name": "夏季凉感T恤",
+            "raw_mentions": ["夏季凉感T恤"],
+        }
+    ]
+    invalid["subject_structure"]["synonym_groups"] = {
+        "夏季凉感T恤": ["冰感T恤"]
+    }
+    llm = RecordingLLM(content=json.dumps(invalid, ensure_ascii=False))
+    service, _db_path, thread = await _owned_service(tmp_path, llm)
+
+    response = await service.submit_presearch(
+        command_id="submit-complete-input-core",
+        seed_text="夏季凉感T恤",
+        user_note=None,
+        thread_id=thread["id"],
+        user_id="user-test",
+        workspace_id="ws-test",
+    )
+
+    assert response.status == "completed"
+    assert response.run.state == "brief_confirmation_required"
+    assert response.subject_structure_analysis_state == "needs_confirmation"
+    assert response.subject_structure_analysis_reason_codes == (
+        "core_entity_is_complete_input",
+    )
+    assert "confirm_subject_structure" not in response.run.allowed_actions
+
+
+@pytest.mark.asyncio
+async def test_invalid_system_structure_gets_one_reason_directed_repair_attempt(tmp_path):
+    invalid = json.loads(_presearch_payload())
+    invalid["subject_structure"]["core_entities"] = [
+        {
+            "canonical_name": "夏季凉感T恤",
+            "raw_mentions": ["夏季凉感T恤"],
+        }
+    ]
+    invalid["subject_structure"]["synonym_groups"] = {
+        "夏季凉感T恤": ["冰感T恤"]
+    }
+    repaired = json.loads(_presearch_payload())
+    repaired["subject_structure"]["core_entities"] = [
+        {"canonical_name": "T恤", "raw_mentions": ["T恤"]}
+    ]
+    repaired["subject_structure"]["synonym_groups"] = {"T恤": ["短袖"]}
+    llm = SequenceLLM(
+        [
+            json.dumps(invalid, ensure_ascii=False),
+            json.dumps(repaired, ensure_ascii=False),
+        ]
+    )
+    service, _db_path, thread = await _owned_service(tmp_path, llm)
+
+    response = await service.submit_presearch(
+        command_id="submit-repaired-structure",
+        seed_text="夏季凉感T恤",
+        user_note=None,
+        thread_id=thread["id"],
+        user_id="user-test",
+        workspace_id="ws-test",
+    )
+
+    assert len(llm.requests) == 2
+    assert "core_entity_is_complete_input" in llm.requests[1].messages[-1].content
+    assert response.subject_structure_analysis_state == "confirmed"
+    assert response.subject_structure_analysis_reason_codes == ()
+    assert response.subject_structure["core_entities"][0]["canonical_name"] == "T恤"
 
 
 @pytest.mark.asyncio
@@ -314,7 +422,7 @@ async def test_presearch_retry_recovers_the_same_run_after_model_repair(tmp_path
 
 
 @pytest.mark.asyncio
-async def test_duplicate_submit_command_returns_one_run_and_invokes_llm_once(tmp_path):
+async def test_duplicate_submit_command_returns_one_run_and_one_bounded_repair(tmp_path):
     llm = RecordingLLM()
     service, db_path, thread = await _owned_service(tmp_path, llm)
 
@@ -334,7 +442,8 @@ async def test_duplicate_submit_command_returns_one_run_and_invokes_llm_once(tmp
     assert first.workflow_run_id == duplicate.workflow_run_id
     assert first.brief_id == duplicate.brief_id
     assert first.run.state_revision == duplicate.run.state_revision == 2
-    assert len(llm.requests) == 1
+    assert len(llm.requests) == 2
+    assert llm.requests[1].task_type == "content_research.presearch.repair"
     with sqlite3.connect(db_path) as connection:
         assert connection.execute("SELECT COUNT(*) FROM workflow_runs").fetchone()[0] == 1
         assert connection.execute(
@@ -367,7 +476,8 @@ async def test_stale_public_action_is_rejected_before_presearch_or_brief_changes
             ),
         )
 
-    assert len(llm.requests) == 1
+    initial_request_count = len(llm.requests)
+    assert initial_request_count == 2
     with sqlite3.connect(db_path) as connection:
         assert connection.execute(
             "SELECT state_revision FROM workflow_runs WHERE run_id=?",
@@ -389,7 +499,7 @@ async def test_stale_public_action_is_rejected_before_presearch_or_brief_changes
                 payload={"clarification_text": "关注通勤"},
             ),
         )
-    assert len(llm.requests) == 1
+    assert len(llm.requests) == initial_request_count
 
 
 @pytest.mark.asyncio

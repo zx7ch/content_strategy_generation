@@ -44,12 +44,17 @@ def compile_product_marketing_query_portfolio(
     core_object: str,
     product_experience_aspect: str | None = None,
     context_audience_aspect: str | None = None,
+    preserve_explicit_aspects: bool = False,
 ) -> tuple[str, ...]:
     """Compile concrete product search suggestions in fixed A/A B/A C order."""
     core = _display_term(core_object)
     if not core:
         raise ValueError("product marketing query portfolio requires a core object")
-    product_aspect = concrete_product_marketing_aspect(product_experience_aspect) or ""
+    product_aspect = (
+        _display_term(product_experience_aspect or "")
+        if preserve_explicit_aspects
+        else concrete_product_marketing_aspect(product_experience_aspect) or ""
+    )
     context_aspect = _display_term(context_audience_aspect or "")
 
     queries = [core]

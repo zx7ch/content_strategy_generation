@@ -126,6 +126,30 @@ def test_complete_sentence_core_with_intent_and_context_needs_confirmation() -> 
     assert decision.reason_codes == ("core_entity_is_complete_input",)
 
 
+def test_complete_brand_name_is_not_rejected_for_an_unmentioned_analysis_role() -> None:
+    decision = parse_subject_structure(
+        {
+            "canonical_subject": "Satisfy Running",
+            "subject_type": "brand",
+            "core_entities": [
+                {
+                    "canonical_name": "Satisfy Running",
+                    "raw_mentions": ["Satisfy Running"],
+                }
+            ],
+            "research_intents": ["品牌内容"],
+            "context_modifiers": [],
+            "synonym_groups": {},
+            "ambiguities": [],
+            "resolution_state": "resolved",
+        },
+        normalized_input="Satisfy Running",
+    )
+
+    assert decision.state == "confirmed"
+    assert decision.reason_codes == ()
+
+
 def test_core_raw_mention_overlapping_intent_needs_confirmation() -> None:
     decision = parse_subject_structure(
         {

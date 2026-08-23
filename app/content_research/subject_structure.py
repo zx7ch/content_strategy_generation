@@ -145,7 +145,7 @@ def parse_subject_structure(
         len(structure.core_entities) == 1
         and len(raw_mentions) == 1
         and _matching_text(raw_mentions[0]) == input_for_matching
-        and role_terms
+        and any(term in input_for_matching for term in role_terms)
     ):
         reason_codes.append("core_entity_is_complete_input")
     elif any(

@@ -218,7 +218,9 @@ def test_creator_submit_subject_reaches_only_the_approved_brief_and_restores_it(
     assert active_run_id == run_id
 
 
-def test_creator_confirms_brief_and_edits_scope_draft_without_collection(browser_page):
+def test_creator_corrects_search_structure_and_reads_only_the_backend_query_preview(
+    browser_page,
+):
     page, stack = browser_page
     page.goto(stack["frontend_url"] + "/creator", wait_until="domcontentloaded")
     page.get_by_role("button", name=re.compile("内容调研")).click(timeout=15000)
@@ -249,13 +251,29 @@ def test_creator_confirms_brief_and_edits_scope_draft_without_collection(browser
         timeout=30000
     )
     expect(scope.get_by_text("重点了解什么", exact=True)).to_have_count(0)
+    expect(scope.get_by_text("核心对象 A", exact=True)).to_have_count(0)
+    expect(scope.get_by_text("产品／体验词 B（可选）", exact=True)).to_have_count(0)
+    expect(scope.get_by_text("场景／人群词 C（可选）", exact=True)).to_have_count(0)
     expect(page.get_by_text("已冻结检索范围", exact=True)).to_have_count(0)
     expect(page.get_by_text("专家调研进行中", exact=True)).to_have_count(0)
-    final_queries = scope.locator("label").filter(has_text="最终搜索词").locator("input")
+    expect(scope.get_by_role("button", name="确认并开始调研")).to_have_count(0)
+    final_queries = scope.get_by_test_id("scope-final-query")
     expect(final_queries).to_have_count(1)
-    expect(final_queries.nth(0)).to_have_value("长袖衬衫")
+    expect(final_queries.nth(0)).to_have_text("长袖衬衫")
+    expect(scope.locator("label").filter(has_text="最终搜索词").locator("input")).to_have_count(0)
 
-    product_input = scope.get_by_label(re.compile("产品／体验词 B"))
+    core_input = scope.get_by_label("核心搜索词")
+    with page.expect_response(
+        lambda response: response.url.endswith("/actions")
+        and '"action":"replace_scope_draft"' in (response.request.post_data or ""),
+        timeout=30000,
+    ) as core_saved:
+        core_input.fill("T恤")
+        core_input.press("Tab")
+    assert core_saved.value.status == 200, core_saved.value.text()
+
+    scope = page.get_by_role("region", name="检索范围确认")
+    product_input = scope.get_by_label("产品或体验补充词（可选）")
     with page.expect_response(
         lambda response: response.url.endswith("/actions")
         and '"action":"replace_scope_draft"' in (response.request.post_data or ""),
@@ -266,22 +284,22 @@ def test_creator_confirms_brief_and_edits_scope_draft_without_collection(browser
     assert product_saved.value.status == 200, product_saved.value.text()
 
     scope = page.get_by_role("region", name="检索范围确认")
-    context_input = scope.get_by_label(re.compile("场景／人群词 C"))
+    context_input = scope.get_by_label("场景或人群补充词（可选）")
     with page.expect_response(
         lambda response: response.url.endswith("/actions")
         and '"action":"replace_scope_draft"' in (response.request.post_data or ""),
         timeout=30000,
     ) as context_saved:
-        context_input.fill("夏季通勤")
+        context_input.fill("夏季")
         context_input.press("Tab")
     assert context_saved.value.status == 200, context_saved.value.text()
 
     scope = page.get_by_role("region", name="检索范围确认")
-    final_queries = scope.locator("label").filter(has_text="最终搜索词").locator("input")
+    final_queries = scope.get_by_test_id("scope-final-query")
     expect(final_queries).to_have_count(3)
-    expect(final_queries.nth(0)).to_have_value("长袖衬衫")
-    expect(final_queries.nth(1)).to_have_value("长袖衬衫 凉感")
-    expect(final_queries.nth(2)).to_have_value("长袖衬衫 夏季通勤")
+    expect(final_queries.nth(0)).to_have_text("T恤")
+    expect(final_queries.nth(1)).to_have_text("T恤 凉感")
+    expect(final_queries.nth(2)).to_have_text("T恤 夏季")
 
     page.reload(wait_until="domcontentloaded")
     scope = page.get_by_role("region", name="检索范围确认")
