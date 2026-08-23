@@ -1431,6 +1431,21 @@ class SQLiteContentResearchStore:
             ).fetchone()
         return self._row_to_coverage_snapshot(row) if row else None
 
+    @staticmethod
+    def _assert_current_coverage_snapshot(
+        conn: sqlite3.Connection,
+        snapshot: CoverageSnapshot,
+    ) -> None:
+        current = conn.execute(
+            """SELECT id FROM content_research_scope_coverage_snapshots
+               WHERE workflow_run_id=? AND scope_contract_id=?
+               ORDER BY execution_revision DESC, created_at DESC, id DESC
+               LIMIT 1""",
+            (snapshot.workflow_run_id, snapshot.scope_contract_id),
+        ).fetchone()
+        if current is None or str(current["id"]) != snapshot.id:
+            raise ValueError("coverage decision requires the current coverage snapshot")
+
     def resolve_coverage_to_execution_unit_atomically(
         self, *, snapshot: CoverageSnapshot, decision: dict[str, Any]
     ) -> tuple[ScopeExecutionUnit, bool]:
@@ -1523,6 +1538,7 @@ class SQLiteContentResearchStore:
                     raise ValueError("coverage_decision_already_resolved")
                 conn.commit()
                 return existing, False
+            self._assert_current_coverage_snapshot(conn, snapshot)
             self._insert_scope_execution_unit(
                 conn,
                 unit,
@@ -2274,6 +2290,8 @@ class SQLiteContentResearchStore:
                     existing_continuation,
                     False,
                 )
+
+            self._assert_current_coverage_snapshot(conn, snapshot)
 
             if successor_scope_contract is not None:
                 self._insert_scope_contract(conn, successor_scope_contract)

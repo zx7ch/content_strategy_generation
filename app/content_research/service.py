@@ -2893,17 +2893,18 @@ class ContentResearchService:
                     workflow_run_id=workflow_run_id,
                     research_plan_id=contract.research_plan_id,
                     version=contract.version,
+                    schema_version=contract.schema_version,
                     constraints=contract.constraints,
                     query_groups=tuple(
                         ScopeQueryGroupInput(query, query, (target.value,)) for query in queries
                     ),
                 )
                 if any(
-                    group.execution_role != "supplementary"
+                    group.execution_role == "exploratory"
                     for group in supplementary_scope.query_groups
                 ):
                     raise ContentResearchValidationError(
-                        "Coverage expansion queries must explicitly target only the selected constraint"
+                        "Coverage expansion queries must include the selected required constraint"
                     )
                 details = {"supplementary_queries": list(queries)}
 
@@ -2923,6 +2924,7 @@ class ContentResearchService:
                     workflow_run_id=workflow_run_id,
                     research_plan_id=contract.research_plan_id,
                     version=contract.version + 1,
+                    schema_version=contract.schema_version,
                     constraints=relaxed_constraints,
                     query_groups=tuple(
                         ScopeQueryGroupInput(

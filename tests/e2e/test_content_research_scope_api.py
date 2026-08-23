@@ -253,6 +253,56 @@ async def _confirm_initial_scope(client: httpx.AsyncClient, workflow_run_id: str
     return confirmed.json()["result"]["scope_contract"]
 
 
+async def _confirmed_v2_scope_with_unmet_core(
+    client: httpx.AsyncClient,
+    *,
+    snapshot_id: str = "scv_v2_unmet_core",
+) -> tuple[str, dict, CoverageSnapshot]:
+    workflow = await _scope_ready_workflow(client)
+    workflow_run_id = workflow["presearch"]["workflow_run_id"]
+    contract = await _confirm_initial_scope(client, workflow_run_id)
+    assert contract["schema_version"] == "content_research_scope_contract_v2"
+    snapshot = CoverageSnapshot(
+        id=snapshot_id,
+        workflow_run_id=workflow_run_id,
+        scope_contract_id=contract["id"],
+        scope_contract_version=contract["version"],
+        state="awaiting_scope_decision",
+        constraint_counts={
+            "core_object": {
+                "matched_candidate_count": 1,
+                "independent_author_count": 1,
+                "required": True,
+            },
+            "_summary": {
+                "minimum_samples": 2,
+                "minimum_independent_authors": 2,
+                "reason_codes": ["required_constraint_coverage_unmet:core_object"],
+            },
+        },
+        unmet_constraint_ids=("core_object",),
+    )
+    app.state.content_research_service._store.save_coverage_snapshot_with_audit_event(
+        snapshot,
+        ScopeAuditEvent(
+            id=f"sae_{snapshot_id}",
+            workflow_run_id=workflow_run_id,
+            scope_contract_id=contract["id"],
+            scope_contract_version=contract["version"],
+            event_name="coverage_evaluated",
+            payload={
+                "schema_version": "content_research_scope_audit_event_v1",
+                "coverage_snapshot_id": snapshot.id,
+                "state": snapshot.state,
+                "constraint_counts": snapshot.constraint_counts,
+                "unmet_constraint_ids": ["core_object"],
+                "reason_codes": ["required_constraint_coverage_unmet:core_object"],
+            },
+        ),
+    )
+    return workflow_run_id, contract, snapshot
+
+
 @pytest.mark.asyncio
 async def test_product_marketing_prepare_scope_builds_v2_a_ab_ac_portfolio(
     scope_client,
@@ -310,6 +360,138 @@ async def test_product_marketing_prepare_scope_builds_v2_a_ab_ac_portfolio(
         confirmed.json()["result"]["scope_contract"]["schema_version"]
         == "content_research_scope_contract_v2"
     )
+
+
+@pytest.mark.asyncio
+async def test_v2_relax_preserves_schema_and_versions_the_frozen_scope(scope_client) -> None:
+    workflow_run_id, contract_v1, snapshot = await _confirmed_v2_scope_with_unmet_core(
+        scope_client
+    )
+    store = app.state.content_research_service._store
+
+    response = await scope_client.post(
+        f"/content-research/workflows/{workflow_run_id}/actions",
+        json={
+            "action": "resolve_coverage",
+            "payload": {
+                "scope_contract_version": 1,
+                "coverage_snapshot_id": snapshot.id,
+                "resolution": "relax_constraint",
+                "constraint_id": "core_object",
+            },
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    contract_v2 = response.json()["result"]["scope_contract"]
+    assert contract_v2["version"] == 2
+    assert contract_v2["schema_version"] == "content_research_scope_contract_v2"
+    assert next(
+        item for item in contract_v2["constraints"] if item["id"] == "core_object"
+    )["mode"] == "preferred"
+    persisted_v1 = store.get_scope_contract(workflow_run_id, version=1)
+    assert persisted_v1 is not None
+    assert next(
+        item for item in persisted_v1.constraints if item.id == "core_object"
+    ).mode == "required"
+
+
+@pytest.mark.asyncio
+async def test_v2_duplicate_expand_reuses_one_authorized_execution(scope_client) -> None:
+    workflow_run_id, _contract, snapshot = await _confirmed_v2_scope_with_unmet_core(
+        scope_client
+    )
+    request = {
+        "action": "resolve_coverage",
+        "payload": {
+            "scope_contract_version": 1,
+            "coverage_snapshot_id": snapshot.id,
+            "resolution": "expand_required_constraint",
+            "constraint_id": "core_object",
+            "supplementary_queries": ["长袖衬衫 防晒"],
+        },
+    }
+
+    first, replay = await asyncio.gather(
+        scope_client.post(
+            f"/content-research/workflows/{workflow_run_id}/actions", json=request
+        ),
+        scope_client.post(
+            f"/content-research/workflows/{workflow_run_id}/actions", json=request
+        ),
+    )
+
+    assert first.status_code == replay.status_code == 200
+    assert first.json()["result"] == replay.json()["result"]
+    store = app.state.content_research_service._store
+    assert len(store.list_scope_execution_authorizations(workflow_run_id)) == 1
+    assert len(store.list_scope_execution_continuations(workflow_run_id)) == 1
+
+
+@pytest.mark.asyncio
+async def test_v2_expand_without_core_has_zero_writes(scope_client) -> None:
+    workflow_run_id, _contract, snapshot = await _confirmed_v2_scope_with_unmet_core(
+        scope_client
+    )
+    store = app.state.content_research_service._store
+
+    response = await scope_client.post(
+        f"/content-research/workflows/{workflow_run_id}/actions",
+        json={
+            "action": "resolve_coverage",
+            "payload": {
+                "scope_contract_version": 1,
+                "coverage_snapshot_id": snapshot.id,
+                "resolution": "expand_required_constraint",
+                "constraint_id": "core_object",
+                "supplementary_queries": ["夏季防晒真实测评"],
+            },
+        },
+    )
+
+    assert response.status_code == 422
+    assert store.list_scope_execution_authorizations(workflow_run_id) == []
+    assert store.list_scope_execution_continuations(workflow_run_id) == []
+
+
+@pytest.mark.asyncio
+async def test_v2_predecessor_coverage_decision_has_zero_writes(scope_client) -> None:
+    workflow_run_id, _contract, predecessor = await _confirmed_v2_scope_with_unmet_core(
+        scope_client,
+        snapshot_id="scv_v2_predecessor",
+    )
+    store = app.state.content_research_service._store
+    current = replace(
+        predecessor,
+        id="scv_v2_current",
+        execution_revision=predecessor.execution_revision + 1,
+        source_coverage_snapshot_id=predecessor.id,
+    )
+    store.save_coverage_snapshot(current)
+    before = (
+        len(store.list_scope_execution_authorizations(workflow_run_id)),
+        len(store.list_scope_execution_continuations(workflow_run_id)),
+        len(store.list_scope_audit_events(workflow_run_id, version=1)),
+    )
+
+    response = await scope_client.post(
+        f"/content-research/workflows/{workflow_run_id}/actions",
+        json={
+            "action": "resolve_coverage",
+            "payload": {
+                "scope_contract_version": 1,
+                "coverage_snapshot_id": predecessor.id,
+                "resolution": "generate_limited_report",
+            },
+        },
+    )
+
+    assert response.status_code == 422
+    assert (
+        len(store.list_scope_execution_authorizations(workflow_run_id)),
+        len(store.list_scope_execution_continuations(workflow_run_id)),
+        len(store.list_scope_audit_events(workflow_run_id, version=1)),
+    ) == before
 
 
 @pytest.mark.asyncio

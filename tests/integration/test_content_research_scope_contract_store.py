@@ -292,6 +292,44 @@ def test_coverage_decision_replay_uses_one_execution_unit_and_one_decision_fact(
     assert unit.recovery_state == "replayable"
 
 
+def test_predecessor_snapshot_cannot_create_a_new_execution_unit(tmp_path) -> None:
+    store = SQLiteContentResearchStore(str(tmp_path / "stale-execution-unit.db"))
+    contract = _contract(version=1)
+    store.save_scope_contract(contract)
+    predecessor = CoverageSnapshot(
+        id="scv_execution_unit_predecessor",
+        workflow_run_id=contract.workflow_run_id,
+        scope_contract_id=contract.id,
+        scope_contract_version=contract.version,
+        state="awaiting_scope_decision",
+        constraint_counts={},
+        unmet_constraint_ids=("season",),
+    )
+    store.save_coverage_snapshot(predecessor)
+    store.save_coverage_snapshot(
+        replace(
+            predecessor,
+            id="scv_execution_unit_current",
+            execution_revision=predecessor.execution_revision + 1,
+            source_coverage_snapshot_id=predecessor.id,
+        )
+    )
+
+    with pytest.raises(ValueError, match="current coverage snapshot"):
+        store.resolve_coverage_to_execution_unit_atomically(
+            snapshot=predecessor,
+            decision={
+                "resolution": "generate_limited_report",
+                "operation": "limited_report",
+            },
+        )
+
+    with sqlite3.connect(store._db_path) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM content_research_scope_execution_units"
+        ).fetchone()[0] == 0
+
+
 def test_competing_execution_unit_decisions_reconcile_exact_replays_and_reject_conflicts(
     tmp_path,
 ) -> None:

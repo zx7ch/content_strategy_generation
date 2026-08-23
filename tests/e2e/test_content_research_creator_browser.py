@@ -28,6 +28,7 @@ from app.content_research.reporting.publication_materializer import (
     ReportPublicationMaterializer,
 )
 from app.content_research.scope_contract import (
+    SCOPE_CONTRACT_SCHEMA_VERSION_V2,
     CoverageSnapshot,
     ScopeAuditEvent,
     ScopeConstraint,
@@ -1050,6 +1051,14 @@ def test_creator_expand_reaches_worker_and_refreshes_real_result(browser_page):
     expect(page.locator('section[aria-label="确认检索范围"]')).to_have_count(0)
 
     initial_projection = scope_responses[-1]
+    assert initial_projection["scope_contract"]["schema_version"] == (
+        SCOPE_CONTRACT_SCHEMA_VERSION_V2
+    )
+    assert [
+        item["id"]
+        for item in initial_projection["scope_contract"]["constraints"]
+        if item["mode"] == "required"
+    ] == ["core_object"]
     assert initial_projection["coverage_snapshot"]["unmet_constraint_ids"] == [
         "not_a_contract_constraint",
         "core_object",
@@ -2695,16 +2704,12 @@ async def seed_scope_awaiting_coverage_offline(
     for direction_contract in direction_contracts:
         store.save_direction_contract(direction_contract)
 
-    constraints = (
-        ScopeConstraint("core_object", "核心对象", "长袖衬衫", "required"),
-        ScopeConstraint("season", "季节", "夏季", "required"),
-        ScopeConstraint("scenario", "研究场景", "通勤", "required"),
-    )
+    constraints = (ScopeConstraint("core_object", "核心对象", "长袖衬衫", "required"),)
     query_groups = (
         ScopeQueryGroupInput(
-            "长袖衬衫 夏季 通勤",
-            "长袖衬衫 夏季 通勤",
-            ("长袖衬衫", "夏季", "通勤"),
+            "长袖衬衫",
+            "长袖衬衫",
+            ("长袖衬衫",),
         ),
     )
     draft = build_scope_draft(
@@ -2713,6 +2718,8 @@ async def seed_scope_awaiting_coverage_offline(
         structure_hash=structure_hash,
         constraints=constraints,
         query_groups=query_groups,
+        schema_version=SCOPE_CONTRACT_SCHEMA_VERSION_V2,
+        core_object="长袖衬衫",
     )
     store.save_scope_draft_with_audit_event(
         draft,
@@ -2741,8 +2748,8 @@ async def seed_scope_awaiting_coverage_offline(
         state="awaiting_scope_decision",
         constraint_counts={
             "core_object": {
-                "matched_candidate_count": 0,
-                "independent_author_count": 0,
+                "matched_candidate_count": 1,
+                "independent_author_count": 1,
                 "required": True,
             },
             "_summary": {
