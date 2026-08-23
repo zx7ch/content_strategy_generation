@@ -34,6 +34,7 @@ from app.content_research.scope_contract import (
     ScopeConstraint,
     ScopeDraftAuditEvent,
     ScopeQueryGroupInput,
+    build_scope_contract,
     build_scope_draft,
 )
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
@@ -942,7 +943,6 @@ def test_creator_historical_run_never_overrides_durable_active_run_after_brief_c
             run_id=historical["run_id"],
         )
     )
-
     page.goto(stack["frontend_url"] + "/creator", wait_until="domcontentloaded")
     page.get_by_text("Run A 历史报告", exact=True).click()
     expect(published_report(page)).to_be_visible(timeout=30000)
@@ -979,9 +979,22 @@ def test_creator_historical_run_never_overrides_durable_active_run_after_brief_c
         page.get_by_role("button", name=re.compile("确认并开始调研")).click()
     run_b = brief_response.value.json()["workflow_run_id"]
     assert run_b != historical["run_id"]
+    attach_historical_v1_scope(stack["db_path"], historical["run_id"])
+    historical_scope_response = page.request.get(
+        f"{stack['backend_url']}/content-research/workflows/{historical['run_id']}/scope",
+        headers=USER_HEADERS,
+    )
+    assert historical_scope_response.status == 200
+    historical_scope = historical_scope_response.json()["scope_contract"]
+    assert historical_scope["schema_version"] == "content_research_scope_contract_v1"
+    assert [item["final_query"] for item in historical_scope["query_groups"]] == [
+        "历史长袖 夏季 通勤"
+    ]
     expect(page.locator('section[aria-label="确认检索范围"]')).to_be_visible(
         timeout=30000
     )
+    current_scope = page.locator('section[aria-label="确认检索范围"]')
+    expect(current_scope.get_by_text("历史长袖 夏季 通勤", exact=True)).to_have_count(0)
 
     requested_urls: list[str] = []
     page.on("request", lambda request: requested_urls.append(request.url))
@@ -2506,6 +2519,48 @@ def published_report(page: Page):
 def default_brand_id(backend_url: str) -> str:
     with urlopen(Request(f"{backend_url}/brands", headers=USER_HEADERS)) as response:
         return str(json.load(response)["items"][0]["id"])
+
+
+def attach_historical_v1_scope(db_path: str, workflow_run_id: str) -> None:
+    store = SQLiteContentResearchStore(db_path)
+    constraints = (
+        ScopeConstraint("core_object", "核心对象", "历史长袖", "required"),
+        ScopeConstraint("season", "季节", "夏季", "required"),
+        ScopeConstraint("scenario", "研究场景", "通勤", "required"),
+    )
+    query_groups = (
+        ScopeQueryGroupInput(
+            "历史长袖 夏季 通勤",
+            "历史长袖 夏季 通勤",
+            ("历史长袖", "夏季", "通勤"),
+        ),
+    )
+    draft = build_scope_draft(
+        workflow_run_id=workflow_run_id,
+        research_plan_id=f"rp_historical_v1_{workflow_run_id}",
+        structure_hash=f"structure_historical_v1_{workflow_run_id}",
+        constraints=constraints,
+        query_groups=query_groups,
+    )
+    store.save_scope_draft_with_audit_event(
+        draft,
+        ScopeDraftAuditEvent(
+            id=f"sda_historical_v1_{workflow_run_id}",
+            workflow_run_id=workflow_run_id,
+            scope_draft_id=draft.id,
+            event_name="scope_suggested",
+            payload={"schema_version": "content_research_scope_audit_event_v1"},
+        ),
+    )
+    store.save_scope_contract(
+        build_scope_contract(
+            workflow_run_id=workflow_run_id,
+            research_plan_id=f"rp_historical_v1_{workflow_run_id}",
+            version=1,
+            constraints=constraints,
+            query_groups=query_groups,
+        )
+    )
 
 
 async def seed_scope_awaiting_coverage_offline(

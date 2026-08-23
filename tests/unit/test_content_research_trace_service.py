@@ -402,8 +402,6 @@ async def _confirmed_workflow(service):
             selected_competitors=["迪卡侬"],
             custom_competitors=["凯乐石"],
             selected_directions=["product_marketing", "content_performance"],
-            custom_research_question="关注轻量速干",
-            primary_marketing_goal="content_seeding",
         ),
     )
     return presearch

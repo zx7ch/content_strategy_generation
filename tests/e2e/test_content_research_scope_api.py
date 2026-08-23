@@ -23,7 +23,10 @@ from app.content_research.presearch.service import PresearchService
 from app.content_research.scope_contract import (
     CoverageSnapshot,
     ScopeAuditEvent,
+    ScopeConstraint,
     ScopeDraftAuditEvent,
+    ScopeQueryGroupInput,
+    build_scope_draft,
 )
 from app.content_research.service import (
     ContentResearchService,
@@ -168,26 +171,49 @@ async def _scope_ready_workflow(client: httpx.AsyncClient) -> dict:
 async def _confirmed_scope_with_unmet_season(client: httpx.AsyncClient) -> tuple[str, dict]:
     workflow = await _scope_ready_workflow(client)
     workflow_run_id = workflow["presearch"]["workflow_run_id"]
-    prepared = await client.post(
-        f"/content-research/workflows/{workflow_run_id}/actions",
-        json={"action": "prepare_scope", "payload": {"direction_id": "product_marketing"}},
+    store = app.state.content_research_service._store
+    draft = build_scope_draft(
+        workflow_run_id=workflow_run_id,
+        research_plan_id=f"rp_historical_v1_{workflow_run_id}",
+        structure_hash=workflow["presearch"]["subject_structure_hash"],
+        constraints=(
+            ScopeConstraint("core_object", "核心对象", "长袖衬衫", "required"),
+            ScopeConstraint("season", "季节", "夏季", "required"),
+            ScopeConstraint("scenario", "研究场景", "通勤", "required"),
+        ),
+        query_groups=(
+            ScopeQueryGroupInput(
+                "长袖衬衫 夏季 通勤",
+                "长袖衬衫 夏季 通勤",
+                ("长袖衬衫", "夏季", "通勤"),
+            ),
+        ),
     )
-    scope = prepared.json()["result"]["scope"]
+    store.save_scope_draft_with_audit_event(
+        draft,
+        ScopeDraftAuditEvent(
+            id=f"sda_historical_v1_{workflow_run_id}",
+            workflow_run_id=workflow_run_id,
+            scope_draft_id=draft.id,
+            event_name="scope_suggested",
+            payload={"schema_version": "content_research_scope_audit_event_v1"},
+        ),
+    )
     confirmed = await client.post(
         f"/content-research/workflows/{workflow_run_id}/actions",
         json={
             "action": "confirm_scope",
             "payload": {
-                "scope_draft_id": scope["id"],
-                "structure_hash": scope["structure_hash"],
+                "scope_draft_id": draft.id,
+                "structure_hash": draft.structure_hash,
                 "query_groups": [
-                    {"final_query": group["final_query"]} for group in scope["query_groups"]
+                    {"final_query": group.final_query} for group in draft.query_groups
                 ],
             },
         },
     )
+    assert confirmed.status_code == 200, confirmed.text
     contract = confirmed.json()["result"]["scope_contract"]
-    store = app.state.content_research_service._store
     snapshot = CoverageSnapshot(
         id="scv_api_unmet_season",
         workflow_run_id=workflow_run_id,

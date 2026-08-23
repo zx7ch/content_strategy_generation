@@ -134,12 +134,6 @@ async def _confirmed_scope_awaiting_coverage(
             "subject_structure_hash": workflow["subject_structure_hash"],
             "subject_type": "category",
             "selected_directions": ["product_marketing"],
-            "primary_marketing_goal": "content_seeding",
-            "subject_structure_confirmation": {
-                "core_object": "长袖衬衫",
-                "research_intent": "通勤",
-                "context_modifiers": ["夏季"],
-            },
         },
     )
     assert confirmed.status_code == 200, confirmed.text
