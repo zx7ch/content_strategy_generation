@@ -199,15 +199,15 @@ proof.
 
 **Acceptance RED:** `test_creator_submit_subject_reaches_only_the_approved_brief_and_restores_it` and `test_creator_run_b_remains_active_after_reload_and_late_run_a_response`.
 
-- [ ] **Step 1: Write migration and pure-transition REDs**
+- [x] **Step 1: Write migration and pure-transition REDs**
 
 Assert legal transitions, revision increments, illegal Brief/Scope combinations, duplicate `command_id`, stale revision rejection, and old-row read-only decoding.
 
-- [ ] **Step 2: Write the two Creator-to-owned-stack Acceptance REDs**
+- [x] **Step 2: Write the two Creator-to-owned-stack Acceptance REDs**
 
 Use real Router and SQLite plus a deterministic recording LLM. Assert no `confirm_subject_structure`, no Scope row, no dispatch row, Run B active, Run A present only in Timeline, and refresh/restart parity.
 
-- [ ] **Step 3: Run REDs**
+- [x] **Step 3: Run REDs**
 
 ```bash
 pytest -q \
@@ -218,15 +218,15 @@ pytest -q \
   -k 'approved_brief or run_b or lifecycle' -vv
 ```
 
-- [ ] **Step 4: Implement the coordinator seam and PreResearch transitions**
+- [x] **Step 4: Implement the coordinator seam and PreResearch transitions**
 
 Keep provider calls outside the transaction. Return the new projection from create/read APIs. Delete `confirm_subject_structure` action/schema/service/UI and rewrite or delete every test that expects it.
 
-- [ ] **Step 5: Prove failure, restart, stale response, and foundation behavior**
+- [x] **Step 5: Prove failure, restart, stale response, and foundation behavior**
 
 Run the owned tests, `frontend npm test`, foundation gate, and old-spec scan. Inject LLM failure, process restart, late Run A response, and stale checkpoint.
 
-- [ ] **Step 6: Commit the independently releasable checkpoint**
+- [x] **Step 6: Commit the independently releasable checkpoint**
 
 ```bash
 git add app/content_research/lifecycle app/content_research app/api/routes/router.py \

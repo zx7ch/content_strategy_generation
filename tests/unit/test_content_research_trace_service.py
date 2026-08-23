@@ -5,8 +5,6 @@ from datetime import timedelta
 
 import pytest
 
-from app.content_research.api_schemas import ContentResearchBriefConfirmRequest
-from app.content_research.execution_decision_identity import build_execution_decision_identity
 from app.content_research.models import ResearchBriefRecord
 from app.content_research.observation.trace_service import (
     _duration_ms,
@@ -16,12 +14,6 @@ from app.content_research.observation.trace_service import (
 )
 from app.content_research.persistence_models import StageCheckpointRecord
 from app.content_research.presearch.service import PresearchService
-from app.content_research.scope_contract import (
-    CoverageSnapshot,
-    ScopeConstraint,
-    ScopeQueryGroupInput,
-    build_scope_contract,
-)
 from app.content_research.service import (
     ContentResearchNotFoundError,
     ContentResearchService,
@@ -29,6 +21,7 @@ from app.content_research.service import (
 )
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
 from app.memory.workflow_store import WorkflowStore
+from app.memory.thread_store import ThreadStore
 from app.services.llm.pricing import UsageCost
 from app.services.llm.types import LLMCallContext, LLMResponse, TokenUsage
 from app.services.llm.usage_tracker import LLMUsageEventInput, LLMUsageTracker
@@ -42,7 +35,6 @@ class FakeLLM:
                     "subject_confirmation": "徒步短裤更可能是户外服饰品类，请确认。",
                     "competitor_tags": ["迪卡侬", "凯乐石"],
                     "research_directions": ["产品营销", "用户评论痛点"],
-                    "custom_research_question": "",
                     "custom_competitor_input": "",
                     "subject_structure": {
                         "schema_version": "content_research_subject_structure_v1",
@@ -387,32 +379,22 @@ def service(db_path, store):
     )
 
 
-async def _confirmed_workflow(service):
-    presearch = await service.submit_presearch(
-        seed_text="徒步短裤",
-        user_note="关注夏季",
-        thread_id="thread-trace-unit",
-        user_id="user-trace-unit",
-    )
-    await service.confirm_brief(
-        brief_id=presearch.brief_id,
-        confirmation_request=ContentResearchBriefConfirmRequest(
-            confirmed_subject="徒步短裤",
-            subject_type="category",
-            selected_competitors=["迪卡侬"],
-            custom_competitors=["凯乐石"],
-            selected_directions=["product_marketing", "content_performance"],
-        ),
-    )
-    return presearch
 
 
 async def _unconfirmed_workflow(service):
+    async with ThreadStore(service._store._db_path) as thread_store:
+        thread = await thread_store.create_thread(
+            title="Trace 预检索",
+            workspace_id="ws-trace",
+            brand_id="brand-trace",
+        )
     return await service.submit_presearch(
+        command_id="trace-unconfirmed-presearch",
         seed_text="徒步短裤",
         user_note="关注异常边界",
-        thread_id="thread-confirm-boundary",
+        thread_id=thread["id"],
         user_id="user-confirm-boundary",
+        workspace_id="ws-trace",
     )
 
 
@@ -467,178 +449,8 @@ async def _record_usage(db_path: str, workflow_run_id: str) -> None:
         )
 
 
-@pytest.mark.asyncio
-async def test_trace_aggregates_runtime_observations_and_usage(db_path, service):
-    presearch = await _confirmed_workflow(service)
-    await _record_usage(db_path, presearch.workflow_run_id)
-
-    trace = await service.get_workflow_trace(presearch.workflow_run_id)
-
-    assert trace.workflow_run_id == presearch.workflow_run_id
-    assert trace.thread_id == "thread-trace-unit"
-    assert trace.current_stage == "formal_research"
-    assert trace.run_status == "running"
-    assert trace.recoverable is True
-    assert trace.duration_ms >= 0
-    assert trace.error_count >= 1
-    assert trace.retry_count >= 1
-    assert [item["event_name"] for item in trace.observation_events] == [
-        "presearch_started",
-        "presearch_completed",
-    ]
-    assert "child_tasks_created" in [event["event_type"] for event in trace.workflow_events]
-    assert [step["step_name"] for step in trace.runtime_steps] == [
-        "presearch",
-        "brief_confirm",
-        "plan_build",
-        "formal_research",
-    ]
-    assert len(trace.runtime_child_tasks) == 2
-    assert trace.usage_summary == {}
-    assert trace.usage_steps == []
-    assert trace.usage_events == []
 
 
-@pytest.mark.asyncio
-async def test_trace_returns_zero_usage_defaults_when_no_usage_rows(service):
-    presearch = await _confirmed_workflow(service)
-
-    trace = await service.get_workflow_trace(presearch.workflow_run_id)
-
-    assert trace.usage_summary == {}
-    assert trace.usage_steps == []
-    assert trace.usage_events == []
-
-
-@pytest.mark.asyncio
-async def test_trace_projects_execution_identity_and_ordered_safe_facts(service, store):
-    presearch = await _unconfirmed_workflow(service)
-    contract = build_scope_contract(
-        workflow_run_id=presearch.workflow_run_id,
-        research_plan_id="rp_trace_identity",
-        version=1,
-        constraints=(
-            ScopeConstraint("core_object", "核心对象", "徒步短裤", "required"),
-            ScopeConstraint("season", "季节", "夏季", "required"),
-        ),
-        query_groups=(ScopeQueryGroupInput("夏季 徒步短裤", "夏季 徒步短裤"),),
-    )
-    store.save_scope_contract(contract)
-    snapshot = CoverageSnapshot(
-        id="scv_trace_identity",
-        workflow_run_id=presearch.workflow_run_id,
-        scope_contract_id=contract.id,
-        scope_contract_version=contract.version,
-        state="awaiting_scope_decision",
-        constraint_counts={},
-        unmet_constraint_ids=("season",),
-    )
-    store.save_coverage_snapshot(snapshot)
-    unit, _created = store.resolve_coverage_to_execution_unit_atomically(
-        snapshot=snapshot,
-        decision={
-            "resolution": "expand_required_constraint",
-            "constraint_id": "season",
-            "supplementary_queries": ("夏季 徒步短裤 防晒",),
-        },
-    )
-    attempt = store.claim_execution_unit(execution_unit_id=unit.id, owner="worker-secret")
-    assert attempt is not None and attempt.lease_token is not None
-    assert store.record_provider_request(
-        execution_unit_id=unit.id,
-        attempt_no=attempt.attempt_no,
-        lease_token=attempt.lease_token,
-        payload={
-            "provider": "xiaohongshu",
-            "provider_operation": "discover_candidates",
-            "query": "must-not-reach-trace",
-            "cookie": "must-not-reach-trace",
-        },
-    )
-    assert store.record_provider_outcome(
-        execution_unit_id=unit.id,
-        attempt_no=attempt.attempt_no,
-        lease_token=attempt.lease_token,
-        provider_state="completed",
-        payload={
-            "provider": "xiaohongshu",
-            "provider_operation": "discover_candidates",
-            "result_status": "completed",
-            "raw_response": "must-not-reach-trace",
-        },
-    )
-
-    trace = await service.get_workflow_trace(presearch.workflow_run_id)
-
-    expected_identity = build_execution_decision_identity(
-        coverage_snapshot_id=snapshot.id,
-        source_scope_contract_id=contract.id,
-        resulting_scope_contract_id=contract.id,
-        resolution="expand_required_constraint",
-        target_constraint_id="season",
-        supplementary_queries=("夏季 徒步短裤 防晒",),
-    )
-    assert trace.model_dump(mode="json")["execution_units"] == [
-        {
-            "id": unit.id,
-            "state": "running",
-            "recovery_state": "replayable",
-            "identity_schema": "execution_decision_identity_v1",
-            "identity_state": "canonical",
-            "identity_json": expected_identity.payload,
-            "facts": [
-                {
-                    "attempt_no": 0,
-                    "sequence_no": 1,
-                    "kind": "decision_accepted",
-                    "payload": {"decision": expected_identity.payload},
-                },
-                {
-                    "attempt_no": 0,
-                    "sequence_no": 2,
-                    "kind": "attempt_claimed",
-                    "payload": {},
-                },
-                {
-                    "attempt_no": 0,
-                    "sequence_no": 3,
-                    "kind": "provider_request_recorded",
-                    "payload": {
-                        "provider": "xiaohongshu",
-                        "provider_operation": "discover_candidates",
-                    },
-                },
-                {
-                    "attempt_no": 0,
-                    "sequence_no": 4,
-                    "kind": "provider_outcome_recorded",
-                    "payload": {
-                        "provider": "xiaohongshu",
-                        "provider_operation": "discover_candidates",
-                        "result_status": "completed",
-                    },
-                },
-            ],
-        }
-    ]
-    assert "must-not-reach-trace" not in trace.model_dump_json()
-    assert "worker-secret" not in trace.model_dump_json()
-
-
-@pytest.mark.asyncio
-async def test_trace_projects_recorded_timing_without_exposing_runtime_json(service):
-    presearch = await _confirmed_workflow(service)
-
-    trace = await service.get_workflow_trace(presearch.workflow_run_id)
-
-    formal_step = trace.runtime_steps[-1]
-    timing = formal_step["timing"]
-    assert timing["timing_source"] == "recorded"
-    assert timing["queued_at"].endswith("+00:00")
-    assert timing["execution_started_at"].endswith("+00:00")
-    assert timing["active_duration_ms"] >= 0
-    assert timing["queue_duration_ms"] >= 0
-    assert "timing_json" not in formal_step
 
 
 def test_trace_timing_marks_legacy_step_estimated_without_precision_invention():
@@ -728,271 +540,13 @@ def test_trace_timing_does_not_project_stale_inactive_boundaries(status, stale_k
     assert stale_key not in timing
 
 
-@pytest.mark.asyncio
-async def test_confirm_validation_failure_aborts_brief_execution_span(db_path, service):
-    presearch = await _unconfirmed_workflow(service)
-
-    with pytest.raises(ValueError, match="Unknown research directions"):
-        await service.confirm_brief(
-            brief_id=presearch.brief_id,
-            confirmation_request=ContentResearchBriefConfirmRequest(
-                confirmed_subject="徒步短裤",
-                subject_type="category",
-                selected_directions=["not_in_lite_catalog"],
-                primary_marketing_goal="content_seeding",
-            ),
-        )
-
-    timings = await _step_timings(db_path, presearch.workflow_run_id)
-    _assert_no_open_execution_span(timings["brief_confirm"])
-    assert timings["plan_build"].get("execution_spans") in (None, [])
 
 
-@pytest.mark.asyncio
-async def test_plan_build_failure_aborts_plan_without_overlapping_brief(
-    db_path, service, monkeypatch
-):
-    presearch = await _unconfirmed_workflow(service)
-
-    def fail_plan_build(**_kwargs):
-        raise RuntimeError("plan build failed")
-
-    monkeypatch.setattr(service._plan_builder, "build", fail_plan_build)
-    with pytest.raises(RuntimeError, match="plan build failed"):
-        await service.confirm_brief(
-            brief_id=presearch.brief_id,
-            confirmation_request=ContentResearchBriefConfirmRequest(
-                confirmed_subject="徒步短裤",
-                subject_type="category",
-                selected_directions=["product_marketing"],
-                primary_marketing_goal="content_seeding",
-            ),
-        )
-
-    timings = await _step_timings(db_path, presearch.workflow_run_id)
-    _assert_no_open_execution_span(timings["brief_confirm"])
-    _assert_no_open_execution_span(timings["plan_build"])
-    brief_span = timings["brief_confirm"]["execution_spans"][-1]
-    plan_span = timings["plan_build"]["execution_spans"][-1]
-    assert brief_span["finished_at"] <= plan_span["started_at"]
 
 
-@pytest.mark.asyncio
-async def test_confirmation_persistence_failure_aborts_plan_execution_span(
-    db_path, service, monkeypatch
-):
-    presearch = await _unconfirmed_workflow(service)
-
-    async def fail_persistence(*_args, **_kwargs):
-        raise RuntimeError("confirmation persistence failed")
-
-    monkeypatch.setattr(service._dispatch, "persist_confirmation", fail_persistence)
-    with pytest.raises(RuntimeError, match="confirmation persistence failed"):
-        await service.confirm_brief(
-            brief_id=presearch.brief_id,
-            confirmation_request=ContentResearchBriefConfirmRequest(
-                confirmed_subject="徒步短裤",
-                subject_type="category",
-                selected_directions=["product_marketing"],
-                primary_marketing_goal="content_seeding",
-            ),
-        )
-
-    timings = await _step_timings(db_path, presearch.workflow_run_id)
-    _assert_no_open_execution_span(timings["brief_confirm"])
-    _assert_no_open_execution_span(timings["plan_build"])
 
 
 @pytest.mark.asyncio
 async def test_trace_missing_workflow_raises_content_research_not_found(service):
     with pytest.raises(ContentResearchNotFoundError):
         await service.get_workflow_trace("run_missing")
-
-
-@pytest.mark.asyncio
-async def test_trace_projects_durable_provider_failure_without_raw_request(service):
-    presearch = await _confirmed_workflow(service)
-    service._store.save_stage_checkpoint(
-        StageCheckpointRecord(
-            id="scp-provider-failure",
-            schema_version="content_research_stage_checkpoint_v1",
-            workflow_run_id=presearch.workflow_run_id,
-            subagent_task_id="sat-provider",
-            stage_name="operation",
-            input_fingerprint="fingerprint-1",
-            status="auth_required",
-            payload={
-                "workflow_run_id": presearch.workflow_run_id,
-                "operation": "discover",
-                "operation_fingerprint": "fingerprint-1",
-                "operation_state": "auth_required",
-                "request": {"query": "徒步短裤"},
-                "completion": {
-                    "failure_code": "auth_required",
-                    "failure_reason": "auth_required",
-                    "retryable": False,
-                    "recovery_action": "更新小红书登录态后继续。",
-                },
-            },
-        )
-    )
-
-    trace = await service.get_workflow_trace(presearch.workflow_run_id)
-
-    assert len(trace.provider_operations) == 1
-    operation = trace.provider_operations[0]
-    assert operation.pop("operation_id").startswith("op_")
-    assert operation == {
-        "operation_fingerprint": "fingerprint-1",
-        "operation": "discover",
-        "provider": None,
-        "provider_operation": None,
-        "source_kind": None,
-        "result_status": None,
-        "status": "auth_required",
-        "started_at": None,
-        "finished_at": None,
-        "failure_code": "auth_required",
-        "retryable": False,
-    }
-
-
-@pytest.mark.asyncio
-async def test_trace_projects_provider_access_rejection_with_safe_browser_session_recovery(service):
-    presearch = await _confirmed_workflow(service)
-    service._store.save_stage_checkpoint(
-        StageCheckpointRecord(
-            id="scp-provider-access-rejected",
-            schema_version="content_research_stage_checkpoint_v1",
-            workflow_run_id=presearch.workflow_run_id,
-            subagent_task_id="sat-provider",
-            stage_name="operation",
-            input_fingerprint="fingerprint-detail-1",
-            status="failed",
-            payload={
-                "workflow_run_id": presearch.workflow_run_id,
-                "operation": "collect_note_detail",
-                "operation_fingerprint": "fingerprint-detail-1",
-                "operation_state": "failed",
-                "request": {
-                    "note_id": "note-1",
-                    "xsec_token": "must-not-reach-trace",
-                    "cookie": "must-not-reach-trace",
-                },
-                "completion": {
-                    "provider": "xiaohongshu",
-                    "provider_operation": "collect_note_detail",
-                    "source_kind": "note_detail",
-                    "result_status": "failed",
-                    "item_count": 0,
-                    "completeness": "unavailable",
-                    "cookie_status": "valid",
-                    "failure_code": "provider_access_rejected",
-                    "failure_reason": "provider_access_rejected",
-                    "retryable": False,
-                    "recovery_action": "笔记详情请求的浏览器安全上下文不兼容；请启用或更新兼容的浏览器会话详情采集提供者后重新发起调研。",
-                },
-            },
-        )
-    )
-
-    trace = await service.get_workflow_trace(presearch.workflow_run_id)
-
-    assert len(trace.provider_operations) == 1
-    operation = trace.provider_operations[0]
-    assert operation.pop("operation_id").startswith("op_")
-    assert operation == {
-        "operation_fingerprint": "fingerprint-detail-1",
-        "operation": "collect_note_detail",
-        "provider": "xiaohongshu",
-        "provider_operation": "collect_note_detail",
-        "source_kind": "note_detail",
-        "result_status": "failed",
-        "status": "failed",
-        "started_at": None,
-        "finished_at": None,
-        "failure_code": "provider_access_rejected",
-        "retryable": False,
-    }
-    assert trace.external_api_summary == {
-        "call_count": 1,
-        "completed_count": 0,
-        "failed_count": 1,
-        "by_provider": {"xiaohongshu": 1},
-        "by_operation": {"collect_note_detail": 1},
-    }
-    assert "must-not-reach-trace" not in trace.model_dump_json()
-
-
-@pytest.mark.asyncio
-async def test_direction_evidence_uses_post_detail_selection_for_coverage_and_counts(service):
-    presearch = await _confirmed_workflow(service)
-    base_payload = {
-        "workflow_run_id": presearch.workflow_run_id,
-        "direction_id": "product_marketing",
-    }
-    service._store.save_stage_checkpoint(
-        StageCheckpointRecord(
-            id="scp-selection-before-detail",
-            schema_version="content_research_stage_checkpoint_v1",
-            workflow_run_id=presearch.workflow_run_id,
-            subagent_task_id="sat-product",
-            stage_name="selection",
-            input_fingerprint="selection-fingerprint",
-            status="completed",
-            payload={
-                **base_payload,
-                "selection": {
-                    "status": "complete",
-                    "selected_source_count": 3,
-                    "eligible_source_count": 3,
-                    "independent_source_count": 3,
-                    "coverage_unmet_query_group_ids": [],
-                    "decisions": [],
-                },
-            },
-        )
-    )
-    service._store.save_stage_checkpoint(
-        StageCheckpointRecord(
-            id="scp-detail-final-selection",
-            schema_version="content_research_stage_checkpoint_v1",
-            workflow_run_id=presearch.workflow_run_id,
-            subagent_task_id="sat-product",
-            stage_name="detail",
-            input_fingerprint="selection-fingerprint",
-            status="completed",
-            payload={
-                **base_payload,
-                "selection": {
-                    "status": "incomplete",
-                    "selected_source_count": 2,
-                    "eligible_source_count": 2,
-                    "independent_source_count": 2,
-                    "coverage_unmet_query_group_ids": ["qg_missing"],
-                    "decisions": [],
-                },
-            },
-        )
-    )
-    service._store.save_stage_checkpoint(
-        StageCheckpointRecord(
-            id="scp-packet-final-selection",
-            schema_version="content_research_stage_checkpoint_v1",
-            workflow_run_id=presearch.workflow_run_id,
-            subagent_task_id="sat-product",
-            stage_name="packet",
-            input_fingerprint="selection-fingerprint",
-            status="completed",
-            payload={**base_payload, "status": "incomplete", "packet_ids": []},
-        )
-    )
-
-    evidence = service.get_direction_evidence(
-        workflow_run_id=presearch.workflow_run_id,
-        direction_id="product_marketing",
-    )
-
-    assert evidence.status == "incomplete"
-    assert evidence.counts["selected_source_count"] == 2
-    assert evidence.coverage_unmet_query_group_ids == ["qg_missing"]

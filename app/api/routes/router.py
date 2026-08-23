@@ -22,17 +22,15 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.config import settings
 from app.content_research.api_schemas import (
-    ContentResearchBriefConfirmRequest,
     ContentResearchDirectionEvidenceResponse,
     ContentResearchGovernanceResponse,
+    ContentResearchHistoricalWorkflowSummaryResponse,
     ContentResearchLiteReportResponse,
     ContentResearchLLMConfigurationRequest,
     ContentResearchLLMConfigurationResponse,
     ContentResearchPresearchRequest,
     ContentResearchPresearchResponse,
     ContentResearchScopeProjectionResponse,
-    ContentResearchSourceCollectionRequest,
-    ContentResearchSourceCollectionResponse,
     ContentResearchTraceResponse,
     ContentResearchWorkflowActionRequest,
     ContentResearchWorkflowActionResponse,
@@ -46,6 +44,10 @@ from app.content_research.api_schemas import (
     XHSQRLoginResponse,
 )
 from app.content_research.presearch.service import PresearchService
+from app.content_research.lifecycle.coordinator import (
+    LifecycleCommandConflict,
+    LifecyclePersistenceBusy,
+)
 from app.content_research.service import (
     ContentResearchNotFoundError,
     ContentResearchService,
@@ -879,6 +881,22 @@ def _require_f003_lite_preview() -> None:
 
 
 def _content_research_error(exc: Exception) -> APIError:
+    if isinstance(exc, LifecyclePersistenceBusy):
+        return APIError(
+            status_code=503,
+            error_code="LOCAL_PERSISTENCE_BUSY",
+            error_message="本地数据写入暂时繁忙，自动重试未成功。",
+            retryable=True,
+            suggested_action="retry_after_refresh",
+        )
+    if isinstance(exc, LifecycleCommandConflict):
+        return APIError(
+            status_code=409,
+            error_code="STALE_CONTENT_RESEARCH_COMMAND",
+            error_message=str(exc),
+            retryable=False,
+            suggested_action="refresh_run_projection",
+        )
     if isinstance(exc, ContentResearchNotFoundError):
         return APIError(
             status_code=404,
@@ -954,6 +972,7 @@ async def create_content_research_presearch(
     service = _get_content_research_service(request)
     try:
         return await service.submit_presearch(
+            command_id=payload.command_id,
             seed_text=payload.seed_text,
             user_note=payload.user_note,
             thread_id=payload.thread_id,
@@ -1086,48 +1105,17 @@ async def get_content_research_presearch(
         raise _content_research_error(exc) from exc
 
 
-@app.post(
-    "/content-research/briefs/{brief_id}/confirm",
-    response_model=ContentResearchWorkflowSummaryResponse,
-)
-async def confirm_content_research_brief(
-    brief_id: str,
-    payload: ContentResearchBriefConfirmRequest,
-    request: Request,
-) -> ContentResearchWorkflowSummaryResponse:
-    _require_f003_lite_preview()
-    service = _get_content_research_service(request)
-    try:
-        return await service.confirm_brief(brief_id=brief_id, confirmation_request=payload)
-    except Exception as exc:  # noqa: BLE001
-        raise _content_research_error(exc) from exc
-
-
-@app.post(
-    "/content-research/workflows",
-    response_model=ContentResearchWorkflowSummaryResponse,
-)
-async def create_content_research_workflow_from_brief(
-    payload: ContentResearchBriefConfirmRequest,
-    request: Request,
-    brief_id: str = Query(...),
-) -> ContentResearchWorkflowSummaryResponse:
-    _require_f003_lite_preview()
-    service = _get_content_research_service(request)
-    try:
-        return await service.confirm_brief(brief_id=brief_id, confirmation_request=payload)
-    except Exception as exc:  # noqa: BLE001
-        raise _content_research_error(exc) from exc
-
-
 @app.get(
     "/content-research/workflows/{workflow_run_id}",
-    response_model=ContentResearchWorkflowSummaryResponse,
+    response_model=(
+        ContentResearchWorkflowSummaryResponse
+        | ContentResearchHistoricalWorkflowSummaryResponse
+    ),
 )
 async def get_content_research_workflow(
     workflow_run_id: str,
     request: Request,
-) -> ContentResearchWorkflowSummaryResponse:
+) -> ContentResearchWorkflowSummaryResponse | ContentResearchHistoricalWorkflowSummaryResponse:
     service = _get_content_research_service(request)
     try:
         return await service.get_workflow_summary(workflow_run_id)
@@ -1279,28 +1267,9 @@ async def run_content_research_workflow_action(
     payload: ContentResearchWorkflowActionRequest,
     request: Request,
 ) -> ContentResearchWorkflowActionResponse:
-    if payload.action.strip() == "confirm_brief":
-        _require_f003_lite_preview()
     service = _get_content_research_service(request)
     try:
         return await service.run_workflow_action(workflow_run_id=workflow_run_id, request=payload)
-    except Exception as exc:  # noqa: BLE001
-        raise _content_research_error(exc) from exc
-
-
-@app.post(
-    "/content-research/workflows/{workflow_run_id}/source-collections",
-    response_model=ContentResearchSourceCollectionResponse,
-)
-async def collect_content_research_sources(
-    workflow_run_id: str,
-    payload: ContentResearchSourceCollectionRequest,
-    request: Request,
-) -> ContentResearchSourceCollectionResponse:
-    """Return diagnostic-only source data outside formal evidence execution."""
-    service = _get_content_research_service(request)
-    try:
-        return await service.collect_sources(workflow_run_id=workflow_run_id, request=payload)
     except Exception as exc:  # noqa: BLE001
         raise _content_research_error(exc) from exc
 

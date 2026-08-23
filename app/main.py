@@ -65,6 +65,7 @@ async def _worker_lifespan(application):
         )}),
         dispatch_wake_event=content_research_dispatch_event,
     )
+    await content_research_service.reconcile_startup()
     content_research_worker = ContentResearchDispatchWorker(
         store=content_research_service._store,
         service_factory=lambda: content_research_service,

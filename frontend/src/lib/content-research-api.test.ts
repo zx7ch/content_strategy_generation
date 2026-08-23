@@ -3,10 +3,7 @@ import test from "node:test";
 
 import {
   ContentResearchApiError,
-  confirmContentResearchScope,
-  confirmContentResearchSubjectStructure,
-  startContentResearchFormalResearch,
-  confirmContentResearchBrief,
+  contentResearchCommand,
   createContentResearchPresearch,
   endContentResearchWorkflow,
   getContentResearchDecisions,
@@ -16,19 +13,37 @@ import {
   getContentResearchScope,
   getContentResearchTrace,
   getContentResearchWorkflow,
-  prepareContentResearchScope,
-  retryContentResearchFormalResearch,
-  resumeContentResearchFormalResearch,
   submitContentResearchBrandDecision,
   submitContentResearchContentDecision,
   isContentResearchReportPending,
   retryContentResearchPresearch,
-  resolveContentResearchCoverage,
   saveLLMConfiguration,
 } from "./content-research-api.ts";
 import { setWorkspaceContext } from "./api.ts";
 
 setWorkspaceContext("ws_test", "user_test");
+
+const testRun = {
+  run_id: "run_1",
+  thread_id: "thread_1",
+  state: "brief_confirmation_required" as const,
+  state_revision: 2,
+  entered_at: "2026-08-23T00:00:00Z",
+  allowed_actions: [],
+};
+
+test("projected action retries retain command identity until state revision changes", () => {
+  const first = contentResearchCommand(testRun, "revise_subject", { clarification_text: "关注通勤" });
+  const transportRetry = contentResearchCommand(testRun, "revise_subject", { clarification_text: "关注通勤" });
+  const refreshed = contentResearchCommand(
+    { ...testRun, state_revision: 3 },
+    "revise_subject",
+    { clarification_text: "关注通勤" },
+  );
+
+  assert.equal(transportRetry.command_id, first.command_id);
+  assert.notEqual(refreshed.command_id, first.command_id);
+});
 
 test("report publication gaps remain pending instead of becoming permanent failures", () => {
   assert.equal(
@@ -127,6 +142,7 @@ test("createContentResearchPresearch posts seed to real P0 endpoint", async () =
   }) as typeof fetch;
 
   const result = await createContentResearchPresearch({
+    command_id: "submit-from-creator",
     seed_text: "徒步短裤",
     user_note: "关注夏季",
     thread_id: "thread_1",
@@ -189,173 +205,16 @@ test("retry presearch returns the same persisted identifiers", async () => {
   globalThis.fetch = (async (_input, init) => {
     requestBody = String(init?.body ?? "");
     return jsonResponse({ schema_version: "content_research_workflow_action_response_v1", workflow_run_id: "run_1", action: "retry_presearch", status: "completed", execution_mode: "local", sync_status: "local_only", result: {
-      attempt_id: "att_1", workflow_run_id: "run_1", brief_id: "rb_1", status: "completed", subject_confirmation: "短裤", competitor_tags: [], research_directions: [], direction_catalog: [], custom_research_question: "", timeout_status: "none", fallback_used: false,
+      attempt_id: "att_1", workflow_run_id: "run_1", brief_id: "rb_1", status: "completed", subject_confirmation: "短裤", competitor_tags: [], research_directions: [], direction_catalog: [], timeout_status: "none", fallback_used: false,
     }});
   }) as typeof fetch;
-  const result = await retryContentResearchPresearch("run_1");
+  const result = await retryContentResearchPresearch({
+    ...testRun,
+    state: "recovery_required",
+  });
   assert.match(requestBody, /"action":"retry_presearch"/);
   assert.equal(result.attempt_id, "att_1");
   assert.equal(result.brief_id, "rb_1");
-});
-
-test("structured subject confirmation stays on the same workflow run", async () => {
-  let requestBody = "";
-  globalThis.fetch = (async (_input, init) => {
-    requestBody = String(init?.body ?? "");
-    return jsonResponse({
-      schema_version: "content_research_workflow_action_response_v1",
-      workflow_run_id: "run_1",
-      action: "confirm_subject_structure",
-      status: "completed",
-      result: {
-        attempt_id: "att_1",
-        workflow_run_id: "run_1",
-        brief_id: "rb_1",
-        status: "completed",
-        subject_confirmation: "Apple 品牌",
-        competitor_tags: [],
-        research_directions: [],
-        direction_catalog: [],
-        custom_research_question: "",
-        timeout_status: "none",
-        fallback_used: false,
-        subject_structure: { canonical_subject: "Apple 品牌" },
-        subject_structure_state: "confirmed",
-        subject_structure_reason_codes: [],
-      },
-    });
-  }) as typeof fetch;
-
-  const response = await confirmContentResearchSubjectStructure("run_1", {
-    subject_structure_hash: "structure_1",
-    core_object: "Apple 品牌",
-    research_intent: "年轻人偏好",
-    context_modifiers: "大学生",
-  });
-
-  assert.match(requestBody, /"action":"confirm_subject_structure"/);
-  assert.match(requestBody, /"core_object":"Apple 品牌"/);
-  assert.equal(response.result.workflow_run_id, "run_1");
-});
-
-test("confirmContentResearchBrief posts the reused structure hash with selected directions", async () => {
-  let requestUrl = "";
-  let requestBody = "";
-  globalThis.fetch = (async (input, init) => {
-    requestUrl = String(input);
-    requestBody = String(init?.body ?? "");
-    return jsonResponse({
-      schema_version: "content_research_workflow_action_response_v1",
-      workflow_run_id: "run_1",
-      action: "confirm_brief",
-      status: "completed",
-      result: workflowPayload(),
-      execution_mode: "local",
-      remote_run_id: null,
-      local_cache_id: "rb_1",
-      sync_status: "local_only",
-    });
-  }) as typeof fetch;
-
-  const result = await confirmContentResearchBrief("run_1", {
-    confirmed_subject: "徒步短裤",
-    subject_structure_hash: "hash_1",
-    subject_type: "category",
-    selected_competitors: ["迪卡侬"],
-    custom_competitors: ["凯乐石"],
-    selected_directions: ["product_marketing"],
-  });
-
-  assert.ok(requestUrl.endsWith("/content-research/workflows/run_1/actions"));
-  assert.match(requestBody, /"action":"confirm_brief"/);
-  assert.match(requestBody, /"selected_directions":\["product_marketing"\]/);
-  assert.match(requestBody, /"subject_structure_hash":"hash_1"/);
-  assert.doesNotMatch(requestBody, /primary_marketing_goal/);
-  assert.doesNotMatch(requestBody, /subject_structure_confirmation/);
-  assert.equal(result.workflow_run_id, "run_1");
-});
-
-test("scope actions use the finalized server-owned payload contract", async () => {
-  const requestBodies: string[] = [];
-  globalThis.fetch = (async (_input, init) => {
-    const requestBody = String(init?.body ?? "");
-    requestBodies.push(requestBody);
-    const action = JSON.parse(requestBody).action as string;
-    if (action === "prepare_scope") {
-      return jsonResponse(workflowActionPayload(action, {
-        scope: scopeDraftPayload(),
-      }));
-    }
-    if (action === "confirm_scope") {
-      return jsonResponse(workflowActionPayload(action, {
-        scope_contract: scopeContractPayload(),
-        audit_event: scopeAuditPayload("scope_confirmed"),
-      }));
-    }
-    return jsonResponse(workflowActionPayload(action, {
-      report_mode: "limited",
-      scope_contract: scopeContractPayload(),
-      unmet_constraint_ids: ["season"],
-      audit_event: scopeAuditPayload("coverage_resolved"),
-      execution_unit: {
-        id: "seu_1",
-        state: "pending",
-        attempt_no: 1,
-        recovery_state: "replayable",
-        allowed_actions: [],
-        trace_summary: { fact_count: 1, attempt_count: 1, last_fact_kind: "decision_accepted" },
-        lease_token: "must-never-reach-the-browser",
-      },
-    }));
-  }) as typeof fetch;
-
-  const draft = await prepareContentResearchScope("run_1", { direction_id: "product_marketing" });
-  await confirmContentResearchScope("run_1", {
-    scope_draft_id: draft.id,
-    structure_hash: draft.structure_hash,
-    query_groups: [
-      { final_query: "白衬衫通勤穿搭" },
-      { final_query: "长袖衬衫" },
-      { final_query: "长袖衬衫 通勤" },
-    ],
-  });
-  const resolution = await resolveContentResearchCoverage("run_1", {
-    scope_contract_version: 1,
-    coverage_snapshot_id: "coverage_1",
-    resolution: "expand_required_constraint",
-    constraint_id: "season",
-    supplementary_queries: ["夏季 防晒 长袖衬衫"],
-  });
-
-  assert.deepEqual(JSON.parse(requestBodies[0]), {
-    action: "prepare_scope",
-    payload: { direction_id: "product_marketing" },
-  });
-  assert.deepEqual(JSON.parse(requestBodies[1]), {
-    action: "confirm_scope",
-    payload: {
-      scope_draft_id: "scope_draft_1",
-      structure_hash: "structure_hash_1",
-      query_groups: [
-        { final_query: "白衬衫通勤穿搭" },
-        { final_query: "长袖衬衫" },
-        { final_query: "长袖衬衫 通勤" },
-      ],
-    },
-  });
-  assert.deepEqual(JSON.parse(requestBodies[2]), {
-    action: "resolve_coverage",
-    payload: {
-      scope_contract_version: 1,
-      coverage_snapshot_id: "coverage_1",
-      resolution: "expand_required_constraint",
-      constraint_id: "season",
-      supplementary_queries: ["夏季 防晒 长袖衬衫"],
-    },
-  });
-  assert.equal(resolution.execution_unit.id, "seu_1");
-  assert.equal(resolution.execution_unit.attempt_no, 1);
-  assert.equal("lease_token" in resolution.execution_unit, false);
 });
 
 test("getContentResearchScope reads the persisted Scope projection and optional version", async () => {
@@ -411,66 +270,6 @@ test("scope reads expose a safe execution-unit projection without worker lease d
   assert.equal(projection.execution_unit?.attempt_no, 2);
   assert.deepEqual(projection.execution_unit?.allowed_actions, ["replay_coverage_decision"]);
   assert.equal("lease_token" in (projection.execution_unit ?? {}), false);
-});
-
-test("formal research dispatch preserves failed specialist state", async () => {
-  globalThis.fetch = (async (input, init) => {
-    assert.ok(String(input).endsWith("/content-research/workflows/run_1/actions"));
-    assert.match(String(init?.body ?? ""), /"action":"start_formal_research"/);
-    assert.match(String(init?.body ?? ""), /"source_kind":"search_result"/);
-    return jsonResponse({
-      schema_version: "content_research_workflow_action_response_v1",
-      workflow_run_id: "run_1",
-      action: "start_formal_research",
-      status: "failed",
-      result: {
-        workflow_run_id: "run_1",
-        provider: "xiaohongshu",
-        source_kind: "search_result",
-        status: "failed",
-        task_count: 2,
-        completed_task_count: 1,
-        partial_completed_task_count: 0,
-        failed_tasks: [{ task_id: "task_2", agent_name: "UGCCommunityResearchAgent", error: "auth_required" }],
-        limit_per_specialist: 50,
-      },
-      execution_mode: "local",
-      remote_run_id: null,
-      local_cache_id: "rb_1",
-      sync_status: "local_only",
-    });
-  }) as typeof fetch;
-
-  const result = await startContentResearchFormalResearch("run_1", {
-    source_kind: "search_result",
-  });
-
-  assert.equal(result.status, "failed");
-  assert.equal(result.failed_tasks[0].error, "auth_required");
-});
-
-test("retry formal research invokes the same-run requeue action", async () => {
-  let requestBody = "";
-  globalThis.fetch = (async (_input, init) => {
-    requestBody = String(init?.body ?? "");
-    return jsonResponse({
-      schema_version: "content_research_workflow_action_response_v1",
-      workflow_run_id: "run_1",
-      action: "retry_formal_research",
-      status: "queued",
-      result: {
-        workflow_run_id: "run_1", provider: "xiaohongshu", source_kind: "search_result",
-        status: "queued", task_count: 2, completed_task_count: 1,
-        partial_completed_task_count: 0, failed_tasks: [], limit_per_specialist: 20,
-      },
-      execution_mode: "local", remote_run_id: null, local_cache_id: "rb_1", sync_status: "local_only",
-    });
-  }) as typeof fetch;
-
-  const result = await retryContentResearchFormalResearch("run_1", { limit: 20 });
-
-  assert.match(requestBody, /"action":"retry_formal_research"/);
-  assert.equal(result.workflow_run_id, "run_1");
 });
 
 test("getContentResearchLiteReport fetches the Lite report contract", async () => {
@@ -549,81 +348,7 @@ test("getContentResearchDecisions fetches replayable decision state", async () =
   assert.equal(result.current_decisions[0].decision_status, "selected");
 });
 
-test("formal research preserves completed and failed specialist states distinctly", async () => {
-  const responses = [
-    {
-      workflow_run_id: "run_1",
-      provider: "xiaohongshu",
-      source_kind: "search_result",
-      status: "completed",
-      task_count: 2,
-      completed_task_count: 2,
-      partial_completed_task_count: 0,
-      failed_tasks: [],
-      limit_per_specialist: 50,
-    },
-    {
-      workflow_run_id: "run_1",
-      provider: "xiaohongshu",
-      source_kind: "search_result",
-      status: "failed",
-      task_count: 2,
-      completed_task_count: 1,
-      partial_completed_task_count: 0,
-      failed_tasks: [{ task_id: "task_2", error: "rate_limited" }],
-      limit_per_specialist: 50,
-    },
-  ];
-  globalThis.fetch = (async () =>
-    jsonResponse({
-      schema_version: "content_research_workflow_action_response_v1",
-      workflow_run_id: "run_1",
-      action: "start_formal_research",
-      status: responses[0].status,
-      result: responses.shift(),
-      execution_mode: "local",
-      remote_run_id: null,
-      local_cache_id: "rb_1",
-      sync_status: "local_only",
-    })) as typeof fetch;
-
-  const completed = await startContentResearchFormalResearch("run_1", {});
-  const failed = await startContentResearchFormalResearch("run_1", {});
-
-  assert.equal(completed.status, "completed");
-  assert.equal(completed.failed_tasks.length, 0);
-  assert.equal(failed.status, "failed");
-  assert.equal(failed.failed_tasks[0].error, "rate_limited");
-});
-
-test("resumeContentResearchFormalResearch sends the recovery continuation action", async () => {
-  let requestBody = "";
-  globalThis.fetch = (async (_input, init) => {
-    requestBody = String(init?.body ?? "");
-    return jsonResponse({
-      schema_version: "content_research_workflow_action_response_v1",
-      workflow_run_id: "run_1",
-      action: "resume_formal_research",
-      status: "running",
-      result: {
-        workflow_run_id: "run_1",
-        status: "running",
-        recoverable: true,
-      },
-      execution_mode: "local",
-      remote_run_id: null,
-      local_cache_id: "rb_1",
-      sync_status: "local_only",
-    });
-  }) as typeof fetch;
-
-  const result = await resumeContentResearchFormalResearch("run_1");
-
-  assert.match(requestBody, /"action":"resume_formal_research"/);
-  assert.equal(result.status, "running");
-});
-
-test("endContentResearchWorkflow sends end workflow action", async () => {
+test("endContentResearchWorkflow sends the authoritative cancel command", async () => {
   let requestUrl = "";
   let requestBody = "";
   globalThis.fetch = (async (input, init) => {
@@ -632,7 +357,7 @@ test("endContentResearchWorkflow sends end workflow action", async () => {
     return jsonResponse({
       schema_version: "content_research_workflow_action_response_v1",
       workflow_run_id: "run_1",
-      action: "end_content_research",
+      action: "cancel",
       status: "completed",
       result: { ended: true },
       execution_mode: "local",
@@ -642,11 +367,11 @@ test("endContentResearchWorkflow sends end workflow action", async () => {
     });
   }) as typeof fetch;
 
-  const result = await endContentResearchWorkflow("run_1");
+  const result = await endContentResearchWorkflow(testRun);
 
   assert.ok(requestUrl.endsWith("/content-research/workflows/run_1/actions"));
-  assert.match(requestBody, /"action":"end_content_research"/);
-  assert.equal(result.action, "end_content_research");
+  assert.match(requestBody, /"action":"cancel"/);
+  assert.equal(result.action, "cancel");
   assert.equal(result.result.ended, true);
 });
 

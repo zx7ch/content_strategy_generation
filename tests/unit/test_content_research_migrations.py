@@ -95,6 +95,41 @@ def test_migration_0032_adds_versioned_scope_draft_columns_with_v1_default(tmp_p
     assert migration == ("version_scope_drafts_for_query_portfolios",)
 
 
+def test_migration_0033_adds_the_single_lifecycle_authority(tmp_path):
+    db_path = str(tmp_path / "lifecycle-authority.db")
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE workflow_runs (run_id TEXT PRIMARY KEY)")
+
+    bootstrap_content_research_schema(db_path)
+
+    with sqlite3.connect(db_path) as conn:
+        workflow_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(workflow_runs)")
+        }
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        migration = conn.execute(
+            "SELECT name FROM content_research_schema_migrations WHERE version='0033'"
+        ).fetchone()
+
+    assert {
+        "content_research_state",
+        "state_revision",
+        "state_entered_at",
+        "lifecycle_error_json",
+        "lifecycle_schema_version",
+    } <= workflow_columns
+    assert {
+        "content_research_state_transitions",
+        "content_research_lifecycle_commands",
+    } <= tables
+    assert migration == ("content_research_lifecycle_authority",)
+
+
 def test_migration_0031_rolls_back_partial_integrity_schema_on_failure(
     tmp_path,
 ):

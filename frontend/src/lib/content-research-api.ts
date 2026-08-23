@@ -23,9 +23,39 @@ export function isContentResearchReportPending(error: unknown): boolean {
 }
 
 export interface ContentResearchPresearchRequest {
+  command_id: string;
   seed_text: string;
   user_note?: string | null;
   thread_id: string;
+}
+
+export type ContentResearchLifecycleState =
+  | "presearch_running"
+  | "brief_confirmation_required"
+  | "scope_confirmation_required"
+  | "retrieval_queued"
+  | "retrieval_running"
+  | "coverage_evaluating"
+  | "coverage_decision_required"
+  | "report_composing"
+  | "report_ready"
+  | "recovery_required"
+  | "cancelled_or_failed";
+
+export interface ContentResearchRunProjection {
+  run_id: string;
+  thread_id: string;
+  state: ContentResearchLifecycleState;
+  state_revision: number;
+  entered_at: string;
+  allowed_actions: string[];
+  reason_code?: string | null;
+  error?: JsonObject | null;
+  brief_id?: string | null;
+  scope_contract_id?: string | null;
+  execution_attempt_id?: string | null;
+  coverage_snapshot_id?: string | null;
+  publication_id?: string | null;
 }
 
 export interface ContentResearchPresearchResponse {
@@ -53,32 +83,22 @@ export interface ContentResearchPresearchResponse {
     [key: string]: unknown;
   };
   subject_structure_hash?: string | null;
-  subject_structure_state: string;
-  subject_structure_reason_codes: string[];
-  subject_structure_user_confirmed_fields?: string[];
+  run: ContentResearchRunProjection;
 }
 
 export interface LLMConfigurationInput { base_url: string; model: string; api_key?: string | null; }
 export interface LLMConfiguration { source: string; status: string; base_url: string; model: string; api_key_configured: boolean; api_key_suffix?: string | null; validated_at?: string | null; error_code?: string | null; }
 
-export interface ContentResearchBriefConfirmRequest {
-  confirmed_subject: string;
-  subject_structure_hash?: string | null;
-  subject_type: string;
-  selected_competitors: string[];
-  custom_competitors: string[];
-  selected_directions: string[];
-}
-
 export interface ContentResearchWorkflowSummary {
   workflow_run_id: string;
-  brief: {
+  run: ContentResearchRunProjection;
+  brief?: {
     id: string;
     workflow_run_id: string;
     thread_id: string;
     status: string;
     payload: JsonObject;
-  };
+  } | null;
   plan?: {
     id: string;
     brief_id: string;
@@ -109,6 +129,9 @@ export interface ContentResearchWorkflowSummary {
 export interface ContentResearchTrace {
   schema_version: string;
   workflow_run_id: string;
+  state?: ContentResearchLifecycleState | null;
+  state_revision?: number | null;
+  state_transitions?: JsonObject[];
   thread_id?: string | null;
   current_stage?: string | null;
   run_status?: string | null;
@@ -184,41 +207,47 @@ export interface ContentResearchMarketingConclusionTraceCheckpoint {
   packet_count_delta?: number;
 }
 
-export interface ContentResearchSourceCollectionRequest {
-  query?: string | null;
-  source_kind?: string;
-  limit?: number;
-  sort?: string;
-  provider?: string;
-}
-
-export interface ContentResearchSourceCollectionResponse {
-  workflow_run_id: string;
-  provider: string;
-  source_kind: string;
-  status: string;
-  failure_reason?: string | null;
-  cookie_status: string;
-  items: JsonObject[];
-  metadata: JsonObject;
-}
-
-export interface ContentResearchFormalResearchResponse {
-  workflow_run_id: string;
-  status: string;
-  task_count: number;
-  completed_task_count: number;
-  partial_completed_task_count: number;
-  failed_tasks: Array<{ task_id: string; agent_name?: string | null; error?: string | null }>;
-  provider: string;
-  source_kind: string;
-  limit_per_specialist: number;
-}
-
 export interface ContentResearchWorkflowActionRequest {
   schema_version?: string;
-  action: "confirm_brief" | "start_formal_research" | "retry_formal_research" | "resume_formal_research" | "end_content_research" | "retry_presearch" | "clarify_subject" | "confirm_subject_structure" | "repair_from_persisted_packets" | "prepare_scope" | "confirm_scope" | "resolve_coverage";
+  command_id: string;
+  expected_state: ContentResearchLifecycleState;
+  expected_revision: number;
+  action: "cancel" | "retry_presearch" | "revise_subject";
   payload?: JsonObject;
+}
+
+export function createContentResearchCommandId(): string {
+  if (typeof globalThis.crypto?.randomUUID === "function") return globalThis.crypto.randomUUID();
+  return `cmd_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+}
+
+const projectedCommandIds = new Map<string, string>();
+
+export function contentResearchCommand(
+  run: ContentResearchRunProjection,
+  action: ContentResearchWorkflowActionRequest["action"],
+  payload: JsonObject = {},
+): ContentResearchWorkflowActionRequest {
+  const identity = JSON.stringify([
+    run.run_id,
+    run.state,
+    run.state_revision,
+    action,
+    payload,
+  ]);
+  const commandId = projectedCommandIds.get(identity) ?? createContentResearchCommandId();
+  if (!projectedCommandIds.has(identity) && projectedCommandIds.size >= 256) {
+    const oldest = projectedCommandIds.keys().next().value;
+    if (oldest) projectedCommandIds.delete(oldest);
+  }
+  projectedCommandIds.set(identity, commandId);
+  return {
+    command_id: commandId,
+    expected_state: run.state,
+    expected_revision: run.state_revision,
+    action,
+    payload,
+  };
 }
 
 export interface ContentResearchWorkflowActionResponse<T = JsonObject> {
@@ -566,10 +595,8 @@ export async function deleteLLMConfiguration(): Promise<LLMConfiguration> {
   return contentResearchFetch("/content-research/llm-config", { method: "DELETE" });
 }
 
-export async function retryContentResearchPresearch(workflowRunId: string): Promise<ContentResearchPresearchResponse> {
-  const response = await runContentResearchWorkflowAction<ContentResearchPresearchResponse>(workflowRunId, {
-    action: "retry_presearch", payload: {},
-  });
+export async function retryContentResearchPresearch(run: ContentResearchRunProjection): Promise<ContentResearchPresearchResponse> {
+  const response = await runContentResearchWorkflowAction<ContentResearchPresearchResponse>(run.run_id, contentResearchCommand(run, "retry_presearch"));
   return response.result;
 }
 
@@ -577,67 +604,8 @@ export async function getContentResearchPresearch(attemptId: string): Promise<Co
   return contentResearchFetch(`/content-research/presearch/${encodeURIComponent(attemptId)}`);
 }
 
-export async function confirmContentResearchBrief(
-  workflowRunId: string,
-  payload: ContentResearchBriefConfirmRequest
-): Promise<ContentResearchWorkflowSummary> {
-  const response = await runContentResearchWorkflowAction<ContentResearchWorkflowSummary>(workflowRunId, {
-    action: "confirm_brief",
-    payload: payload as unknown as JsonObject,
-  });
-  return response.result;
-}
-
-export async function confirmContentResearchBriefLegacy(
-  briefId: string,
-  payload: ContentResearchBriefConfirmRequest
-): Promise<ContentResearchWorkflowSummary> {
-  return contentResearchFetch(`/content-research/briefs/${encodeURIComponent(briefId)}/confirm`, {
-    method: "POST",
-    body: payload,
-  });
-}
-
 export async function getContentResearchWorkflow(workflowRunId: string): Promise<ContentResearchWorkflowSummary> {
   return contentResearchFetch(`/content-research/workflows/${encodeURIComponent(workflowRunId)}`);
-}
-
-export async function prepareContentResearchScope(
-  workflowRunId: string,
-  payload: ContentResearchPrepareScopeRequest,
-): Promise<ContentResearchScopeDraft> {
-  const response = await runContentResearchWorkflowAction<{ scope: ContentResearchScopeDraft }>(workflowRunId, {
-    action: "prepare_scope",
-    payload: payload as unknown as JsonObject,
-  });
-  return response.result.scope;
-}
-
-export async function confirmContentResearchScope(
-  workflowRunId: string,
-  payload: ContentResearchConfirmScopeRequest,
-): Promise<ContentResearchConfirmScopeResult> {
-  const response = await runContentResearchWorkflowAction<ContentResearchConfirmScopeResult>(workflowRunId, {
-    action: "confirm_scope",
-    payload: payload as unknown as JsonObject,
-  });
-  return response.result;
-}
-
-export async function resolveContentResearchCoverage(
-  workflowRunId: string,
-  payload: ContentResearchResolveCoverageRequest,
-): Promise<ContentResearchResolveCoverageResult> {
-  const response = await runContentResearchWorkflowAction<ContentResearchResolveCoverageResult & {
-    execution_unit: UnsafeContentResearchExecutionUnitProjection;
-  }>(workflowRunId, {
-    action: "resolve_coverage",
-    payload: payload as unknown as JsonObject,
-  });
-  return {
-    ...response.result,
-    execution_unit: safeContentResearchExecutionUnit(response.result.execution_unit),
-  };
 }
 
 export async function getContentResearchScope(
@@ -724,90 +692,15 @@ export async function getContentResearchDecisions(
   return contentResearchFetch(`/content-research/workflows/${encodeURIComponent(workflowRunId)}/decisions`);
 }
 
-export async function startContentResearchFormalResearch(
-  workflowRunId: string,
-  payload: ContentResearchSourceCollectionRequest
-): Promise<ContentResearchFormalResearchResponse> {
-  const response = await runContentResearchWorkflowAction<ContentResearchFormalResearchResponse>(workflowRunId, {
-    action: "start_formal_research",
-    payload: payload as unknown as JsonObject,
-  });
-  return response.result;
+export async function endContentResearchWorkflow(run: ContentResearchRunProjection): Promise<ContentResearchWorkflowActionResponse> {
+  return runContentResearchWorkflowAction(run.run_id, contentResearchCommand(run, "cancel"));
 }
 
-export async function retryContentResearchFormalResearch(
-  workflowRunId: string,
-  payload: ContentResearchSourceCollectionRequest
-): Promise<ContentResearchFormalResearchResponse> {
-  const response = await runContentResearchWorkflowAction<ContentResearchFormalResearchResponse>(workflowRunId, {
-    action: "retry_formal_research",
-    payload: payload as unknown as JsonObject,
-  });
-  return response.result;
-}
-
-export async function resumeContentResearchFormalResearch(
-  workflowRunId: string
-): Promise<ContentResearchWorkflowActionResponse<{
-  workflow_run_id: string;
-  status: string;
-  recoverable: boolean;
-}>> {
-  return runContentResearchWorkflowAction(workflowRunId, {
-    action: "resume_formal_research",
-    payload: {},
-  });
-}
-
-export async function endContentResearchWorkflow(workflowRunId: string): Promise<ContentResearchWorkflowActionResponse> {
-  return runContentResearchWorkflowAction(workflowRunId, {
-    action: "end_content_research",
-    payload: {},
-  });
-}
-
-export async function clarifyContentResearchSubject(
-  workflowRunId: string,
+export async function reviseContentResearchSubject(
+  run: ContentResearchRunProjection,
   clarificationText: string
 ): Promise<ContentResearchWorkflowActionResponse<ContentResearchPresearchResponse>> {
-  return runContentResearchWorkflowAction(workflowRunId, {
-    action: "clarify_subject",
-    payload: { clarification_text: clarificationText },
-  });
-}
-
-export async function confirmContentResearchSubjectStructure(
-  workflowRunId: string,
-  payload: {
-    subject_structure_hash: string;
-    core_object: string;
-    research_intent: string;
-    context_modifiers?: string;
-  },
-): Promise<ContentResearchWorkflowActionResponse<ContentResearchPresearchResponse>> {
-  return runContentResearchWorkflowAction(workflowRunId, {
-    action: "confirm_subject_structure",
-    payload,
-  });
-}
-
-export async function repairContentResearchFromPersistedPackets(
-  workflowRunId: string,
-): Promise<ContentResearchWorkflowActionResponse> {
-  return runContentResearchWorkflowAction(workflowRunId, {
-    action: "repair_from_persisted_packets",
-    payload: {},
-  });
-}
-
-export async function collectContentResearchSourcesLegacy(
-  workflowRunId: string,
-  payload: ContentResearchSourceCollectionRequest
-): Promise<ContentResearchSourceCollectionResponse> {
-  return contentResearchFetch(`/content-research/workflows/${encodeURIComponent(workflowRunId)}/source-collections`, {
-    method: "POST",
-    body: payload,
-  });
+  return runContentResearchWorkflowAction(run.run_id, contentResearchCommand(run, "revise_subject", { clarification_text: clarificationText }));
 }
 
 export async function runContentResearchWorkflowAction<T = JsonObject>(

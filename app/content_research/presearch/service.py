@@ -38,8 +38,8 @@ class PresearchChecklist:
     research_directions: list[str]
     custom_competitor_input: str = ""
     subject_structure: SubjectStructure | None = None
-    subject_structure_state: str = "needs_confirmation"
-    subject_structure_reason_codes: tuple[str, ...] = ()
+    subject_structure_analysis_state: str = "unresolved"
+    subject_structure_analysis_reason_codes: tuple[str, ...] = ()
     subject_structure_hash: str | None = None
 
 
@@ -163,12 +163,7 @@ class PresearchService:
                     model=response.model,
                     configuration_source=response.configuration_source,
                 )
-            status = (
-                "completed"
-                if checklist.subject_structure_state == "confirmed"
-                else "subject_needs_confirmation"
-            )
-            return PresearchOutcome(status=status, checklist=checklist, fallback_used=False,
+            return PresearchOutcome(status="completed", checklist=checklist, fallback_used=False,
                 provider=response.provider, model=response.model,
                 configuration_source=response.configuration_source)
         except asyncio.TimeoutError:
@@ -224,8 +219,8 @@ class PresearchService:
             research_directions=self._string_list(data.get("research_directions")),
             custom_competitor_input=str(data.get("custom_competitor_input") or ""),
             subject_structure=structure,
-            subject_structure_state=structure_decision.state,
-            subject_structure_reason_codes=structure_decision.reason_codes,
+            subject_structure_analysis_state=structure_decision.state,
+            subject_structure_analysis_reason_codes=structure_decision.reason_codes,
             subject_structure_hash=(
                 subject_structure_fingerprint(structure) if structure else None
             ),

@@ -5,32 +5,20 @@ export interface ContentResearchRequestTicket {
   generation: number;
 }
 
-export type ProjectedRecoveryAction = {
-  action: "retry_formal_research" | "resume_formal_research" | "repair_from_persisted_packets";
-  request: Record<string, unknown>;
-};
-
-export function projectedRecoveryAction(report: {
-  recovery_projection?: Record<string, unknown> | null;
-} | null): ProjectedRecoveryAction | null {
-  const allowedActions = report?.recovery_projection?.allowed_actions;
-  if (!Array.isArray(allowedActions)) return null;
-  const projected = allowedActions.find((item) => (
-    item && typeof item === "object" && !Array.isArray(item)
-      && (item as Record<string, unknown>).available === true
-  ));
-  if (!projected || typeof projected !== "object" || Array.isArray(projected)) return null;
-  const action = (projected as Record<string, unknown>).action;
-  if (action !== "retry_formal_research"
-    && action !== "resume_formal_research"
-    && action !== "repair_from_persisted_packets") return null;
-  const request = (projected as Record<string, unknown>).request;
-  return {
-    action,
-    request: request && typeof request === "object" && !Array.isArray(request)
-      ? request as Record<string, unknown>
-      : {},
-  };
+export function projectedModelRecoveryVisible({
+  recoveryPending,
+  lifecycleState,
+  currentStage,
+  hasDurableRun,
+}: {
+  recoveryPending: boolean;
+  lifecycleState?: string | null;
+  currentStage?: string | null;
+  hasDurableRun: boolean;
+}) {
+  if (!recoveryPending) return false;
+  if (!hasDurableRun) return true;
+  return lifecycleState === "recovery_required" && currentStage === "presearch";
 }
 
 export class ContentResearchRequestEpoch {

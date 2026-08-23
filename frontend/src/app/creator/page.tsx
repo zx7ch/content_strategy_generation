@@ -22,26 +22,20 @@ import {
 } from "@/lib/api";
 import { useBrandContext } from "@/components/providers/BrandProvider";
 import {
-  startContentResearchFormalResearch,
-  confirmContentResearchScope,
-  confirmContentResearchSubjectStructure,
-  confirmContentResearchBrief,
+  contentResearchCommand,
   createContentResearchPresearch,
+  createContentResearchCommandId,
   endContentResearchWorkflow,
   getContentResearchDirectionEvidence,
   getContentResearchTrace,
-  getCurrentXHSQRLogin,
   isContentResearchReportPending,
   getContentResearchLiteReport,
   getContentResearchLiteReportWithRetry,
   getContentResearchScope,
   getContentResearchWorkflow,
-  prepareContentResearchScope,
+  reviseContentResearchSubject,
   retryContentResearchPresearch,
-  resolveContentResearchCoverage,
   runContentResearchWorkflowAction,
-  startXHSQRLogin,
-  type ContentResearchFormalResearchResponse,
   type ContentResearchDirectionEvidence,
   type ContentResearchLiteReportResponse,
   type ContentResearchPresearchResponse,
@@ -61,8 +55,7 @@ import { contentResearchErrorFeedback } from "@/lib/content-research-error-feedb
 import {
   ContentResearchRequestEpoch,
   frozenReportScopeQueries,
-  projectedRecoveryAction,
-  type ProjectedRecoveryAction,
+  projectedModelRecoveryVisible,
 } from "./page-state";
 
 type TaskStatus = "running" | "paused" | "failed" | "cancelled" | "completed";
@@ -99,11 +92,16 @@ interface ContentResearchRunState {
   workflowRunId: string;
   summary: ContentResearchWorkflowSummary;
   trace: ContentResearchTrace | null;
-  formalResearch: ContentResearchFormalResearchResponse | null;
+  formalResearch: ContentResearchFormalResearchReadModel | null;
   formalResearchStatus: "idle" | "collecting" | "completed" | "failed" | "invalid";
   report: ContentResearchLiteReportResponse | null;
   reportStatus: "idle" | "loading" | "ready" | "unavailable" | "failed";
   reportError: string | null;
+}
+interface ContentResearchFormalResearchReadModel {
+  status: string;
+  task_count: number;
+  failed_tasks: Array<{ task_id: string; agent_name?: string | null; error?: string | null }>;
 }
 type LitePublicationState = "complete_verified_report" | "partial_verified_report" | "directional_report" | "evidence_only_report";
 
@@ -169,7 +167,7 @@ function createId(prefix: string) {
   return `${prefix}-${Math.random().toString(16).slice(2, 10)}`;
 }
 
-function formalResearchStatus(result: ContentResearchFormalResearchResponse | null): ContentResearchRunState["formalResearchStatus"] {
+function formalResearchStatus(result: ContentResearchFormalResearchReadModel | null): ContentResearchRunState["formalResearchStatus"] {
   if (!result) return "idle";
   if (result.status === "failed") return "failed";
   return ["completed", "partial_completed", "succeeded"].includes(result.status)
@@ -206,7 +204,7 @@ function contentResearchRunWithReport(
   workflowRunId: string,
   summary: ContentResearchWorkflowSummary,
   trace: ContentResearchTrace | null,
-  formalResearch: ContentResearchFormalResearchResponse | null,
+  formalResearch: ContentResearchFormalResearchReadModel | null,
   report: ContentResearchLiteReportResponse | null
 ): ContentResearchRunState {
   return {
@@ -221,25 +219,35 @@ function contentResearchRunWithReport(
   };
 }
 
-function interruptedPresearchSummary(
-  workflowRunId: string,
-  threadId: string,
-): ContentResearchWorkflowSummary {
+function presearchFromWorkflowSummary(
+  summary: ContentResearchWorkflowSummary,
+): ContentResearchPresearchResponse {
+  if (!summary.brief) throw new Error("当前状态尚未生成 Brief");
+  const payload = summary.brief.payload;
+  const rawStructure = payload.subject_structure;
+  const subjectStructure = rawStructure && typeof rawStructure === "object" && !Array.isArray(rawStructure)
+    ? rawStructure as ContentResearchPresearchResponse["subject_structure"]
+    : {};
   return {
-    workflow_run_id: workflowRunId,
-    brief: {
-      id: `pending-${workflowRunId}`,
-      workflow_run_id: workflowRunId,
-      thread_id: threadId,
-      status: "presearch_interrupted",
-      payload: {},
-    },
-    plan: null,
-    directions: [],
-    subagent_tasks: [],
-    runtime_run: null,
-    runtime_steps: [],
-    runtime_child_tasks: [],
+    attempt_id: stringField(payload, "attempt_id", `restored-${summary.workflow_run_id}`),
+    workflow_run_id: summary.workflow_run_id,
+    brief_id: summary.brief.id,
+    status: stringField(payload, "status", summary.brief.status),
+    subject_confirmation: stringField(payload, "subject_confirmation"),
+    competitor_tags: arrayField(payload, "competitor_tags"),
+    research_directions: arrayField(payload, "research_directions"),
+    direction_catalog: arrayField(payload, "direction_catalog"),
+    custom_competitor_input: stringField(payload, "custom_competitor_input"),
+    timeout_status: stringField(payload, "timeout_status", "none"),
+    fallback_used: payload.fallback_used === true,
+    error_code: stringField(payload, "error_code") || null,
+    error_message: stringField(payload, "error_message") || null,
+    recoverable: payload.recoverable === true,
+    configuration_source: stringField(payload, "configuration_source") || null,
+    model: stringField(payload, "model") || null,
+    subject_structure: subjectStructure,
+    subject_structure_hash: stringField(payload, "subject_structure_hash") || null,
+    run: summary.run,
   };
 }
 
@@ -262,7 +270,7 @@ function workflowStatusLabel(status: string) {
 }
 
 function contentResearchSubject(run: ContentResearchRunState): string {
-  const payload = run.summary.brief.payload;
+  const payload = run.summary.brief?.payload ?? {};
   return stringField(payload, "seed_text") ||
     stringField(payload, "confirmed_subject") ||
     stringField(payload, "subject_confirmation") ||
@@ -710,14 +718,8 @@ function liteDirectionLabel(value: string) {
 
 function ContentResearchIntentCard({
   intent,
-  onConfirmed,
-  onPresearchUpdated,
-  onError,
 }: {
   intent: ContentResearchIntentState;
-  onConfirmed: (summary: ContentResearchWorkflowSummary) => void;
-  onPresearchUpdated: (presearch: ContentResearchPresearchResponse) => void;
-  onError: (message: string) => void;
 }) {
   const structure = intent.presearch.subject_structure ?? {};
   const subject = structure.canonical_subject?.trim() || intent.seed || "本轮调研";
@@ -733,17 +735,6 @@ function ContentResearchIntentCard({
   const [selectedCompetitors, setSelectedCompetitors] = useState<string[]>([]);
   const [selectedDirections, setSelectedDirections] = useState<string[]>([]);
   const [extraCompetitors, setExtraCompetitors] = useState(intent.presearch.custom_competitor_input ?? "");
-  const [isConfirming, setIsConfirming] = useState(false);
-  const [coreObjectInput, setCoreObjectInput] = useState(
-    structure.core_entities?.[0]?.canonical_name?.trim() ?? "",
-  );
-  const [researchIntentInput, setResearchIntentInput] = useState(
-    structure.research_intents?.[0]?.trim() ?? "",
-  );
-  const [contextInput, setContextInput] = useState(
-    (structure.context_modifiers ?? []).filter(Boolean).join("，"),
-  );
-  const confirmationInFlightRef = useRef(false);
 
   function toggleValue(
     value: string,
@@ -756,33 +747,7 @@ function ContentResearchIntentCard({
     ));
   }
 
-  async function confirmBrief() {
-    if (!subjectConfirmed) {
-      onError("请先确认调研主体是否准确。");
-      return;
-    }
-    if (confirmationInFlightRef.current) return;
-    confirmationInFlightRef.current = true;
-    setIsConfirming(true);
-    try {
-      const summary = await confirmContentResearchBrief(intent.presearch.workflow_run_id, {
-        confirmed_subject: subject,
-        subject_structure_hash: intent.presearch.subject_structure_hash ?? "",
-        subject_type: "category",
-        selected_competitors: selectedCompetitors,
-        custom_competitors: splitInlineList(extraCompetitors),
-        selected_directions: selectedDirections,
-      });
-      onConfirmed(summary);
-    } catch {
-      onError("确认调研 brief 失败，请检查 runtime 后重试。");
-    } finally {
-      confirmationInFlightRef.current = false;
-      setIsConfirming(false);
-    }
-  }
-
-  if (intent.presearch.status === "waiting_model_config") {
+  if (intent.presearch.run.state === "recovery_required") {
     return (
       <div className="flex justify-start">
         <div className="w-full max-w-[92%] rounded-2xl border border-amber-200 bg-amber-50 px-5 py-4 text-sm text-amber-900">
@@ -792,53 +757,7 @@ function ContentResearchIntentCard({
     );
   }
 
-  if (intent.presearch.status === "subject_needs_confirmation") {
-    async function confirmSubjectStructure() {
-      if (!coreObjectInput.trim() || !researchIntentInput.trim()) {
-        onError("请填写核心对象和研究意图。");
-        return;
-      }
-      setIsConfirming(true);
-      try {
-        const response = await confirmContentResearchSubjectStructure(
-          intent.presearch.workflow_run_id,
-          {
-            subject_structure_hash: intent.presearch.subject_structure_hash ?? "",
-            core_object: coreObjectInput,
-            research_intent: researchIntentInput,
-            context_modifiers: contextInput,
-          },
-        );
-        onPresearchUpdated(response.result);
-      } catch {
-        onError("主题确认失败，请刷新后重试。");
-      } finally {
-        setIsConfirming(false);
-      }
-    }
-    return (
-      <div className="flex justify-start">
-        <div className="w-full max-w-[92%] rounded-2xl border border-amber-200 bg-amber-50 px-5 py-4 text-sm text-amber-950 shadow-sm">
-          <p className="text-base font-semibold">还需要你确认调研主体</p>
-          <p className="mt-2 leading-6">{intent.presearch.subject_confirmation}</p>
-          <div className="mt-3 grid gap-3 rounded-xl bg-white/70 p-3">
-            <label className="grid gap-1 text-xs font-medium">核心对象 *
-              <input aria-label="调研主体核心对象" value={coreObjectInput} onChange={(event) => setCoreObjectInput(event.target.value)} placeholder="T恤" className="rounded-lg border border-line bg-white px-3 py-2 text-sm font-normal outline-none" />
-            </label>
-            <label className="grid gap-1 text-xs font-medium">研究意图 *
-              <input aria-label="调研主体研究意图" value={researchIntentInput} onChange={(event) => setResearchIntentInput(event.target.value)} placeholder="凉感" className="rounded-lg border border-line bg-white px-3 py-2 text-sm font-normal outline-none" />
-            </label>
-            <label className="grid gap-1 text-xs font-medium">使用场景
-              <input aria-label="调研主体使用场景" value={contextInput} onChange={(event) => setContextInput(event.target.value)} placeholder="夏季" className="rounded-lg border border-line bg-white px-3 py-2 text-sm font-normal outline-none" />
-            </label>
-            <button type="button" onClick={() => void confirmSubjectStructure()} disabled={isConfirming} className="justify-self-start rounded-lg bg-ink px-3 py-2 text-xs font-medium text-white disabled:opacity-40">
-              {isConfirming ? "确认中" : "确认调研主体"}
-            </button>
-          </div>
-        </div>
-      </div>
-    );
-  }
+  if (intent.presearch.run.state !== "brief_confirmation_required") return null;
 
   return (
     <div className="flex justify-start">
@@ -939,16 +858,6 @@ function ContentResearchIntentCard({
               </button>
             ))}
           </div>
-          <div className="mt-4 flex justify-end gap-2">
-            <button
-              type="button"
-              onClick={() => void confirmBrief()}
-              disabled={isConfirming || selectedDirections.length === 0}
-              className="h-10 rounded-xl bg-ink px-5 text-sm font-medium text-white hover:bg-slate-800 disabled:opacity-40"
-            >
-              {isConfirming ? "确认中" : "确认并开始调研"}
-            </button>
-          </div>
         </div>
       </div>
     </div>
@@ -1023,25 +932,10 @@ function marketingConclusionTrackLabel(track: string) {
   return "结论";
 }
 
-function marketingConclusionRecoveryRequired(trace: ContentResearchTrace | null) {
-  return recordList(trace?.logical_checkpoints).some((checkpoint) =>
-    stringField(checkpoint, "stage") === "marketing_conclusion"
-      && arrayField(checkpoint, "reason_codes").includes("marketing_analysis_unavailable")
-  );
-}
-
 function ContentResearchReportMessage({
   report,
-  onRecover,
-  onRepair,
-  onOpenTrace,
-  recoveryAllowed = true,
 }: {
   report: ContentResearchLiteReportResponse;
-  onRecover?: (action: ProjectedRecoveryAction) => void;
-  onRepair?: (action: ProjectedRecoveryAction) => void;
-  onOpenTrace?: () => void;
-  recoveryAllowed?: boolean;
 }) {
   const [selectedCitation, setSelectedCitation] = useState<Record<string, unknown> | null>(null);
   const [candidateAudit, setCandidateAudit] = useState<ContentResearchDirectionEvidence | null>(null);
@@ -1051,7 +945,6 @@ function ContentResearchReportMessage({
     ? report.recovery_projection
     : null;
   const publicationIsNone = report.publication.state === null;
-  const recoveryAction = projectedRecoveryAction(report);
 
   useEffect(() => {
     setSelectedCitation(null);
@@ -1060,8 +953,6 @@ function ContentResearchReportMessage({
   if (!publicationState) {
     if (!publicationIsNone || !recovery) return null;
     const completedStages = arrayField(recovery, "completed_stages");
-    const actionable = stringField(recovery, "actionability") === "available";
-    const authenticationRequired = ["auth_expired", "auth_required"].includes(stringField(recovery, "reason_code"));
     return (
       <section
         className="w-full max-w-[92%] rounded-2xl border border-amber-200 bg-amber-50 px-5 py-4 text-sm text-ink shadow-sm"
@@ -1073,17 +964,6 @@ function ContentResearchReportMessage({
         <p className="mt-2 text-xs text-quiet">
           {completedStages.length ? `已保存阶段：${completedStages.join("、")}` : "尚无已完成阶段。"}
         </p>
-        {recoveryAllowed && actionable && recoveryAction && recoveryAction.action !== "repair_from_persisted_packets" && (
-          <button
-            type="button"
-            onClick={authenticationRequired ? onOpenTrace : () => onRecover?.(recoveryAction)}
-            className="mt-4 rounded-lg bg-ink px-3 py-2 text-xs font-medium text-white"
-          >
-            {authenticationRequired
-              ? "打开登录恢复"
-              : "继续调研"}
-          </button>
-        )}
       </section>
     );
   }
@@ -1230,12 +1110,6 @@ function ContentResearchReportMessage({
             <p className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900">
               {stringField(report.publication, "publication_reason")}
             </p>
-          )}
-          {evidenceOnly && recoveryAllowed && recoveryAction?.action === "repair_from_persisted_packets" && onRepair && (
-            <section className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-3" aria-label="已有笔记重新处理">
-              <p className="text-xs text-amber-900">可复用已保存的笔记重新评估相关性，不会新增采集。</p>
-              <button type="button" onClick={() => onRepair(recoveryAction)} className="mt-2 rounded-lg bg-ink px-3 py-2 text-xs font-medium text-white">使用已有笔记重新处理</button>
-            </section>
           )}
           {evidenceOnly && (
             <section className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-3" aria-label="候选笔记与筛选">
@@ -1549,6 +1423,18 @@ function contentResearchRecoveryState(run: ContentResearchRunState): ContentRese
 }
 
 function contentResearchContextStatus(run: ContentResearchRunState): string {
+  const lifecycleState = run.summary.run.state;
+  if (lifecycleState === "presearch_running") return "轻量预检索进行中";
+  if (lifecycleState === "brief_confirmation_required") return "等待确认调研 Brief";
+  if (lifecycleState === "scope_confirmation_required") return "等待确认检索范围";
+  if (lifecycleState === "retrieval_queued") return "内容检索等待开始";
+  if (lifecycleState === "retrieval_running") return "内容检索进行中";
+  if (lifecycleState === "coverage_evaluating") return "正在评估证据覆盖";
+  if (lifecycleState === "coverage_decision_required") return "等待覆盖范围决策";
+  if (lifecycleState === "report_composing") return "正在生成调研报告";
+  if (lifecycleState === "report_ready") return "调研报告已完成";
+  if (lifecycleState === "recovery_required") return "本轮调研需要恢复";
+  if (lifecycleState === "cancelled_or_failed") return "本轮调研已结束";
   if (run.report) {
     const state = litePublicationState(run.report);
     if (state) return reportStateLabel(state);
@@ -1584,25 +1470,18 @@ function ContentResearchTraceInspector({
   expanded,
   onExpandedChange,
   onRefresh,
-  onRetry,
-  legacyRecoveryAllowed,
 }: {
   run: ContentResearchRunState;
   expanded: boolean;
   onExpandedChange: (expanded: boolean) => void;
   onRefresh: () => Promise<void>;
-  onRetry: () => Promise<void>;
-  legacyRecoveryAllowed: boolean;
 }) {
-  const [qrLogin, setQrLogin] = useState<{ status: string; image?: string | null } | null>(null);
   const [refreshing, setRefreshing] = useState(false);
-  const [resuming, setResuming] = useState(false);
   const timeline = contentResearchTraceTimeline(run.trace);
   const displayTimeline = [...timeline].reverse();
   const recovery = contentResearchRecoveryState(run);
   const childTasks = recordList(run.trace?.runtime_child_tasks);
   const logicalCheckpoints = recordList(run.trace?.logical_checkpoints);
-  const marketingModelRecoveryRequired = marketingConclusionRecoveryRequired(run.trace);
   const terminalPublished = run.report ? litePublicationState(run.report) !== null : false;
   const [expandedStepId, setExpandedStepId] = useState<string | null>(null);
   const refreshTraceRef = useRef(onRefresh);
@@ -1611,27 +1490,6 @@ function ContentResearchTraceInspector({
   useEffect(() => {
     refreshTraceRef.current = onRefresh;
   }, [onRefresh]);
-
-  useEffect(() => {
-    setQrLogin(null);
-  }, [run.workflowRunId]);
-
-  useEffect(() => {
-    if (!recovery.authRequired || qrLogin !== null) return;
-    void getCurrentXHSQRLogin()
-      .then((value) => setQrLogin({ status: value.status, image: value.qr_image_data_url }))
-      .catch(() => undefined);
-  }, [recovery.authRequired, qrLogin]);
-
-  useEffect(() => {
-    if (qrLogin?.status !== "pending") return;
-    const refreshLoginStatus = () => void getCurrentXHSQRLogin()
-      .then((value) => setQrLogin({ status: value.status, image: value.qr_image_data_url }))
-      .catch(() => undefined);
-    refreshLoginStatus();
-    const timer = window.setInterval(refreshLoginStatus, 1500);
-    return () => window.clearInterval(timer);
-  }, [qrLogin?.status]);
 
   useEffect(() => {
     if (!expanded) return;
@@ -1652,10 +1510,6 @@ function ContentResearchTraceInspector({
 
   if (!expanded) return null;
 
-  const startLogin = async () => {
-    const value = await startXHSQRLogin();
-    setQrLogin({ status: value.status, image: value.qr_image_data_url });
-  };
   const refreshTrace = async () => {
     if (refreshing) return;
     setRefreshing(true);
@@ -1665,44 +1519,6 @@ function ContentResearchTraceInspector({
       setRefreshing(false);
     }
   };
-  const resumeRun = async () => {
-    if (resuming || terminalPublished) return;
-    if (recovery.authRequired && qrLogin?.status !== "authenticated") return;
-    setResuming(true);
-    try {
-      await onRetry();
-    } finally {
-      setResuming(false);
-    }
-  };
-  const authenticationControls = legacyRecoveryAllowed && recovery.authRequired && !terminalPublished ? (
-    <div className="mt-3">
-      {qrLogin?.status !== "authenticated" && (
-        <button
-          type="button"
-          onClick={() => void startLogin()}
-          className="rounded-lg bg-[#486b5b] px-3 py-1.5 text-xs font-medium text-white"
-        >
-          扫码登录小红书
-        </button>
-      )}
-      {qrLogin?.image && qrLogin.status === "pending" && <>
-        <img src={qrLogin.image} alt="小红书登录二维码" className="mt-3 h-40 w-40 rounded bg-white p-2" />
-        <p className="mt-2 text-xs text-quiet">请在小红书 App 扫码并确认。</p>
-      </>}
-      {qrLogin?.status === "authenticated" && (
-        <button
-          type="button"
-          onClick={() => void resumeRun()}
-          disabled={resuming}
-          className="mt-3 block rounded-lg border border-[#486b5b] px-3 py-1.5 text-xs font-medium text-[#486b5b] disabled:opacity-40"
-        >
-          {resuming ? "继续中" : "登录成功，继续本轮调研"}
-        </button>
-      )}
-    </div>
-  ) : null;
-
   return (
     <section
       className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/30 p-6"
@@ -1761,14 +1577,12 @@ function ContentResearchTraceInspector({
               <p className="mt-2 text-xs leading-5 text-ink">
                 {recovery.authRequired ? "更新小红书登录态后继续。" : "该外部调用未产生可安全继续的结果，请先确认外部状态。"}
               </p>
-              {authenticationControls}
             </article>
           )}
           {!recovery.providerFailure && recovery.authRequired && (
             <article className="mb-3 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-ink" aria-label="认证恢复">
               <p className="font-semibold">需要登录小红书网页端</p>
               <p className="mt-2 text-xs leading-5 text-ink">完成扫码认证后可继续同一轮调研。</p>
-              {authenticationControls}
             </article>
           )}
 
@@ -1883,13 +1697,6 @@ function ContentResearchTraceInspector({
             </section>
           )}
 
-          {legacyRecoveryAllowed && recovery.recoverable && !recovery.authRequired && !marketingModelRecoveryRequired && !terminalPublished && (
-            <div className="mt-4 flex justify-end">
-              <button type="button" onClick={() => void resumeRun()} disabled={resuming} className="rounded-lg bg-ink px-3 py-1.5 text-xs font-medium text-white disabled:opacity-40">
-                {resuming ? "继续中" : "继续本轮调研"}
-              </button>
-            </div>
-          )}
         </div>
       </div>
     </section>
@@ -1993,292 +1800,7 @@ function ContentResearchContextSidebar({
   );
 }
 
-interface ContentResearchScopeCardProps {
-  draft: ContentResearchScopeDraft | null;
-  projection: ContentResearchScopeProjection | null;
-  busy: boolean;
-  onPrepare: (payload: ContentResearchPrepareScopeRequest) => void;
-  onConfirm: (payload: ContentResearchConfirmScopeRequest) => void;
-  onResolve: (payload: ContentResearchResolveCoverageRequest) => void;
-}
-
-function pendingCoverageDecision(projection: ContentResearchScopeProjection | null) {
-  if (
-    !projection?.coverage_snapshot
-    || projection.decision_recovery?.state !== "coverage_decision_required"
-    || !projection.allowed_actions.some((item) => item.action === "resolve_coverage" && item.available)
-  ) return null;
-  return {
-    coverageSnapshotId: projection.coverage_snapshot.id,
-    unmetConstraintIds: projection.coverage_snapshot.unmet_constraint_ids,
-    allowedResolutions: projection.allowed_resolutions.filter((item) => item.available),
-    reasonCodes: arrayField(
-      projection.coverage_snapshot.constraint_counts._summary as Record<string, unknown> | undefined,
-      "reason_codes",
-    ),
-  };
-}
-
-function scopeCoverageReasonLabel(reason: string, constraintLabel: string) {
-  if (reason.startsWith("required_constraint_coverage_unmet:")) return `${constraintLabel}条件的合格样本不足`;
-  if (reason === "minimum_samples_unmet") return "合格样本总数不足";
-  if (reason === "minimum_independent_authors_unmet") return "独立作者数量不足";
-  return reason;
-}
-
-function scopeExecutionRoleLabel(role: string) {
-  if (role === "coverage") return "覆盖检索";
-  if (role === "supplementary") return "补充覆盖";
-  if (role === "exploratory") return "探索补充";
-  return role;
-}
-
-function ContentResearchScopeCard({
-  draft,
-  projection,
-  busy,
-  onPrepare,
-  onConfirm,
-  onResolve,
-}: ContentResearchScopeCardProps) {
-  const [finalQueries, setFinalQueries] = useState<string[]>([]);
-  const [productExperienceAspect, setProductExperienceAspect] = useState("");
-  const [contextAudienceAspect, setContextAudienceAspect] = useState("");
-  const [supplementaryQueries, setSupplementaryQueries] = useState(["", ""]);
-  const [selectedResolution, setSelectedResolution] = useState<string | null>(null);
-  const projectedConfirmAction = projection?.allowed_actions.find((item) => (
-    item.action === "confirm_scope"
-      && item.available === true
-      && item.scope_draft_id === projection.draft.id
-      && item.structure_hash === projection.draft.structure_hash
-  ));
-  const restoredDraft = (
-    projection?.state === "awaiting_confirmation"
-      && projection.scope_contract === null
-      && projectedConfirmAction
-  ) ? projection.draft : null;
-  const effectiveDraft = draft ?? restoredDraft;
-  const confirmAuthority = draft
-    ? { scopeDraftId: draft.id, structureHash: draft.structure_hash }
-    : projectedConfirmAction
-      ? {
-          scopeDraftId: stringField(projectedConfirmAction, "scope_draft_id"),
-          structureHash: stringField(projectedConfirmAction, "structure_hash"),
-        }
-      : null;
-  useEffect(() => {
-    setFinalQueries(effectiveDraft?.query_groups.map((group) => group.final_query) ?? []);
-    setProductExperienceAspect(effectiveDraft?.product_experience_aspect ?? "");
-    setContextAudienceAspect(effectiveDraft?.context_audience_aspect ?? "");
-  }, [effectiveDraft]);
-  useEffect(() => {
-    setSelectedResolution(null);
-    setSupplementaryQueries(["", ""]);
-  }, [projection?.coverage_snapshot?.id, projection?.execution_unit?.id]);
-
-  const pending = pendingCoverageDecision(projection);
-  const contract = projection?.scope_contract ?? null;
-  const expandResolution = pending?.allowedResolutions.find((item) => item.action === "expand_required_constraint");
-  const relaxResolution = pending?.allowedResolutions.find((item) => item.action === "relax_constraint");
-  const expandConstraintId = expandResolution?.valid_constraint_ids[0] ?? null;
-  const relaxConstraintId = relaxResolution?.valid_constraint_ids[0] ?? null;
-  const constraintLabel = (constraintId: string | null) => {
-    const constraint = contract?.constraints.find((item) => item.id === constraintId);
-    return constraint?.value || constraint?.label || "必要范围";
-  };
-  const expandLabel = constraintLabel(expandConstraintId);
-  const relaxLabel = constraintLabel(relaxConstraintId);
-  const unknownOutcome = projection?.execution_unit?.recovery_state === "outcome_unknown"
-    || projection?.execution_unit?.recovery_state === "manual_recovery_required";
-  const replayAction = projection?.execution_unit?.allowed_actions.find((item) => (
-    item.action === "replay_coverage_decision" && item.available
-  ));
-  const replayRequest = replayAction?.request as ContentResearchResolveCoverageRequest | undefined;
-
-  if (effectiveDraft && confirmAuthority && !projection?.scope_contract) {
-    const valid = finalQueries.length === effectiveDraft.query_groups.length
-      && finalQueries.every((query) => query.trim().length > 0);
-    return (
-      <div className="flex justify-start">
-        <section className="w-full max-w-[92%] rounded-2xl border border-line bg-[#f0f2f5] px-5 py-4 text-sm text-ink" aria-label="确认检索范围">
-          <p className="text-xs font-semibold uppercase tracking-wider text-quiet">检索范围确认</p>
-          <h2 className="mt-1 text-base font-semibold">确认每组最终检索词</h2>
-          <p className="mt-1 text-xs leading-5 text-quiet">这些检索词会冻结为本轮执行范围。可以编辑最终检索词，范围约束仍由服务端管理。</p>
-          {effectiveDraft.schema_version === "content_research_scope_contract_v2"
-            && (!effectiveDraft.product_experience_aspect || !effectiveDraft.context_audience_aspect) && (
-            <div className="mt-4 grid gap-3 rounded-xl border border-blue-100 bg-blue-50/70 p-3">
-              {!effectiveDraft.product_experience_aspect && (
-                <label className="grid gap-1 text-xs font-medium text-ink">
-                  产品／体验检索词（可选）
-                  <span className="font-normal leading-5 text-quiet">填写用户会和“{effectiveDraft.core_object}”一起搜索的具体产品感受，例如：凉感、显瘦。按 Enter 更新下方检索词。</span>
-                  <input
-                    aria-label="产品／体验检索词"
-                    value={productExperienceAspect}
-                    onChange={(event) => setProductExperienceAspect(event.target.value)}
-                    onKeyDown={(event) => {
-                      if (event.key !== "Enter" || !productExperienceAspect.trim()) return;
-                      event.preventDefault();
-                      onPrepare({
-                        direction_id: "product_marketing",
-                        replaces_scope_draft_id: effectiveDraft.id,
-                        product_experience_aspect: productExperienceAspect.trim(),
-                        context_audience_aspect: contextAudienceAspect.trim() || null,
-                      });
-                    }}
-                    placeholder="例如：凉感、显瘦"
-                    className="rounded-lg border border-line bg-white px-3 py-2 text-sm font-normal outline-none focus:border-ink"
-                  />
-                </label>
-              )}
-              {!effectiveDraft.context_audience_aspect && (
-                <label className="grid gap-1 text-xs font-medium text-ink">
-                  场景／人群检索词（可选）
-                  <span className="font-normal leading-5 text-quiet">填写具体场景、人群或使用时机，例如：夏季通勤。按 Enter 更新下方检索词。</span>
-                  <input
-                    aria-label="场景／人群检索词"
-                    value={contextAudienceAspect}
-                    onChange={(event) => setContextAudienceAspect(event.target.value)}
-                    onKeyDown={(event) => {
-                      if (event.key !== "Enter" || !contextAudienceAspect.trim()) return;
-                      event.preventDefault();
-                      onPrepare({
-                        direction_id: "product_marketing",
-                        replaces_scope_draft_id: effectiveDraft.id,
-                        product_experience_aspect: productExperienceAspect.trim() || null,
-                        context_audience_aspect: contextAudienceAspect.trim(),
-                      });
-                    }}
-                    placeholder="例如：夏季通勤"
-                    className="rounded-lg border border-line bg-white px-3 py-2 text-sm font-normal outline-none focus:border-ink"
-                  />
-                </label>
-              )}
-              <p className="text-[11px] leading-5 text-blue-800">不补充也可以直接确认当前已有检索词。</p>
-            </div>
-          )}
-          <div className="mt-4 space-y-3">
-            {effectiveDraft.query_groups.map((group, index) => (
-              <label key={`${effectiveDraft.id}-${index}`} className="block rounded-xl border border-line bg-white px-3 py-3">
-                <span className="flex items-center justify-between gap-2 text-xs font-medium text-ink">
-                  检索组 {index + 1}
-                  <span className="text-[10px] font-normal text-quiet">
-                    {group.origin === "user_edited" ? "用户补充" : "系统建议"}
-                  </span>
-                </span>
-                <input
-                  aria-label={`检索组 ${index + 1}`}
-                  value={finalQueries[index] ?? ""}
-                  onChange={(event) => setFinalQueries((current) => current.map((query, queryIndex) => (
-                    queryIndex === index ? event.target.value : query
-                  )))}
-                  className="mt-2 w-full rounded-lg border border-line bg-white px-3 py-2 text-sm outline-none focus:border-ink"
-                />
-                {group.suggested_query !== (finalQueries[index] ?? "") && (
-                  <span className="mt-1 block text-[11px] text-quiet">系统建议：{group.suggested_query}</span>
-                )}
-              </label>
-            ))}
-          </div>
-          <div className="mt-4 flex justify-end">
-            <button
-              type="button"
-              disabled={busy || !valid}
-              onClick={() => onConfirm({
-                scope_draft_id: confirmAuthority.scopeDraftId,
-                structure_hash: confirmAuthority.structureHash,
-                query_groups: finalQueries.map((finalQuery) => ({ final_query: finalQuery.trim() })),
-              })}
-              className="rounded-lg bg-ink px-4 py-2 text-xs font-medium text-white disabled:cursor-not-allowed disabled:opacity-40"
-            >
-              {busy ? "确认中…" : "确认并开始调研"}
-            </button>
-          </div>
-        </section>
-      </div>
-    );
-  }
-
-  if (!projection || !contract) return null;
-
-  return (
-    <div className="flex justify-start">
-      <section className="w-full max-w-[92%] rounded-2xl border border-line bg-[#f0f2f5] px-5 py-4 text-sm text-ink" aria-label="已确认检索范围">
-        <div className="flex items-center justify-between gap-3">
-          <div>
-            <p className="text-xs font-semibold uppercase tracking-wider text-quiet">已冻结检索范围</p>
-            <h2 className="mt-1 text-base font-semibold">Scope v{contract.version}</h2>
-          </div>
-          <span className="rounded-full bg-white px-2.5 py-1 text-[11px] text-quiet">服务端已保存</span>
-        </div>
-        <div className="mt-3 space-y-2">
-          {contract.query_groups.map((group, index) => (
-            <div key={group.id} className="rounded-xl border border-line bg-white px-3 py-2.5">
-              <div className="flex items-center justify-between gap-3">
-                <span className="text-xs font-medium">检索组 {index + 1}</span>
-                <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] text-quiet">
-                  {group.origin === "user_edited" ? "用户补充" : "系统建议"} · {scopeExecutionRoleLabel(group.execution_role)}
-                </span>
-              </div>
-              <p className="mt-1.5 leading-5">{group.final_query}</p>
-              {group.suggested_query !== group.final_query && (
-                <p className="mt-1 text-[11px] text-quiet">原建议：{group.suggested_query}</p>
-              )}
-            </div>
-          ))}
-        </div>
-
-        {unknownOutcome && (
-          <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50 px-4 py-4 text-amber-950" aria-label="执行结果需要人工恢复">
-            <p className="text-sm font-semibold">需要人工确认执行结果</p>
-            <p className="mt-1 text-xs leading-5 text-amber-800">外部调用是否完成未知，系统不会自动重放。请检查只读 Trace 后按人工恢复流程处理。</p>
-            <p className="mt-2 text-[11px] text-amber-700">执行单元 {projection.execution_unit?.id} · 尝试 {projection.execution_unit?.attempt_no}</p>
-          </div>
-        )}
-
-        {!unknownOutcome && replayRequest && (
-          <div className="mt-4 rounded-xl border border-blue-200 bg-blue-50 px-4 py-4 text-blue-950" aria-label="执行单元可恢复">
-            <p className="text-sm font-semibold">上次执行已明确失败，可以安全重试</p>
-            <p className="mt-1 text-xs leading-5 text-blue-800">将重放同一份已保存决定，不会创建新的 Scope 含义。</p>
-            <button type="button" disabled={busy} onClick={() => onResolve(replayRequest)} className="mt-3 rounded-lg bg-blue-900 px-3 py-2 text-xs font-medium text-white disabled:opacity-40">重试本次已保存决定</button>
-          </div>
-        )}
-
-        {projection.execution_unit && ["pending", "running"].includes(projection.execution_unit.state) && (
-          <p className="mt-4 rounded-xl border border-line bg-white px-4 py-3 text-xs text-quiet">执行单元处理中 · 尝试 {projection.execution_unit.attempt_no}</p>
-        )}
-
-        {pending && !unknownOutcome && (
-          <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50 px-4 py-4 text-amber-950" aria-label="覆盖不足决策">
-            <p className="text-sm font-semibold">样本覆盖不足，需要你决定下一步</p>
-            <p className="mt-1 text-xs leading-5 text-amber-800">范围已锁定，普通范围确认不可用。这里只显示服务端允许的处理方式。</p>
-            {pending.reasonCodes.map((reason) => {
-              const reasonConstraintId = reason.startsWith("required_constraint_coverage_unmet:")
-                ? reason.slice("required_constraint_coverage_unmet:".length)
-                : null;
-              return <p key={reason} className="mt-1 text-xs leading-5 text-amber-800">{scopeCoverageReasonLabel(reason, constraintLabel(reasonConstraintId))}</p>;
-            })}
-            <div className="mt-3 flex flex-wrap gap-2">
-              {expandResolution && <button type="button" disabled={busy || !expandConstraintId} onClick={() => setSelectedResolution("expand_required_constraint")} className="rounded-lg bg-amber-900 px-3 py-2 text-xs font-medium text-white">继续补充{expandLabel}样本</button>}
-              {pending.allowedResolutions.some((item) => item.action === "generate_limited_report") && <button type="button" disabled={busy} onClick={() => onResolve({ scope_contract_version: contract.version, coverage_snapshot_id: pending.coverageSnapshotId, resolution: "generate_limited_report" })} className="rounded-lg border border-amber-300 bg-white px-3 py-2 text-xs font-medium">基于现有证据生成受限报告</button>}
-              {relaxResolution && <button type="button" disabled={busy || !relaxConstraintId} onClick={() => onResolve({ scope_contract_version: contract.version, coverage_snapshot_id: pending.coverageSnapshotId, resolution: "relax_constraint", ...(relaxConstraintId ? { constraint_id: relaxConstraintId } : {}) })} className="rounded-lg border border-amber-300 bg-white px-3 py-2 text-xs font-medium">放宽{relaxLabel}约束</button>}
-            </div>
-            {selectedResolution === "expand_required_constraint" && (
-              <div className="mt-3 rounded-lg border border-amber-200 bg-amber-100/40 p-3">
-                <p className="mb-2 text-xs text-amber-800">补搜只针对服务端声明的未满足条件，不会修改已确认 Scope。</p>
-                <div className="grid gap-2 sm:grid-cols-2">
-                  {supplementaryQueries.map((query, index) => <input key={index} aria-label={`补充检索词 ${index + 1}`} value={query} onChange={(event) => setSupplementaryQueries((current) => current.map((item, queryIndex) => queryIndex === index ? event.target.value : item))} placeholder={`补充检索词 ${index + 1}${index === 1 ? "（可选）" : ""}`} className="rounded-lg border border-amber-200 bg-white px-3 py-2 text-xs text-ink outline-none focus:border-amber-500" />)}
-                </div>
-                <button type="button" disabled={busy || !expandConstraintId || !supplementaryQueries.some((query) => query.trim())} onClick={() => onResolve({ scope_contract_version: contract.version, coverage_snapshot_id: pending.coverageSnapshotId, resolution: "expand_required_constraint", ...(expandConstraintId ? { constraint_id: expandConstraintId } : {}), supplementary_queries: supplementaryQueries.map((query) => query.trim()).filter(Boolean) })} className="mt-3 rounded-lg bg-amber-900 px-3 py-2 text-xs font-medium text-white disabled:cursor-not-allowed disabled:opacity-40">提交补搜决定</button>
-              </div>
-            )}
-          </div>
-        )}
-      </section>
-    </div>
-  );
-}
-
-function CreatorPage() {
+ function CreatorPage() {
   const { selectedBrandId } = useBrandContext();
   const [threads, setThreads] = useState<CreatorThreadSummary[]>([]);
   const [activeThreadId, setActiveThreadId] = useState<string | null>(null);
@@ -2311,6 +1833,8 @@ function CreatorPage() {
   const snapshotRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const snapshotRefreshInFlightRef = useRef(false);
   const contentResearchRequestEpochRef = useRef(new ContentResearchRequestEpoch());
+  const contentResearchSubmitEpochRef = useRef(0);
+  const pendingPresearchCommandsRef = useRef(new Map<string, { seed: string; commandId: string }>());
   // Tracks the most recently *requested* thread load to discard stale responses
   const loadingThreadRef = useRef<string | null>(null);
   const scopeProjection = contentResearchRun
@@ -2334,19 +1858,16 @@ function CreatorPage() {
     durableRun: contentResearchRun
       ? {
           workflowRunId: contentResearchRun.workflowRunId,
-          llmRecovery: marketingConclusionRecoveryRequired(contentResearchRun.trace)
-            ? {
-                required: true,
-                required_since: contentResearchRun.trace?.llm_recovery?.required_since ?? null,
-              }
-            : contentResearchRun.trace?.llm_recovery,
+          llmRecovery: contentResearchRun.trace?.llm_recovery,
         }
       : null,
   });
-  const durableRecoveryAction = projectedRecoveryAction(contentResearchRun?.report ?? null);
-  const projectedModelRecoveryPending = modelRecovery.recoveryPending && (
-    !contentResearchRun || durableRecoveryAction !== null
-  );
+  const projectedModelRecoveryPending = projectedModelRecoveryVisible({
+    recoveryPending: modelRecovery.recoveryPending,
+    lifecycleState: contentResearchRun?.trace?.state,
+    currentStage: contentResearchRun?.trace?.current_stage,
+    hasDurableRun: contentResearchRun !== null,
+  });
 
   useEffect(() => { taskRef.current = task; }, [task]);
   useEffect(() => { activeThreadIdRef.current = activeThreadId; }, [activeThreadId]);
@@ -2368,7 +1889,7 @@ function CreatorPage() {
         try {
           const workflow = await getContentResearchWorkflow(workflowRunId);
           if (cancelled) return;
-          restoredThreadId = workflow.brief.thread_id;
+          restoredThreadId = workflow.run.thread_id;
           saveContentResearchRunForThread(restoredThreadId, workflowRunId);
         } catch (error) {
           if (isExpectedLiteReportAbsence(error)) {
@@ -2580,12 +2101,24 @@ function CreatorPage() {
       if (!workflowRunId) return false;
       contentResearchRequestEpochRef.current.activate(workflowRunId);
       const ticket = contentResearchRequestEpochRef.current.ticket(workflowRunId, "hydrate");
+      const workflow = await getContentResearchWorkflow(workflowRunId);
+      if (!contentResearchRequestEpochRef.current.accepts(ticket)) return false;
       const trace = await getContentResearchTrace(workflowRunId);
       if (!contentResearchRequestEpochRef.current.accepts(ticket)) return false;
-      setContentResearchIntent(null);
+      if (
+        ["brief_confirmation_required", "recovery_required"].includes(workflow.run.state)
+        && workflow.brief
+      ) {
+        setContentResearchIntent({
+          seed: stringField(workflow.brief.payload, "seed_text", "本轮调研"),
+          presearch: presearchFromWorkflowSummary(workflow),
+        });
+      } else {
+        setContentResearchIntent(null);
+      }
       setContentResearchRun(contentResearchRunWithReport(
         workflowRunId,
-        interruptedPresearchSummary(workflowRunId, threadId),
+        workflow,
         trace,
         null,
         null,
@@ -2651,126 +2184,14 @@ function CreatorPage() {
       ) {
         return report;
       }
-      try {
-        const projection = await refreshContentResearchScope(workflowRunId);
-        if (pendingCoverageDecision(projection)) return null;
-      } catch {
-        // Scope does not exist before confirmation and can lag collection briefly.
-      }
       await new Promise<void>((resolve) => window.setTimeout(resolve, 1000));
     }
     return null;
   }
 
-  async function startContentResearchForRun(workflowRunId: string) {
-    const ticket = contentResearchRequestEpochRef.current.ticket(workflowRunId);
-    setContentResearchRun((current) =>
-      current && current.workflowRunId === workflowRunId ? { ...current, formalResearchStatus: "collecting" } : current
-    );
-    let formalResearch: ContentResearchFormalResearchResponse | null = null;
-    try {
-      formalResearch = await startContentResearchFormalResearch(workflowRunId, {
-        source_kind: "search_result",
-        sort: "likes",
-        provider: "xiaohongshu",
-      });
-    } catch (error) {
-      if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
-      const detail = error instanceof Error && error.message.trim() ? error.message.trim() : "未知运行时错误";
-      if (isUncertainContentResearchDispatchFailure(detail)) {
-        appendMessage({
-          role: "system",
-          text: "调研已入队，正在读取运行状态；无需重复发起调研。",
-        });
-      } else {
-        const failure = contentResearchStartFailure(detail);
-        setContentResearchRun((current) =>
-          current && current.workflowRunId === workflowRunId ? { ...current, formalResearchStatus: failure.status } : current
-        );
-        appendMessage({ role: "system", text: failure.message });
-        return;
-      }
-    }
-    if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
-    if (formalResearch) {
-      setContentResearchRun((current) =>
-        current && current.workflowRunId === workflowRunId
-          ? {
-              ...current,
-              formalResearch,
-              formalResearchStatus: formalResearchStatus(formalResearch),
-            }
-          : current
-      );
-    }
-    try {
-      await refreshContentResearchTrace(workflowRunId);
-    } catch {
-      // Dispatch succeeded; Trace remains available through manual refresh.
-    }
-    try {
-      const projection = await pollContentResearchReport(workflowRunId);
-      if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
-      if (projection && litePublicationState(projection)) {
-        setContentResearchRun((current) =>
-          current && current.workflowRunId === workflowRunId
-            ? { ...current, formalResearchStatus: "completed" }
-            : current
-        );
-      }
-      if (formalResearch?.status === "failed") {
-        setStatusLog((log) => [...log, `${formalResearch.failed_tasks.length} 个专家任务未完成。`].slice(-6));
-      } else if (formalResearch) {
-        setStatusLog((log) => [...log, `已提交 ${formalResearch.task_count} 个专家的独立采集与分析。`].slice(-6));
-      }
-    } catch (error) {
-      if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
-      appendMessage({
-        role: "system",
-        text: `调研已启动，但正式报告读取失败：${error instanceof Error ? error.message : "未知错误"}`,
-      });
-    }
-  }
-
-  async function executeProjectedRecovery(
-    workflowRunId: string,
-    recoveryAction: ProjectedRecoveryAction,
-  ) {
-    const ticket = contentResearchRequestEpochRef.current.ticket(workflowRunId, "recovery-command");
-    setContentResearchRun((current) =>
-      current && current.workflowRunId === workflowRunId
-        ? { ...current, formalResearchStatus: "collecting", reportError: null }
-        : current
-    );
-    try {
-      await runContentResearchWorkflowAction(workflowRunId, {
-        action: recoveryAction.action,
-        payload: recoveryAction.request,
-      });
-      try {
-        await refreshContentResearchTrace(workflowRunId);
-      } catch {
-        // Resume succeeded; a transient read must not trigger another action.
-      }
-      const report = await pollContentResearchReport(workflowRunId, { requirePublication: true });
-      if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
-      if (report && litePublicationState(report)) {
-        setContentResearchRun((current) =>
-          current && current.workflowRunId === workflowRunId
-            ? { ...current, formalResearchStatus: "completed" }
-            : current
-        );
-      }
-    } catch (error) {
-      if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
-      const detail = error instanceof Error ? error.message : "未知错误";
-      appendMessage({ role: "system", text: `继续调研失败：${detail}` });
-    }
-  }
-
   async function modifyContentResearchDirections() {
     const run = contentResearchRun;
-    if (!run || !activeThreadId) return;
+    if (!run || !activeThreadId || !run.summary.brief) return;
     const payload = run.summary.brief.payload;
     const subject = stringField(payload, "seed_text") ||
       stringField(payload, "confirmed_subject") ||
@@ -2785,9 +2206,9 @@ function CreatorPage() {
       ? arrayField(payload, "selected_directions")
       : arrayField(payload, "research_directions");
     try {
-      await endContentResearchWorkflow(run.workflowRunId);
+      await endContentResearchWorkflow(run.summary.run);
       removeContentResearchRunForThread(run.summary.brief.thread_id);
-      const presearch = await createContentResearchPresearch({ seed_text: subject, user_note: null, thread_id: activeThreadId });
+      const presearch = await createContentResearchPresearch({ command_id: createContentResearchCommandId(), seed_text: subject, user_note: null, thread_id: activeThreadId });
       setContentResearchIntent({ seed: subject, presearch: { ...presearch, competitor_tags: [...new Set([...presearch.competitor_tags, ...competitors])], research_directions: directions.length ? directions : presearch.research_directions } });
       setContentResearchRun(null);
       setPreparedScope(null);
@@ -2803,8 +2224,8 @@ function CreatorPage() {
     const run = contentResearchRun;
     if (!run) return;
     try {
-      await endContentResearchWorkflow(run.workflowRunId);
-      removeContentResearchRunForThread(run.summary.brief.thread_id);
+      await endContentResearchWorkflow(run.summary.run);
+      if (run.summary.brief) removeContentResearchRunForThread(run.summary.brief.thread_id);
       setContentResearchRun(null);
       setContentResearchIntent(null);
       setPreparedScope(null);
@@ -2824,141 +2245,17 @@ function CreatorPage() {
     }
   }
 
-  async function handleContentResearchConfirmed(summary: ContentResearchWorkflowSummary) {
-    contentResearchRequestEpochRef.current.activate(summary.workflow_run_id);
-    const ticket = contentResearchRequestEpochRef.current.ticket(summary.workflow_run_id, "hydrate");
-    setContentResearchIntent(null);
-    saveContentResearchRunForThread(summary.brief.thread_id, summary.workflow_run_id);
-    setContentResearchRun({
-      workflowRunId: summary.workflow_run_id,
-      summary,
-      trace: null,
-      formalResearch: null,
-      formalResearchStatus: "idle",
-      report: null,
-      reportStatus: "idle",
-      reportError: null,
-    });
-    setPreparedScope(null);
-    setTraceExpanded(false);
-    appendMessage({
-      role: "assistant",
-      text: "调研 brief 已确认，请确认本轮最终检索词。",
-    });
-    try {
-      await refreshContentResearchTrace(summary.workflow_run_id);
-    } catch {
-      if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
-      appendMessage({ role: "system", text: "调研过程暂时不可用，稍后可在 Trace 中刷新。" });
-    }
-    if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
-    const selectedDirectionIds = arrayField(summary.brief.payload, "selected_directions");
-    const directionId = selectedDirectionIds.includes("product_marketing")
-      ? "product_marketing"
-      : selectedDirectionIds[0] || stringField(summary.directions[0]?.payload, "direction_id");
-    if (!directionId) {
-      appendMessage({ role: "system", text: "无法读取已确认的调研方向，请返回 checklist 后重试。" });
-      return;
-    }
-    try {
-      const scope = await prepareContentResearchScope(summary.workflow_run_id, { direction_id: directionId });
-      if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
-      setPreparedScope(scope);
-    } catch (error) {
-      if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
-      appendMessage({
-        role: "system",
-        text: `检索范围准备失败：${error instanceof Error ? error.message : "请稍后重试。"}`,
-      });
-    }
-  }
-
-  async function confirmPreparedContentResearchScope(payload: ContentResearchConfirmScopeRequest) {
-    const run = contentResearchRun;
-    if (!run || scopeActionBusy) return;
-    const ticket = contentResearchRequestEpochRef.current.ticket(run.workflowRunId);
-    setScopeActionBusy(true);
-    try {
-      await confirmContentResearchScope(run.workflowRunId, payload);
-      if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
-      await refreshContentResearchScope(run.workflowRunId);
-      if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
-      appendMessage({ role: "assistant", text: "检索范围已冻结，正在开始内容调研。" });
-      void startContentResearchForRun(run.workflowRunId);
-    } catch (error) {
-      if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
-      appendMessage({
-        role: "system",
-        text: `确认检索范围失败：${error instanceof Error ? error.message : "请刷新后重试。"}`,
-      });
-    } finally {
-      if (contentResearchRequestEpochRef.current.accepts(ticket)) setScopeActionBusy(false);
-    }
-  }
-
-  async function replacePreparedContentResearchScope(
-    payload: ContentResearchPrepareScopeRequest,
-  ) {
-    const run = contentResearchRun;
-    if (!run) return;
-    const ticket = contentResearchRequestEpochRef.current.ticket(
-      run.workflowRunId,
-      "scope-prepare",
-    );
-    try {
-      const scope = await prepareContentResearchScope(run.workflowRunId, payload);
-      if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
-      setPreparedScope(scope);
-    } catch (error) {
-      if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
-      appendMessage({
-        role: "system",
-        text: `检索词更新失败：${error instanceof Error ? error.message : "请稍后重试。"}`,
-      });
-    }
-  }
-
-  async function resolvePendingContentResearchCoverage(payload: ContentResearchResolveCoverageRequest) {
-    const run = contentResearchRun;
-    if (!run || scopeActionBusy) return;
-    const ticket = contentResearchRequestEpochRef.current.ticket(run.workflowRunId);
-    setScopeActionBusy(true);
-    try {
-      await resolveContentResearchCoverage(run.workflowRunId, payload);
-      if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
-      await refreshContentResearchScope(run.workflowRunId);
-      try {
-        await refreshContentResearchTrace(run.workflowRunId);
-      } catch {
-        // The decision is durable; a transient Trace read must not replay it.
-      }
-      void pollContentResearchReport(run.workflowRunId, {
-        requirePublication: payload.resolution === "generate_limited_report",
-      });
-    } catch (error) {
-      if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
-      appendMessage({
-        role: "system",
-        text: `覆盖范围决策失败：${error instanceof Error ? error.message : "请稍后重试。"}`,
-      });
-    } finally {
-      if (contentResearchRequestEpochRef.current.accepts(ticket)) setScopeActionBusy(false);
-    }
-  }
-
   async function continueModelRecovery() {
     const workflowRunId = modelRecovery.workflowRunId;
     if (!workflowRunId) return;
-    if (
-      contentResearchRun?.workflowRunId === workflowRunId
-      && marketingConclusionRecoveryRequired(contentResearchRun.trace)
-    ) {
-      const action = projectedRecoveryAction(contentResearchRun.report);
-      if (action) await executeProjectedRecovery(workflowRunId, action);
-      return;
-    }
-    const presearch = await retryContentResearchPresearch(workflowRunId);
-    const durablePayload = contentResearchRun?.summary.brief.payload ?? {};
+    const projection = contentResearchRun?.workflowRunId === workflowRunId
+      ? contentResearchRun.summary.run
+      : contentResearchIntent?.presearch.workflow_run_id === workflowRunId
+        ? contentResearchIntent.presearch.run
+        : null;
+    if (!projection) throw new Error("当前 Run 状态不可用，请刷新后重试。");
+    const presearch = await retryContentResearchPresearch(projection);
+    const durablePayload = contentResearchRun?.summary.brief?.payload ?? {};
     const seed = contentResearchIntent?.seed
       || stringField(durablePayload, "seed_text")
       || stringField(durablePayload, "subject_confirmation")
@@ -3027,7 +2324,18 @@ function CreatorPage() {
           : undefined;
         try {
           const workflow = await getContentResearchWorkflow(runIdForThread);
-          if (loadingThreadRef.current !== threadId || workflow.brief.thread_id !== threadId) return;
+          if (loadingThreadRef.current !== threadId || workflow.run.thread_id !== threadId) return;
+          if (
+            ["brief_confirmation_required", "recovery_required"].includes(workflow.run.state)
+            && workflow.brief
+          ) {
+            setContentResearchIntent({
+              seed: stringField(workflow.brief.payload, "seed_text", thread.title),
+              presearch: presearchFromWorkflowSummary(workflow),
+            });
+          } else {
+            setContentResearchIntent(null);
+          }
           contentResearchRequestEpochRef.current.activate(runIdForThread);
           const requestTicket = contentResearchRequestEpochRef.current.ticket(runIdForThread, "hydrate");
           saveContentResearchRunForThread(threadId, runIdForThread);
@@ -3195,20 +2503,39 @@ function CreatorPage() {
     }
 
     if (contentResearchMode) {
+      const submitEpoch = ++contentResearchSubmitEpochRef.current;
+      const pending = pendingPresearchCommandsRef.current.get(threadId);
+      const commandId = pending?.seed === text
+        ? pending.commandId
+        : createContentResearchCommandId();
+      pendingPresearchCommandsRef.current.set(threadId, { seed: text, commandId });
       try {
         appendMessage({
           role: "assistant",
           text: "我会先做一次轻量预检索，确认你要研究的主体、竞品范围和调研方向。这个阶段不会生成正式结论。",
         });
         const result = await createContentResearchPresearch({
+          command_id: commandId,
           seed_text: text,
           user_note: null,
           thread_id: threadId,
         });
+        if (
+          submitEpoch !== contentResearchSubmitEpochRef.current
+          || activeThreadIdRef.current !== threadId
+        ) return;
+        pendingPresearchCommandsRef.current.delete(threadId);
+        contentResearchRequestEpochRef.current.activate(result.workflow_run_id);
+        saveContentResearchRunForThread(threadId, result.workflow_run_id);
         setContentResearchIntent({ seed: text, presearch: result });
         setContentResearchMode(false);
       } catch (error) {
+        if (
+          submitEpoch !== contentResearchSubmitEpochRef.current
+          || activeThreadIdRef.current !== threadId
+        ) return;
         const restored = await restoreInterruptedContentResearchRun(threadId);
+        if (restored) pendingPresearchCommandsRef.current.delete(threadId);
         appendMessage({
           role: "system",
           text: restored
@@ -3216,7 +2543,41 @@ function CreatorPage() {
             : contentResearchErrorFeedback(error, "内容调研预检索失败"),
         });
       } finally {
-        setIsLoading(false);
+        if (submitEpoch === contentResearchSubmitEpochRef.current) {
+          setIsLoading(false);
+          inputRef.current?.focus();
+        }
+      }
+      return;
+    }
+
+    if (
+      contentResearchIntent
+      && contentResearchIntent.presearch.run.allowed_actions.includes("revise_subject")
+    ) {
+      const ticket = contentResearchRequestEpochRef.current.ticket(
+        contentResearchIntent.presearch.workflow_run_id,
+        "revise-subject",
+      );
+      try {
+        const revised = await reviseContentResearchSubject(
+          contentResearchIntent.presearch.run,
+          text,
+        );
+        if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
+        setContentResearchIntent({ seed: text, presearch: revised.result });
+        appendMessage({
+          role: "assistant",
+          text: "已根据你的补充重新完成轻量预检索，请确认更新后的 Brief。",
+        });
+      } catch (error) {
+        if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
+        appendMessage({
+          role: "system",
+          text: contentResearchErrorFeedback(error, "更新调研主体失败"),
+        });
+      } finally {
+        if (contentResearchRequestEpochRef.current.accepts(ticket)) setIsLoading(false);
         inputRef.current?.focus();
       }
       return;
@@ -3462,29 +2823,13 @@ function CreatorPage() {
               const isUser = message.role === "user";
               const isSystem = message.role === "system";
               const editing = editingMessageId === message.id;
-              const hideReportForPendingScope = Boolean(
-                message.report
-                && message.report.workflow_run_id === scopeProjection?.workflow_run_id
-                && pendingCoverageDecision(scopeProjection),
-              );
-              if (hideReportForPendingScope) return null;
-
               return (
                 <div
                   key={message.id}
                   className={["group flex", isUser ? "justify-end" : "justify-start"].join(" ")}
                 >
                   {message.report ? (
-                    <ContentResearchReportMessage
-                      report={message.report}
-                      onRecover={(action) => void executeProjectedRecovery(message.report!.workflow_run_id, action)}
-                      onRepair={(action) => void executeProjectedRecovery(message.report!.workflow_run_id, action)}
-                      onOpenTrace={() => setTraceExpanded(true)}
-                      recoveryAllowed={!(
-                        message.report.workflow_run_id === scopeProjection?.workflow_run_id
-                        && (pendingCoverageDecision(scopeProjection) || scopeProjection.execution_unit)
-                      )}
-                    />
+                    <ContentResearchReportMessage report={message.report} />
                   ) : (
                   <div
                     className={[
@@ -3548,20 +2893,6 @@ function CreatorPage() {
             {contentResearchIntent && (
               <ContentResearchIntentCard
                 intent={contentResearchIntent}
-                onConfirmed={(summary) => void handleContentResearchConfirmed(summary)}
-                onPresearchUpdated={(presearch) => setContentResearchIntent((current) => current ? { ...current, presearch } : current)}
-                onError={(message) => appendMessage({ role: "system", text: message })}
-              />
-            )}
-
-            {(preparedScope || scopeProjection) && (
-              <ContentResearchScopeCard
-                draft={preparedScope}
-                projection={scopeProjection}
-                busy={scopeActionBusy}
-                onPrepare={(payload) => void replacePreparedContentResearchScope(payload)}
-                onConfirm={(payload) => void confirmPreparedContentResearchScope(payload)}
-                onResolve={(payload) => void resolvePendingContentResearchCoverage(payload)}
               />
             )}
 
@@ -3838,16 +3169,11 @@ function CreatorPage() {
         expanded={traceExpanded}
         onExpandedChange={setTraceExpanded}
         onRefresh={async () => { await refreshContentResearchTrace(contentResearchRun.workflowRunId); }}
-        onRetry={() => durableRecoveryAction
-          ? executeProjectedRecovery(contentResearchRun.workflowRunId, durableRecoveryAction)
-          : Promise.resolve()}
-        legacyRecoveryAllowed={Boolean(durableRecoveryAction) && !pendingCoverageDecision(scopeProjection) && !scopeProjection?.execution_unit}
       />}
     </div>
   );
 }
 
 CreatorPage.ContentResearchIntentCard = ContentResearchIntentCard;
-CreatorPage.ContentResearchScopeCard = ContentResearchScopeCard;
 
 export default CreatorPage;

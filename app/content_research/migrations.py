@@ -1450,6 +1450,54 @@ def _apply_0032(conn: sqlite3.Connection) -> None:
     _add_columns(conn, _V32_SCOPE_DRAFT_VERSION_COLUMNS)
 
 
+_V33_LIFECYCLE_AUTHORITY_SQL = """
+CREATE TABLE content_research_state_transitions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
+    from_state TEXT,
+    to_state TEXT NOT NULL,
+    event TEXT NOT NULL,
+    state_revision INTEGER NOT NULL,
+    reason_code TEXT,
+    error_json TEXT,
+    attempt_id TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE(run_id, state_revision)
+);
+CREATE INDEX idx_cr_state_transition_run_revision
+    ON content_research_state_transitions(run_id, state_revision);
+CREATE TABLE content_research_lifecycle_commands (
+    command_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    command_kind TEXT NOT NULL,
+    request_fingerprint TEXT NOT NULL,
+    result_revision INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX idx_cr_lifecycle_command_run_created
+    ON content_research_lifecycle_commands(run_id, created_at, command_id);
+"""
+
+_V33_WORKFLOW_RUN_COLUMNS = {
+    "workflow_runs": (
+        "content_research_state TEXT",
+        "state_revision INTEGER",
+        "state_entered_at TEXT",
+        "lifecycle_error_json TEXT",
+        "lifecycle_schema_version TEXT",
+    ),
+}
+
+
+def _apply_0033(conn: sqlite3.Connection) -> None:
+    conn.executescript(_V33_LIFECYCLE_AUTHORITY_SQL)
+    if conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow_runs'"
+    ).fetchone():
+        _add_columns(conn, _V33_WORKFLOW_RUN_COLUMNS)
+
+
 def _apply_0015(conn: sqlite3.Connection) -> None:
     conn.execute(_V15_LLM_CONFIGURATION_SQL)
 
@@ -1521,6 +1569,7 @@ def _expected_checksums(migration_0002_sql: str, legacy_checksum: str) -> dict[s
         ),
         "0031": _checksum(_V31_REPORT_INTEGRITY_EVENT_STATEMENTS),
         "0032": _checksum(_V32_SCOPE_DRAFT_VERSION_COLUMNS),
+        "0033": hashlib.sha256(_V33_LIFECYCLE_AUTHORITY_SQL.encode("utf-8")).hexdigest(),
     }
 
 
@@ -1824,6 +1873,13 @@ def apply_content_research_migrations(
                 name="version_scope_drafts_for_query_portfolios",
                 checksum=expected_checksums["0032"],
                 apply=lambda: _apply_0032(conn),
+            )
+            _apply_migration(
+                conn,
+                version="0033",
+                name="content_research_lifecycle_authority",
+                checksum=expected_checksums["0033"],
+                apply=lambda: _apply_0033(conn),
             )
         except Exception:
             conn.rollback()

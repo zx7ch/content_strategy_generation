@@ -162,13 +162,31 @@ class WorkflowStore:
                 failed_at TIMESTAMP,
                 cancelled_at TIMESTAMP,
                 error_code TEXT,
-                error_message TEXT
+                error_message TEXT,
+                content_research_state TEXT,
+                state_revision INTEGER,
+                state_entered_at TEXT,
+                lifecycle_error_json TEXT,
+                lifecycle_schema_version TEXT
             )
             """
         )
         await self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_workflow_runs_thread ON workflow_runs(thread_id, created_at DESC)"
         )
+        for column_name, column_sql in (
+            ("content_research_state", "content_research_state TEXT"),
+            ("state_revision", "state_revision INTEGER"),
+            ("state_entered_at", "state_entered_at TEXT"),
+            ("lifecycle_error_json", "lifecycle_error_json TEXT"),
+            ("lifecycle_schema_version", "lifecycle_schema_version TEXT"),
+        ):
+            await ensure_column(
+                self._conn,
+                table_name="workflow_runs",
+                column_name=column_name,
+                column_sql=column_sql,
+            )
         await self._conn.execute(
             """
             CREATE TABLE IF NOT EXISTS workflow_steps (

@@ -1,117 +1,60 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import sqlite3
+import asyncio
 
 import pytest
 
-from app.content_research.api_schemas import (
-    ContentResearchBriefConfirmRequest,
-    ContentResearchSubjectStructureConfirmationRequest,
-    ContentResearchWorkflowActionRequest,
-)
-from app.content_research.persistence_models import StageCheckpointRecord
+from app.content_research.api_schemas import ContentResearchWorkflowActionRequest
+from app.content_research.lifecycle.coordinator import LifecyclePersistenceBusy
+from app.content_research.lifecycle.models import ContentResearchState, LifecycleCommand
 from app.content_research.presearch.service import PresearchService
-from app.content_research.service import (
-    ContentResearchService,
-    ContentResearchStateConflictError,
-    ContentResearchValidationError,
-    WorkflowRunManagerRuntime,
-)
+from app.content_research.service import ContentResearchService, WorkflowRunManagerRuntime
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
-from app.services.llm.failures import LLMProviderFailure
+from app.memory.thread_store import ThreadStore
 from app.services.llm.types import LLMResponse, TokenUsage
 
 
-class FakeRuntime:
-    def __init__(self) -> None:
-        self.calls: list[dict] = []
-        self.waiting = False
-
-    async def start_presearch_run(self, *, thread_id: str, user_id: str, seed_text: str) -> str:
-        self.calls.append({"thread_id": thread_id, "user_id": user_id, "seed_text": seed_text})
-        return "run_1"
-
-    async def mark_presearch_ready(self, workflow_run_id: str) -> None:
-        self.calls.append({"workflow_run_id": workflow_run_id, "event": "presearch_ready"})
-
-    async def wait_for_presearch_recovery(self, workflow_run_id: str, reason: dict) -> dict:
-        self.waiting = True
-        self.calls.append({"workflow_run_id": workflow_run_id, "event": "wait_for_presearch_recovery", "reason": reason})
-        return {"workflow_run_id": workflow_run_id, "status": "waiting_user"}
-
-    async def wait_for_subject_clarification(self, workflow_run_id: str, reason: dict) -> dict:
-        self.waiting = True
-        self.calls.append({
-            "workflow_run_id": workflow_run_id,
-            "event": "wait_for_subject_clarification",
-            "reason": reason,
-        })
-        return {"workflow_run_id": workflow_run_id, "status": "waiting_user"}
-
-    async def resume_subject_clarification(self, workflow_run_id: str) -> dict:
-        self.waiting = False
-        self.calls.append({
-            "workflow_run_id": workflow_run_id,
-            "event": "resume_subject_clarification",
-        })
-        return {"workflow_run_id": workflow_run_id, "status": "running"}
-
-    async def restart_presearch_step(self, workflow_run_id: str) -> dict:
-        self.waiting = False
-        self.calls.append({"workflow_run_id": workflow_run_id, "event": "restart_presearch_step"})
-        return {"workflow_run_id": workflow_run_id, "status": "running"}
-
-    async def get_runtime_snapshot(self, workflow_run_id: str) -> dict:
-        return {
-            "run": {"run_id": workflow_run_id, "status": "waiting_user" if self.waiting else "running"},
-            "steps": [{"step_name": "presearch", "status": "retrying", "attempt_count": 1, "max_attempts": 3}],
-            "child_tasks": [],
-        }
-
-    async def list_events(self, workflow_run_id: str) -> list[dict]:
-        return []
-
-
-class FakeLLM:
-    def __init__(self, content: str | None = None, *, delay: float = 0.0, fail: bool = False) -> None:
-        self.content = content or json.dumps(
-            {
-                "subject_confirmation": "徒步短裤更可能是户外服饰品类，请确认。",
-                "competitor_tags": ["迪卡侬", "凯乐石"],
-                "research_directions": ["产品卖点表达", "用户评论痛点"],
-                "custom_research_question": "关注夏季轻量户外",
-                "custom_competitor_input": "",
-                "subject_structure": {
-                    "schema_version": "content_research_subject_structure_v1",
-                    "canonical_subject": "短裤",
-                    "subject_type": "category",
-                    "core_entities": [
-                        {
-                            "canonical_name": "短裤",
-                            "raw_mentions": ["短裤"],
-                        }
-                    ],
-                    "research_intents": ["产品卖点"],
-                    "context_modifiers": ["夏季轻量户外"],
-                    "synonym_groups": {"短裤": ["户外短裤"]},
-                    "ambiguities": [],
-                    "resolution_state": "resolved",
-                },
+def _presearch_payload(*, resolution_state: str = "resolved") -> str:
+    ambiguities = ["苹果指 Apple 品牌还是水果"] if resolution_state != "resolved" else []
+    return json.dumps(
+        {
+            "subject_confirmation": "已识别本轮需要调研的对象与方向。",
+            "competitor_tags": ["迪卡侬", "凯乐石"],
+            "research_directions": ["产品营销"],
+            "custom_competitor_input": "",
+            "subject_structure": {
+                "schema_version": "content_research_subject_structure_v1",
+                "canonical_subject": "夏季凉感T恤",
+                "subject_type": "category",
+                "core_entities": [
+                    {
+                        "canonical_name": "凉感T恤",
+                        "raw_mentions": ["夏季凉感T恤"],
+                    }
+                ],
+                "research_intents": ["凉感"],
+                "context_modifiers": ["夏季"],
+                "synonym_groups": {"凉感T恤": ["冰感T恤"]},
+                "ambiguities": ambiguities,
+                "resolution_state": resolution_state,
             },
-            ensure_ascii=False,
-        )
-        self.delay = delay
-        self.fail = fail
+        },
+        ensure_ascii=False,
+    )
+
+
+class RecordingLLM:
+    def __init__(self, *, content: str | None = None, error: Exception | None = None) -> None:
+        self.content = content or _presearch_payload()
+        self.error = error
         self.requests = []
 
     async def generate(self, request):
         self.requests.append(request)
-        if self.delay:
-            await asyncio.sleep(self.delay)
-        if self.fail:
-            raise RuntimeError("llm unavailable")
+        if self.error is not None:
+            raise self.error
         return LLMResponse(
             content=self.content,
             provider="fake",
@@ -121,748 +64,477 @@ class FakeLLM:
         )
 
 
-class AmbiguousThenClarifiedLLM(FakeLLM):
+class LockingOutcomeLLM(RecordingLLM):
     def __init__(self) -> None:
         super().__init__()
-        self.responses = [
-            {
-                "subject_confirmation": "‘苹果’可能指品牌或水果，请补充说明。",
-                "competitor_tags": [],
-                "research_directions": ["产品营销"],
-                "custom_research_question": "",
-                "custom_competitor_input": "",
-                "subject_structure": {
-                    "schema_version": "content_research_subject_structure_v1",
-                    "canonical_subject": "苹果",
-                    "subject_type": "ambiguous",
-                    "core_entities": [
-                        {"canonical_name": "Apple 品牌", "raw_mentions": ["苹果"]},
-                        {"canonical_name": "苹果水果", "raw_mentions": ["苹果"]},
-                    ],
-                    "research_intents": ["年轻人偏好"],
-                    "context_modifiers": [],
-                    "synonym_groups": {},
-                    "ambiguities": ["苹果指 Apple 品牌还是水果"],
-                    "resolution_state": "needs_confirmation",
-                },
-            },
-            {
-                "subject_confirmation": "已确认调研 Apple 品牌在年轻人中的偏好。",
-                "competitor_tags": ["华为", "小米"],
-                "research_directions": ["产品营销"],
-                "custom_research_question": "",
-                "custom_competitor_input": "",
-                "subject_structure": {
-                    "schema_version": "content_research_subject_structure_v1",
-                    "canonical_subject": "Apple 品牌",
-                    "subject_type": "brand",
-                    "core_entities": [
-                        {"canonical_name": "Apple 品牌", "raw_mentions": ["苹果"]},
-                    ],
-                    "research_intents": ["年轻人偏好"],
-                    "context_modifiers": [],
-                    "synonym_groups": {"Apple 品牌": ["Apple"]},
-                    "ambiguities": [],
-                    "resolution_state": "resolved",
-                },
-            },
-        ]
+        self.db_path: str | None = None
 
     async def generate(self, request):
-        self.requests.append(request)
-        response = self.responses.pop(0)
-        return LLMResponse(
-            content=json.dumps(response, ensure_ascii=False),
-            provider="fake",
-            model="fake-model",
-            usage=TokenUsage(total_tokens=10),
-            latency_ms=1,
+        response = await super().generate(request)
+        assert self.db_path is not None
+        blocker = sqlite3.connect(self.db_path, timeout=0)
+        blocker.execute("BEGIN IMMEDIATE")
+
+        async def release() -> None:
+            await asyncio.sleep(2.5)
+            blocker.commit()
+            blocker.close()
+
+        asyncio.create_task(release())
+        return response
+
+
+async def _owned_service(tmp_path, llm: RecordingLLM):
+    db_path = str(tmp_path / "content-research.db")
+    async with ThreadStore(db_path) as thread_store:
+        thread = await thread_store.create_thread(
+            title="夏季凉感T恤",
+            workspace_id="ws-test",
+            brand_id="brand-test",
         )
-
-
-@pytest.fixture()
-def store(tmp_path):
-    return SQLiteContentResearchStore(str(tmp_path / "content_research.db"))
-
-
-def _service(store, llm=None, *, first_timeout=0.05, hard_cutoff=0.1, runtime=None):
-    return ContentResearchService(
-        store=store,
-        presearch=PresearchService(
-            llm,
-            first_feedback_timeout_seconds=first_timeout,
-            hard_cutoff_seconds=hard_cutoff,
+    return (
+        ContentResearchService(
+            store=SQLiteContentResearchStore(db_path),
+            presearch=PresearchService(
+                llm,
+                first_feedback_timeout_seconds=0.05,
+                hard_cutoff_seconds=0.1,
+            ),
+            workflow_runtime=WorkflowRunManagerRuntime(db_path),
         ),
-        workflow_runtime=runtime or FakeRuntime(),
+        db_path,
+        thread,
     )
 
 
 @pytest.mark.asyncio
-async def test_presearch_success_creates_workflow_brief_trace_and_observation(store):
-    service = _service(store, FakeLLM())
+async def test_presearch_success_uses_the_owned_lifecycle_and_returns_only_brief(tmp_path):
+    llm = RecordingLLM()
+    service, db_path, thread = await _owned_service(tmp_path, llm)
 
     response = await service.submit_presearch(
-        seed_text="徒步短裤",
-        user_note="关注夏季",
-        thread_id="thread_1",
-        user_id="user_1",
+        command_id="submit-presearch-success",
+        seed_text="夏季凉感T恤",
+        user_note="关注通勤场景",
+        thread_id=thread["id"],
+        user_id="user-test",
+        workspace_id="ws-test",
     )
 
-    assert response.workflow_run_id == "run_1"
-    assert response.attempt_id.startswith("att_")
-    assert response.brief_id.startswith("rb_")
     assert response.status == "completed"
-    assert response.fallback_used is False
-    assert response.timeout_status == "none"
-    assert response.competitor_tags == ["迪卡侬", "凯乐石"]
-    assert service._presearch._llm.requests[0].response_format is None
-    assert service._presearch._llm.requests[0].temperature == 1.0
-    assert service._presearch._llm.requests[0].model_policy == "balanced"
-    system_prompt = service._presearch._llm.requests[0].messages[0].content
-    assert "只输出一个合法 JSON 对象" in system_prompt
-    assert "不要输出 Markdown" in system_prompt
-    assert "competitor_tags" in system_prompt
-    assert "核心对象只保留可被调研的实体" in system_prompt
-    assert "不要把包含意图或场景修饰的完整用户句子直接复制为核心对象" in system_prompt
-    assert store.get_brief(response.brief_id).payload["attempt_id"] == response.attempt_id
-    traces = store.list_traces_for_workflow(response.workflow_run_id)
-    assert len(traces) == 1
-    events = store.list_observation_events(traces[0].id)
-    assert [event.event_name for event in events] == ["presearch_started", "presearch_completed"]
+    assert response.run.state == "brief_confirmation_required"
+    assert response.run.state_revision == 2
+    assert response.run.brief_id == response.brief_id
+    assert response.subject_structure["core_entities"][0]["canonical_name"] == "凉感T恤"
+    assert llm.requests[0].temperature == 1.0
+    assert llm.requests[0].model_policy == "balanced"
+    assert "只输出一个合法 JSON 对象" in llm.requests[0].messages[0].content
 
-    with sqlite3.connect(store._db_path) as conn:
-        evidence_rows = conn.execute("SELECT COUNT(*) FROM content_research_evidence_records").fetchone()[0]
-    assert evidence_rows == 0
+    with sqlite3.connect(db_path) as connection:
+        run = connection.execute(
+            "SELECT content_research_state, state_revision, status FROM workflow_runs WHERE run_id=?",
+            (response.workflow_run_id,),
+        ).fetchone()
+        brief_status = connection.execute(
+            "SELECT status FROM content_research_briefs WHERE id=?",
+            (response.brief_id,),
+        ).fetchone()[0]
+        active_run_id = connection.execute(
+            "SELECT active_run_id FROM creator_threads WHERE id=?",
+            (thread["id"],),
+        ).fetchone()[0]
+        assert connection.execute(
+            "SELECT COUNT(*) FROM content_research_scope_contracts WHERE workflow_run_id=?",
+            (response.workflow_run_id,),
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM content_research_dispatch_jobs WHERE workflow_run_id=?",
+            (response.workflow_run_id,),
+        ).fetchone()[0] == 0
+
+    assert run == ("brief_confirmation_required", 2, "waiting_user")
+    assert brief_status == "draft"
+    assert active_run_id == response.workflow_run_id
 
 
 @pytest.mark.asyncio
-async def test_presearch_returns_backend_validated_subject_structure(store):
-    content = json.dumps(
-        {
-            "subject_confirmation": "夏季防晒穿搭",
-            "subject_structure": {
-                "schema_version": "content_research_subject_structure_v1",
-                "canonical_subject": "防晒服饰",
-                "subject_type": "category",
-                "core_entities": [
-                        {
-                            "canonical_name": "防晒服饰",
-                            "raw_mentions": ["防晒"],
-                    }
-                ],
-                "research_intents": ["穿搭"],
-                "context_modifiers": ["夏季"],
-                "synonym_groups": {"防晒服饰": ["防晒衣", "防晒服"]},
-                "ambiguities": [],
-                "resolution_state": "resolved",
-            },
-            "competitor_tags": [],
-            "research_directions": ["产品营销"],
-            "custom_research_question": "",
-            "custom_competitor_input": "",
-        },
-        ensure_ascii=False,
-    )
-    service = _service(store, FakeLLM(content=content))
+async def test_ambiguous_model_interpretation_does_not_create_a_user_confirmation_stage(
+    tmp_path,
+):
+    llm = RecordingLLM(content=_presearch_payload(resolution_state="needs_confirmation"))
+    service, _db_path, thread = await _owned_service(tmp_path, llm)
 
     response = await service.submit_presearch(
-        seed_text="夏季防晒穿搭",
-        user_note=None,
-        thread_id="thread_1",
-        user_id="user_1",
-    )
-
-    assert response.subject_structure_state == "confirmed"
-    assert response.subject_structure_reason_codes == []
-    assert response.subject_structure["canonical_subject"] == "防晒服饰"
-    assert response.subject_structure_hash
-    brief = store.get_brief(response.brief_id)
-    assert brief is not None
-    assert brief.payload["subject_structure_hash"] == response.subject_structure_hash
-
-
-@pytest.mark.asyncio
-async def test_subject_clarification_reuses_run_without_model_recovery_or_spider(store):
-    runtime = FakeRuntime()
-    llm = AmbiguousThenClarifiedLLM()
-    service = _service(store, llm, runtime=runtime)
-
-    first = await service.submit_presearch(
+        command_id="submit-presearch-ambiguous",
         seed_text="苹果适合年轻人吗",
         user_note=None,
-        thread_id="thread_1",
-        user_id="user_1",
+        thread_id=thread["id"],
+        user_id="user-test",
+        workspace_id="ws-test",
     )
 
-    assert first.status == "subject_needs_confirmation"
-    assert first.subject_structure_state == "needs_confirmation"
-    assert runtime.calls[-1]["event"] == "wait_for_subject_clarification"
-    assert all(call.get("event") != "wait_for_presearch_recovery" for call in runtime.calls)
-
-    action = await service.run_workflow_action(
-        workflow_run_id=first.workflow_run_id,
-        request=ContentResearchWorkflowActionRequest(
-            action="clarify_subject",
-            payload={"clarification_text": "这里的苹果是 Apple 品牌，不是水果。"},
-        ),
-    )
-
-    assert action.workflow_run_id == first.workflow_run_id
-    assert action.result["attempt_id"] == first.attempt_id
-    assert action.result["brief_id"] == first.brief_id
-    assert action.result["status"] == "completed"
-    assert action.result["subject_structure_state"] == "confirmed"
-    assert action.result["subject_structure_hash"] != first.subject_structure_hash
-    assert runtime.calls[-2]["event"] == "resume_subject_clarification"
-    assert runtime.calls[-1]["event"] == "presearch_ready"
-    assert all(call.get("event") != "restart_presearch_step" for call in runtime.calls)
-    assert all(call.get("event") != "wait_for_presearch_recovery" for call in runtime.calls)
-    assert len(llm.requests) == 2
-    assert "Apple 品牌" in llm.requests[1].messages[-1].content
-
-    with pytest.raises(ContentResearchValidationError, match="stale subject structure"):
-        await service.confirm_brief(
-            brief_id=first.brief_id,
-            confirmation_request=ContentResearchBriefConfirmRequest(
-                confirmed_subject="Apple 品牌",
-                subject_structure_hash=str(first.subject_structure_hash),
-                subject_type="brand",
-                selected_competitors=[],
-                    custom_competitors=[],
-                    selected_directions=["product_marketing"],
-                ),
-        )
-
-    checkpoints = [
-        item
-        for item in store.list_typed_records(StageCheckpointRecord)
-        if item.workflow_run_id == first.workflow_run_id
-        and item.stage_name == "subject_structure"
-    ]
-    assert len(checkpoints) == 2
-    assert [item.payload["state"] for item in checkpoints] == [
-        "needs_confirmation",
-        "confirmed",
-    ]
-    assert all(item.payload.get("raw_input") is None for item in checkpoints)
-    assert all(item.stage_name != "operation" for item in store.list_typed_records(StageCheckpointRecord))
+    assert response.status == "completed"
+    assert response.run.state == "brief_confirmation_required"
+    assert "confirm_subject_structure" not in response.run.allowed_actions
+    assert response.subject_structure["resolution_state"] == "needs_confirmation"
 
 
 @pytest.mark.asyncio
-async def test_structured_subject_confirmation_atomically_updates_real_runtime(store):
-    runtime = WorkflowRunManagerRuntime(store._db_path)
-    llm = AmbiguousThenClarifiedLLM()
-    service = _service(store, llm, runtime=runtime)
-
-    first = await service.submit_presearch(
-        seed_text="苹果适合年轻人吗",
-        user_note=None,
-        thread_id="thread_structured_confirmation",
-        user_id="user_1",
-    )
-
-    action = await service.run_workflow_action(
-        workflow_run_id=first.workflow_run_id,
-        request=ContentResearchWorkflowActionRequest(
-            action="confirm_subject_structure",
-            payload={
-                "subject_structure_hash": first.subject_structure_hash,
-                "core_object": "Apple 品牌",
-                "research_intent": "年轻人偏好",
-                "context_modifiers": "大学生，日常使用",
-            },
-        ),
-    )
-
-    result = action.result
-    assert result["status"] == "completed"
-    assert result["subject_structure_state"] == "confirmed"
-    assert result["subject_structure"]["core_entities"] == [
-        {"canonical_name": "Apple 品牌", "raw_mentions": ["Apple 品牌"]}
-    ]
-    assert result["subject_structure"]["research_intents"] == ["年轻人偏好"]
-    assert result["subject_structure"]["context_modifiers"] == ["大学生", "日常使用"]
-    persisted_brief = store.get_brief(first.brief_id)
-    assert persisted_brief is not None
-    assert persisted_brief.payload["subject_structure_user_confirmed_fields"] == [
-        "core_entities[0]",
-        "research_intents[0]",
-        "context_modifiers",
-    ]
-    assert len(llm.requests) == 1
-
-    confirmed_checkpoints = [
-        item
-        for item in store.list_typed_records(StageCheckpointRecord)
-        if item.workflow_run_id == first.workflow_run_id
-        and item.stage_name == "subject_structure"
-        and item.payload.get("state") == "confirmed"
-    ]
-    assert len(confirmed_checkpoints) == 1
-    snapshot = await runtime.get_runtime_snapshot(first.workflow_run_id)
-    presearch_step = next(step for step in snapshot["steps"] if step["step_name"] == "presearch")
-    assert snapshot["run"]["status"] == "running"
-    assert snapshot["run"]["current_step"] == "brief_confirm"
-    assert presearch_step["status"] == "succeeded"
-
-    with pytest.raises(ContentResearchValidationError, match="stale subject structure"):
-        await service.run_workflow_action(
-            workflow_run_id=first.workflow_run_id,
-            request=ContentResearchWorkflowActionRequest(
-                action="confirm_subject_structure",
-                payload={
-                    "subject_structure_hash": first.subject_structure_hash,
-                    "core_object": "Apple 品牌",
-                    "research_intent": "年轻人偏好",
-                },
-            ),
-        )
-
-
-@pytest.mark.asyncio
-async def test_subject_confirmation_conflict_rolls_back_brief_checkpoint_and_runtime(store, monkeypatch):
-    runtime = WorkflowRunManagerRuntime(store._db_path)
-    service = _service(store, AmbiguousThenClarifiedLLM(), runtime=runtime)
-    first = await service.submit_presearch(
-        seed_text="苹果适合年轻人吗",
-        user_note=None,
-        thread_id="thread_subject_confirmation_conflict",
-        user_id="user_1",
-    )
-
-    brief_before = store.get_brief(first.brief_id)
-    checkpoints_before = store.list_typed_records(StageCheckpointRecord)
-    snapshot_before = await runtime.get_runtime_snapshot(first.workflow_run_id)
-
-    async def locked_confirmation_writer(conn, *, brief, checkpoint):
-        await conn.execute(
-            "UPDATE content_research_briefs SET status='draft' WHERE id=?",
-            (brief.id,),
-        )
-        await conn.execute(
-            """INSERT INTO content_research_stage_checkpoints
-               (id, schema_version, workflow_run_id, subagent_task_id, stage_name,
-                input_fingerprint, status, retry_count, payload_json, metadata_json, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, 'completed', 0, ?, '{}', CURRENT_TIMESTAMP)""",
-            (
-                "scp_lock_conflict",
-                checkpoint.schema_version,
-                checkpoint.workflow_run_id,
-                checkpoint.subagent_task_id,
-                checkpoint.stage_name,
-                checkpoint.input_fingerprint,
-                json.dumps(checkpoint.payload, ensure_ascii=False),
-            ),
-        )
-        raise sqlite3.OperationalError("database is locked")
-
-    monkeypatch.setattr(
-        service._dispatch,
-        "persist_subject_structure_confirmation",
-        locked_confirmation_writer,
-        raising=False,
-    )
-
-    with pytest.raises(ContentResearchStateConflictError) as exc_info:
-        await service.confirm_subject_structure(
-            workflow_run_id=first.workflow_run_id,
-            confirmation=ContentResearchSubjectStructureConfirmationRequest(
-                subject_structure_hash=first.subject_structure_hash,
-                core_object="Apple 品牌",
-                research_intent="年轻人偏好",
-                context_modifiers="大学生，日常使用",
-            ),
-        )
-
-    assert exc_info.value.error_code == "CONTENT_RESEARCH_SUBJECT_CONFIRMATION_CONFLICT"
-    assert store.get_brief(first.brief_id) == brief_before
-    assert store.list_typed_records(StageCheckpointRecord) == checkpoints_before
-    assert await runtime.get_runtime_snapshot(first.workflow_run_id) == snapshot_before
-
-
-@pytest.mark.asyncio
-async def test_subject_clarification_does_not_increment_real_runtime_attempt_count(store):
-    runtime = WorkflowRunManagerRuntime(store._db_path)
-    service = _service(store, AmbiguousThenClarifiedLLM(), runtime=runtime)
-
-    first = await service.submit_presearch(
-        seed_text="苹果适合年轻人吗",
-        user_note=None,
-        thread_id="thread_real_runtime_clarification",
-        user_id="user_1",
-    )
-    waiting = await runtime.get_runtime_snapshot(first.workflow_run_id)
-    waiting_step = next(
-        step for step in waiting["steps"] if step["step_name"] == "presearch"
-    )
-    assert waiting["run"]["status"] == "waiting_user"
-    assert waiting_step["status"] == "retrying"
-    assert waiting_step["attempt_count"] == 0
-
-    await service.run_workflow_action(
-        workflow_run_id=first.workflow_run_id,
-        request=ContentResearchWorkflowActionRequest(
-            action="clarify_subject",
-            payload={"clarification_text": "这里的苹果是 Apple 品牌，不是水果。"},
-        ),
-    )
-
-    completed = await runtime.get_runtime_snapshot(first.workflow_run_id)
-    completed_step = next(
-        step for step in completed["steps"] if step["step_name"] == "presearch"
-    )
-    assert completed["run"]["status"] == "running"
-    assert completed_step["status"] == "succeeded"
-    assert completed_step["attempt_count"] == 0
-
-
-@pytest.mark.asyncio
-async def test_presearch_llm_failure_waits_for_model_configuration(store):
-    service = _service(store, FakeLLM(fail=True))
+async def test_llm_failure_converges_run_and_trace_to_recovery_required(tmp_path):
+    llm = RecordingLLM(error=RuntimeError("provider secret detail"))
+    service, db_path, thread = await _owned_service(tmp_path, llm)
 
     response = await service.submit_presearch(
-        seed_text="Satisfy Running",
+        command_id="submit-presearch-llm-failure",
+        seed_text="夏季凉感T恤",
         user_note=None,
-        thread_id="thread_1",
-        user_id="user_1",
+        thread_id=thread["id"],
+        user_id="user-test",
+        workspace_id="ws-test",
     )
+    trace = await service.get_workflow_trace(response.workflow_run_id)
 
     assert response.status == "waiting_model_config"
-    assert response.fallback_used is False
-    assert response.error_code == "llm_service_unavailable"
+    assert response.run.state == "recovery_required"
+    assert response.run.state_revision == 2
+    assert response.run.reason_code == "llm_service_unavailable"
+    assert response.run.allowed_actions == ["retry_presearch", "cancel"]
+    assert trace.state == "recovery_required"
+    assert trace.state_revision == 2
+    assert trace.current_stage == "presearch"
+    assert trace.run_status == "waiting_user"
+    assert [item["event"] for item in trace.state_transitions] == [
+        "submit_research_subject",
+        "fail",
+    ]
+    assert "provider secret detail" not in json.dumps(
+        trace.model_dump(mode="json"), ensure_ascii=False
+    )
+
+    with sqlite3.connect(db_path) as connection:
+        run = connection.execute(
+            "SELECT content_research_state, status, error_code FROM workflow_runs WHERE run_id=?",
+            (response.workflow_run_id,),
+        ).fetchone()
+    assert run == ("recovery_required", "waiting_user", "llm_service_unavailable")
 
 
 @pytest.mark.asyncio
-async def test_presearch_malformed_llm_response_waits_for_configuration(store):
-    llm = FakeLLM(content="not json")
-    service = _service(store, llm)
+async def test_malformed_model_output_is_a_recoverable_lifecycle_failure(tmp_path):
+    service, _db_path, thread = await _owned_service(
+        tmp_path,
+        RecordingLLM(content="not json"),
+    )
 
     response = await service.submit_presearch(
+        command_id="submit-presearch-malformed",
         seed_text="露营灯",
         user_note=None,
-        thread_id="thread_1",
-        user_id="user_1",
+        thread_id=thread["id"],
+        user_id="user-test",
+        workspace_id="ws-test",
     )
 
-    assert response.status == "waiting_model_config"
-    assert response.fallback_used is False
     assert response.error_code == "llm_structured_output_invalid"
-    assert len(llm.requests) == 1
-
-
-class FailingLLM:
-    def __init__(self, error: Exception) -> None:
-        self.error = error
-
-    async def generate(self, _request):
-        raise self.error
-
-
-class FailOnceThenSucceedLLM(FakeLLM):
-    def __init__(self) -> None:
-        super().__init__()
-        self.call_count = 0
-
-    async def generate(self, request):
-        self.call_count += 1
-        if self.call_count == 1:
-            raise LLMProviderFailure("llm_auth_invalid", "API Key 无效", True, 401,
-                provider="openai_compatible", model="model-x", configuration_source="user")
-        return await super().generate(request)
-
-
-class DelayedProviderFailureLLM:
-    async def generate(self, _request):
-        await asyncio.sleep(0.02)
-        raise LLMProviderFailure(
-            "llm_auth_invalid",
-            "API Key 无效",
-            True,
-            401,
-            provider="openai_compatible",
-            model="model-x",
-            configuration_source="user",
-        )
-
-
-class FailThenDelayedProviderFailureLLM:
-    def __init__(self) -> None:
-        self.call_count = 0
-
-    async def generate(self, _request):
-        self.call_count += 1
-        if self.call_count == 1:
-            raise LLMProviderFailure(
-                "llm_auth_invalid", "API Key 无效", True, 401,
-                provider="openai_compatible", model="model-x", configuration_source="user",
-            )
-        await asyncio.sleep(0.02)
-        raise LLMProviderFailure(
-            "llm_auth_invalid", "API Key 无效", True, 401,
-            provider="openai_compatible", model="model-x", configuration_source="user",
-        )
-
-
-class ControlledSuccessLLM(FakeLLM):
-    def __init__(self) -> None:
-        super().__init__()
-        self.release = asyncio.Event()
-
-    async def generate(self, request):
-        await self.release.wait()
-        return await super().generate(request)
-
-
-class BlockingReadyRuntime(WorkflowRunManagerRuntime):
-    def __init__(self, db_path: str) -> None:
-        super().__init__(db_path)
-        self.ready_transition_started = asyncio.Event()
-        self.allow_ready_transition = asyncio.Event()
-
-    async def mark_presearch_ready(self, workflow_run_id: str) -> None:
-        self.ready_transition_started.set()
-        await self.allow_ready_transition.wait()
-        await super().mark_presearch_ready(workflow_run_id)
+    assert response.run.state == "recovery_required"
+    assert response.run.error is not None
+    assert response.run.error["stage"] == "presearch"
 
 
 @pytest.mark.asyncio
-async def test_provider_failure_waits_for_configuration_without_completing_presearch(store):
-    runtime = FakeRuntime()
-    service = _service(store, FailingLLM(
-        LLMProviderFailure("llm_account_unavailable", "模型账户不可用", True, 402)
-    ), runtime=runtime)
-
-    response = await service.submit_presearch(
-        seed_text="夏季通勤短裤", user_note=None, thread_id="thread_1", workspace_id="ws_1", user_id="user_1",
-    )
-
-    assert response.status == "waiting_model_config"
-    assert response.error_code == "llm_account_unavailable"
-    assert runtime.calls[-1]["event"] == "wait_for_presearch_recovery"
-    assert all(call.get("event") != "presearch_ready" for call in runtime.calls)
-
-
-@pytest.mark.asyncio
-async def test_submit_presearch_propagates_real_workspace_scope_to_llm(store):
-    llm = FakeLLM()
-    service = _service(store, llm)
-
-    await service.submit_presearch(
-        seed_text="夏季通勤短裤",
-        user_note=None,
-        thread_id="thread_1",
-        workspace_id="workspace_from_router",
-        user_id="user_1",
-    )
-
-    assert llm.requests[0].context is not None
-    assert llm.requests[0].context.tenant_id == "workspace_from_router"
-    assert llm.requests[0].context.user_id == "user_1"
-
-
-@pytest.mark.asyncio
-async def test_retry_presearch_reuses_attempt_brief_and_run(store):
-    runtime = FakeRuntime()
-    service = _service(store, FailOnceThenSucceedLLM(), runtime=runtime)
+async def test_user_revision_reuses_run_and_brief_with_monotonic_revision(tmp_path):
+    llm = RecordingLLM()
+    service, _db_path, thread = await _owned_service(tmp_path, llm)
     first = await service.submit_presearch(
-        seed_text="夏季通勤短裤", user_note=None, thread_id="thread_1", workspace_id="ws_1", user_id="user_1",
-    )
-    retried = await service.retry_presearch(first.workflow_run_id)
-
-    assert retried.attempt_id == first.attempt_id
-    assert retried.brief_id == first.brief_id
-    assert retried.workflow_run_id == first.workflow_run_id
-    assert retried.status == "completed"
-
-
-@pytest.mark.asyncio
-async def test_presearch_first_timeout_returns_fallback_then_hard_cutoff_updates_attempt(store):
-    service = _service(store, FakeLLM(delay=0.2), first_timeout=0.01, hard_cutoff=0.03)
-
-    response = await service.submit_presearch(
-        seed_text="越野跑背心",
+        command_id="submit-presearch-before-revision",
+        seed_text="夏季凉感T恤",
         user_note=None,
-        thread_id="thread_1",
-        user_id="user_1",
+        thread_id=thread["id"],
+        user_id="user-test",
+        workspace_id="ws-test",
     )
 
-    assert response.status == "fallback"
-    assert response.timeout_status == "first_timeout"
-    assert response.fallback_used is True
-
-    await asyncio.sleep(0.06)
-    final = service.get_presearch(response.attempt_id)
-    assert final.status == "final_timeout"
-    assert final.timeout_status == "final_timeout"
-
-    trace = store.list_traces_for_workflow(response.workflow_run_id)[0]
-    event_names = [event.event_name for event in store.list_observation_events(trace.id)]
-    assert event_names == ["presearch_started", "presearch_first_timeout", "presearch_final_timeout"]
-
-
-@pytest.mark.asyncio
-async def test_late_provider_failure_after_first_timeout_atomically_waits_for_user(store):
-    service = _service(
-        store,
-        DelayedProviderFailureLLM(),
-        first_timeout=0.005,
-        hard_cutoff=0.1,
-        runtime=WorkflowRunManagerRuntime(store._db_path),
-    )
-
-    first = await service.submit_presearch(
-        seed_text="夏季通勤短裤",
-        user_note=None,
-        thread_id="thread_late_failure",
-        workspace_id="ws_1",
-        user_id="user_1",
-    )
-    assert first.status == "fallback"
-    assert first.timeout_status == "first_timeout"
-
-    for _ in range(20):
-        await asyncio.sleep(0.01)
-        settled = service.get_presearch(first.attempt_id)
-        snapshot = await service._workflow_runtime.get_runtime_snapshot(first.workflow_run_id)
-        if settled.status == "waiting_model_config" and snapshot["run"]["status"] == "waiting_user":
-            break
-    else:
-        pytest.fail("late provider failure did not converge to waiting_user")
-
-    assert settled.error_code == "llm_auth_invalid"
-    assert snapshot["steps"][0]["status"] == "retrying"
-
-
-@pytest.mark.asyncio
-async def test_retry_first_timeout_keeps_task_until_late_auth_failure_waits_for_user(store):
-    llm = FailThenDelayedProviderFailureLLM()
-    service = _service(
-        store,
-        llm,
-        first_timeout=0.005,
-        hard_cutoff=0.1,
-        runtime=WorkflowRunManagerRuntime(store._db_path),
-    )
-    first = await service.submit_presearch(
-        seed_text="夏季通勤短裤",
-        user_note=None,
-        thread_id="thread_retry_late_failure",
-        workspace_id="ws_1",
-        user_id="user_1",
-    )
-    assert first.status == "waiting_model_config"
-
-    retried = await service.retry_presearch(first.workflow_run_id)
-    assert retried.status == "fallback"
-    assert retried.timeout_status == "first_timeout"
-
-    for _ in range(20):
-        await asyncio.sleep(0.01)
-        settled = service.get_presearch(first.attempt_id)
-        snapshot = await service._workflow_runtime.get_runtime_snapshot(first.workflow_run_id)
-        if settled.status == "waiting_model_config" and snapshot["run"]["status"] == "waiting_user":
-            break
-    else:
-        pytest.fail("retry late provider failure did not converge to waiting_user")
-
-    assert llm.call_count == 2
-    assert settled.error_code == "llm_auth_invalid"
-    assert snapshot["steps"][0]["status"] == "retrying"
-    assert not any(step["status"] == "succeeded" for step in snapshot["steps"] if step["step_name"] == "presearch")
-
-
-@pytest.mark.asyncio
-async def test_confirmation_waits_for_brief_and_runtime_presearch_to_settle(store):
-    llm = ControlledSuccessLLM()
-    runtime = BlockingReadyRuntime(store._db_path)
-    service = _service(
-        store,
-        llm,
-        first_timeout=0.005,
-        hard_cutoff=0.1,
-        runtime=runtime,
-    )
-    first = await service.submit_presearch(
-        seed_text="夏季通勤短裤",
-        user_note=None,
-        thread_id="thread_confirmation_race",
-        workspace_id="ws_1",
-        user_id="user_1",
-    )
-    assert first.timeout_status == "first_timeout"
-
-    confirmation = ContentResearchBriefConfirmRequest(
-        confirmed_subject="夏季通勤短裤",
-        subject_type="category",
-        selected_competitors=[],
-        custom_competitors=[],
-        selected_directions=["product_marketing"],
-    )
-    with pytest.raises(ContentResearchValidationError, match="Presearch final outcome is not ready"):
-        await service.confirm_brief(brief_id=first.brief_id, confirmation_request=confirmation)
-
-    llm.release.set()
-    await asyncio.wait_for(runtime.ready_transition_started.wait(), timeout=0.1)
-    assert service.get_presearch(first.attempt_id).status == "completed"
-    snapshot = await runtime.get_runtime_snapshot(first.workflow_run_id)
-    presearch_step = next(step for step in snapshot["steps"] if step["step_name"] == "presearch")
-    assert presearch_step["status"] == "running"
-    with pytest.raises(ContentResearchValidationError, match="Presearch final outcome is not ready"):
-        await service.confirm_brief(brief_id=first.brief_id, confirmation_request=confirmation)
-
-    runtime.allow_ready_transition.set()
-    for _ in range(20):
-        await asyncio.sleep(0.005)
-        snapshot = await runtime.get_runtime_snapshot(first.workflow_run_id)
-        presearch_step = next(step for step in snapshot["steps"] if step["step_name"] == "presearch")
-        if presearch_step["status"] == "succeeded":
-            break
-    else:
-        pytest.fail("presearch runtime transition did not settle")
-
-    summary = await service.confirm_brief(brief_id=first.brief_id, confirmation_request=confirmation)
-    assert summary.brief.status == "ready"
-    with sqlite3.connect(store._db_path) as conn:
-        assert conn.execute("SELECT COUNT(*) FROM content_research_dispatch_jobs").fetchone()[0] == 0
-
-    dispatched = await service.run_workflow_action(
+    revised = await service.run_workflow_action(
         workflow_run_id=first.workflow_run_id,
         request=ContentResearchWorkflowActionRequest(
-            action="start_formal_research",
-            payload={"provider": "xiaohongshu", "source_kind": "search_result", "limit": 20},
+            command_id="revise-subject-once",
+            expected_state="brief_confirmation_required",
+            expected_revision=2,
+            action="revise_subject",
+            payload={"clarification_text": "这里重点是通勤场景，不是户外运动。"},
         ),
     )
-    assert dispatched.status == "queued"
-    with sqlite3.connect(store._db_path) as conn:
-        assert conn.execute("SELECT COUNT(*) FROM content_research_dispatch_jobs").fetchone()[0] == 1
+
+    result = revised.result
+    assert result["workflow_run_id"] == first.workflow_run_id
+    assert result["brief_id"] == first.brief_id
+    assert result["run"]["state"] == "brief_confirmation_required"
+    assert result["run"]["state_revision"] == 4
+    assert "通勤场景" in llm.requests[-1].messages[-1].content
+    brief = service._store.get_brief(first.brief_id)
+    assert brief is not None
+    assert brief.payload["subject_clarifications"] == [
+        "这里重点是通勤场景，不是户外运动。"
+    ]
+    transitions = await service._lifecycle.list_transitions(first.workflow_run_id)
+    assert [item["event"] for item in transitions] == [
+        "submit_research_subject",
+        "presearch_completed",
+        "revise_subject",
+        "presearch_completed",
+    ]
 
 
 @pytest.mark.asyncio
-async def test_start_formal_research_rejects_unconfirmed_first_timeout_without_dispatch(store):
-    service = _service(
-        store,
-        FakeLLM(delay=0.2),
-        first_timeout=0.005,
-        hard_cutoff=0.1,
-        runtime=WorkflowRunManagerRuntime(store._db_path),
-    )
-    first = await service.submit_presearch(
-        seed_text="夏季通勤短裤",
+async def test_presearch_retry_recovers_the_same_run_after_model_repair(tmp_path):
+    llm = RecordingLLM(error=RuntimeError("temporary provider failure"))
+    service, _db_path, thread = await _owned_service(tmp_path, llm)
+    failed = await service.submit_presearch(
+        command_id="submit-presearch-before-retry",
+        seed_text="夏季凉感T恤",
         user_note=None,
-        thread_id="thread_no_early_dispatch",
-        workspace_id="ws_1",
-        user_id="user_1",
+        thread_id=thread["id"],
+        user_id="user-test",
+        workspace_id="ws-test",
     )
-    assert first.timeout_status == "first_timeout"
+    llm.error = None
 
-    with pytest.raises(ContentResearchValidationError, match="Formal research is not ready to dispatch"):
+    recovered = await service.retry_presearch(
+        failed.workflow_run_id,
+        command_id="retry-presearch-once",
+        expected_state=ContentResearchState.RECOVERY_REQUIRED,
+        expected_revision=2,
+    )
+
+    assert recovered.workflow_run_id == failed.workflow_run_id
+    assert recovered.brief_id == failed.brief_id
+    assert recovered.run.state == "brief_confirmation_required"
+    assert recovered.run.state_revision == 4
+    assert recovered.run.reason_code is None
+
+
+@pytest.mark.asyncio
+async def test_duplicate_submit_command_returns_one_run_and_invokes_llm_once(tmp_path):
+    llm = RecordingLLM()
+    service, db_path, thread = await _owned_service(tmp_path, llm)
+
+    request = dict(
+        command_id="stable-browser-submit-command",
+        seed_text="夏季凉感T恤",
+        user_note=None,
+        thread_id=thread["id"],
+        user_id="user-test",
+        workspace_id="ws-test",
+    )
+    first, duplicate = await __import__("asyncio").gather(
+        service.submit_presearch(**request),
+        service.submit_presearch(**request),
+    )
+
+    assert first.workflow_run_id == duplicate.workflow_run_id
+    assert first.brief_id == duplicate.brief_id
+    assert first.run.state_revision == duplicate.run.state_revision == 2
+    assert len(llm.requests) == 1
+    with sqlite3.connect(db_path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM workflow_runs").fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT COUNT(*) FROM content_research_briefs"
+        ).fetchone()[0] == 1
+
+
+@pytest.mark.asyncio
+async def test_stale_public_action_is_rejected_before_presearch_or_brief_changes(tmp_path):
+    llm = RecordingLLM()
+    service, db_path, thread = await _owned_service(tmp_path, llm)
+    first = await service.submit_presearch(
+        command_id="submit-before-stale-action",
+        seed_text="夏季凉感T恤",
+        user_note=None,
+        thread_id=thread["id"],
+        user_id="user-test",
+        workspace_id="ws-test",
+    )
+
+    with pytest.raises(Exception, match="revision"):
         await service.run_workflow_action(
             workflow_run_id=first.workflow_run_id,
             request=ContentResearchWorkflowActionRequest(
-                action="start_formal_research",
-                payload={"provider": "xiaohongshu", "source_kind": "search_result", "limit": 20},
+                command_id="stale-revise",
+                expected_state="brief_confirmation_required",
+                expected_revision=1,
+                action="revise_subject",
+                payload={"clarification_text": "关注通勤"},
             ),
         )
 
-    with sqlite3.connect(store._db_path) as conn:
-        assert conn.execute("SELECT COUNT(*) FROM content_research_dispatch_jobs").fetchone()[0] == 0
+    assert len(llm.requests) == 1
+    with sqlite3.connect(db_path) as connection:
+        assert connection.execute(
+            "SELECT state_revision FROM workflow_runs WHERE run_id=?",
+            (first.workflow_run_id,),
+        ).fetchone()[0] == 2
+        assert connection.execute(
+            "SELECT COUNT(*) FROM content_research_state_transitions WHERE run_id=?",
+            (first.workflow_run_id,),
+        ).fetchone()[0] == 2
+
+    with pytest.raises(Exception, match="expected_state"):
+        await service.run_workflow_action(
+            workflow_run_id=first.workflow_run_id,
+            request=ContentResearchWorkflowActionRequest(
+                command_id="wrong-state-revise",
+                expected_state="presearch_running",
+                expected_revision=2,
+                action="revise_subject",
+                payload={"clarification_text": "关注通勤"},
+            ),
+        )
+    assert len(llm.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_presearch_outcome_persistence_exhaustion_converges_to_recovery(tmp_path, monkeypatch):
+    llm = RecordingLLM()
+    service, _db_path, thread = await _owned_service(tmp_path, llm)
+    original_apply = service._lifecycle.apply
+    injected = False
+
+    async def fail_first_outcome(command):
+        nonlocal injected
+        if command.kind == "presearch_completed" and not injected:
+            injected = True
+            raise LifecyclePersistenceBusy("LOCAL_PERSISTENCE_BUSY after 3 attempts")
+        return await original_apply(command)
+
+    monkeypatch.setattr(service._lifecycle, "apply", fail_first_outcome)
+    response = await service.submit_presearch(
+        command_id="submit-with-persistence-contention",
+        seed_text="夏季凉感T恤",
+        user_note=None,
+        thread_id=thread["id"],
+        user_id="user-test",
+        workspace_id="ws-test",
+    )
+    trace = await service.get_workflow_trace(response.workflow_run_id)
+
+    assert response.run.state == "recovery_required"
+    assert response.run.reason_code == "LOCAL_PERSISTENCE_BUSY"
+    assert response.run.error["automatic_attempts"] == 3
+    assert trace.run_status == "waiting_user"
+    assert trace.current_stage == "presearch"
+
+
+@pytest.mark.asyncio
+async def test_busy_outcome_and_busy_authority_read_still_schedule_reconciliation(tmp_path, monkeypatch):
+    service, _db_path, thread = await _owned_service(tmp_path, RecordingLLM())
+    original_apply = service._lifecycle.apply
+    original_load = service._lifecycle.load
+    outcome_failed = False
+    read_failed = False
+
+    async def fail_outcome_once(command):
+        nonlocal outcome_failed
+        if command.kind == "presearch_completed" and not outcome_failed:
+            outcome_failed = True
+            raise LifecyclePersistenceBusy("LOCAL_PERSISTENCE_BUSY after 3 attempts")
+        return await original_apply(command)
+
+    async def fail_authority_read_once(run_id):
+        nonlocal read_failed
+        if not read_failed:
+            read_failed = True
+            raise LifecyclePersistenceBusy("LOCAL_PERSISTENCE_BUSY after 3 attempts")
+        return await original_load(run_id)
+
+    monkeypatch.setattr(service._lifecycle, "apply", fail_outcome_once)
+    monkeypatch.setattr(service._lifecycle, "load", fail_authority_read_once)
+
+    with pytest.raises(LifecyclePersistenceBusy):
+        await service.submit_presearch(
+            command_id="submit-with-busy-authority-read",
+            seed_text="夏季凉感T恤",
+            user_note=None,
+            thread_id=thread["id"],
+            user_id="user-test",
+            workspace_id="ws-test",
+        )
+
+    tasks = list(service._lifecycle_reconciliation_tasks)
+    assert len(tasks) == 1
+    await asyncio.wait_for(asyncio.gather(*tasks), timeout=3)
+    run_id = service._stable_id("run", "submit-with-busy-authority-read")
+    projection = await original_load(run_id)
+    assert projection.state is ContentResearchState.RECOVERY_REQUIRED
+    assert projection.reason_code == "LOCAL_PERSISTENCE_BUSY"
+
+
+@pytest.mark.asyncio
+async def test_busy_beyond_request_retry_budgets_converges_after_lock_release(tmp_path):
+    llm = LockingOutcomeLLM()
+    service, db_path, thread = await _owned_service(tmp_path, llm)
+    llm.db_path = db_path
+
+    with pytest.raises(LifecyclePersistenceBusy):
+        await service.submit_presearch(
+            command_id="submit-with-long-sqlite-lock",
+            seed_text="夏季凉感T恤",
+            user_note=None,
+            thread_id=thread["id"],
+            user_id="user-test",
+            workspace_id="ws-test",
+        )
+
+    tasks = list(service._lifecycle_reconciliation_tasks)
+    assert len(tasks) == 1
+    await asyncio.wait_for(asyncio.gather(*tasks), timeout=6)
+    run_id = service._stable_id("run", "submit-with-long-sqlite-lock")
+    projection = await service._lifecycle.load(run_id)
+    assert projection.state is ContentResearchState.RECOVERY_REQUIRED
+    assert projection.reason_code == "LOCAL_PERSISTENCE_BUSY"
+
+
+@pytest.mark.asyncio
+async def test_accepted_presearch_without_brief_has_truthful_read_and_trace_projection(tmp_path):
+    service, db_path, thread = await _owned_service(tmp_path, RecordingLLM())
+    run_id = "run-accepted-before-llm-outcome"
+    await service._lifecycle.apply(LifecycleCommand(
+        command_id="accepted-before-llm-outcome",
+        run_id=run_id,
+        expected_state=None,
+        expected_revision=0,
+        kind="submit_research_subject",
+        payload={
+            "thread_id": thread["id"],
+            "user_id": "user-test",
+            "workspace_id": "ws-test",
+            "seed_text": "夏季凉感T恤",
+        },
+    ))
+
+    summary = await service.get_workflow_summary(run_id)
+    trace = await service.get_workflow_trace(run_id)
+
+    assert summary.run.state == "presearch_running"
+    assert summary.brief is None
+    assert trace.state == "presearch_running"
+    assert trace.current_stage == "presearch"
+    assert trace.run_status == "running"
+
+    cancelled = await service.run_workflow_action(
+        workflow_run_id=run_id,
+        request=ContentResearchWorkflowActionRequest(
+            command_id="cancel-accepted-presearch",
+            expected_state="presearch_running",
+            expected_revision=1,
+            action="cancel",
+        ),
+    )
+    assert cancelled.result["run"]["state"] == "cancelled_or_failed"
+    with sqlite3.connect(db_path) as connection:
+        statuses = {
+            row[0]
+            for row in connection.execute(
+                "SELECT status FROM workflow_steps WHERE run_id=?", (run_id,)
+            )
+        }
+    assert statuses == {"cancelled"}

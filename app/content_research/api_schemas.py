@@ -11,23 +11,16 @@ CONTENT_RESEARCH_API_SCHEMA_VERSION = "content_research_api_v1"
 WORKFLOW_ACTION_REQUEST_SCHEMA_VERSION = "content_research_workflow_action_request_v1"
 WORKFLOW_ACTION_RESPONSE_SCHEMA_VERSION = "content_research_workflow_action_response_v1"
 P0_WORKFLOW_ACTIONS = (
-    "confirm_brief",
-    "start_formal_research",
-    "retry_formal_research",
-    "pause_formal_research",
-    "resume_formal_research",
-    "end_content_research",
+    "cancel",
     "retry_presearch",
-    "clarify_subject",
-    "confirm_subject_structure",
-    "repair_from_persisted_packets",
-    "prepare_scope",
-    "confirm_scope",
-    "resolve_coverage",
+    "revise_subject",
 )
 
 
 class ContentResearchPresearchRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    command_id: str = Field(min_length=1)
     seed_text: str = Field(min_length=1)
     user_note: str | None = None
     thread_id: str = Field(min_length=1)
@@ -57,6 +50,22 @@ class ContentResearchChecklistResponse(BaseModel):
     custom_competitor_input: str = ""
 
 
+class ContentResearchRunProjectionResponse(BaseModel):
+    run_id: str
+    thread_id: str
+    state: str
+    state_revision: int = Field(ge=1)
+    entered_at: datetime
+    allowed_actions: list[str] = Field(default_factory=list)
+    reason_code: str | None = None
+    error: dict | None = None
+    brief_id: str | None = None
+    scope_contract_id: str | None = None
+    execution_attempt_id: str | None = None
+    coverage_snapshot_id: str | None = None
+    publication_id: str | None = None
+
+
 class ContentResearchPresearchResponse(BaseModel):
     schema_version: str = CONTENT_RESEARCH_API_SCHEMA_VERSION
     attempt_id: str
@@ -81,23 +90,7 @@ class ContentResearchPresearchResponse(BaseModel):
     model: str | None = None
     subject_structure: dict = Field(default_factory=dict)
     subject_structure_hash: str | None = None
-    subject_structure_state: str = "needs_confirmation"
-    subject_structure_reason_codes: list[str] = Field(default_factory=list)
-    subject_structure_user_confirmed_fields: list[str] = Field(default_factory=list)
-
-
-class ContentResearchBriefConfirmRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
-
-    confirmed_subject: str = Field(min_length=1)
-    subject_structure_hash: str | None = Field(default=None, min_length=1)
-    subject_type: str = "unknown"
-    selected_competitors: list[str] = Field(default_factory=list)
-    custom_competitors: list[str] = Field(default_factory=list)
-    selected_directions: list[str] = Field(
-        min_length=1,
-        description="Non-empty requested subset of the Lite direction catalog.",
-    )
+    run: ContentResearchRunProjectionResponse
 
 
 class ContentResearchDirectionResponse(BaseModel):
@@ -136,7 +129,8 @@ class ContentResearchBriefResponse(BaseModel):
 class ContentResearchWorkflowSummaryResponse(BaseModel):
     schema_version: str = CONTENT_RESEARCH_API_SCHEMA_VERSION
     workflow_run_id: str
-    brief: ContentResearchBriefResponse
+    run: ContentResearchRunProjectionResponse
+    brief: ContentResearchBriefResponse | None = None
     plan: ContentResearchPlanResponse | None = None
     directions: list[ContentResearchDirectionResponse] = Field(default_factory=list)
     subagent_tasks: list[ContentResearchSubagentTaskResponse] = Field(default_factory=list)
@@ -147,6 +141,22 @@ class ContentResearchWorkflowSummaryResponse(BaseModel):
     remote_run_id: str | None = None
     local_cache_id: str | None = None
     sync_status: str = "local_only"
+
+
+class ContentResearchHistoricalWorkflowSummaryResponse(BaseModel):
+    """Explicit read-only decoder for Runs created before lifecycle v1."""
+
+    schema_version: str = CONTENT_RESEARCH_API_SCHEMA_VERSION
+    workflow_run_id: str
+    historical_read_only: Literal[True] = True
+    historical_run: dict
+    brief: ContentResearchBriefResponse
+    plan: ContentResearchPlanResponse | None = None
+    directions: list[ContentResearchDirectionResponse] = Field(default_factory=list)
+    subagent_tasks: list[ContentResearchSubagentTaskResponse] = Field(default_factory=list)
+    runtime_run: dict | None = None
+    runtime_steps: list[dict] = Field(default_factory=list)
+    runtime_child_tasks: list[dict] = Field(default_factory=list)
 
 
 class ContentResearchWorkflowEventsResponse(BaseModel):
@@ -208,6 +218,9 @@ class ContentResearchExecutionUnitTraceResponse(BaseModel):
 class ContentResearchTraceResponse(BaseModel):
     schema_version: str = CONTENT_RESEARCH_API_SCHEMA_VERSION
     workflow_run_id: str
+    state: str | None = None
+    state_revision: int | None = None
+    state_transitions: list[dict] = Field(default_factory=list)
     thread_id: str | None = None
     current_stage: str | None = None
     run_status: str | None = None
@@ -246,24 +259,6 @@ class ContentResearchSourceCollectionRequest(BaseModel):
     limit: int = Field(default=50, ge=1, le=50)
     sort: str = "likes"
     provider: str = "xiaohongshu"
-
-
-class ContentResearchSourceCollectionResponse(BaseModel):
-    schema_version: str = CONTENT_RESEARCH_API_SCHEMA_VERSION
-    execution_authority: Literal["diagnostic_only"] = "diagnostic_only"
-    workflow_run_id: str
-    provider: str
-    source_kind: str
-    operation: str = "discover_candidates"
-    status: str
-    failure_reason: str | None = None
-    cookie_status: str = "unknown"
-    items: list[dict] = Field(default_factory=list)
-    metadata: dict = Field(default_factory=dict)
-    next_cursor: str | None = None
-    completeness: str = "complete"
-    field_availability: dict[str, str] = Field(default_factory=dict)
-    retryable: bool = False
 
 
 class XHSQRLoginResponse(BaseModel):
@@ -340,7 +335,24 @@ class ContentResearchFormalResearchResponse(BaseModel):
 
 
 class ContentResearchWorkflowActionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
     schema_version: str = WORKFLOW_ACTION_REQUEST_SCHEMA_VERSION
+    command_id: str = Field(min_length=1)
+    expected_state: Literal[
+        "presearch_running",
+        "brief_confirmation_required",
+        "scope_confirmation_required",
+        "retrieval_queued",
+        "retrieval_running",
+        "coverage_evaluating",
+        "coverage_decision_required",
+        "report_composing",
+        "report_ready",
+        "recovery_required",
+        "cancelled_or_failed",
+    ]
+    expected_revision: int = Field(ge=1)
     action: str = Field(min_length=1)
     payload: dict = Field(default_factory=dict)
 
@@ -399,15 +411,8 @@ class ScopeExecutionAuthorizationResponse(BaseModel):
     created_at: datetime
 
 
-class ContentResearchSubjectClarificationRequest(BaseModel):
+class ContentResearchSubjectRevisionRequest(BaseModel):
     clarification_text: str = Field(min_length=1, max_length=2000)
-
-
-class ContentResearchSubjectStructureConfirmationRequest(BaseModel):
-    subject_structure_hash: str = Field(min_length=1)
-    core_object: str = Field(min_length=1, max_length=200)
-    research_intent: str = Field(min_length=1, max_length=200)
-    context_modifiers: str | list[str] = Field(default_factory=list)
 
 
 class ContentResearchWorkflowActionResponse(BaseModel):
