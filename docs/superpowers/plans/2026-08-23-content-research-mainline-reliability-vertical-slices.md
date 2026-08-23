@@ -303,6 +303,135 @@ git commit -m "feat(content-research): make brief confirmation produce the exact
 
 ---
 
+### Slice 2.1: Grounded Search Structure and Server-Compiled Read-Only Preview
+
+**Outcome:** A model proposal such as `core=夏季凉感T恤` retains its
+`core_entity_is_complete_input` diagnosis instead of being presented as a reliable split. In
+the existing Scope card the user edits “核心搜索词 / 产品或体验补充词 / 场景或人群补充词”,
+and the backend atomically replaces the Draft with the exact derived queries. The query list is
+read-only. This slice ends in `scope_confirmation_required`; it does not add the Task 3 confirm
+button, Scope Contract, dispatch, Spider call, or running state.
+
+**Contract IDs:** `STATE-CR-03`, `AUTH-CR-05`, `AUTH-CR-09..10`, `INV-CR-02..03`,
+`INV-CR-19`, `FAIL-CR-13..14`, `ACC-STATE-14..16`.
+
+**Files:**
+
+- Modify `app/content_research/presearch/prompts.py`
+- Modify `app/content_research/presearch/service.py`
+- Modify `app/content_research/api_schemas.py`
+- Modify `app/content_research/service.py`
+- Modify `app/content_research/lifecycle/coordinator.py`
+- Modify `app/content_research/scope_contract.py` only if the existing Draft model cannot expose
+  the current analysis warning without weakening Scope Contract validation
+- Modify `frontend/src/lib/content-research-api.ts`
+- Modify `frontend/src/app/creator/page.tsx`
+- Test `tests/unit/test_content_research_presearch.py`
+- Test `tests/unit/test_content_research_subject_structure.py`
+- Test `tests/e2e/test_content_research_brief_scope_draft_api.py`
+- Test `tests/e2e/test_content_research_creator_browser.py`
+- Test `frontend/src/lib/content-research-api.test.ts`
+
+**Interfaces:**
+
+- `ReplaceScopeDraftRequest` consumes `scope_draft_id`, `core_object`,
+  `product_experience_aspect`, and `context_audience_aspect`; it no longer accepts client-owned
+  `final_queries`.
+- `ContentResearchService._build_scope_v2_draft(...)` remains the only compiler of query groups,
+  core constraint, and targeted required terms.
+- Scope projection exposes the persisted PreResearch analysis state/reason codes needed to label
+  a system proposal, without adding a lifecycle state.
+- The Creator renders `draft.query_groups[].final_query` as read-only and sends only structured
+  terms through `replace_scope_draft`.
+
+**Transition:** `scope_confirmation_required` → `replace_scope_draft` →
+`scope_confirmation_required`; state revision and predecessor identity fence duplicate/stale
+mutations.
+
+**Authority / transaction:** The replacement command validates current Draft/revision, compiles
+the three structured terms on the backend, and commits the replacement Draft plus lifecycle
+revision/event together. The client never submits an executable query bundle.
+
+**Side effect:** None. No Scope Contract, dispatch, subagent, XHS request, or Task 3 confirmation
+action is reachable.
+
+**Failure rows:** Invalid system analysis is preserved; arbitrary explicit user wording is not
+semantically rejected; empty core is rejected; B/C remain optional; stale replacement has zero
+delta; late frontend response cannot overwrite the latest input; editing core replaces the core
+constraint, targeted terms, and every derived query together.
+
+**Acceptance RED:**
+`test_invalid_complete_input_reaches_one_editable_server_compiled_scope_without_collection` and
+`test_creator_corrects_search_structure_and_reads_only_the_backend_query_preview`.
+
+- [ ] **Step 1: Write the PreResearch and owned-stack REDs**
+
+  Use an LLM response with `core=夏季凉感T恤`, `product=凉感`, and `context=夏季` whose
+  analysis contains `core_entity_is_complete_input`. Assert the diagnosis remains projected.
+  Replace the Scope with `core=T恤`, `product=凉感`, `context=夏季`; assert the stored constraint,
+  targeted terms, and final queries are exactly `T恤 / T恤 凉感 / T恤 夏季`, with zero contracts,
+  dispatches, subtasks, and provider requests.
+
+- [ ] **Step 2: Write the Creator and API REDs**
+
+  Assert the card contains no visible `A/B/C`, final-query inputs are read-only, structured edits
+  send no `final_queries`, and only the latest response updates the preview. Assert there is no
+  “确认并开始调研” button in this slice.
+
+- [ ] **Step 3: Run REDs and record the expected failures**
+
+```bash
+pytest -q \
+  tests/unit/test_content_research_presearch.py \
+  tests/unit/test_content_research_subject_structure.py \
+  tests/e2e/test_content_research_brief_scope_draft_api.py \
+  tests/e2e/test_content_research_creator_browser.py \
+  -k 'complete_input or search_structure or backend_query_preview' -vv
+cd frontend && npm test -- --runInBand
+```
+
+- [ ] **Step 4: Implement the single backend compiler path**
+
+  Preserve analysis diagnostics, add one bounded reason-directed repair opportunity without a new
+  state, accept structured replacement fields, and remove client-owned `final_queries`. Recompile
+  constraints, targeted terms, and all groups from the submitted structured fields before the
+  coordinator persists the successor Draft.
+
+- [ ] **Step 5: Implement the current Scope UI**
+
+  Rename the three fields, make core editable, remove A/B/C labels and per-query editors, render
+  server-returned query groups as read-only, and fence late replacement responses. Keep the card in
+  `scope_confirmation_required` with no Task 3 button.
+
+- [ ] **Step 6: Verify the closed slice and foundations**
+
+```bash
+pytest -q \
+  tests/unit/test_content_research_presearch.py \
+  tests/unit/test_content_research_subject_structure.py \
+  tests/e2e/test_content_research_presearch_api.py \
+  tests/e2e/test_content_research_brief_scope_draft_api.py \
+  tests/e2e/test_content_research_creator_browser.py \
+  tests/integration/test_content_research_lifecycle_coordinator.py
+pytest -q \
+  tests/e2e/test_content_research_model_configuration_api.py \
+  tests/e2e/test_xhs_qr_login_api.py \
+  tests/e2e/test_xhs_login_api.py \
+  tests/unit/test_content_research_llm_scope.py \
+  tests/unit/test_xhs_credentials.py \
+  tests/unit/test_xhs_qr_auth.py
+cd frontend && npm test -- --runInBand && npm run build
+```
+
+- [ ] **Step 7: Commit and stop before Task 3**
+
+```bash
+git add app/content_research frontend/src tests docs/superpowers
+git commit -m "fix(content-research): ground the editable scope query preview"
+```
+
+---
+
 ### Slice 3: Atomic Scope Confirmation Through the Complete Happy Path
 
 **Outcome:** One Creator confirmation freezes the exact current Scope and starts retrieval. The real owned worker sends each frozen query to the recording/real XHS adapter, stores safe note facts, evaluates adequate Coverage, composes and publishes one verified report, and every intermediate UI state is truthful.

@@ -30,27 +30,35 @@ Content Research 主流程已经稳定交付。Task 1 与 Task 2 尤其不能作
 - 以“旧规格测试失败”为理由保留旧生产行为。
 
 [`2026-08-15-lite-research-scope-contract-design.md`](./2026-08-15-lite-research-scope-contract-design.md)
-中已经确认的 Scope v2 查询语义继续有效：产品营销使用 `A`、可用的 `A B`、
-可用的 `A C`；只有 A 是候选笔记硬性准入条件；B/C 是可选检索扩展；用户可提交
-任意一至三条非空最终搜索词；历史 v1 数据只允许通过显式只读兼容路径读取，
-不得继续驱动新 Run。
+中已经确认的 Scope v2 组合语义继续有效：产品营销使用核心搜索词、可用的
+“核心搜索词 + 产品或体验补充词”、可用的“核心搜索词 + 场景或人群补充词”；
+只有核心搜索词是候选笔记硬性准入条件，两个补充词均为可选检索扩展。历史 v1
+数据只允许通过显式只读兼容路径读取，不得继续驱动新 Run。
 
 本设计替代该 Scope 设计中“existing Trace UI remains unchanged”的限制。Trace
 必须按本文整改为唯一状态机的真实执行投影。
 
 ### 继续有效的 Scope v2 查询合同
 
-- A 是核心检索对象，也是候选笔记准入时唯一必须满足的对象条件。
-- B 是“产品／体验检索词”，必须是用户可能实际搜索的具体短语，例如 `凉感`、
-  `显瘦`；它不是“重点了解什么”或抽象分析目标。
-- C 是“场景／人群检索词”，必须是具体场景、受众或使用语境，例如 `夏季通勤`。
-- 系统建议组合固定为 `A`、可用时的 `A B`、可用时的 `A C`；空格表示普通词组
-  组合，不承诺来源平台支持 Boolean AND。
-- B/C 缺失时，现有 Scope 卡解释其含义并提供可选行内输入，但确认按钮仍然可用；
-  不新增阶段、卡片或动作按钮，也不为了凑满三组而生成抽象词。
-- 用户可将任意建议组编辑为任意非空最终词；缺少 A 的最终词标记为 exploratory，
-  其结果仍须在详情证据中独立匹配 A 才能准入。
-- 页面只展示将按原文发送给小红书的 `final_query`。不会原样发送的研究问题、
+- “A/B/C”只允许作为内部合同速记，不得出现在前端。页面使用“核心搜索词”、
+  “产品或体验补充词（可选）”、“场景或人群补充词（可选）”。
+- 核心搜索词是候选笔记准入时唯一必须满足的对象条件。
+- 产品或体验补充词必须是用户可能实际搜索的具体短语，例如 `凉感`、`显瘦`；
+  它不是“重点了解什么”或抽象分析目标。
+- 场景或人群补充词必须是具体场景、受众或使用语境，例如 `夏季通勤`。
+- 后端唯一查询编译器固定生成“核心搜索词”、可用时的“核心搜索词 + 产品或体验
+  补充词”、可用时的“核心搜索词 + 场景或人群补充词”；空格表示普通词组组合，
+  不承诺来源平台支持 Boolean AND。
+- 两个补充词缺失时，Scope 卡解释其含义并提供可选输入；不为了凑满三组而生成
+  抽象词，只保留一至两组合法查询。
+- 用户只编辑三个结构化搜索词。页面中的最终搜索词是后端编译结果的只读预览，
+  不再提供逐组覆盖入口；修改结构化词后，用最新 request ticket 同步刷新预览。
+- 系统生成的结构必须保留 `analysis_state` 和 reason codes；无效建议不得伪装成
+  可靠拆解。系统可以有界修复一次，仍无效时在同一 Scope 卡提示用户修正，不恢复
+  已废弃的独立主体结构确认阶段。
+- 用户显式编辑后的结构由用户拥有语义决定权；后端只做非空、长度、版本、数量和
+  编译一致性校验，不以“搜索质量”为由拒绝用户选择。
+- 页面只展示会进入冻结 Scope 的 `final_query`。不会原样发送的研究问题、
   “上身感受”等分析目标不得伪装成可执行搜索词展示。
 - 后续检索逐组原样发送冻结的 `final_query`；按笔记 ID 去重，并保留命中的
   query group。B/C 不作为候选准入条件，也不单独触发 Coverage 不足。
@@ -162,7 +170,7 @@ stateDiagram-v2
 |---|---|---|---|---|
 | `STATE-CR-01` | `presearch_running` | 正在进行轻量预检索 | 等待、取消 | Brief、搜索词、冻结 Scope、调研运行卡 |
 | `STATE-CR-02` | `brief_confirmation_required` | 原型中的 Brief 卡：主体、竞品、调研方向 | 确认；补充或修正研究对象 | 旧主体结构卡、冻结 Scope、provider 调用 |
-| `STATE-CR-03` | `scope_confirmation_required` | 一至三组可编辑的实际搜索词和可选 B/C 输入 | 编辑；补充 B/C；确认并开始检索 | 冻结标识、dispatch、调研运行状态 |
+| `STATE-CR-03` | `scope_confirmation_required` | 三个结构化搜索词输入和一至三组后端编译的只读实际搜索词；系统建议异常显示安全提示 | 编辑核心词；补充可选词；确认并开始检索 | A/B/C 代号、逐组编辑、冻结标识、dispatch、调研运行状态 |
 | `STATE-CR-04` | `retrieval_queued` | 已冻结 Scope，等待执行 | 等待、取消 | 编辑冻结搜索词、前置确认卡 |
 | `STATE-CR-05` | `retrieval_running` | 真实搜索进度、返回数量和安全笔记引用 | 等待、取消 | Brief/Scope 编辑、未发生的 provider 事件 |
 | `STATE-CR-06` | `coverage_evaluating` | 正在评估样本和作者覆盖 | 无用户 mutation | 提前显示 Coverage 决策或报告 |
@@ -184,14 +192,16 @@ stateDiagram-v2
 | `AUTH-CR-06` | 一个 Run 同时最多有一个有效 execution attempt；worker 写入必须匹配 Run、Scope、attempt、lease 和预期 revision。 |
 | `AUTH-CR-07` | 用户提交研究对象并成功创建 Run B 时，Run B 立即成为 `thread.active_run_id`；历史 Run A 只保留在 Timeline。 |
 | `AUTH-CR-08` | 所有公共 mutation 必须提交预期状态与 revision；旧 revision、旧 Run、旧 Scope、旧 Draft 或旧 attempt 在第一笔业务写入前被拒绝。 |
+| `AUTH-CR-09` | 后端查询编译器是 Draft query bundle 的唯一权威；前端不得自行生成可提交的 `final_query`。结构化词、Scope constraint、`targeted_required_terms` 和 query groups 必须来自同一次编译。 |
+| `AUTH-CR-10` | 用户确认的 `final_query`、冻结 Scope、dispatch、Spider 实际参数和 Trace request fact 必须保持同一 query identity；Task 2 只负责确认前 Draft，Task 3 才建立冻结与执行链。 |
 
 ### 状态转换与原子边界
 
 | ID | From → event → To | Guard 与原子写入 | 外部副作用 |
 |---|---|---|---|
 | `INV-CR-01` | 无 Run → `submit_research_subject` → `presearch_running` | 创建 Run、初始 transition event、`thread.active_run_id` 在一个事务提交 | 事务提交后才调用 LLM |
-| `INV-CR-02` | `presearch_running` → `presearch_completed` → `brief_confirmation_required` | 保存 SubjectStructure 内部快照、Brief Draft、状态和 revision；不创建 Scope Contract/dispatch | 无 provider 调用 |
-| `INV-CR-03` | `brief_confirmation_required` → `confirm_brief` → `scope_confirmation_required` | 校验 revision；保存确认 Brief、Plan、Scope Draft、transition event；不得启动 formal research | 无 provider 调用 |
+| `INV-CR-02` | `presearch_running` → `presearch_completed` → `brief_confirmation_required` | 保存 SubjectStructure 候选、analysis state/reasons、Brief Draft、状态和 revision；无效系统建议不得丢失诊断；不创建 Scope Contract/dispatch | 无 provider 调用；结构无效时最多追加一次 LLM 定向修复 |
+| `INV-CR-03` | `brief_confirmation_required` → `confirm_brief` → `scope_confirmation_required` | 校验 revision；由后端编译并保存确认 Brief、Plan、Scope Draft、结构分析提示、transition event；不得启动 formal research | 无 provider 调用 |
 | `INV-CR-04` | `brief_confirmation_required` → `revise_subject` → `presearch_running` | 保存用户补充、增加 revision、使旧 Brief command 失效 | 事务提交后重新 PreResearch |
 | `INV-CR-05` | `scope_confirmation_required` → `confirm_scope` → `retrieval_queued` | 精确 Draft identity、一至三组非空词；冻结 Scope、创建唯一 dispatch/task、更新 Run 和 event | 事务提交后唤醒 worker |
 | `INV-CR-06` | `retrieval_queued` → `worker_claimed` → `retrieval_running` | dispatch claim、subagent running、Run state/revision、attempt/lease fact 同一事务 | 无；领取完成后才可进入 provider 边界 |
@@ -207,6 +217,7 @@ stateDiagram-v2
 | `INV-CR-16` | 任意非终态 → 已知失败 → `recovery_required` | Run、相关 task/job、错误契约、transition event 一起收敛 | 不自动执行未授权 recovery |
 | `INV-CR-17` | `recovery_required` → 精确恢复命令 → 对应阶段 | 仅服务端投影的动作；沿用精确 Run/Scope/attempt authority | 是否重放由 outcome 语义决定 |
 | `INV-CR-18` | 任意非终态 → cancel → `cancelled_or_failed` | 状态、取消原因和所有未开始执行一起提交；迟到 worker 被 fenced | 已记录 request 的未知外部结果只追加诊断 |
+| `INV-CR-19` | `scope_confirmation_required` → `replace_scope_draft` → `scope_confirmation_required` | 请求只提交核心词和两个可选补充词；后端在同一事务保存由它编译的 constraint、targeted terms、query groups、后继 Draft、state revision 和 event | 无 provider 调用；迟到响应由 request ticket 丢弃 |
 
 ### 状态投影
 
@@ -365,6 +376,8 @@ Trace 不复制原始笔记正文，只引用持久化来源：
 | `FAIL-CR-10` | provider outcome unknown 不自动重放；刷新/重启后保持人工恢复语义。 |
 | `FAIL-CR-11` | publication 失败不能产生 `report_ready` 或成功 Timeline 消息。 |
 | `FAIL-CR-12` | 历史 v1 数据只通过显式只读 decoder/projection 存在；不能重新启用旧新 Run 交互或 mutation。 |
+| `FAIL-CR-13` | SubjectStructure 已检测为 `needs_confirmation` 时不得丢弃 reason codes 或将候选结构投影成可靠拆解；删除旧确认阶段后，其修正职责必须由当前 Scope 卡承接。 |
+| `FAIL-CR-14` | 修改核心搜索词不得只改变页面或某一条 query；Scope core constraint、targeted required terms 和全部派生 query 必须整体替换。 |
 
 ## 旧规格删除契约
 
@@ -420,6 +433,9 @@ Trace 不复制原始笔记正文，只引用持久化来源：
 | `ACC-STATE-11` | dispatch/subagent 失败 | Run、相关任务、错误和 Trace 同步收敛 | Fault-controlled owned stack |
 | `ACC-STATE-12` | 非法组合构造 | Brief 待确认 + frozen Scope/running 等组合在写入与读取两端都被拒绝 | Transition unit + read model integration |
 | `ACC-STATE-13` | 旧规格删除扫描 | 旧命令、字段、组件和新 Run fixture 不再存在 | Static inventory + focused suites |
+| `ACC-STATE-14` | 模型把 `夏季凉感T恤` 整体作为核心词 | 保留 `core_entity_is_complete_input` 诊断；Scope 可修正为 `T恤 / 凉感 / 夏季`，不恢复旧主体确认阶段 | Browser-to-owned-stack + PreResearch unit |
+| `ACC-STATE-15` | Scope 修改核心词和可选补充词 | 后端返回只读 `T恤`、`T恤 凉感`、`T恤 夏季`；constraint 与 targeted terms 同步，零 Scope Contract/dispatch/XHS | Router/SQLite + browser |
+| `ACC-STATE-16` | 连续编辑产生乱序响应 | 旧 Draft 响应不能覆盖最新结构化词或 query 预览 | Frontend async ordering |
 
 ### Task 2：SQLite 主流程整改
 
