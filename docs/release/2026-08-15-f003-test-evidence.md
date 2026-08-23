@@ -83,3 +83,35 @@
   isolated port, and verifies the same SQLite run, 28-detail fixture, Trace and
   recoverable report read model after restart. It uses a persisted local fixture,
   not a live provider call.
+
+## 2026-08-23 final vertical-slice evidence
+
+Verified commits: `29b8fae`, `64eda1a`, `e754cfb`, `4da8bd4`, `7065061`.
+
+- Five owned Creator journeys passed in 63.29s: durable Run B precedence beside
+  historical Run A, v2 `A / A+B / A+C`, missing B/C replacement, exact edited
+  provider query with A-only admission, and real Coverage Expand through the
+  Router/SQLite/worker/provider/read model (`5 passed`).
+- Version-owned v1/v2 Scope, Limited/Expand/Relax and replay checks passed
+  (`18 passed`); frozen draft round-trip and provider-failure recovery checks
+  passed separately (`4 passed`).
+- Task 5 atomic decision checks passed (`6 passed`): v2 Relax preserves the v2
+  schema, duplicate Expand creates one authorization, a predecessor Coverage
+  snapshot writes nothing, the lower-level execution-unit entry rejects the same
+  stale snapshot, and an Expand query without A writes nothing.
+- Foundation checks for Trace, model configuration/LLM and Xiaohongshu QR/Cookie
+  state passed (`35 passed`). Frontend tests passed (`82 passed`) and the production
+  build completed. The build retained only the previously recorded image and React
+  hook lint warnings.
+- The broad touched-area run produced `123 passed, 5 failed`. Four failures are
+  historical test-fixture assumptions (missing Draft replacement identity or an
+  isolated store without the shared workflow tables); one asserts the superseded
+  product-marketing rule that season/scenario are required. These are not used to
+  change the confirmed v2 contract, where only A is required.
+- The repository-wide `pytest -q` was sampled but stopped after the known unbounded
+  browser portion again made the command unsuitable as a release gate. It is not
+  recorded as a pass. This is the same open gate-runner limitation documented in
+  item 4 above; the five owned browser journeys were run explicitly and passed.
+- No authenticated canary is claimed. This workspace run did not establish both a
+  validated live LLM credential and an authenticated live Xiaohongshu session with
+  redacted evidence, so deterministic adapters were used for provider execution.
