@@ -2988,10 +2988,16 @@ function CreatorPage() {
       // 404 and is hydrated by the legacy snapshot path below.
       const durableContentResearchRunId = thread.active_run_id ?? null;
       const runIdForThread =
-        restoredRunId
+        durableContentResearchRunId
         ?? contentResearchRunForThread(threadId)
-        ?? durableContentResearchRunId;
+        ?? restoredRunId;
       if (runIdForThread) {
+        let currentReport = latestReport?.workflow_run_id === runIdForThread
+          ? latestReport
+          : null;
+        let currentFailure = latestFailure?.workflowRunId === runIdForThread
+          ? latestFailure
+          : undefined;
         try {
           const workflow = await getContentResearchWorkflow(runIdForThread);
           if (loadingThreadRef.current !== threadId || workflow.brief.thread_id !== threadId) return;
@@ -3022,7 +3028,7 @@ function CreatorPage() {
             // Workflow/report restoration remains usable when Trace is temporarily unavailable.
           }
           if (!contentResearchRequestEpochRef.current.accepts(requestTicket)) return;
-          if (!latestReport && !latestFailure) {
+          if (!currentReport && !currentFailure) {
             try {
               const projection = await getContentResearchLiteReportWithRetry(runIdForThread);
               if (
@@ -3030,14 +3036,14 @@ function CreatorPage() {
                 || (projection.publication.state === null && projection.recovery_projection)
               ) {
                 if (!contentResearchRequestEpochRef.current.accepts(requestTicket)) return;
-                latestReport = projection;
+                currentReport = projection;
                 appendLiteReportMessage(projection);
               }
             } catch (error) {
               if (!contentResearchRequestEpochRef.current.accepts(requestTicket)) return;
               if (!isExpectedLiteReportAbsence(error)) {
                 const detail = error instanceof Error ? error.message : "报告读取失败";
-                latestFailure = {
+                currentFailure = {
                   messageId: `active-${runIdForThread}`,
                   workflowRunId: runIdForThread,
                   error: detail,
@@ -3047,15 +3053,15 @@ function CreatorPage() {
             }
           }
           if (!contentResearchRequestEpochRef.current.accepts(requestTicket)) return;
-          const restoredRun = contentResearchRunWithReport(runIdForThread, workflow, trace, null, latestReport);
+          const restoredRun = contentResearchRunWithReport(runIdForThread, workflow, trace, null, currentReport);
           // A historical artifact can outlive its readable publication. Keep
           // the restored workflow visible and expose the report failure; do
           // not silently substitute a legacy result or clear the Timeline.
-          if (latestFailure) {
+          if (currentFailure) {
             setContentResearchRun({
               ...restoredRun,
               reportStatus: "failed",
-              reportError: latestFailure.error,
+              reportError: currentFailure.error,
             });
           } else {
             setContentResearchRun(restoredRun);
@@ -3063,6 +3069,10 @@ function CreatorPage() {
         } catch (error) {
           if (isExpectedLiteReportAbsence(error)) {
             removeContentResearchRunForThread(threadId);
+            if (durableContentResearchRunId === runIdForThread) {
+              const detail = error instanceof Error ? error.message : "运行读取失败";
+              appendMessage({ role: "system", text: `内容调研运行暂不可读取：${detail}` });
+            }
           } else {
             const detail = error instanceof Error ? error.message : "运行读取失败";
             appendMessage({ role: "system", text: `内容调研运行暂不可读取：${detail}` });

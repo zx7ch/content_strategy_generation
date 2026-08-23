@@ -654,6 +654,110 @@ def test_creator_discards_a_late_scope_response_after_switching_runs(browser_pag
     expect(page.get_by_text("旧任务过期范围", exact=True)).to_have_count(0)
 
 
+def test_creator_historical_run_never_overrides_durable_active_run_after_brief_confirmation(
+    browser_page,
+):
+    page, stack = browser_page
+    historical = run_async_in_thread(
+        seed_publication(
+            stack["db_path"],
+            brand_id=default_brand_id(stack["backend_url"]),
+            title="Run A 历史报告",
+            publication_state="complete_verified_report",
+            requested_directions=("product_marketing",),
+            direction_results={
+                "product_marketing": {
+                    "state": "formal_directional_result",
+                    "limitations": [],
+                    "recovery_actions": [],
+                }
+            },
+            evidence_refs=all_navigation_evidence_refs()[:1],
+        )
+    )
+    run_async_in_thread(
+        append_historical_report_message(
+            stack["db_path"],
+            thread_id=historical["thread_id"],
+            run_id=historical["run_id"],
+        )
+    )
+
+    page.goto(stack["frontend_url"] + "/creator", wait_until="domcontentloaded")
+    page.get_by_text("Run A 历史报告", exact=True).click()
+    expect(published_report(page)).to_be_visible(timeout=30000)
+
+    page.get_by_role("button", name=re.compile("内容调研")).first.click()
+    research_input = page.get_by_role(
+        "textbox",
+        name="输入品类、品牌或 SKU，发送后开始内容调研",
+    )
+    expect(research_input).to_be_enabled(timeout=30000)
+    research_input.fill("Run B 夏季通勤短裤")
+    with page.expect_response(
+        lambda response: response.url.endswith("/content-research/presearch"),
+        timeout=30000,
+    ) as presearch_response:
+        research_input.press("Enter")
+    assert presearch_response.value.status == 201, presearch_response.value.text()
+
+    expect(page.get_by_text("还需要你确认调研主体", exact=True)).to_be_visible(
+        timeout=30000
+    )
+    page.get_by_role("button", name="确认调研主体", exact=True).click()
+    page.get_by_role("heading", name="在开始前，请确认几个关键点").wait_for(
+        timeout=30000
+    )
+    page.get_by_role("button", name="准确，继续").click()
+    page.get_by_role("button", name="产品营销", exact=True).click()
+    page.get_by_label("产品营销目标", exact=True).select_option("content_seeding")
+    with page.expect_response(
+        lambda response: response.url.endswith("/actions")
+        and '"action":"confirm_brief"' in (response.request.post_data or "")
+        and response.status == 200,
+        timeout=30000,
+    ) as brief_response:
+        page.get_by_role("button", name=re.compile("确认并开始调研")).click()
+    run_b = brief_response.value.json()["workflow_run_id"]
+    assert run_b != historical["run_id"]
+    expect(page.locator('section[aria-label="确认检索范围"]')).to_be_visible(
+        timeout=30000
+    )
+
+    requested_urls: list[str] = []
+    page.on("request", lambda request: requested_urls.append(request.url))
+    page.reload(wait_until="domcontentloaded")
+
+    expect(page.locator('section[aria-label="确认检索范围"]')).to_be_visible(
+        timeout=30000
+    )
+    expect(page.get_by_text("Run A 历史报告", exact=True)).to_be_visible()
+    assert any(
+        url.endswith(f"/content-research/workflows/{run_b}/scope")
+        for url in requested_urls
+    )
+    assert any(
+        url.endswith(f"/content-research/workflows/{run_b}/trace")
+        for url in requested_urls
+    )
+
+    page.route(
+        f"**/content-research/workflows/{run_b}",
+        lambda route: route.fulfill(
+            status=404,
+            content_type="application/json",
+            body=json.dumps({"detail": "workflow projection unavailable"}),
+        ),
+    )
+    page.reload(wait_until="domcontentloaded")
+
+    expect(
+        page.get_by_text(re.compile("内容调研运行暂不可读取"), exact=False)
+    ).to_be_visible(timeout=30000)
+    expect(page.get_by_text("Run A 历史报告", exact=True)).to_be_visible()
+    expect(page.locator('section[aria-label="确认检索范围"]')).to_have_count(0)
+
+
 @pytest.mark.parametrize(
     "real_creator_stack",
     [{"scope_coverage_seed": True, "source_scenario": "success"}],
@@ -2472,6 +2576,23 @@ async def seed_publication(
         "brief_id": brief.id,
         "publication_id": publication_id,
     }
+
+
+async def append_historical_report_message(
+    db_path: str,
+    *,
+    thread_id: str,
+    run_id: str,
+) -> None:
+    async with ThreadStore(db_path) as thread_store:
+        await thread_store.append_message(
+            thread_id=thread_id,
+            role="assistant",
+            text="Run A 历史报告",
+            message_type="artifact_result",
+            run_id=run_id,
+            artifact_refs=[{"type": "content_research_lite_report", "run_id": run_id}],
+        )
 
 
 async def seed_recovery(

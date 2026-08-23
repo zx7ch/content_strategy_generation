@@ -160,6 +160,7 @@ class AsyncFormalResearchDispatchRepository:
         conn: aiosqlite.Connection,
         *,
         brief: ResearchBriefRecord,
+        active_run_id: str,
         plan: ResearchPlanRecord,
         snapshot: RunPolicySnapshot,
         sample_policies: list[SamplePolicy],
@@ -174,6 +175,21 @@ class AsyncFormalResearchDispatchRepository:
         transaction and decides whether the complete run becomes visible. The
         explicit start-formal-research action creates the dispatch job later.
         """
+        async with conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'creator_threads'"
+        ) as cursor:
+            has_thread_table = await cursor.fetchone() is not None
+        if has_thread_table:
+            updated_thread = await conn.execute(
+                """UPDATE creator_threads
+                   SET active_run_id = ?, updated_at = CURRENT_TIMESTAMP
+                   WHERE id = ?""",
+                (active_run_id, brief.thread_id),
+            )
+            if updated_thread.rowcount != 1:
+                raise ValueError(
+                    "confirmed Content Research brief does not belong to a durable thread"
+                )
         await conn.execute(
             """INSERT INTO content_research_briefs
                (id, workflow_run_id, thread_id, schema_version, status, created_at, updated_at, payload_json, metadata_json)

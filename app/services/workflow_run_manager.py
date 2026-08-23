@@ -457,6 +457,7 @@ class WorkflowRunManager:
         user_id: str,
         user_message_id: Optional[str] = None,
         initial_request: Optional[str] = None,
+        activate_thread: bool = True,
     ) -> WorkflowRun:
         async def op() -> WorkflowRun:
             assert self._conn is not None
@@ -472,7 +473,8 @@ class WorkflowRunManager:
                 """,
                 (run_id, thread_id, user_id, user_message_id),
             )
-            await self._set_thread_active_run_if_present(thread_id, run_id)
+            if activate_thread:
+                await self._set_thread_active_run_if_present(thread_id, run_id)
             await self._append_event(
                 run_id=run_id,
                 thread_id=thread_id,

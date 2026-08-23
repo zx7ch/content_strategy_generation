@@ -12,8 +12,9 @@ from app.config import settings
 from app.content_research.contracts import policy_hash
 from app.content_research.persistence_models import StageCheckpointRecord
 from app.content_research.presearch.service import PresearchService
-from app.content_research.service import ContentResearchService
+from app.content_research.service import ContentResearchService, WorkflowRunManagerRuntime
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
+from app.memory.thread_store import ThreadStore
 from app.services.llm.types import LLMResponse, TokenUsage
 
 WORKSPACE_HEADERS = {"X-Workspace-Id": "ws-1", "X-User-Id": "user-1"}
@@ -172,6 +173,38 @@ async def product_marketing_client(tmp_path):
         app.state.content_research_service = original
 
 
+@pytest.fixture()
+async def atomic_active_run_client(tmp_path):
+    db_path = str(tmp_path / "content_research_active_run.db")
+    async with ThreadStore(db_path) as thread_store:
+        thread = await thread_store.create_thread(
+            title="Run authority",
+            workspace_id="ws-1",
+        )
+        await thread_store.update_thread_active_run(thread["id"], "run_A")
+
+    original = getattr(app.state, "content_research_service", None)
+    service = ContentResearchService(
+        store=SQLiteContentResearchStore(db_path),
+        presearch=PresearchService(
+            FakeLLM(), first_feedback_timeout_seconds=0.05, hard_cutoff_seconds=0.1
+        ),
+        workflow_runtime=WorkflowRunManagerRuntime(db_path),
+    )
+    app.state.content_research_service = service
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://testserver",
+        headers=WORKSPACE_HEADERS,
+    ) as c:
+        yield c, service, db_path, thread["id"]
+    if original is None:
+        delattr(app.state, "content_research_service")
+    else:
+        app.state.content_research_service = original
+
+
 async def _create_presearch(client, *, seed_text: str = "徒步短裤"):
     response = await client.post(
         "/content-research/presearch",
@@ -179,6 +212,111 @@ async def _create_presearch(client, *, seed_text: str = "徒步短裤"):
     )
     assert response.status_code == 201
     return response.json()
+
+
+async def _active_run_id(db_path: str, thread_id: str) -> str | None:
+    async with ThreadStore(db_path) as thread_store:
+        thread = await thread_store.get_thread(thread_id)
+    assert thread is not None
+    return thread["active_run_id"]
+
+
+async def _create_and_confirm_brief(client, *, thread_id: str, seed_text: str) -> dict:
+    presearch_response = await client.post(
+        "/content-research/presearch",
+        json={"seed_text": seed_text, "thread_id": thread_id},
+    )
+    assert presearch_response.status_code == 201
+    presearch = presearch_response.json()
+    confirmation = await client.post(
+        f"/content-research/briefs/{presearch['brief_id']}/confirm",
+        json={
+            "confirmed_subject": seed_text,
+            "subject_structure_hash": presearch["subject_structure_hash"],
+            "subject_type": "category",
+            "selected_directions": ["product_marketing"],
+            "primary_marketing_goal": "content_seeding",
+            "subject_structure_confirmation": _shorts_structure_confirmation(),
+        },
+    )
+    assert confirmation.status_code == 200
+    return presearch
+
+
+@pytest.mark.asyncio
+async def test_confirm_brief_atomically_sets_the_thread_active_run(
+    atomic_active_run_client,
+):
+    client, _service, db_path, thread_id = atomic_active_run_client
+
+    presearch_response = await client.post(
+        "/content-research/presearch",
+        json={"seed_text": "Run B 徒步短裤", "thread_id": thread_id},
+    )
+    assert presearch_response.status_code == 201
+    presearch = presearch_response.json()
+    assert await _active_run_id(db_path, thread_id) == "run_A"
+
+    confirmation = await client.post(
+        f"/content-research/briefs/{presearch['brief_id']}/confirm",
+        json={
+            "confirmed_subject": "Run B 徒步短裤",
+            "subject_structure_hash": presearch["subject_structure_hash"],
+            "subject_type": "category",
+            "selected_directions": ["product_marketing"],
+            "primary_marketing_goal": "content_seeding",
+            "subject_structure_confirmation": _shorts_structure_confirmation(),
+        },
+    )
+
+    assert confirmation.status_code == 200
+    assert await _active_run_id(db_path, thread_id) == presearch["workflow_run_id"]
+    assert len(app.state.content_research_service._store.list_plans_for_brief(presearch["brief_id"])) == 1
+
+
+@pytest.mark.asyncio
+async def test_confirm_brief_writer_failure_rolls_back_plan_and_active_run(
+    atomic_active_run_client,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    client, service, db_path, thread_id = atomic_active_run_client
+    run_b = await _create_and_confirm_brief(
+        client,
+        thread_id=thread_id,
+        seed_text="Run B 徒步短裤",
+    )
+    assert await _active_run_id(db_path, thread_id) == run_b["workflow_run_id"]
+
+    presearch_response = await client.post(
+        "/content-research/presearch",
+        json={"seed_text": "Run C 徒步短裤", "thread_id": thread_id},
+    )
+    assert presearch_response.status_code == 201
+    run_c = presearch_response.json()
+    assert await _active_run_id(db_path, thread_id) == run_b["workflow_run_id"]
+
+    original_persist = service._dispatch.persist_confirmation
+
+    async def fail_before_commit(*args, **kwargs):
+        await original_persist(*args, **kwargs)
+        raise RuntimeError("forced confirmation rollback")
+
+    monkeypatch.setattr(service._dispatch, "persist_confirmation", fail_before_commit)
+    failed_confirmation = await client.post(
+        f"/content-research/briefs/{run_c['brief_id']}/confirm",
+        json={
+            "confirmed_subject": "Run C 徒步短裤",
+            "subject_structure_hash": run_c["subject_structure_hash"],
+            "subject_type": "category",
+            "selected_directions": ["product_marketing"],
+            "primary_marketing_goal": "content_seeding",
+            "subject_structure_confirmation": _shorts_structure_confirmation(),
+        },
+    )
+
+    assert failed_confirmation.status_code == 500
+    assert await _active_run_id(db_path, thread_id) == run_b["workflow_run_id"]
+    assert service._store.list_plans_for_brief(run_c["brief_id"]) == []
 
 
 def _shorts_structure_confirmation() -> dict:

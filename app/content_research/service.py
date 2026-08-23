@@ -337,6 +337,7 @@ class WorkflowRunManagerRuntime:
                 thread_id=thread_id,
                 user_id=user_id,
                 initial_request=seed_text,
+                activate_thread=False,
             )
             await manager.initialize_steps(
                 run.run_id,
@@ -1548,6 +1549,7 @@ class ContentResearchService:
             await self._dispatch.persist_confirmation(
                 conn,
                 brief=updated_brief,
+                active_run_id=brief.workflow_run_id,
                 plan=plan,
                 snapshot=snapshot,
                 sample_policies=sample_policies,
