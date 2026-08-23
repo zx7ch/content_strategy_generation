@@ -46,6 +46,7 @@ import {
   type ContentResearchLiteReportResponse,
   type ContentResearchPresearchResponse,
   type ContentResearchConfirmScopeRequest,
+  type ContentResearchPrepareScopeRequest,
   type ContentResearchResolveCoverageRequest,
   type ContentResearchScopeDraft,
   type ContentResearchScopeProjection,
@@ -703,10 +704,6 @@ const LITE_DIRECTION_CATALOG = [
   { id: "content_performance", label: "内容表现" },
 ] as const;
 
-const LITE_MARKETING_GOAL_CATALOG = [
-  { id: "content_seeding", label: "内容种草" },
-] as const;
-
 function liteDirectionLabel(value: string) {
   return LITE_DIRECTION_CATALOG.find((item) => item.id === value)?.label ?? value;
 }
@@ -736,8 +733,6 @@ function ContentResearchIntentCard({
   const [selectedCompetitors, setSelectedCompetitors] = useState<string[]>([]);
   const [selectedDirections, setSelectedDirections] = useState<string[]>([]);
   const [extraCompetitors, setExtraCompetitors] = useState(intent.presearch.custom_competitor_input ?? "");
-  const [customQuestion, setCustomQuestion] = useState(intent.presearch.custom_research_question ?? "");
-  const [primaryMarketingGoal, setPrimaryMarketingGoal] = useState("");
   const [isConfirming, setIsConfirming] = useState(false);
   const [coreObjectInput, setCoreObjectInput] = useState(
     structure.core_entities?.[0]?.canonical_name?.trim() ?? "",
@@ -749,14 +744,6 @@ function ContentResearchIntentCard({
     (structure.context_modifiers ?? []).filter(Boolean).join("，"),
   );
   const confirmationInFlightRef = useRef(false);
-  const confirmedStructureFields = intent.presearch.subject_structure_user_confirmed_fields ?? [];
-  const hasConfirmedStructureFields = [
-    "core_entities[0]",
-    "research_intents[0]",
-    "context_modifiers",
-  ].every((field) => confirmedStructureFields.includes(field));
-  const needsProductStructureConfirmation = selectedDirections.includes("product_marketing")
-    && !hasConfirmedStructureFields;
 
   function toggleValue(
     value: string,
@@ -774,10 +761,6 @@ function ContentResearchIntentCard({
       onError("请先确认调研主体是否准确。");
       return;
     }
-    if (needsProductStructureConfirmation && (!coreObjectInput.trim() || !researchIntentInput.trim())) {
-      onError("请选择产品营销时，请确认核心对象和研究意图。");
-      return;
-    }
     if (confirmationInFlightRef.current) return;
     confirmationInFlightRef.current = true;
     setIsConfirming(true);
@@ -789,17 +772,6 @@ function ContentResearchIntentCard({
         selected_competitors: selectedCompetitors,
         custom_competitors: splitInlineList(extraCompetitors),
         selected_directions: selectedDirections,
-        custom_research_question: customQuestion.trim(),
-        primary_marketing_goal: primaryMarketingGoal,
-        ...(needsProductStructureConfirmation
-          ? {
-              subject_structure_confirmation: {
-                core_object: coreObjectInput,
-                research_intent: researchIntentInput,
-                context_modifiers: splitInlineList(contextInput),
-              },
-            }
-          : {}),
       });
       onConfirmed(summary);
     } catch {
@@ -967,45 +939,11 @@ function ContentResearchIntentCard({
               </button>
             ))}
           </div>
-          <input
-            value={customQuestion}
-            onChange={(event) => setCustomQuestion(event.target.value)}
-            className="mt-4 h-11 w-full rounded-xl border border-line bg-white px-4 text-sm outline-none focus:border-[#789180]"
-            placeholder="补充你的调研问题，例如：更关注小众品牌而不是大牌"
-          />
-          {needsProductStructureConfirmation && (
-            <div className="mt-4 grid gap-3 rounded-xl bg-[#f4f7f5] p-3">
-              <p className="text-sm font-medium text-ink">请确认产品营销要检索的结构</p>
-              <label className="grid gap-1 text-xs font-medium">核心对象 *
-                <input aria-label="产品营销核心对象" value={coreObjectInput} onChange={(event) => setCoreObjectInput(event.target.value)} placeholder="T恤" className="rounded-lg border border-line bg-white px-3 py-2 text-sm font-normal outline-none" />
-              </label>
-              <label className="grid gap-1 text-xs font-medium">首要研究意图 *
-                <input aria-label="产品营销研究意图" value={researchIntentInput} onChange={(event) => setResearchIntentInput(event.target.value)} placeholder="凉感" className="rounded-lg border border-line bg-white px-3 py-2 text-sm font-normal outline-none" />
-              </label>
-              <label className="grid gap-1 text-xs font-medium">使用场景
-                <input aria-label="产品营销使用场景" value={contextInput} onChange={(event) => setContextInput(event.target.value)} placeholder="夏季" className="rounded-lg border border-line bg-white px-3 py-2 text-sm font-normal outline-none" />
-              </label>
-            </div>
-          )}
-          <label className="mt-4 grid gap-2 text-sm font-medium text-ink">
-            请选择本轮产品营销目标 *
-            <select
-              aria-label="产品营销目标"
-              value={primaryMarketingGoal}
-              onChange={(event) => setPrimaryMarketingGoal(event.target.value)}
-              className="h-11 rounded-xl border border-line bg-white px-3 text-sm font-normal outline-none focus:border-[#789180]"
-            >
-              <option value="">请选择</option>
-              {LITE_MARKETING_GOAL_CATALOG.map((goal) => (
-                <option key={goal.id} value={goal.id}>{goal.label}</option>
-              ))}
-            </select>
-          </label>
           <div className="mt-4 flex justify-end gap-2">
             <button
               type="button"
               onClick={() => void confirmBrief()}
-              disabled={isConfirming || selectedDirections.length === 0 || !primaryMarketingGoal}
+              disabled={isConfirming || selectedDirections.length === 0}
               className="h-10 rounded-xl bg-ink px-5 text-sm font-medium text-white hover:bg-slate-800 disabled:opacity-40"
             >
               {isConfirming ? "确认中" : "确认并开始调研"}
@@ -2059,6 +1997,7 @@ interface ContentResearchScopeCardProps {
   draft: ContentResearchScopeDraft | null;
   projection: ContentResearchScopeProjection | null;
   busy: boolean;
+  onPrepare: (payload: ContentResearchPrepareScopeRequest) => void;
   onConfirm: (payload: ContentResearchConfirmScopeRequest) => void;
   onResolve: (payload: ContentResearchResolveCoverageRequest) => void;
 }
@@ -2098,10 +2037,13 @@ function ContentResearchScopeCard({
   draft,
   projection,
   busy,
+  onPrepare,
   onConfirm,
   onResolve,
 }: ContentResearchScopeCardProps) {
   const [finalQueries, setFinalQueries] = useState<string[]>([]);
+  const [productExperienceAspect, setProductExperienceAspect] = useState("");
+  const [contextAudienceAspect, setContextAudienceAspect] = useState("");
   const [supplementaryQueries, setSupplementaryQueries] = useState(["", ""]);
   const [selectedResolution, setSelectedResolution] = useState<string | null>(null);
   const projectedConfirmAction = projection?.allowed_actions.find((item) => (
@@ -2126,6 +2068,8 @@ function ContentResearchScopeCard({
       : null;
   useEffect(() => {
     setFinalQueries(effectiveDraft?.query_groups.map((group) => group.final_query) ?? []);
+    setProductExperienceAspect(effectiveDraft?.product_experience_aspect ?? "");
+    setContextAudienceAspect(effectiveDraft?.context_audience_aspect ?? "");
   }, [effectiveDraft]);
   useEffect(() => {
     setSelectedResolution(null);
@@ -2160,10 +2104,67 @@ function ContentResearchScopeCard({
           <p className="text-xs font-semibold uppercase tracking-wider text-quiet">检索范围确认</p>
           <h2 className="mt-1 text-base font-semibold">确认每组最终检索词</h2>
           <p className="mt-1 text-xs leading-5 text-quiet">这些检索词会冻结为本轮执行范围。可以编辑最终检索词，范围约束仍由服务端管理。</p>
+          {effectiveDraft.schema_version === "content_research_scope_contract_v2"
+            && (!effectiveDraft.product_experience_aspect || !effectiveDraft.context_audience_aspect) && (
+            <div className="mt-4 grid gap-3 rounded-xl border border-blue-100 bg-blue-50/70 p-3">
+              {!effectiveDraft.product_experience_aspect && (
+                <label className="grid gap-1 text-xs font-medium text-ink">
+                  产品／体验检索词（可选）
+                  <span className="font-normal leading-5 text-quiet">填写用户会和“{effectiveDraft.core_object}”一起搜索的具体产品感受，例如：凉感、显瘦。按 Enter 更新下方检索词。</span>
+                  <input
+                    aria-label="产品／体验检索词"
+                    value={productExperienceAspect}
+                    onChange={(event) => setProductExperienceAspect(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key !== "Enter" || !productExperienceAspect.trim()) return;
+                      event.preventDefault();
+                      onPrepare({
+                        direction_id: "product_marketing",
+                        replaces_scope_draft_id: effectiveDraft.id,
+                        product_experience_aspect: productExperienceAspect.trim(),
+                        context_audience_aspect: contextAudienceAspect.trim() || null,
+                      });
+                    }}
+                    placeholder="例如：凉感、显瘦"
+                    className="rounded-lg border border-line bg-white px-3 py-2 text-sm font-normal outline-none focus:border-ink"
+                  />
+                </label>
+              )}
+              {!effectiveDraft.context_audience_aspect && (
+                <label className="grid gap-1 text-xs font-medium text-ink">
+                  场景／人群检索词（可选）
+                  <span className="font-normal leading-5 text-quiet">填写具体场景、人群或使用时机，例如：夏季通勤。按 Enter 更新下方检索词。</span>
+                  <input
+                    aria-label="场景／人群检索词"
+                    value={contextAudienceAspect}
+                    onChange={(event) => setContextAudienceAspect(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key !== "Enter" || !contextAudienceAspect.trim()) return;
+                      event.preventDefault();
+                      onPrepare({
+                        direction_id: "product_marketing",
+                        replaces_scope_draft_id: effectiveDraft.id,
+                        product_experience_aspect: productExperienceAspect.trim() || null,
+                        context_audience_aspect: contextAudienceAspect.trim(),
+                      });
+                    }}
+                    placeholder="例如：夏季通勤"
+                    className="rounded-lg border border-line bg-white px-3 py-2 text-sm font-normal outline-none focus:border-ink"
+                  />
+                </label>
+              )}
+              <p className="text-[11px] leading-5 text-blue-800">不补充也可以直接确认当前已有检索词。</p>
+            </div>
+          )}
           <div className="mt-4 space-y-3">
             {effectiveDraft.query_groups.map((group, index) => (
               <label key={`${effectiveDraft.id}-${index}`} className="block rounded-xl border border-line bg-white px-3 py-3">
-                <span className="text-xs font-medium text-ink">检索组 {index + 1}</span>
+                <span className="flex items-center justify-between gap-2 text-xs font-medium text-ink">
+                  检索组 {index + 1}
+                  <span className="text-[10px] font-normal text-quiet">
+                    {group.origin === "user_edited" ? "用户补充" : "系统建议"}
+                  </span>
+                </span>
                 <input
                   aria-label={`检索组 ${index + 1}`}
                   value={finalQueries[index] ?? ""}
@@ -2214,7 +2215,9 @@ function ContentResearchScopeCard({
             <div key={group.id} className="rounded-xl border border-line bg-white px-3 py-2.5">
               <div className="flex items-center justify-between gap-3">
                 <span className="text-xs font-medium">检索组 {index + 1}</span>
-                <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] text-quiet">{scopeExecutionRoleLabel(group.execution_role)}</span>
+                <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] text-quiet">
+                  {group.origin === "user_edited" ? "用户补充" : "系统建议"} · {scopeExecutionRoleLabel(group.execution_role)}
+                </span>
               </div>
               <p className="mt-1.5 leading-5">{group.final_query}</p>
               {group.suggested_query !== group.final_query && (
@@ -2849,8 +2852,10 @@ function CreatorPage() {
       appendMessage({ role: "system", text: "调研过程暂时不可用，稍后可在 Trace 中刷新。" });
     }
     if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
-    const directionId = arrayField(summary.brief.payload, "selected_directions")[0]
-      || stringField(summary.directions[0]?.payload, "direction_id");
+    const selectedDirectionIds = arrayField(summary.brief.payload, "selected_directions");
+    const directionId = selectedDirectionIds.includes("product_marketing")
+      ? "product_marketing"
+      : selectedDirectionIds[0] || stringField(summary.directions[0]?.payload, "direction_id");
     if (!directionId) {
       appendMessage({ role: "system", text: "无法读取已确认的调研方向，请返回 checklist 后重试。" });
       return;
@@ -2888,6 +2893,28 @@ function CreatorPage() {
       });
     } finally {
       if (contentResearchRequestEpochRef.current.accepts(ticket)) setScopeActionBusy(false);
+    }
+  }
+
+  async function replacePreparedContentResearchScope(
+    payload: ContentResearchPrepareScopeRequest,
+  ) {
+    const run = contentResearchRun;
+    if (!run) return;
+    const ticket = contentResearchRequestEpochRef.current.ticket(
+      run.workflowRunId,
+      "scope-prepare",
+    );
+    try {
+      const scope = await prepareContentResearchScope(run.workflowRunId, payload);
+      if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
+      setPreparedScope(scope);
+    } catch (error) {
+      if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
+      appendMessage({
+        role: "system",
+        text: `检索词更新失败：${error instanceof Error ? error.message : "请稍后重试。"}`,
+      });
     }
   }
 
@@ -3532,6 +3559,7 @@ function CreatorPage() {
                 draft={preparedScope}
                 projection={scopeProjection}
                 busy={scopeActionBusy}
+                onPrepare={(payload) => void replacePreparedContentResearchScope(payload)}
                 onConfirm={(payload) => void confirmPreparedContentResearchScope(payload)}
                 onResolve={(payload) => void resolvePendingContentResearchCoverage(payload)}
               />

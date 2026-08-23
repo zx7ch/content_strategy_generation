@@ -12,25 +12,24 @@ PRESEARCH_SYSTEM_PROMPT = (
     '- subject_confirmation: string，一句可让用户确认或修改的主体识别。\n'
     '- competitor_tags: string[]，候选竞品、相邻品牌或相关品类标签；如果无法确定，返回空数组。\n'
     '- research_directions: string[]，本轮可选调研方向；如果无法确定，返回空数组。\n'
-    '- custom_research_question: string，可选补充问题；没有则返回空字符串。\n'
     '- custom_competitor_input: string，可选用户补充竞品；没有则返回空字符串。\n'
     '- subject_structure: object，必须包含 schema_version、canonical_subject、subject_type、'
     'core_entities（每项包含 canonical_name、raw_mentions）、research_intents、'
     'context_modifiers、synonym_groups、ambiguities、resolution_state。raw_mentions 必须来自用户原文。\n'
     "结构拆分规则：核心对象只保留可被调研的实体（品牌、品类、产品或型号）；"
-    "用户要研究的行为或问题放入 research_intents，季节、人群、地点、场合等放入 context_modifiers。\n"
+    "research_intents 只放用户会直接和核心对象一起检索的具体产品属性或体验短词；"
+    "不要放产品卖点、购买考虑、研究目标等分析概念。季节、人群、地点、场合等放入 context_modifiers。\n"
     "不要把包含意图或场景修饰的完整用户句子直接复制为核心对象。"
     "raw_mentions 必须是用户原文中连续出现的实体片段；canonical_name 可对该片段做品类归一化。\n"
     "示例输出：\n"
     '{"subject_confirmation":"徒步短裤更可能是户外服饰品类，请确认。",'
     '"competitor_tags":["迪卡侬","凯乐石"],'
     '"research_directions":["产品卖点表达","用户评论痛点"],'
-    '"custom_research_question":"关注夏季轻量户外",'
     '"custom_competitor_input":"",'
     '"subject_structure":{"schema_version":"content_research_subject_structure_v1",'
     '"canonical_subject":"徒步短裤","subject_type":"category",'
     '"core_entities":[{"canonical_name":"徒步短裤","raw_mentions":["徒步短裤"]}],'
-    '"research_intents":["产品卖点"],"context_modifiers":["夏季轻量户外"],'
+    '"research_intents":["轻量"],"context_modifiers":["夏季户外"],'
     '"synonym_groups":{"徒步短裤":["户外短裤"]},"ambiguities":[],'
     '"resolution_state":"resolved"}}'
 )

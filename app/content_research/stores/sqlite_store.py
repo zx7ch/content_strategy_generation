@@ -717,7 +717,11 @@ class SQLiteContentResearchStore:
         return [self._row_to_observation_event(row) for row in rows]
 
     def save_scope_draft_with_audit_event(
-        self, draft: ResearchScopeDraft, event: ScopeDraftAuditEvent
+        self,
+        draft: ResearchScopeDraft,
+        event: ScopeDraftAuditEvent,
+        *,
+        replaces_scope_draft_id: str | None = None,
     ) -> ResearchScopeDraft:
         _validate_payload("ScopeDraftAuditEvent", event.payload)
         if event.workflow_run_id != draft.workflow_run_id or event.scope_draft_id != draft.id:
@@ -737,6 +741,7 @@ class SQLiteContentResearchStore:
                 "suggested_query": item.suggested_query,
                 "final_query": item.final_query,
                 "targeted_required_terms": list(item.targeted_required_terms),
+                "origin": item.origin,
             }
             for item in draft.query_groups
         ]
@@ -749,10 +754,24 @@ class SQLiteContentResearchStore:
                         "coverage_decision_required: resolve_coverage must resolve the current "
                         "Coverage before prepare_scope can create another Scope draft"
                     )
+                latest = conn.execute(
+                    """SELECT id FROM content_research_scope_drafts
+                       WHERE workflow_run_id=?
+                       ORDER BY created_at DESC, id DESC LIMIT 1""",
+                    (draft.workflow_run_id,),
+                ).fetchone()
+                if latest is not None and replaces_scope_draft_id is None:
+                    raise ValueError("scope_draft_replacement_id_required")
+                if replaces_scope_draft_id is not None and (
+                    latest is None or str(latest["id"]) != replaces_scope_draft_id
+                ):
+                    raise ValueError("stale_scope_draft_replacement")
                 conn.execute(
                     """INSERT INTO content_research_scope_drafts
                        (id, workflow_run_id, research_plan_id, structure_hash, constraints_json,
-                        query_groups_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                        query_groups_json, created_at, schema_version, core_object,
+                        product_experience_aspect, context_audience_aspect)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         draft.id,
                         draft.workflow_run_id,
@@ -761,6 +780,10 @@ class SQLiteContentResearchStore:
                         _dumps_any_list(constraints),
                         _dumps_any_list(groups),
                         _fmt_dt(draft.created_at),
+                        draft.schema_version,
+                        draft.core_object,
+                        draft.product_experience_aspect,
+                        draft.context_audience_aspect,
                     ),
                 )
                 conn.execute(
@@ -907,6 +930,7 @@ class SQLiteContentResearchStore:
                     suggested_query=proposal.suggested_query,
                     final_query=final_query,
                     targeted_required_terms=proposal.targeted_required_terms,
+                    origin=proposal.origin,
                 )
                 for proposal, final_query in zip(draft.query_groups, final_queries, strict=True)
             )
@@ -916,6 +940,7 @@ class SQLiteContentResearchStore:
                 version=version,
                 constraints=draft.constraints,
                 query_groups=query_groups,
+                schema_version=draft.schema_version,
             )
             event = ScopeAuditEvent(
                 id=event_id,
@@ -3948,6 +3973,7 @@ class SQLiteContentResearchStore:
                 targeted_required_terms=tuple(
                     str(term) for term in item.get("targeted_required_terms") or ()
                 ),
+                origin=item.get("origin"),
             )
             for item in _loads_any_list(row["query_groups_json"])
         )
@@ -3959,6 +3985,18 @@ class SQLiteContentResearchStore:
             constraints=constraints,
             query_groups=groups,
             created_at=_parse_dt(row["created_at"]),
+            schema_version=str(row["schema_version"]),
+            core_object=str(row["core_object"] or ""),
+            product_experience_aspect=(
+                str(row["product_experience_aspect"])
+                if row["product_experience_aspect"] is not None
+                else None
+            ),
+            context_audience_aspect=(
+                str(row["context_audience_aspect"])
+                if row["context_audience_aspect"] is not None
+                else None
+            ),
         )
 
     @staticmethod

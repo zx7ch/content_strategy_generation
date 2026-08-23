@@ -51,8 +51,6 @@ class ResearchPlanBuilder:
             "selected_competitors": confirmation.selected_competitors,
             "custom_competitors": confirmation.custom_competitors,
             "selected_directions": confirmation.selected_directions,
-            "custom_research_question": confirmation.custom_research_question,
-            "primary_marketing_goal": confirmation.primary_marketing_goal,
             "objective": _objective(confirmation),
             "strategy_summary": "P0 plan compiles selected directions into queued subagent task specs.",
             "directions_payload": direction_payloads,
@@ -71,7 +69,4 @@ class ResearchPlanBuilder:
 
 
 def _objective(confirmation: BriefConfirmation) -> str:
-    question = confirmation.custom_research_question.strip()
-    if question:
-        return question
     return f"围绕 {confirmation.confirmed_subject} 生成小红书内容调研计划"

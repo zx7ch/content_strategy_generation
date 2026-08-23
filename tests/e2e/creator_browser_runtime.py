@@ -46,6 +46,18 @@ class DeterministicPresearchLLM:
         )
         seed_match = re.search(r"用户输入:\s*(.+)", user_prompt)
         subject = seed_match.group(1).strip() if seed_match else "夏季通勤短裤"
+        if subject == "长袖衬衫 凉感 夏季通勤":
+            core_object = "长袖衬衫"
+            research_intents = ["凉感"]
+            context_modifiers = ["夏季通勤"]
+        elif subject == "长袖衬衫":
+            core_object = "长袖衬衫"
+            research_intents = ["上身感受"]
+            context_modifiers = []
+        else:
+            core_object = subject
+            research_intents = ["内容调研"]
+            context_modifiers = []
         return LLMResponse(
             content=json.dumps(
                 {
@@ -63,10 +75,10 @@ class DeterministicPresearchLLM:
                         "canonical_subject": subject,
                         "subject_type": "category",
                         "core_entities": [
-                            {"canonical_name": subject, "raw_mentions": [subject]}
+                            {"canonical_name": core_object, "raw_mentions": [core_object]}
                         ],
-                        "research_intents": ["内容调研"],
-                        "context_modifiers": [],
+                        "research_intents": research_intents,
+                        "context_modifiers": context_modifiers,
                         "synonym_groups": {},
                         "ambiguities": [],
                         "resolution_state": "resolved",
@@ -132,6 +144,7 @@ class DeterministicSuccessfulSource(CapableFakeAdapter):
 
     def __init__(self, call_log_path: str) -> None:
         super().__init__()
+        self.authenticated = True
         self._call_log_path = Path(call_log_path)
 
     async def discover_candidates(self, request):
@@ -148,6 +161,16 @@ class DeterministicSuccessfulSource(CapableFakeAdapter):
                 + "\n"
             )
         return await super().discover_candidates(request)
+
+    async def collect_note_detail(self, request):
+        result = await super().collect_note_detail(request)
+        for item in result.items:
+            item["title"] = "长袖衬衫与徒步短裤真实体验"
+            item["content_text"] = (
+                "这条笔记明确讨论长袖衬衫和徒步短裤，"
+                "但不把凉感或夏季通勤作为硬性准入条件。"
+            )
+        return result
 
 
 class DeterministicWorkflowRestoreFailure:

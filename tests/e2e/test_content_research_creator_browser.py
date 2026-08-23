@@ -173,6 +173,194 @@ def browser_page(real_creator_stack):
         browser.close()
 
 
+def _open_product_marketing_scope(page: Page, stack: dict, *, seed: str):
+    page.goto(stack["frontend_url"] + "/creator", wait_until="domcontentloaded")
+    page.get_by_role("button", name=re.compile("内容调研")).click(timeout=15000)
+    research_input = page.get_by_role(
+        "textbox", name="输入品类、品牌或 SKU，发送后开始内容调研"
+    )
+    expect(research_input).to_be_enabled(timeout=15000)
+    research_input.fill(seed)
+    with page.expect_response(
+        lambda response: response.url.endswith("/content-research/presearch")
+        and response.status == 201,
+        timeout=30000,
+    ):
+        research_input.press("Enter")
+    subject_confirm = page.get_by_role("button", name="确认调研主体", exact=True)
+    brief_heading = page.get_by_role("heading", name="在开始前，请确认几个关键点")
+    expect(subject_confirm.or_(brief_heading)).to_be_visible(timeout=30000)
+    if subject_confirm.is_visible():
+        with page.expect_response(
+            lambda response: response.url.endswith("/actions")
+            and '"action":"confirm_subject_structure"' in (response.request.post_data or "")
+            and response.status == 200,
+            timeout=15000,
+        ):
+            subject_confirm.click()
+    brief_heading.wait_for(timeout=30000)
+    page.get_by_role("button", name="准确，继续").click()
+    page.get_by_role("button", name="产品营销", exact=True).click()
+    with page.expect_response(
+        lambda response: response.url.endswith("/actions")
+        and '"action":"confirm_brief"' in (response.request.post_data or "")
+        and response.status == 200,
+        timeout=30000,
+    ) as brief_response:
+        page.get_by_role("button", name=re.compile("确认并开始调研")).click()
+    scope = page.locator('section[aria-label="确认检索范围"]')
+    expect(scope).to_be_visible(timeout=30000)
+    return scope, brief_response.value.json()["workflow_run_id"]
+
+
+@pytest.mark.parametrize(
+    "real_creator_stack",
+    [{"source_scenario": "success"}],
+    indirect=True,
+)
+def test_creator_confirms_suggested_v2_portfolio_and_provider_receives_exact_queries(
+    browser_page,
+):
+    page, stack = browser_page
+    scope, workflow_run_id = _open_product_marketing_scope(
+        page,
+        stack,
+        seed="长袖衬衫 凉感 夏季通勤",
+    )
+    expected_queries = ["长袖衬衫", "长袖衬衫 凉感", "长袖衬衫 夏季通勤"]
+    for index, query in enumerate(expected_queries, start=1):
+        expect(scope.get_by_label(f"检索组 {index}")).to_have_value(query)
+
+    with page.expect_response(
+        lambda response: response.url.endswith("/actions")
+        and '"action":"confirm_scope"' in (response.request.post_data or "")
+        and response.status == 200,
+        timeout=30000,
+    ):
+        scope.get_by_role("button", name="确认并开始调研").click()
+
+    for _ in range(160):
+        if stack["source_call_log"].exists():
+            calls = [
+                json.loads(line)
+                for line in stack["source_call_log"].read_text(encoding="utf-8").splitlines()
+            ]
+            discovered = [
+                item["query"] for item in calls if item["operation"] == "discover_candidates"
+            ]
+            if len(discovered) >= 3:
+                break
+        page.wait_for_timeout(250)
+    else:
+        pytest.fail("Formal worker did not call the provider with the frozen portfolio")
+
+    assert discovered[:3] == expected_queries
+    for _ in range(160):
+        with sqlite3.connect(stack["db_path"]) as connection:
+            row = connection.execute(
+                "SELECT constraint_counts_json "
+                "FROM content_research_scope_coverage_snapshots "
+                "WHERE workflow_run_id=? ORDER BY created_at DESC LIMIT 1",
+                (workflow_run_id,),
+            ).fetchone()
+        if row is not None:
+            counts = json.loads(row[0])
+            break
+        page.wait_for_timeout(250)
+    else:
+        pytest.fail("Formal worker did not persist Scope coverage")
+    assert counts["core_object"]["matched_candidate_count"] >= 1
+    assert counts["_summary"]["eligible_candidate_count"] >= 1
+
+
+@pytest.mark.parametrize(
+    "real_creator_stack",
+    [{"source_scenario": "success"}],
+    indirect=True,
+)
+def test_creator_completes_missing_aspects_and_only_latest_draft_executes(browser_page):
+    page, stack = browser_page
+    scope, _workflow_run_id = _open_product_marketing_scope(
+        page,
+        stack,
+        seed="长袖衬衫",
+    )
+    expect(scope.get_by_label("检索组 1")).to_have_value("长袖衬衫")
+    expect(scope.get_by_label("产品／体验检索词")).to_be_visible()
+    expect(scope.get_by_label("场景／人群检索词")).to_be_visible()
+
+    held: list[object] = []
+
+    def hold_first_replacement(route) -> None:
+        payload = route.request.post_data_json
+        action_payload = payload.get("payload", {}) if isinstance(payload, dict) else {}
+        if (
+            payload.get("action") == "prepare_scope"
+            and action_payload.get("product_experience_aspect") == "凉感"
+            and not action_payload.get("context_audience_aspect")
+            and not held
+        ):
+            held.append(route)
+            return
+        route.continue_()
+
+    page.route("**/content-research/workflows/*/actions", hold_first_replacement)
+    scope.get_by_label("产品／体验检索词").fill("凉感")
+    scope.get_by_label("产品／体验检索词").press("Enter")
+    for _ in range(60):
+        if held:
+            break
+        page.wait_for_timeout(250)
+    else:
+        pytest.fail("First Scope replacement response was not held")
+
+    scope.get_by_label("场景／人群检索词").fill("夏季通勤")
+    with page.expect_response(
+        lambda response: response.url.endswith("/actions")
+        and '"action":"prepare_scope"' in (response.request.post_data or "")
+        and response.status == 200,
+        timeout=30000,
+    ):
+        scope.get_by_label("场景／人群检索词").press("Enter")
+    expect(scope.get_by_label("检索组 3")).to_have_value("长袖衬衫 夏季通勤")
+
+    held_route = held[0]
+    with page.expect_response(
+        lambda response: response.url.endswith("/actions")
+        and '"action":"prepare_scope"' in (response.request.post_data or "")
+        and response.status == 422,
+        timeout=30000,
+    ):
+        held_route.continue_()
+    page.wait_for_timeout(500)
+    expect(scope.get_by_label("检索组 2")).to_have_value("长袖衬衫 凉感")
+    expect(scope.get_by_label("检索组 3")).to_have_value("长袖衬衫 夏季通勤")
+
+    with page.expect_response(
+        lambda response: response.url.endswith("/actions")
+        and '"action":"confirm_scope"' in (response.request.post_data or "")
+        and response.status == 200,
+        timeout=30000,
+    ):
+        scope.get_by_role("button", name="确认并开始调研").click()
+
+    for _ in range(160):
+        if stack["source_call_log"].exists():
+            calls = [
+                json.loads(line)
+                for line in stack["source_call_log"].read_text(encoding="utf-8").splitlines()
+            ]
+            discovered = [
+                item["query"] for item in calls if item["operation"] == "discover_candidates"
+            ]
+            if len(discovered) >= 3:
+                break
+        page.wait_for_timeout(250)
+    else:
+        pytest.fail("Latest Scope Draft was not dispatched")
+    assert discovered[:3] == ["长袖衬衫", "长袖衬衫 凉感", "长袖衬衫 夏季通勤"]
+
+
 @pytest.mark.parametrize(
     "selected_direction_ids",
     [
@@ -245,7 +433,6 @@ def test_creator_brief_uses_fixed_catalog_and_submits_selected_subset(
             name=direction_labels[direction_id],
             exact=True,
         ).click()
-    page.get_by_label("产品营销目标", exact=True).select_option("content_seeding")
     confirm_button = page.get_by_role(
         "button",
         name=re.compile("确认并开始调研"),
@@ -307,7 +494,6 @@ def test_creator_restores_persisted_scope_draft_after_reload(browser_page):
     )
     page.get_by_role("button", name="准确，继续").click()
     page.get_by_role("button", name="产品营销", exact=True).click()
-    page.get_by_label("产品营销目标", exact=True).select_option("content_seeding")
     with page.expect_response(
         lambda response: response.url.endswith("/actions")
         and '"action":"confirm_brief"' in (response.request.post_data or "")
@@ -710,7 +896,6 @@ def test_creator_historical_run_never_overrides_durable_active_run_after_brief_c
     )
     page.get_by_role("button", name="准确，继续").click()
     page.get_by_role("button", name="产品营销", exact=True).click()
-    page.get_by_label("产品营销目标", exact=True).select_option("content_seeding")
     with page.expect_response(
         lambda response: response.url.endswith("/actions")
         and '"action":"confirm_brief"' in (response.request.post_data or "")

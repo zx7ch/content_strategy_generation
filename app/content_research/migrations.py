@@ -1436,6 +1436,20 @@ def _apply_0031(conn: sqlite3.Connection) -> None:
         conn.execute(statement)
 
 
+_V32_SCOPE_DRAFT_VERSION_COLUMNS = {
+    "content_research_scope_drafts": (
+        "schema_version TEXT NOT NULL DEFAULT 'content_research_scope_contract_v1'",
+        "core_object TEXT",
+        "product_experience_aspect TEXT",
+        "context_audience_aspect TEXT",
+    ),
+}
+
+
+def _apply_0032(conn: sqlite3.Connection) -> None:
+    _add_columns(conn, _V32_SCOPE_DRAFT_VERSION_COLUMNS)
+
+
 def _apply_0015(conn: sqlite3.Connection) -> None:
     conn.execute(_V15_LLM_CONFIGURATION_SQL)
 
@@ -1506,6 +1520,7 @@ def _expected_checksums(migration_0002_sql: str, legacy_checksum: str) -> dict[s
             (_V30_REPORT_LINEAGE_COLUMNS, _V30_REPORT_LINEAGE_INDEXES)
         ),
         "0031": _checksum(_V31_REPORT_INTEGRITY_EVENT_STATEMENTS),
+        "0032": _checksum(_V32_SCOPE_DRAFT_VERSION_COLUMNS),
     }
 
 
@@ -1802,6 +1817,13 @@ def apply_content_research_migrations(
                 name="report_publication_integrity_events",
                 checksum=expected_checksums["0031"],
                 apply=lambda: _apply_0031(conn),
+            )
+            _apply_migration(
+                conn,
+                version="0032",
+                name="version_scope_drafts_for_query_portfolios",
+                checksum=expected_checksums["0032"],
+                apply=lambda: _apply_0032(conn),
             )
         except Exception:
             conn.rollback()

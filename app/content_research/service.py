@@ -52,7 +52,6 @@ from app.content_research.async_dispatch import AsyncFormalResearchDispatchRepos
 from app.content_research.contracts import (
     DIRECTION_CATALOG_V1,
     LOCKED_QUERY_PLAN_SCHEMA_VERSION,
-    PRIMARY_MARKETING_GOAL_CATALOG,
     build_default_snapshot,
 )
 from app.content_research.decisions import ResearchDecisionService
@@ -115,6 +114,7 @@ from app.content_research.reporting.read_model import (
 )
 from app.content_research.runtime import canonical_fingerprint
 from app.content_research.scope_contract import (
+    SCOPE_CONTRACT_SCHEMA_VERSION_V2,
     CoverageSnapshot,
     DispatchLeaseContext,
     ExecutionContext,
@@ -161,7 +161,10 @@ from app.content_research.workflow.directional_pipeline import (
 from app.content_research.workflow.query_planner import (
     QUERY_COMPILER_VERSION,
     CompiledQueryPlan,
+    compile_product_marketing_query_plan,
+    compile_product_marketing_query_portfolio,
     compile_structured_query_plan,
+    concrete_product_marketing_aspect,
 )
 from app.content_research.workflow_mutation_authority import (
     LegacyRecoveryActionUnavailableError,
@@ -1209,24 +1212,14 @@ class ContentResearchService:
                     "Selected directions must belong to the Lite direction catalog"
                 )
             directions = self._direction_registry.require_many(selected_direction_ids)
-            if "product_marketing" in selected_direction_ids:
-                brief = self._apply_product_marketing_structure_confirmation(
-                    brief=brief,
-                    confirmation_request=confirmation_request,
-                )
-            primary_marketing_goal = confirmation_request.primary_marketing_goal.strip()
-            if primary_marketing_goal not in PRIMARY_MARKETING_GOAL_CATALOG:
-                raise ContentResearchValidationError(
-                    "primary_marketing_goal must be a Lite marketing goal"
-                )
             confirmation = BriefConfirmation(
                 confirmed_subject=confirmation_request.confirmed_subject.strip(),
                 subject_type=confirmation_request.subject_type.strip() or "unknown",
                 selected_competitors=_dedupe(confirmation_request.selected_competitors),
                 custom_competitors=_dedupe(confirmation_request.custom_competitors),
                 selected_directions=selected_direction_ids,
-                custom_research_question=confirmation_request.custom_research_question.strip(),
-                primary_marketing_goal=primary_marketing_goal,
+                custom_research_question="",
+                primary_marketing_goal="content_seeding",
             )
         except BaseException:
             if abort_boundary is not None:
@@ -1250,70 +1243,6 @@ class ContentResearchService:
         if finish_boundary is not None:
             await finish_boundary(brief.workflow_run_id, "plan_build")
         return response
-
-    def _apply_product_marketing_structure_confirmation(
-        self,
-        *,
-        brief: ResearchBriefRecord,
-        confirmation_request: ContentResearchBriefConfirmRequest,
-    ) -> ResearchBriefRecord:
-        required_fields = [
-            "core_entities[0]",
-            "research_intents[0]",
-            "context_modifiers",
-        ]
-        persisted_fields = list(brief.payload.get("subject_structure_user_confirmed_fields") or [])
-        if all(field in persisted_fields for field in required_fields):
-            return brief
-
-        submitted = confirmation_request.subject_structure_confirmation
-        if submitted is None:
-            raise ContentResearchValidationError(
-                "product_marketing requires explicit subject structure confirmation"
-            )
-
-        core_object = _normalized_subject_term(submitted.core_object)
-        research_intent = _normalized_subject_term(submitted.research_intent)
-        contexts = _normalized_subject_contexts(submitted.context_modifiers)
-        if not core_object or not research_intent:
-            raise ContentResearchValidationError("core_object and research_intent are required")
-        if len(contexts) > 8:
-            raise ContentResearchValidationError("at most 8 context modifiers are allowed")
-        structure = SubjectStructure(
-            schema_version=SUBJECT_STRUCTURE_SCHEMA_VERSION,
-            canonical_subject=_normalized_subject_term(
-                str(brief.payload.get("seed_text") or core_object)
-            ),
-            subject_type=str(
-                (brief.payload.get("subject_structure") or {}).get("subject_type") or "unknown"
-            ),
-            core_entities=(
-                SubjectEntity(
-                    canonical_name=core_object,
-                    raw_mentions=(core_object,),
-                ),
-            ),
-            research_intents=(research_intent,),
-            context_modifiers=tuple(contexts),
-            synonym_groups=(),
-            ambiguities=(),
-            resolution_state="resolved",
-        )
-        structure_hash = subject_structure_fingerprint(structure)
-        return replace(
-            brief,
-            payload={
-                **brief.payload,
-                "subject_confirmation": f"已确认调研 {core_object} 的 {research_intent}。",
-                "subject_structure": subject_structure_payload(structure),
-                "subject_structure_hash": structure_hash,
-                "subject_structure_state": "confirmed",
-                "subject_structure_reason_codes": [],
-                "subject_structure_authority": "user_confirmed",
-                "subject_structure_user_confirmed_fields": required_fields,
-            },
-            updated_at=utcnow(),
-        )
 
     async def _build_and_persist_confirmed_plan(
         self,
@@ -1384,9 +1313,9 @@ class ContentResearchService:
                 "run_as_of_at": run_as_of_at,
             }
             if direction.id == "product_marketing":
-                compiled_plans[direction.id] = compile_structured_query_plan(
-                    **compile_kwargs,
-                    primary_marketing_goal=confirmation.primary_marketing_goal,
+                compiled_plans[direction.id] = compile_product_marketing_query_plan(
+                    subject_structure=structure_decision.structure,
+                    run_as_of_at=run_as_of_at,
                 )
                 continue
             compiled_plans[direction.id] = compile_structured_query_plan(
@@ -1420,7 +1349,6 @@ class ContentResearchService:
                 "input_payload": {
                     **dict(spec.get("input_payload") or {}),
                     "query_plan_hash": compiled_plans[direction.id].plan_hash,
-                    "primary_marketing_goal": confirmation.primary_marketing_goal,
                 },
             }
             for spec, direction in zip(task_specs, directions, strict=True)
@@ -1436,7 +1364,11 @@ class ContentResearchService:
             brief,
             status="ready",
             payload={
-                **brief.payload,
+                **{
+                    key: value
+                    for key, value in brief.payload.items()
+                    if key != "custom_research_question"
+                },
                 "status": "ready",
                 "confirmed_subject": confirmation.confirmed_subject,
                 "subject_type": confirmation.subject_type,
@@ -1444,8 +1376,6 @@ class ContentResearchService:
                 "custom_competitors": confirmation.custom_competitors,
                 "selected_directions": confirmation.selected_directions,
                 "requested_direction_ids": confirmation.selected_directions,
-                "custom_research_question": confirmation.custom_research_question,
-                "primary_marketing_goal": confirmation.primary_marketing_goal,
             },
             updated_at=utcnow(),
         )
@@ -2683,7 +2613,8 @@ class ContentResearchService:
             limit=limit,
         )
 
-    def _prepare_scope(self, *, brief: ResearchBriefRecord, direction_id: str) -> dict[str, Any]:
+    def _prepare_scope(self, *, brief: ResearchBriefRecord, request: PrepareScopeRequest) -> dict[str, Any]:
+        direction_id = request.direction_id
         unresolved = self._store.get_unresolved_coverage_snapshot(brief.workflow_run_id)
         if unresolved is not None:
             raise ContentResearchValidationError(
@@ -2703,6 +2634,10 @@ class ContentResearchService:
         if direction_id not in direction_ids:
             raise ContentResearchValidationError(
                 "Scope direction is not part of the confirmed research plan"
+            )
+        if "product_marketing" in direction_ids and direction_id != "product_marketing":
+            raise ContentResearchValidationError(
+                "Product-marketing runs must prepare the product-marketing Scope v2"
             )
         structure_payload = dict(brief.payload.get("subject_structure") or {})
         normalized_input = " ".join(
@@ -2725,6 +2660,75 @@ class ContentResearchService:
             )
         structure = decision.structure
         core = structure.core_entities[0]
+        if direction_id == "product_marketing":
+            proposed_product_aspect = (
+                request.product_experience_aspect
+                if request.product_experience_aspect is not None
+                else structure.research_intents[0]
+                if structure.research_intents
+                else None
+            )
+            product_aspect = concrete_product_marketing_aspect(proposed_product_aspect)
+            context_aspect = " ".join(
+                (
+                    request.context_audience_aspect,
+                )
+                if request.context_audience_aspect is not None
+                else structure.context_modifiers
+            ).strip() or None
+            suggestions = compile_product_marketing_query_portfolio(
+                core_object=core.canonical_name,
+                product_experience_aspect=product_aspect,
+                context_audience_aspect=context_aspect,
+            )
+            user_supplied_queries = {
+                query
+                for query in (
+                    (
+                        f"{core.canonical_name} {product_aspect}"
+                        if request.product_experience_aspect is not None and product_aspect
+                        else None
+                    ),
+                    (
+                        f"{core.canonical_name} {context_aspect}"
+                        if request.context_audience_aspect is not None and context_aspect
+                        else None
+                    ),
+                )
+                if query is not None
+            }
+            constraints = (
+                ScopeConstraint(
+                    "core_object",
+                    "核心对象",
+                    core.canonical_name,
+                    "required",
+                    tuple(value for value in core.raw_mentions if value != core.canonical_name),
+                ),
+            )
+            draft = build_scope_draft(
+                workflow_run_id=brief.workflow_run_id,
+                research_plan_id=plan.id,
+                structure_hash=str(brief.payload.get("subject_structure_hash") or ""),
+                schema_version=SCOPE_CONTRACT_SCHEMA_VERSION_V2,
+                core_object=core.canonical_name,
+                product_experience_aspect=product_aspect,
+                context_audience_aspect=context_aspect,
+                constraints=constraints,
+                query_groups=tuple(
+                    ScopeQueryGroupInput(
+                        query,
+                        query,
+                        (core.canonical_name,),
+                        "user_edited" if query in user_supplied_queries else "system_suggested",
+                    )
+                    for query in suggestions
+                ),
+            )
+            return self._persist_scope_draft(
+                draft,
+                replaces_scope_draft_id=request.replaces_scope_draft_id,
+            )
         constraints = [
             ScopeConstraint(
                 "core_object",
@@ -2770,20 +2774,36 @@ class ContentResearchService:
                 ),
             ),
         )
+        return self._persist_scope_draft(draft)
+
+    def _persist_scope_draft(
+        self,
+        draft: ResearchScopeDraft,
+        *,
+        replaces_scope_draft_id: str | None = None,
+    ) -> dict[str, Any]:
         event = ScopeDraftAuditEvent(
             id=_new_id("sae"),
-            workflow_run_id=brief.workflow_run_id,
+            workflow_run_id=draft.workflow_run_id,
             scope_draft_id=draft.id,
             event_name="scope_suggested",
             payload={
                 "schema_version": "content_research_scope_audit_event_v1",
                 "scope_draft_id": draft.id,
                 "structure_hash": draft.structure_hash,
+                "scope_contract_schema_version": draft.schema_version,
+                "core_object": draft.core_object,
+                "product_experience_aspect": draft.product_experience_aspect,
+                "context_audience_aspect": draft.context_audience_aspect,
                 "constraints": [_scope_constraint_payload(item) for item in draft.constraints],
                 "query_groups": [_scope_query_input_payload(item) for item in draft.query_groups],
             },
         )
-        self._store.save_scope_draft_with_audit_event(draft, event)
+        self._store.save_scope_draft_with_audit_event(
+            draft,
+            event,
+            replaces_scope_draft_id=replaces_scope_draft_id,
+        )
         return {**_scope_draft_payload(draft), "audit_event": _scope_draft_audit_payload(event)}
 
     def _confirm_scope(
@@ -3095,9 +3115,10 @@ class ContentResearchService:
             )
 
         if action == "prepare_scope":
+            prepare_request = PrepareScopeRequest(**request.payload)
             prepared = self._prepare_scope(
                 brief=brief,
-                direction_id=PrepareScopeRequest(**request.payload).direction_id,
+                request=prepare_request,
             )
             return self._action_response(
                 workflow_run_id=workflow_run_id,
@@ -3554,6 +3575,27 @@ class ContentResearchService:
             )
         requested_directions = {item.strip() for item in requested_directions_value}
         if "product_marketing" not in requested_directions:
+            return
+
+        scope_contracts = self._store.list_scope_contracts(brief.workflow_run_id)
+        current_scope = scope_contracts[-1] if scope_contracts else None
+        if (
+            current_scope is not None
+            and current_scope.schema_version == SCOPE_CONTRACT_SCHEMA_VERSION_V2
+        ):
+            required_constraint_ids = tuple(
+                item.id for item in current_scope.constraints if item.mode == "required"
+            )
+            if required_constraint_ids != ("core_object",):
+                raise ContentResearchValidationError(
+                    "Product marketing Scope v2 requires only the frozen core object"
+                )
+            if not 1 <= len(current_scope.query_groups) <= 3 or any(
+                not item.final_query.strip() for item in current_scope.query_groups
+            ):
+                raise ContentResearchValidationError(
+                    "Product marketing Scope v2 requires one to three frozen queries"
+                )
             return
 
         required_fields = [
@@ -5739,7 +5781,6 @@ class ContentResearchService:
             "competitor_tags": checklist.competitor_tags,
             "research_directions": checklist.research_directions,
             "direction_catalog": list(DIRECTION_CATALOG_V1),
-            "custom_research_question": checklist.custom_research_question,
             "custom_competitor_input": checklist.custom_competitor_input,
             "timeout_status": outcome.timeout_status,
             "fallback_used": outcome.fallback_used,
@@ -5789,7 +5830,6 @@ class ContentResearchService:
             competitor_tags=list(payload.get("competitor_tags") or []),
             research_directions=list(payload.get("research_directions") or []),
             direction_catalog=list(payload.get("direction_catalog") or DIRECTION_CATALOG_V1),
-            custom_research_question=str(payload.get("custom_research_question") or ""),
             custom_competitor_input=str(payload.get("custom_competitor_input") or ""),
             timeout_status=str(payload.get("timeout_status") or "none"),
             fallback_used=bool(payload.get("fallback_used")),
@@ -6067,6 +6107,7 @@ def _scope_query_input_payload(item: ScopeQueryGroupInput) -> dict[str, Any]:
         "suggested_query": item.suggested_query,
         "final_query": item.final_query,
         "targeted_required_terms": list(item.targeted_required_terms),
+        "origin": item.origin,
     }
 
 
@@ -6082,10 +6123,14 @@ def _scope_query_group_payload(item: Any) -> dict[str, Any]:
 
 def _scope_draft_payload(draft: ResearchScopeDraft) -> dict[str, Any]:
     return {
+        "schema_version": draft.schema_version,
         "id": draft.id,
         "workflow_run_id": draft.workflow_run_id,
         "research_plan_id": draft.research_plan_id,
         "structure_hash": draft.structure_hash,
+        "core_object": draft.core_object,
+        "product_experience_aspect": draft.product_experience_aspect,
+        "context_audience_aspect": draft.context_audience_aspect,
         "constraints": [_scope_constraint_payload(item) for item in draft.constraints],
         "query_groups": [_scope_query_input_payload(item) for item in draft.query_groups],
         "created_at": draft.created_at.isoformat(),

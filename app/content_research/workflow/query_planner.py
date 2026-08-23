@@ -15,6 +15,90 @@ PRIMARY_QUERY_GROUP_CAP = 2
 COVERAGE_FALLBACK_QUERY_GROUP_CAP = 1
 QUERY_GROUP_CANDIDATE_CAP = 20
 PRODUCT_MARKETING_GOAL_FACETS = {"content_seeding": "上身感受"}
+_ABSTRACT_PRODUCT_MARKETING_ASPECTS = frozenset(PRODUCT_MARKETING_GOAL_FACETS.values())
+_ABSTRACT_PRODUCT_MARKETING_MARKERS = (
+    "分析",
+    "调研",
+    "研究",
+    "营销",
+    "卖点",
+    "购买考虑",
+    "用户需求",
+    "品牌内容",
+)
+
+
+def concrete_product_marketing_aspect(value: str | None) -> str | None:
+    aspect = _display_term(value or "")
+    if (
+        not aspect
+        or aspect in _ABSTRACT_PRODUCT_MARKETING_ASPECTS
+        or any(marker in aspect for marker in _ABSTRACT_PRODUCT_MARKETING_MARKERS)
+    ):
+        return None
+    return aspect
+
+
+def compile_product_marketing_query_portfolio(
+    *,
+    core_object: str,
+    product_experience_aspect: str | None = None,
+    context_audience_aspect: str | None = None,
+) -> tuple[str, ...]:
+    """Compile concrete product search suggestions in fixed A/A B/A C order."""
+    core = _display_term(core_object)
+    if not core:
+        raise ValueError("product marketing query portfolio requires a core object")
+    product_aspect = concrete_product_marketing_aspect(product_experience_aspect) or ""
+    context_aspect = _display_term(context_audience_aspect or "")
+
+    queries = [core]
+    if product_aspect:
+        queries.append(f"{core} {product_aspect}")
+    if context_aspect:
+        queries.append(f"{core} {context_aspect}")
+    return tuple(dict.fromkeys(queries))
+
+
+def compile_product_marketing_query_plan(
+    *,
+    subject_structure: SubjectStructure,
+    run_as_of_at: datetime,
+    product_experience_aspect: str | None = None,
+    context_audience_aspect: str | None = None,
+    provider: str = "xiaohongshu",
+    sort: str = "likes",
+) -> CompiledQueryPlan:
+    if len(subject_structure.core_entities) != 1:
+        raise ValueError("Lite query compilation requires one core entity")
+    if run_as_of_at.tzinfo is None or run_as_of_at.utcoffset() is None:
+        raise ValueError("run_as_of_at must be timezone-aware")
+    queries = compile_product_marketing_query_portfolio(
+        core_object=subject_structure.core_entities[0].canonical_name,
+        product_experience_aspect=product_experience_aspect,
+        context_audience_aspect=context_audience_aspect,
+    )
+    roles = ("core_object", "product_experience", "context_audience")
+    groups = tuple(
+        _planned_group(
+            direction_id="product_marketing",
+            role=roles[index],
+            activation="primary",
+            terms=(query,),
+            priority=index,
+            provider=provider,
+            sort=sort,
+            run_as_of_at=run_as_of_at,
+        )
+        for index, query in enumerate(queries)
+    )
+    return CompiledQueryPlan(
+        primary_groups=groups,
+        fallback_group=None,
+        plan_hash=canonical_fingerprint(
+            {"query_groups": [_planned_payload(item)["query_group"] for item in groups]}
+        ),
+    )
 
 
 @dataclass(frozen=True)

@@ -141,17 +141,6 @@ async def test_trace_is_readable_after_presearch_started_before_a_brief_exists(
     assert [event["event_name"] for event in payload["observation_events"]] == ["presearch_started"]
 
 
-def _subject_structure_confirmation(presearch: dict) -> dict:
-    return {
-        "subject_structure_hash": presearch["subject_structure_hash"],
-        "subject_structure_confirmation": {
-            "core_object": "Satisfy Running",
-            "research_intent": "品牌内容",
-            "context_modifiers": [],
-        },
-    }
-
-
 def test_provider_operations_do_not_merge_identical_calls_from_two_specialists(tmp_path):
     store = SQLiteContentResearchStore(str(tmp_path / "trace-specialists.db"))
     for task_id in ("specialist-a", "specialist-b"):
@@ -201,13 +190,11 @@ async def test_content_research_trace_api_restores_runtime_observation_and_usage
         f"/content-research/briefs/{presearch['brief_id']}/confirm",
         json={
             "confirmed_subject": "Satisfy Running",
-            **_subject_structure_confirmation(presearch),
+            "subject_structure_hash": presearch["subject_structure_hash"],
             "subject_type": "brand",
             "selected_competitors": ["District Vision"],
             "custom_competitors": ["Salomon"],
             "selected_directions": ["product_marketing", "content_performance"],
-            "custom_research_question": "关注跑步社群活动",
-            "primary_marketing_goal": "content_seeding",
         },
     )
     assert confirm_response.status_code == 200
@@ -340,13 +327,11 @@ async def test_terminal_trace_timing_is_stable_across_repeated_reads(client_with
         f"/content-research/briefs/{presearch['brief_id']}/confirm",
         json={
             "confirmed_subject": "Satisfy Running",
-            **_subject_structure_confirmation(presearch),
+            "subject_structure_hash": presearch["subject_structure_hash"],
             "subject_type": "brand",
             "selected_competitors": [],
             "custom_competitors": [],
             "selected_directions": ["product_marketing"],
-            "custom_research_question": "",
-            "primary_marketing_goal": "content_seeding",
         },
     )
     assert confirm_response.status_code == 200
@@ -395,13 +380,11 @@ async def test_content_research_trace_api_keeps_running_parent_and_safe_auth_req
         f"/content-research/briefs/{presearch['brief_id']}/confirm",
         json={
             "confirmed_subject": "Satisfy Running",
-            **_subject_structure_confirmation(presearch),
+            "subject_structure_hash": presearch["subject_structure_hash"],
             "subject_type": "brand",
             "selected_competitors": [],
             "custom_competitors": [],
             "selected_directions": ["product_marketing"],
-            "custom_research_question": "",
-            "primary_marketing_goal": "content_seeding",
         },
     )
     assert confirm_response.status_code == 200

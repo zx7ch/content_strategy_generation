@@ -235,8 +235,6 @@ async def _create_and_confirm_brief(client, *, thread_id: str, seed_text: str) -
             "subject_structure_hash": presearch["subject_structure_hash"],
             "subject_type": "category",
             "selected_directions": ["product_marketing"],
-            "primary_marketing_goal": "content_seeding",
-            "subject_structure_confirmation": _shorts_structure_confirmation(),
         },
     )
     assert confirmation.status_code == 200
@@ -264,8 +262,6 @@ async def test_confirm_brief_atomically_sets_the_thread_active_run(
             "subject_structure_hash": presearch["subject_structure_hash"],
             "subject_type": "category",
             "selected_directions": ["product_marketing"],
-            "primary_marketing_goal": "content_seeding",
-            "subject_structure_confirmation": _shorts_structure_confirmation(),
         },
     )
 
@@ -309,8 +305,6 @@ async def test_confirm_brief_writer_failure_rolls_back_plan_and_active_run(
             "subject_structure_hash": run_c["subject_structure_hash"],
             "subject_type": "category",
             "selected_directions": ["product_marketing"],
-            "primary_marketing_goal": "content_seeding",
-            "subject_structure_confirmation": _shorts_structure_confirmation(),
         },
     )
 
@@ -327,9 +321,7 @@ def _shorts_structure_confirmation() -> dict:
     }
 
 
-async def _confirm_product_marketing_brief(
-    client, *, presearch: dict | None = None, custom_research_question: str = ""
-):
+async def _confirm_product_marketing_brief(client, *, presearch: dict | None = None):
     presearch = presearch or await _create_presearch(client, seed_text="夏季凉感 T恤")
     response = await client.post(
         f"/content-research/briefs/{presearch['brief_id']}/confirm",
@@ -338,13 +330,6 @@ async def _confirm_product_marketing_brief(
             "subject_structure_hash": presearch["subject_structure_hash"],
             "subject_type": "category",
             "selected_directions": ["product_marketing"],
-            "custom_research_question": custom_research_question,
-            "primary_marketing_goal": "content_seeding",
-            "subject_structure_confirmation": {
-                "core_object": "T恤",
-                "research_intent": "凉感",
-                "context_modifiers": ["夏季"],
-            },
         },
     )
     assert response.status_code == 200
@@ -413,12 +398,6 @@ async def test_product_marketing_dispatch_guard_rejects_missing_confirmed_fields
             "subject_structure_hash": presearch["subject_structure_hash"],
             "subject_type": "category",
             "selected_directions": ["product_marketing"],
-            "primary_marketing_goal": "content_seeding",
-            "subject_structure_confirmation": {
-                "core_object": "T恤",
-                "research_intent": "凉感",
-                "context_modifiers": ["夏季"],
-            },
         },
     )
     assert confirmed.status_code == 200
@@ -435,52 +414,6 @@ async def test_product_marketing_dispatch_guard_rejects_missing_confirmed_fields
             },
         )
     )
-
-    response = await _start_formal_research(
-        product_marketing_client, presearch["workflow_run_id"]
-    )
-
-    assert response.status_code == 422
-    assert response.json()["error_code"] == "INVALID_CONTENT_RESEARCH_PAYLOAD"
-    assert await _dispatch_job_count(service) == 0
-
-
-@pytest.mark.asyncio
-async def test_product_marketing_dispatch_guard_rejects_tampered_q2_without_first_intent_before_enqueue(
-    product_marketing_client,
-):
-    presearch = await _create_presearch(product_marketing_client, seed_text="夏季凉感 T恤")
-    await _confirm_product_marketing_brief(
-        product_marketing_client, presearch=presearch
-    )
-    service = app.state.content_research_service
-    snapshot = service._store.get_run_policy_snapshot_for_workflow(
-        presearch["workflow_run_id"]
-    )
-    assert snapshot is not None
-    tampered_policy = json.loads(json.dumps(snapshot.effective_policy))
-    primary_groups = [
-        group
-        for group in tampered_policy["locked_query_plan"]["directions"]["product_marketing"][
-            "query_groups"
-        ]
-        if group["activation"] == "primary"
-    ]
-    assert len(primary_groups) == 2
-    primary_groups[1]["normalized_query"] = "T恤 上身感受"
-
-    async with aiosqlite.connect(service._store._db_path) as conn:
-        await conn.execute(
-            """UPDATE content_research_run_policy_snapshots
-               SET effective_policy_json = ?, effective_policy_hash = ?
-               WHERE id = ?""",
-            (
-                json.dumps(tampered_policy, ensure_ascii=False, sort_keys=True),
-                policy_hash(tampered_policy),
-                snapshot.id,
-            ),
-        )
-        await conn.commit()
 
     response = await _start_formal_research(
         product_marketing_client, presearch["workflow_run_id"]
@@ -634,110 +567,6 @@ async def test_formal_research_requires_confirmed_scope_before_runtime_dispatch(
 
 
 @pytest.mark.asyncio
-async def test_product_marketing_confirmation_requires_explicit_structure_fields(
-    product_marketing_client,
-):
-    presearch = await _create_presearch(product_marketing_client, seed_text="夏季凉感 T恤")
-
-    response = await product_marketing_client.post(
-        f"/content-research/briefs/{presearch['brief_id']}/confirm",
-        json={
-            "confirmed_subject": "夏季凉感 T 恤",
-            "subject_structure_hash": presearch["subject_structure_hash"],
-            "subject_type": "category",
-            "selected_directions": ["product_marketing"],
-            "primary_marketing_goal": "content_seeding",
-        },
-    )
-
-    assert response.status_code == 422
-    assert response.json()["error_code"] == "INVALID_CONTENT_RESEARCH_PAYLOAD"
-
-
-@pytest.mark.asyncio
-async def test_product_marketing_confirmation_freezes_explicit_structure_fields_and_query_plan(
-    product_marketing_client,
-):
-    presearch = await _create_presearch(product_marketing_client, seed_text="夏季凉感 T恤")
-
-    response = await product_marketing_client.post(
-        f"/content-research/briefs/{presearch['brief_id']}/confirm",
-        json={
-            "confirmed_subject": "夏季透气 T 恤",
-            "subject_structure_hash": presearch["subject_structure_hash"],
-            "subject_type": "category",
-            "selected_directions": ["product_marketing"],
-            "primary_marketing_goal": "content_seeding",
-            "subject_structure_confirmation": {
-                "core_object": "T恤",
-                "research_intent": "透气",
-                "context_modifiers": ["通勤", "夏季"],
-            },
-        },
-    )
-
-    assert response.status_code == 200
-    frozen_structure = response.json()["brief"]["payload"]["subject_structure"]
-    assert frozen_structure["core_entities"][0]["canonical_name"] == "T恤"
-    assert frozen_structure["research_intents"] == ["透气"]
-    assert frozen_structure["context_modifiers"] == ["通勤", "夏季"]
-    assert response.json()["brief"]["payload"]["subject_structure_user_confirmed_fields"] == [
-        "core_entities[0]",
-        "research_intents[0]",
-        "context_modifiers",
-    ]
-
-    snapshot = await product_marketing_client.get(
-        f"/content-research/workflows/{presearch['workflow_run_id']}/policy-snapshot"
-    )
-    groups = snapshot.json()["effective_policy"]["locked_query_plan"]["directions"][
-        "product_marketing"
-    ]["query_groups"]
-    assert [group["normalized_query"] for group in groups if group["activation"] == "primary"] == [
-        "T恤 透气",
-        "T恤 透气 上身感受",
-    ]
-
-
-@pytest.mark.asyncio
-async def test_product_marketing_confirmation_freezes_user_corrected_core_absent_from_seed(
-    product_marketing_client,
-):
-    presearch = await _create_presearch(product_marketing_client, seed_text="夏季凉感 T恤")
-
-    response = await product_marketing_client.post(
-        f"/content-research/briefs/{presearch['brief_id']}/confirm",
-        json={
-            "confirmed_subject": "夏季透气背心",
-            "subject_structure_hash": presearch["subject_structure_hash"],
-            "subject_type": "category",
-            "selected_directions": ["product_marketing"],
-            "primary_marketing_goal": "content_seeding",
-            "subject_structure_confirmation": {
-                "core_object": "背心",
-                "research_intent": "透气",
-                "context_modifiers": ["夏季"],
-            },
-        },
-    )
-
-    assert response.status_code == 200
-    assert response.json()["brief"]["payload"]["subject_structure"]["core_entities"] == [
-        {"canonical_name": "背心", "raw_mentions": ["背心"]}
-    ]
-    snapshot = await product_marketing_client.get(
-        f"/content-research/workflows/{presearch['workflow_run_id']}/policy-snapshot"
-    )
-    groups = snapshot.json()["effective_policy"]["locked_query_plan"]["directions"][
-        "product_marketing"
-    ]["query_groups"]
-    assert [group["normalized_query"] for group in groups if group["activation"] == "primary"] == [
-        "背心 透气",
-        "背心 透气 上身感受",
-    ]
-
-
-@pytest.mark.asyncio
 async def test_product_marketing_confirmation_reuses_task_one_confirmed_fields_without_second_payload(
     product_marketing_client,
 ):
@@ -766,7 +595,6 @@ async def test_product_marketing_confirmation_reuses_task_one_confirmed_fields_w
             "subject_structure_hash": presearch["subject_structure_hash"],
             "subject_type": "category",
             "selected_directions": ["product_marketing"],
-            "primary_marketing_goal": "content_seeding",
         },
     )
 
@@ -779,32 +607,13 @@ async def test_product_marketing_confirmation_reuses_task_one_confirmed_fields_w
 
 
 @pytest.mark.asyncio
-async def test_confirmed_product_marketing_plan_uses_goal_facet_with_subject_intent(
+async def test_confirmed_product_marketing_brief_locks_only_the_core_query(
     product_marketing_client,
 ):
     locked_plan = await _confirm_product_marketing_brief(product_marketing_client)
 
     groups = locked_plan["directions"]["product_marketing"]["query_groups"]
-    primary_queries = [
-        group["normalized_query"] for group in groups if group["activation"] == "primary"
-    ]
-    assert primary_queries == ["T恤 凉感", "T恤 凉感 上身感受"]
-
-
-@pytest.mark.asyncio
-async def test_confirmed_product_marketing_plan_prefers_custom_focus_over_goal_facet(
-    product_marketing_client,
-):
-    locked_plan = await _confirm_product_marketing_brief(
-        product_marketing_client,
-        custom_research_question="通勤",
-    )
-
-    groups = locked_plan["directions"]["product_marketing"]["query_groups"]
-    primary_queries = [
-        group["normalized_query"] for group in groups if group["activation"] == "primary"
-    ]
-    assert primary_queries == ["T恤 凉感", "T恤 凉感 通勤"]
+    assert [group["normalized_query"] for group in groups] == ["T恤"]
 
 
 @pytest.mark.asyncio
@@ -828,15 +637,12 @@ async def test_confirm_brief_creates_plan_directions_tasks_and_workflow_summary(
     response = await client.post(
         f"/content-research/briefs/{presearch['brief_id']}/confirm",
         json={
-                "confirmed_subject": "徒步短裤",
-                "subject_structure_hash": presearch["subject_structure_hash"],
+            "confirmed_subject": "徒步短裤",
+            "subject_structure_hash": presearch["subject_structure_hash"],
             "subject_type": "category",
             "selected_competitors": ["迪卡侬"],
             "custom_competitors": ["凯乐石"],
             "selected_directions": ["product_marketing", "competitor_discovery"],
-            "custom_research_question": "关注夏季轻量户外",
-            "primary_marketing_goal": "content_seeding",
-            "subject_structure_confirmation": _shorts_structure_confirmation(),
         },
     )
 
@@ -845,18 +651,14 @@ async def test_confirm_brief_creates_plan_directions_tasks_and_workflow_summary(
     assert payload["workflow_run_id"] == presearch["workflow_run_id"]
     assert payload["brief"]["status"] == "ready"
     assert payload["brief"]["payload"]["confirmed_subject"] == "徒步短裤"
-    assert payload["brief"]["payload"]["subject_structure_hash"] != presearch[
+    assert payload["brief"]["payload"]["subject_structure_hash"] == presearch[
         "subject_structure_hash"
-    ]
-    assert payload["brief"]["payload"]["subject_structure_user_confirmed_fields"] == [
-        "core_entities[0]",
-        "research_intents[0]",
-        "context_modifiers",
     ]
     frozen_structure_hash = payload["brief"]["payload"]["subject_structure_hash"]
     assert payload["brief"]["payload"]["selected_competitors"] == ["迪卡侬"]
     assert payload["brief"]["payload"]["custom_competitors"] == ["凯乐石"]
-    assert payload["brief"]["payload"]["primary_marketing_goal"] == "content_seeding"
+    assert "primary_marketing_goal" not in payload["brief"]["payload"]
+    assert "custom_research_question" not in payload["brief"]["payload"]
     assert payload["brief"]["payload"]["direction_catalog"] == [
         "product_marketing",
         "competitor_discovery",
@@ -885,11 +687,11 @@ async def test_confirm_brief_creates_plan_directions_tasks_and_workflow_summary(
         for item in payload["subagent_tasks"]
     )
     assert all(
-        item["payload"]["input_payload"]["primary_marketing_goal"] == "content_seeding"
+        "primary_marketing_goal" not in item["payload"]["input_payload"]
         for item in payload["subagent_tasks"]
     )
     assert payload["plan"]["payload"]["subject_structure_hash"] == frozen_structure_hash
-    assert payload["plan"]["payload"]["primary_marketing_goal"] == "content_seeding"
+    assert "primary_marketing_goal" not in payload["plan"]["payload"]
 
     fetched = await client.get(f"/content-research/workflows/{presearch['workflow_run_id']}")
     assert fetched.status_code == 200
@@ -935,7 +737,7 @@ async def test_confirm_brief_creates_plan_directions_tasks_and_workflow_summary(
     assert locked["primary_query_group_cap"] == 2
     assert locked["coverage_fallback_query_group_cap"] == 1
     assert locked["candidate_cap_per_group"] == 20
-    assert locked["custom_research_question"] == "关注夏季轻量户外"
+    assert locked["custom_research_question"] == ""
     assert set(locked["directions"]) == {
         "product_marketing",
         "competitor_discovery",
@@ -967,11 +769,11 @@ async def test_confirm_brief_creates_plan_directions_tasks_and_workflow_summary(
         assert (
             task["payload"]["input_payload"]["query_plan_hash"] == direction_plan["query_plan_hash"]
         )
-    assert any(
-        "关注夏季轻量户外" in group["normalized_query"]
-        for direction in locked["directions"].values()
-        for group in direction["query_groups"]
-    )
+    product_queries = [
+        group["normalized_query"]
+        for group in locked["directions"]["product_marketing"]["query_groups"]
+    ]
+    assert product_queries == ["短裤"]
     assert all(
         sorted(contract["metadata"]["query_relevance"]["query_group_ids"])
         == sorted(
@@ -1000,8 +802,6 @@ async def test_confirm_brief_creates_plan_directions_tasks_and_workflow_summary(
             "selected_competitors": [],
             "custom_competitors": [],
             "selected_directions": ["product_marketing"],
-            "custom_research_question": "",
-            "primary_marketing_goal": "content_seeding",
         },
     )
     assert repeat_confirmation.status_code == 409
@@ -1029,12 +829,6 @@ async def test_confirm_freezes_catalog_and_requested_subset(client, requested):
             "confirmed_subject": "徒步短裤",
             "subject_type": "category",
             "selected_directions": requested,
-            "primary_marketing_goal": "content_seeding",
-            **(
-                {"subject_structure_confirmation": _shorts_structure_confirmation()}
-                if "product_marketing" in requested
-                else {}
-            ),
         },
     )
 
@@ -1060,9 +854,6 @@ async def test_confirm_brief_freezes_one_primary_marketing_goal(client):
             "selected_competitors": [],
             "custom_competitors": [],
             "selected_directions": ["product_marketing"],
-            "custom_research_question": "",
-            "primary_marketing_goal": "content_seeding",
-            "subject_structure_confirmation": _shorts_structure_confirmation(),
         },
     )
 
@@ -1083,25 +874,16 @@ async def test_confirm_brief_freezes_one_primary_marketing_goal(client):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "primary_marketing_goal",
-    [None, "unknown_goal", ["content_seeding"]],
-)
-async def test_confirm_brief_rejects_missing_unknown_or_list_valued_marketing_goal(
-    client, primary_marketing_goal
-):
+async def test_confirm_brief_rejects_removed_analysis_and_structure_fields(client):
     presearch = await _create_presearch(client)
-    confirmation = {
-        "confirmed_subject": "徒步短裤",
-        "subject_type": "category",
-        "selected_directions": ["product_marketing"],
-    }
-    if primary_marketing_goal is not None:
-        confirmation["primary_marketing_goal"] = primary_marketing_goal
-
     response = await client.post(
         f"/content-research/briefs/{presearch['brief_id']}/confirm",
-        json=confirmation,
+        json={
+            "confirmed_subject": "徒步短裤",
+            "subject_type": "category",
+            "selected_directions": ["product_marketing"],
+            "primary_marketing_goal": "content_seeding",
+        },
     )
 
     assert response.status_code == 422
@@ -1117,7 +899,6 @@ async def test_confirm_brief_rejects_empty_requested_direction_selection(client)
             "confirmed_subject": "徒步短裤",
             "subject_type": "category",
             "selected_directions": [],
-            "primary_marketing_goal": "content_seeding",
         },
     )
 
@@ -1134,7 +915,6 @@ async def test_confirm_brief_rejects_direction_outside_lite_catalog(client):
             "confirmed_subject": "徒步短裤",
             "subject_type": "category",
             "selected_directions": ["comment_insight"],
-            "primary_marketing_goal": "content_seeding",
         },
     )
 
@@ -1153,8 +933,6 @@ async def test_create_workflow_alias_confirms_brief(client):
             "confirmed_subject": "徒步短裤",
             "subject_type": "category",
             "selected_directions": ["product_marketing"],
-            "primary_marketing_goal": "content_seeding",
-            "subject_structure_confirmation": _shorts_structure_confirmation(),
         },
     )
 
@@ -1182,7 +960,6 @@ async def test_preview_off_rejects_every_confirmation_entry_before_persisting_pl
         "confirmed_subject": "徒步短裤",
         "subject_type": "category",
         "selected_directions": ["product_marketing"],
-        "primary_marketing_goal": "content_seeding",
     }
 
     if confirmation_endpoint == "brief":

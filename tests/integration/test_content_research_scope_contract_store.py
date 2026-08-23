@@ -10,6 +10,8 @@ import pytest
 from app.content_research.execution_decision_identity import build_execution_decision_identity
 from app.content_research.models import ResearchBriefRecord
 from app.content_research.scope_contract import (
+    SCOPE_CONTRACT_SCHEMA_VERSION_V1,
+    SCOPE_CONTRACT_SCHEMA_VERSION_V2,
     CoverageSnapshot,
     ResearchScopeContract,
     ResearchScopeDraft,
@@ -606,6 +608,59 @@ def test_scope_draft_and_suggestion_audit_event_commit_atomically(tmp_path) -> N
     assert store.get_scope_draft(draft.id) == draft
     with pytest.raises(ValueError, match="append-only"):
         store.save_scope_draft_with_audit_event(draft, event)
+
+
+def test_v1_and_v2_scope_drafts_round_trip_without_reinterpreting_v1(tmp_path) -> None:
+    store = SQLiteContentResearchStore(str(tmp_path / "scope-draft-versions.db"))
+    v1 = build_scope_draft(
+        workflow_run_id="run_scope_v1",
+        research_plan_id="rp_scope_v1",
+        structure_hash="structure_hash_v1",
+        constraints=_contract(version=1).constraints,
+        query_groups=(ScopeQueryGroupInput("夏季 长袖衬衫 通勤", "夏季 长袖衬衫 通勤"),),
+    )
+    v2 = build_scope_draft(
+        workflow_run_id="run_scope_v2",
+        research_plan_id="rp_scope_v2",
+        structure_hash="structure_hash_v2",
+        schema_version=SCOPE_CONTRACT_SCHEMA_VERSION_V2,
+        core_object="长袖衬衫",
+        product_experience_aspect="凉感",
+        context_audience_aspect="夏季通勤",
+        constraints=(ScopeConstraint("core_object", "核心对象", "长袖衬衫", "required"),),
+        query_groups=(
+            ScopeQueryGroupInput("长袖衬衫", "长袖衬衫"),
+            ScopeQueryGroupInput("长袖衬衫 凉感", "长袖衬衫 凉感"),
+            ScopeQueryGroupInput("长袖衬衫 夏季通勤", "长袖衬衫 夏季通勤"),
+        ),
+    )
+    for index, draft in enumerate((v1, v2), start=1):
+        _save_current_brief(
+            store,
+            workflow_run_id=draft.workflow_run_id,
+            structure_hash=draft.structure_hash,
+        )
+        store.save_scope_draft_with_audit_event(
+            draft,
+            ScopeDraftAuditEvent(
+                id=f"sda_version_{index}",
+                workflow_run_id=draft.workflow_run_id,
+                scope_draft_id=draft.id,
+                event_name="scope_suggested",
+                payload={"schema_version": "content_research_scope_audit_event_v1"},
+            ),
+        )
+
+    assert store.get_scope_draft(v1.id) == v1
+    assert store.get_scope_draft(v1.id).schema_version == SCOPE_CONTRACT_SCHEMA_VERSION_V1
+    assert store.get_scope_draft(v2.id) == v2
+    confirmed_v2, _event, created = _confirm_scope(
+        store,
+        draft=v2,
+        event_id="sae_confirm_v2",
+    )
+    assert created is True
+    assert confirmed_v2.schema_version == SCOPE_CONTRACT_SCHEMA_VERSION_V2
 
 
 def test_scope_records_reject_a_reference_to_another_or_missing_contract(tmp_path) -> None:

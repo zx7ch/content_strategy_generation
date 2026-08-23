@@ -23,6 +23,5 @@ def build_fallback_checklist(seed_text: str, user_note: str | None = None) -> Pr
         ),
         competitor_tags=[],
         research_directions=list(DEFAULT_RESEARCH_DIRECTIONS),
-        custom_research_question=user_note or "",
         custom_competitor_input="",
     )

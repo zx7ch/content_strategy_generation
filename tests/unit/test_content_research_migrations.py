@@ -78,6 +78,23 @@ def test_migration_0031_creates_append_only_report_integrity_events(tmp_path):
     assert migration == ("report_publication_integrity_events",)
 
 
+def test_migration_0032_adds_versioned_scope_draft_columns_with_v1_default(tmp_path):
+    db_path = str(tmp_path / "scope-draft-v2.db")
+    bootstrap_content_research_schema(db_path)
+    with sqlite3.connect(db_path) as conn:
+        columns = {
+            row[1]: row[4]
+            for row in conn.execute("PRAGMA table_info(content_research_scope_drafts)")
+        }
+        migration = conn.execute(
+            "SELECT name FROM content_research_schema_migrations WHERE version='0032'"
+        ).fetchone()
+
+    assert columns["schema_version"] == "'content_research_scope_contract_v1'"
+    assert {"core_object", "product_experience_aspect", "context_audience_aspect"} <= set(columns)
+    assert migration == ("version_scope_drafts_for_query_portfolios",)
+
+
 def test_migration_0031_rolls_back_partial_integrity_schema_on_failure(
     tmp_path,
 ):

@@ -54,7 +54,6 @@ class ContentResearchChecklistResponse(BaseModel):
     subject_confirmation: str
     competitor_tags: list[str]
     research_directions: list[str]
-    custom_research_question: str = ""
     custom_competitor_input: str = ""
 
 
@@ -68,7 +67,6 @@ class ContentResearchPresearchResponse(BaseModel):
     competitor_tags: list[str]
     research_directions: list[str]
     direction_catalog: list[str]
-    custom_research_question: str
     custom_competitor_input: str = ""
     timeout_status: str
     fallback_used: bool
@@ -88,13 +86,9 @@ class ContentResearchPresearchResponse(BaseModel):
     subject_structure_user_confirmed_fields: list[str] = Field(default_factory=list)
 
 
-class ContentResearchSubjectStructureConfirmationInput(BaseModel):
-    core_object: str = Field(min_length=1, max_length=200)
-    research_intent: str = Field(min_length=1, max_length=200)
-    context_modifiers: str | list[str] = Field(default_factory=list)
-
-
 class ContentResearchBriefConfirmRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
     confirmed_subject: str = Field(min_length=1)
     subject_structure_hash: str | None = Field(default=None, min_length=1)
     subject_type: str = "unknown"
@@ -104,9 +98,6 @@ class ContentResearchBriefConfirmRequest(BaseModel):
         min_length=1,
         description="Non-empty requested subset of the Lite direction catalog.",
     )
-    custom_research_question: str = ""
-    primary_marketing_goal: str = Field(min_length=1)
-    subject_structure_confirmation: ContentResearchSubjectStructureConfirmationInput | None = None
 
 
 class ContentResearchDirectionResponse(BaseModel):
@@ -355,7 +346,12 @@ class ContentResearchWorkflowActionRequest(BaseModel):
 
 
 class PrepareScopeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
     direction_id: str = Field(min_length=1)
+    product_experience_aspect: str | None = Field(default=None, max_length=200)
+    context_audience_aspect: str | None = Field(default=None, max_length=200)
+    replaces_scope_draft_id: str | None = Field(default=None, min_length=1)
 
 
 class ScopeFinalQueryEdit(BaseModel):

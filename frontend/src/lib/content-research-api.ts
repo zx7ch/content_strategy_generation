@@ -37,7 +37,6 @@ export interface ContentResearchPresearchResponse {
   competitor_tags: string[];
   research_directions: string[];
   direction_catalog: string[];
-  custom_research_question: string;
   custom_competitor_input?: string;
   timeout_status: string;
   fallback_used: boolean;
@@ -69,13 +68,6 @@ export interface ContentResearchBriefConfirmRequest {
   selected_competitors: string[];
   custom_competitors: string[];
   selected_directions: string[];
-  custom_research_question: string;
-  primary_marketing_goal: string;
-  subject_structure_confirmation?: {
-    core_object: string;
-    research_intent: string;
-    context_modifiers: string[];
-  };
 }
 
 export interface ContentResearchWorkflowSummary {
@@ -253,13 +245,18 @@ export interface ContentResearchScopeDraftQueryGroup {
   suggested_query: string;
   final_query: string;
   targeted_required_terms: string[];
+  origin?: "system_suggested" | "user_edited" | null;
 }
 
 export interface ContentResearchScopeDraft {
+  schema_version: string;
   id: string;
   workflow_run_id: string;
   research_plan_id: string;
   structure_hash: string;
+  core_object: string;
+  product_experience_aspect?: string | null;
+  context_audience_aspect?: string | null;
   constraints: ContentResearchScopeConstraint[];
   query_groups: ContentResearchScopeDraftQueryGroup[];
   created_at: string;
@@ -360,6 +357,9 @@ function safeContentResearchExecutionUnit(
 
 export interface ContentResearchPrepareScopeRequest {
   direction_id: string;
+  product_experience_aspect?: string | null;
+  context_audience_aspect?: string | null;
+  replaces_scope_draft_id?: string;
 }
 
 export interface ContentResearchConfirmScopeRequest {

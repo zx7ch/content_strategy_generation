@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from app.content_research.scope_contract import (
+    SCOPE_CONTRACT_SCHEMA_VERSION_V2,
     ScopeConstraint,
     ScopeQueryGroupInput,
     build_scope_contract,
@@ -153,3 +154,30 @@ def test_query_group_id_is_unique_to_its_scope_contract() -> None:
     )
 
     assert first.query_groups[0].id != second.query_groups[0].id
+
+
+def test_v2_product_scope_requires_only_core_object() -> None:
+    contract = build_scope_contract(
+        workflow_run_id="run_v2",
+        research_plan_id="rp_v2",
+        version=1,
+        schema_version=SCOPE_CONTRACT_SCHEMA_VERSION_V2,
+        constraints=(
+            ScopeConstraint("core_object", "核心对象", "长袖衬衫", "required"),
+        ),
+        query_groups=(
+            ScopeQueryGroupInput("长袖衬衫", "长袖衬衫"),
+            ScopeQueryGroupInput("长袖衬衫 凉感", "长袖衬衫 凉感"),
+            ScopeQueryGroupInput("长袖衬衫 夏季通勤", "长袖衬衫 夏季通勤"),
+        ),
+    )
+
+    assert contract.schema_version == SCOPE_CONTRACT_SCHEMA_VERSION_V2
+    assert [item.id for item in contract.constraints if item.mode == "required"] == [
+        "core_object"
+    ]
+    assert [item.execution_role for item in contract.query_groups] == [
+        "coverage",
+        "coverage",
+        "coverage",
+    ]

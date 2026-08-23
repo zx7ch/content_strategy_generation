@@ -8,7 +8,6 @@ import pytest
 
 from app.content_research.api_schemas import (
     ContentResearchBriefConfirmRequest,
-    ContentResearchSubjectStructureConfirmationInput,
     ContentResearchSubjectStructureConfirmationRequest,
     ContentResearchWorkflowActionRequest,
 )
@@ -331,8 +330,6 @@ async def test_subject_clarification_reuses_run_without_model_recovery_or_spider
                 selected_competitors=[],
                     custom_competitors=[],
                     selected_directions=["product_marketing"],
-                    custom_research_question="",
-                    primary_marketing_goal="content_seeding",
                 ),
         )
 
@@ -800,13 +797,6 @@ async def test_confirmation_waits_for_brief_and_runtime_presearch_to_settle(stor
         selected_competitors=[],
         custom_competitors=[],
         selected_directions=["product_marketing"],
-        custom_research_question="",
-        primary_marketing_goal="content_seeding",
-        subject_structure_confirmation=ContentResearchSubjectStructureConfirmationInput(
-            core_object="短裤",
-            research_intent="产品卖点",
-            context_modifiers=["夏季轻量户外"],
-        ),
     )
     with pytest.raises(ContentResearchValidationError, match="Presearch final outcome is not ready"):
         await service.confirm_brief(brief_id=first.brief_id, confirmation_request=confirmation)

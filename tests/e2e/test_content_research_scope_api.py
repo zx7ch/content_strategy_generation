@@ -159,12 +159,6 @@ async def _scope_ready_workflow(client: httpx.AsyncClient) -> dict:
             "subject_structure_hash": brief["subject_structure_hash"],
             "subject_type": "category",
             "selected_directions": ["product_marketing"],
-            "primary_marketing_goal": "content_seeding",
-            "subject_structure_confirmation": {
-                "core_object": "长袖衬衫",
-                "research_intent": "通勤",
-                "context_modifiers": ["夏季"],
-            },
         },
     )
     assert confirmed.status_code == 200
@@ -257,6 +251,196 @@ async def _confirm_initial_scope(client: httpx.AsyncClient, workflow_run_id: str
     )
     assert confirmed.status_code == 200
     return confirmed.json()["result"]["scope_contract"]
+
+
+@pytest.mark.asyncio
+async def test_product_marketing_prepare_scope_builds_v2_a_ab_ac_portfolio(
+    scope_client,
+) -> None:
+    workflow = await _scope_ready_workflow(scope_client)
+    workflow_run_id = workflow["presearch"]["workflow_run_id"]
+
+    prepared = await scope_client.post(
+        f"/content-research/workflows/{workflow_run_id}/actions",
+        json={
+            "action": "prepare_scope",
+            "payload": {
+                "direction_id": "product_marketing",
+                "product_experience_aspect": "凉感",
+                "context_audience_aspect": "夏季通勤",
+            },
+        },
+    )
+
+    assert prepared.status_code == 200
+    draft = prepared.json()["result"]["scope"]
+    assert draft["schema_version"] == "content_research_scope_contract_v2"
+    assert draft["core_object"] == "长袖衬衫"
+    assert draft["product_experience_aspect"] == "凉感"
+    assert draft["context_audience_aspect"] == "夏季通勤"
+    assert [item["id"] for item in draft["constraints"] if item["mode"] == "required"] == [
+        "core_object"
+    ]
+    assert [item["final_query"] for item in draft["query_groups"]] == [
+        "长袖衬衫",
+        "长袖衬衫 凉感",
+        "长袖衬衫 夏季通勤",
+    ]
+    assert [item["origin"] for item in draft["query_groups"]] == [
+        "system_suggested",
+        "user_edited",
+        "user_edited",
+    ]
+
+    confirmed = await scope_client.post(
+        f"/content-research/workflows/{workflow_run_id}/actions",
+        json={
+            "action": "confirm_scope",
+            "payload": {
+                "scope_draft_id": draft["id"],
+                "structure_hash": draft["structure_hash"],
+                "query_groups": [
+                    {"final_query": item["final_query"]} for item in draft["query_groups"]
+                ],
+            },
+        },
+    )
+    assert confirmed.status_code == 200
+    assert (
+        confirmed.json()["result"]["scope_contract"]["schema_version"]
+        == "content_research_scope_contract_v2"
+    )
+
+
+@pytest.mark.asyncio
+async def test_multi_direction_product_run_cannot_prepare_a_non_product_v1_scope(
+    scope_client,
+) -> None:
+    presearch = await scope_client.post(
+        "/content-research/presearch",
+        json={"seed_text": "夏季通勤长袖", "thread_id": "thread-multi-scope"},
+    )
+    assert presearch.status_code == 201
+    brief = presearch.json()
+    confirmed = await scope_client.post(
+        f"/content-research/briefs/{brief['brief_id']}/confirm",
+        json={
+            "confirmed_subject": "夏季通勤长袖",
+            "subject_structure_hash": brief["subject_structure_hash"],
+            "subject_type": "category",
+            "selected_directions": ["content_performance", "product_marketing"],
+        },
+    )
+    assert confirmed.status_code == 200
+
+    rejected = await scope_client.post(
+        f"/content-research/workflows/{brief['workflow_run_id']}/actions",
+        json={"action": "prepare_scope", "payload": {"direction_id": "content_performance"}},
+    )
+    assert rejected.status_code == 422
+
+    prepared = await scope_client.post(
+        f"/content-research/workflows/{brief['workflow_run_id']}/actions",
+        json={"action": "prepare_scope", "payload": {"direction_id": "product_marketing"}},
+    )
+    assert prepared.status_code == 200
+    assert (
+        prepared.json()["result"]["scope"]["schema_version"]
+        == "content_research_scope_contract_v2"
+    )
+
+
+@pytest.mark.asyncio
+async def test_product_marketing_missing_aspects_can_be_confirmed_or_replaced(
+    scope_client,
+) -> None:
+    workflow = await _scope_ready_workflow(scope_client)
+    workflow_run_id = workflow["presearch"]["workflow_run_id"]
+
+    initial = await scope_client.post(
+        f"/content-research/workflows/{workflow_run_id}/actions",
+        json={
+            "action": "prepare_scope",
+            "payload": {
+                "direction_id": "product_marketing",
+                "product_experience_aspect": "上身感受",
+                "context_audience_aspect": "",
+            },
+        },
+    )
+    assert initial.status_code == 200
+    old_draft = initial.json()["result"]["scope"]
+    assert [group["final_query"] for group in old_draft["query_groups"]] == [
+        "长袖衬衫"
+    ]
+    assert old_draft["product_experience_aspect"] is None
+    assert old_draft["context_audience_aspect"] is None
+
+    unfenced = await scope_client.post(
+        f"/content-research/workflows/{workflow_run_id}/actions",
+        json={
+            "action": "prepare_scope",
+            "payload": {
+                "direction_id": "product_marketing",
+                "product_experience_aspect": "凉感",
+                "context_audience_aspect": "夏季通勤",
+            },
+        },
+    )
+    assert unfenced.status_code == 422
+
+    replacement = await scope_client.post(
+        f"/content-research/workflows/{workflow_run_id}/actions",
+        json={
+            "action": "prepare_scope",
+            "payload": {
+                "direction_id": "product_marketing",
+                "replaces_scope_draft_id": old_draft["id"],
+                "product_experience_aspect": "凉感",
+                "context_audience_aspect": "夏季通勤",
+            },
+        },
+    )
+    assert replacement.status_code == 200
+    new_draft = replacement.json()["result"]["scope"]
+    assert new_draft["id"] != old_draft["id"]
+    assert [group["final_query"] for group in new_draft["query_groups"]] == [
+        "长袖衬衫",
+        "长袖衬衫 凉感",
+        "长袖衬衫 夏季通勤",
+    ]
+
+    stale = await scope_client.post(
+        f"/content-research/workflows/{workflow_run_id}/actions",
+        json={
+            "action": "confirm_scope",
+            "payload": {
+                "scope_draft_id": old_draft["id"],
+                "structure_hash": old_draft["structure_hash"],
+                "query_groups": [
+                    {"final_query": group["final_query"]}
+                    for group in old_draft["query_groups"]
+                ],
+            },
+        },
+    )
+    assert stale.status_code == 422
+
+    confirmed = await scope_client.post(
+        f"/content-research/workflows/{workflow_run_id}/actions",
+        json={
+            "action": "confirm_scope",
+            "payload": {
+                "scope_draft_id": new_draft["id"],
+                "structure_hash": new_draft["structure_hash"],
+                "query_groups": [
+                    {"final_query": group["final_query"]}
+                    for group in new_draft["query_groups"]
+                ],
+            },
+        },
+    )
+    assert confirmed.status_code == 200
 
 
 def _workflow_row_counts(db_path: str, workflow_run_id: str) -> dict[str, int]:

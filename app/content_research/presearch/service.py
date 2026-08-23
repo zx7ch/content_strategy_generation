@@ -36,7 +36,6 @@ class PresearchChecklist:
     subject_confirmation: str
     competitor_tags: list[str]
     research_directions: list[str]
-    custom_research_question: str = ""
     custom_competitor_input: str = ""
     subject_structure: SubjectStructure | None = None
     subject_structure_state: str = "needs_confirmation"
@@ -223,7 +222,6 @@ class PresearchService:
             subject_confirmation=subject,
             competitor_tags=self._string_list(data.get("competitor_tags")),
             research_directions=self._string_list(data.get("research_directions")),
-            custom_research_question=str(data.get("custom_research_question") or ""),
             custom_competitor_input=str(data.get("custom_competitor_input") or ""),
             subject_structure=structure,
             subject_structure_state=structure_decision.state,

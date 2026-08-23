@@ -238,7 +238,7 @@ test("structured subject confirmation stays on the same workflow run", async () 
   assert.equal(response.result.workflow_run_id, "run_1");
 });
 
-test("confirmContentResearchBrief posts product structure confirmation with selected directions", async () => {
+test("confirmContentResearchBrief posts the reused structure hash with selected directions", async () => {
   let requestUrl = "";
   let requestBody = "";
   globalThis.fetch = (async (input, init) => {
@@ -259,24 +259,19 @@ test("confirmContentResearchBrief posts product structure confirmation with sele
 
   const result = await confirmContentResearchBrief("run_1", {
     confirmed_subject: "徒步短裤",
+    subject_structure_hash: "hash_1",
     subject_type: "category",
     selected_competitors: ["迪卡侬"],
     custom_competitors: ["凯乐石"],
     selected_directions: ["product_marketing"],
-    custom_research_question: "轻量速干",
-    primary_marketing_goal: "content_seeding",
-    subject_structure_confirmation: {
-      core_object: "徒步短裤",
-      research_intent: "速干",
-      context_modifiers: ["夏季"],
-    },
   });
 
   assert.ok(requestUrl.endsWith("/content-research/workflows/run_1/actions"));
   assert.match(requestBody, /"action":"confirm_brief"/);
   assert.match(requestBody, /"selected_directions":\["product_marketing"\]/);
-  assert.match(requestBody, /"primary_marketing_goal":"content_seeding"/);
-  assert.match(requestBody, /"subject_structure_confirmation":\{"core_object":"徒步短裤","research_intent":"速干","context_modifiers":\["夏季"\]\}/);
+  assert.match(requestBody, /"subject_structure_hash":"hash_1"/);
+  assert.doesNotMatch(requestBody, /primary_marketing_goal/);
+  assert.doesNotMatch(requestBody, /subject_structure_confirmation/);
   assert.equal(result.workflow_run_id, "run_1");
 });
 

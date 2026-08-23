@@ -15,7 +15,9 @@ from typing import Literal
 from app.content_research.models import utcnow
 from app.content_research.persistence_models import CoverageManifest
 
-SCOPE_CONTRACT_SCHEMA_VERSION = "content_research_scope_contract_v1"
+SCOPE_CONTRACT_SCHEMA_VERSION_V1 = "content_research_scope_contract_v1"
+SCOPE_CONTRACT_SCHEMA_VERSION_V2 = "content_research_scope_contract_v2"
+SCOPE_CONTRACT_SCHEMA_VERSION = SCOPE_CONTRACT_SCHEMA_VERSION_V1
 MAX_LITE_QUERY_GROUPS = 3
 
 ConstraintMode = Literal["required", "preferred"]
@@ -58,6 +60,7 @@ class ScopeQueryGroupInput:
     suggested_query: str
     final_query: str
     targeted_required_terms: tuple[str, ...] = ()
+    origin: QueryOrigin | None = None
 
 
 @dataclass(frozen=True)
@@ -78,6 +81,10 @@ class ResearchScopeDraft:
     constraints: tuple[ScopeConstraint, ...]
     query_groups: tuple[ScopeQueryGroupInput, ...]
     created_at: datetime
+    schema_version: str = SCOPE_CONTRACT_SCHEMA_VERSION_V1
+    core_object: str = ""
+    product_experience_aspect: str | None = None
+    context_audience_aspect: str | None = None
 
 
 @dataclass(frozen=True)
@@ -440,12 +447,18 @@ def build_scope_contract(
     version: int,
     constraints: tuple[ScopeConstraint, ...],
     query_groups: tuple[ScopeQueryGroupInput, ...],
+    schema_version: str = SCOPE_CONTRACT_SCHEMA_VERSION_V1,
 ) -> ResearchScopeContract:
     """Build the one immutable scope that authorizes a Lite collection."""
     if not workflow_run_id.strip() or not research_plan_id.strip():
         raise ValueError("workflow_run_id and research_plan_id are required")
     if version < 1:
         raise ValueError("scope contract version must be positive")
+    if schema_version not in {
+        SCOPE_CONTRACT_SCHEMA_VERSION_V1,
+        SCOPE_CONTRACT_SCHEMA_VERSION_V2,
+    }:
+        raise ValueError("unsupported scope contract schema version")
     if not constraints:
         raise ValueError("scope contract requires constraints")
     core_object_count = sum(constraint.id == "core_object" for constraint in constraints)
@@ -485,7 +498,7 @@ def build_scope_contract(
         workflow_run_id=workflow_run_id,
         research_plan_id=research_plan_id,
         version=version,
-        schema_version=SCOPE_CONTRACT_SCHEMA_VERSION,
+        schema_version=schema_version,
         constraints=constraints,
         query_groups=frozen_groups,
         created_at=utcnow(),
@@ -499,6 +512,10 @@ def build_scope_draft(
     structure_hash: str,
     constraints: tuple[ScopeConstraint, ...],
     query_groups: tuple[ScopeQueryGroupInput, ...],
+    schema_version: str = SCOPE_CONTRACT_SCHEMA_VERSION_V1,
+    core_object: str = "",
+    product_experience_aspect: str | None = None,
+    context_audience_aspect: str | None = None,
 ) -> ResearchScopeDraft:
     if not workflow_run_id.strip() or not research_plan_id.strip() or not structure_hash.strip():
         raise ValueError("scope draft identity is required")
@@ -508,7 +525,18 @@ def build_scope_draft(
         version=1,
         constraints=constraints,
         query_groups=query_groups,
+        schema_version=schema_version,
     )
+    core_constraint = next(item for item in constraints if item.id == "core_object")
+    frozen_core = _clean_query(core_object or core_constraint.value, field_name="core_object")
+    frozen_product_aspect = _optional_query_aspect(product_experience_aspect)
+    frozen_context_aspect = _optional_query_aspect(context_audience_aspect)
+    if schema_version == SCOPE_CONTRACT_SCHEMA_VERSION_V2:
+        required_ids = tuple(item.id for item in constraints if item.mode == "required")
+        if required_ids != ("core_object",) or _normalized(frozen_core) != _normalized(
+            core_constraint.value
+        ):
+            raise ValueError("v2 product scope requires only its core_object")
     draft_id = (
         "rsd_"
         + _fingerprint(
@@ -518,6 +546,10 @@ def build_scope_draft(
                 "structure_hash": structure_hash,
                 "constraints": [item.__dict__ for item in constraints],
                 "query_groups": [item.__dict__ for item in query_groups],
+                "schema_version": schema_version,
+                "core_object": frozen_core,
+                "product_experience_aspect": frozen_product_aspect,
+                "context_audience_aspect": frozen_context_aspect,
             }
         )[:24]
     )
@@ -529,7 +561,16 @@ def build_scope_draft(
         constraints,
         query_groups,
         utcnow(),
+        schema_version,
+        frozen_core,
+        frozen_product_aspect,
+        frozen_context_aspect,
     )
+
+
+def _optional_query_aspect(value: str | None) -> str | None:
+    normalized = " ".join(str(value or "").split())
+    return normalized or None
 
 
 def _build_query_group(
@@ -541,11 +582,13 @@ def _build_query_group(
 ) -> ScopeQueryGroup:
     suggested_query = _clean_query(value.suggested_query, field_name="suggested_query")
     final_query = _clean_query(value.final_query, field_name="final_query")
-    origin: QueryOrigin = (
+    origin: QueryOrigin = value.origin or (
         "system_suggested"
         if _normalized(suggested_query) == _normalized(final_query)
         else "user_edited"
     )
+    if origin not in {"system_suggested", "user_edited"}:
+        raise ValueError("invalid query group origin")
     role = classify_query_group(
         final_query,
         required_terms=required_terms,

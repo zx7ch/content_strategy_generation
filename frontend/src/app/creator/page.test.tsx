@@ -202,7 +202,7 @@ test("model setup explains the action a Creator can take when a Key is rejected"
   globalThis.fetch = previousFetch;
 });
 
-test("Brief confirmation requires an explicit marketing goal before enabling confirmation", async () => {
+test("Brief confirmation reuses the interpreted structure without analysis-goal inputs", async () => {
   const dom = new JSDOM("<!doctype html><html><body></body></html>", {
     url: "http://localhost",
   });
@@ -269,16 +269,10 @@ test("Brief confirmation requires an explicit marketing goal before enabling con
     buttonNamed("准确，继续")?.click();
     buttonNamed("产品营销")?.click();
   });
-  assert.equal(confirm.disabled, true);
-
-  const goalSelector = container.querySelector(
-    'select[aria-label="产品营销目标"]',
-  ) as HTMLSelectElement;
-  await act(async () => {
-    goalSelector.value = "content_seeding";
-    goalSelector.dispatchEvent(new dom.window.Event("change", { bubbles: true }));
-  });
   assert.equal(confirm.disabled, false);
+  assert.equal(container.querySelector('[aria-label="产品营销目标"]'), null);
+  assert.equal(container.textContent?.includes("重点了解什么"), false);
+  assert.equal(container.textContent?.includes("补充你的调研问题"), false);
 
   await act(async () => {
     root.unmount();

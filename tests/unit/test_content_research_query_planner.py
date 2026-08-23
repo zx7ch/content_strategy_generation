@@ -4,7 +4,10 @@ from datetime import datetime, timezone
 
 from app.content_research.subject_structure import parse_subject_structure
 from app.content_research.workflow.direction_registry import ResearchDirectionRegistry
-from app.content_research.workflow.query_planner import compile_structured_query_plan
+from app.content_research.workflow.query_planner import (
+    compile_product_marketing_query_portfolio,
+    compile_structured_query_plan,
+)
 
 
 def _structure(*, context_modifiers: list[str] | None = None):
@@ -33,81 +36,30 @@ def test_product_marketing_registry_exposes_only_the_product_value_proposition_q
     assert direction.default_questions == ["提炼小红书产品卖点表达"]
 
 
-def test_product_marketing_q2_keeps_intent_and_uses_goal_facet() -> None:
-    plan = compile_structured_query_plan(
-        direction_id="product_marketing",
-        subject_structure=_structure(),
-        primary_marketing_goal="content_seeding",
-        run_as_of_at=datetime(2026, 8, 4, tzinfo=timezone.utc),
-    )
-
-    assert [group.query_group.query for group in plan.primary_groups] == [
-        "防晒服饰 穿搭",
-        "防晒服饰 穿搭 上身感受",
-    ]
-    assert plan.primary_groups[1].role == "goal_facet"
+def test_product_marketing_portfolio_is_a_then_available_a_b_and_a_c() -> None:
+    assert compile_product_marketing_query_portfolio(
+        core_object="长袖衬衫",
+        product_experience_aspect="凉感",
+        context_audience_aspect="夏季 通勤",
+    ) == ("长袖衬衫", "长袖衬衫 凉感", "长袖衬衫 夏季 通勤")
 
 
-def test_product_marketing_custom_focus_replaces_only_the_facet() -> None:
-    plan = compile_structured_query_plan(
-        direction_id="product_marketing",
-        subject_structure=_structure(),
-        explicit_focus="通勤",
-        primary_marketing_goal="content_seeding",
-        run_as_of_at=datetime(2026, 8, 4, tzinfo=timezone.utc),
-    )
-
-    assert plan.primary_groups[1].query_group.query == "防晒服饰 穿搭 通勤"
-    assert plan.primary_groups[1].role == "user_focus"
-
-
-def test_equivalent_product_marketing_intent_and_focus_merge_into_one_group() -> None:
-    plan = compile_structured_query_plan(
-        direction_id="product_marketing",
-        subject_structure=_structure(),
-        explicit_focus="穿搭！",
-        primary_marketing_goal="content_seeding",
-        run_as_of_at=datetime(2026, 8, 4, tzinfo=timezone.utc),
-    )
-
-    assert len(plan.primary_groups) == 1
-    assert plan.primary_groups[0].roles == ("core_intent", "user_focus")
-    assert plan.primary_groups[0].query_group.query == "防晒服饰 穿搭"
-
-
-def test_product_marketing_fallback_uses_primary_intent_when_context_is_absent() -> None:
-    plan = compile_structured_query_plan(
-        direction_id="product_marketing",
-        subject_structure=_structure(context_modifiers=[]),
-        primary_marketing_goal="content_seeding",
-        run_as_of_at=datetime(2026, 8, 4, tzinfo=timezone.utc),
-    )
-
-    assert plan.fallback_group is not None
-    assert plan.fallback_group.query_group.query == "防晒衣 穿搭"
-
-
-def test_product_marketing_fallback_preserves_context_metadata_and_query_cap() -> None:
-    run_as_of = datetime(2026, 8, 4, tzinfo=timezone.utc)
-
-    plan = compile_structured_query_plan(
-        direction_id="product_marketing",
-        subject_structure=_structure(),
-        primary_marketing_goal="content_seeding",
-        run_as_of_at=run_as_of,
-    )
-
-    assert len(plan.primary_groups) == 2
-    assert all(group.query_group.candidate_limit == 20 for group in plan.primary_groups)
-    assert all(
-        group.query_group.time_window == {"end_at": run_as_of.isoformat()}
-        for group in plan.primary_groups
-    )
-    assert plan.fallback_group is not None
-    assert plan.fallback_group.role == "coverage_fallback"
-    assert plan.fallback_group.activation == "coverage_fallback"
-    assert plan.fallback_group.query_group.query == "防晒衣 夏季"
-    assert plan.fallback_group.query_group.candidate_limit == 20
+def test_product_marketing_portfolio_omits_missing_or_abstract_aspects() -> None:
+    assert compile_product_marketing_query_portfolio(
+        core_object="长袖衬衫",
+        product_experience_aspect=None,
+        context_audience_aspect="",
+    ) == ("长袖衬衫",)
+    assert compile_product_marketing_query_portfolio(
+        core_object="长袖衬衫",
+        product_experience_aspect="上身感受",
+        context_audience_aspect="夏季通勤",
+    ) == ("长袖衬衫", "长袖衬衫 夏季通勤")
+    assert compile_product_marketing_query_portfolio(
+        core_object="长袖衬衫",
+        product_experience_aspect="产品卖点分析",
+        context_audience_aspect=None,
+    ) == ("长袖衬衫",)
 
 
 def test_equivalent_non_product_primary_queries_merge_and_retain_roles() -> None:
@@ -141,10 +93,9 @@ def test_non_product_marketing_query_compilation_is_unchanged() -> None:
 
 def test_compilation_hash_and_order_are_stable_and_synonyms_are_not_primary() -> None:
     kwargs = {
-        "direction_id": "product_marketing",
+        "direction_id": "content_performance",
         "subject_structure": _structure(),
         "explicit_focus": "通勤",
-        "primary_marketing_goal": "content_seeding",
         "run_as_of_at": datetime(2026, 8, 4, tzinfo=timezone.utc),
     }
 
