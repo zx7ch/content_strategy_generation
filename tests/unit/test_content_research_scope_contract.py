@@ -181,3 +181,44 @@ def test_v2_product_scope_requires_only_core_object() -> None:
         "coverage",
         "coverage",
     ]
+
+
+def test_final_query_edit_overrides_the_draft_origin() -> None:
+    contract = build_scope_contract(
+        workflow_run_id="run_edited",
+        research_plan_id="rp_edited",
+        version=1,
+        schema_version=SCOPE_CONTRACT_SCHEMA_VERSION_V2,
+        constraints=(ScopeConstraint("core_object", "核心对象", "长袖衬衫", "required"),),
+        query_groups=(
+            ScopeQueryGroupInput(
+                "长袖衬衫",
+                "衬衫真实测评",
+                ("长袖衬衫",),
+                "system_suggested",
+            ),
+        ),
+    )
+
+    assert contract.query_groups[0].origin == "user_edited"
+    assert contract.query_groups[0].execution_role == "exploratory"
+
+
+def test_punctuation_only_final_query_edit_is_user_edited() -> None:
+    contract = build_scope_contract(
+        workflow_run_id="run_punctuation_edit",
+        research_plan_id="rp_punctuation_edit",
+        version=1,
+        schema_version=SCOPE_CONTRACT_SCHEMA_VERSION_V2,
+        constraints=(ScopeConstraint("core_object", "核心对象", "长袖衬衫", "required"),),
+        query_groups=(
+            ScopeQueryGroupInput(
+                "长袖衬衫 凉感",
+                "长袖衬衫-凉感",
+                ("长袖衬衫",),
+                "system_suggested",
+            ),
+        ),
+    )
+
+    assert contract.query_groups[0].origin == "user_edited"

@@ -362,6 +362,79 @@ def test_creator_completes_missing_aspects_and_only_latest_draft_executes(browse
 
 
 @pytest.mark.parametrize(
+    "real_creator_stack",
+    [{"source_scenario": "success"}],
+    indirect=True,
+)
+def test_creator_executes_arbitrary_edited_query_but_admits_only_core_match(
+    browser_page,
+):
+    page, stack = browser_page
+    scope, workflow_run_id = _open_product_marketing_scope(
+        page,
+        stack,
+        seed="长袖衬衫",
+    )
+    final_query = "衬衫真实测评"
+    scope.get_by_label("检索组 1").fill(final_query)
+    expect(scope.get_by_text("系统建议：长袖衬衫", exact=True)).to_be_visible()
+
+    with page.expect_response(
+        lambda response: response.url.endswith("/actions")
+        and '"action":"confirm_scope"' in (response.request.post_data or "")
+        and response.status == 200,
+        timeout=30000,
+    ) as confirmation:
+        scope.get_by_role("button", name="确认并开始调研").click()
+    frozen = confirmation.value.json()["result"]["scope_contract"]["query_groups"]
+    assert len(frozen) == 1
+    assert frozen[0]["suggested_query"] == "长袖衬衫"
+    assert frozen[0]["final_query"] == final_query
+    assert frozen[0]["origin"] == "user_edited"
+    assert frozen[0]["execution_role"] == "exploratory"
+    confirmed_scope = page.locator('section[aria-label="已确认检索范围"]')
+    expect(confirmed_scope.get_by_text(final_query, exact=True)).to_be_visible(timeout=30000)
+    expect(confirmed_scope.get_by_text(re.compile("用户补充.*探索补充"))).to_be_visible()
+    page.reload(wait_until="domcontentloaded")
+    confirmed_scope = page.locator('section[aria-label="已确认检索范围"]')
+    expect(confirmed_scope.get_by_text(final_query, exact=True)).to_be_visible(timeout=30000)
+    expect(confirmed_scope.get_by_text(re.compile("用户补充.*探索补充"))).to_be_visible()
+
+    for _ in range(160):
+        calls = (
+            [
+                json.loads(line)
+                for line in stack["source_call_log"].read_text(encoding="utf-8").splitlines()
+            ]
+            if stack["source_call_log"].exists()
+            else []
+        )
+        discovered = [
+            item["query"] for item in calls if item["operation"] == "discover_candidates"
+        ]
+        with sqlite3.connect(stack["db_path"]) as connection:
+            audit_rows = connection.execute(
+                "SELECT payload_json FROM content_research_scope_audit_events "
+                "WHERE workflow_run_id=? AND event_name='candidate_scope_evaluated'",
+                (workflow_run_id,),
+            ).fetchall()
+        if discovered and audit_rows:
+            break
+        page.wait_for_timeout(250)
+    else:
+        pytest.fail("Edited query did not reach provider and admission")
+
+    assert discovered == [final_query]
+    admission = [json.loads(row[0]) for row in audit_rows]
+    assert any(item["eligibility"] == "eligible" for item in admission)
+    assert any(
+        item["eligibility"] == "excluded"
+        and "required_constraint_unmatched:core_object" in item["exclusion_reasons"]
+        for item in admission
+    )
+
+
+@pytest.mark.parametrize(
     "selected_direction_ids",
     [
         ("product_marketing",),

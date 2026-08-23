@@ -11,6 +11,7 @@ from app.content_research.service import ContentResearchService, WorkflowRunMana
 from app.content_research.sources import SourceAdapterRegistry
 from app.content_research.sources.base import SourceOperationResult
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
+from app.memory.thread_store import ThreadStore
 from app.services.llm.types import LLMResponse, TokenUsage
 
 
@@ -69,7 +70,11 @@ async def client_factory(tmp_path):
             source_registry=SourceAdapterRegistry({"xiaohongshu": FakeSourceAdapter(result)}),
         )
         transport = httpx.ASGITransport(app=app)
-        client = httpx.AsyncClient(transport=transport, base_url="http://testserver")
+        client = httpx.AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+            headers={"X-Workspace-Id": "ws-source", "X-User-Id": "user-source"},
+        )
         clients.append((client, original))
         return client
 
@@ -85,23 +90,45 @@ async def client_factory(tmp_path):
 
 
 async def _confirmed_workflow(client):
+    service = app.state.content_research_service
+    async with ThreadStore(service._store._db_path) as threads:
+        thread = await threads.create_thread(
+            title="Source collection API",
+            workspace_id="ws-source",
+        )
     presearch_response = await client.post(
         "/content-research/presearch",
-        json={"seed_text": "徒步短裤", "thread_id": "thread-source-api"},
+        json={"seed_text": "徒步短裤", "thread_id": thread["id"]},
     )
-    assert presearch_response.status_code == 201
+    assert presearch_response.status_code == 201, presearch_response.text
     presearch = presearch_response.json()
+    if presearch["subject_structure_state"] != "confirmed":
+        structured = await client.post(
+            f"/content-research/workflows/{presearch['workflow_run_id']}/actions",
+            json={
+                "action": "confirm_subject_structure",
+                "payload": {
+                    "subject_structure_hash": presearch["subject_structure_hash"],
+                    "core_object": "徒步短裤",
+                    "research_intent": "产品营销",
+                    "context_modifiers": [],
+                },
+            },
+        )
+        assert structured.status_code == 200, structured.text
+        presearch = structured.json()["result"]
+    confirmation = {
+        "confirmed_subject": "徒步短裤",
+        "subject_type": "category",
+        "selected_competitors": ["迪卡侬"],
+        "custom_competitors": ["凯乐石"],
+        "selected_directions": ["product_marketing"],
+    }
     confirm_response = await client.post(
         f"/content-research/briefs/{presearch['brief_id']}/confirm",
-        json={
-            "confirmed_subject": "徒步短裤",
-            "subject_type": "category",
-            "selected_competitors": ["迪卡侬"],
-            "custom_competitors": ["凯乐石"],
-            "selected_directions": ["product_marketing"],
-        },
+        json=confirmation,
     )
-    assert confirm_response.status_code == 200
+    assert confirm_response.status_code == 200, confirm_response.text
     return presearch
 
 

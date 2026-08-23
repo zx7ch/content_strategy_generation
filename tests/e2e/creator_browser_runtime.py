@@ -165,11 +165,15 @@ class DeterministicSuccessfulSource(CapableFakeAdapter):
     async def collect_note_detail(self, request):
         result = await super().collect_note_detail(request)
         for item in result.items:
-            item["title"] = "长袖衬衫与徒步短裤真实体验"
-            item["content_text"] = (
-                "这条笔记明确讨论长袖衬衫和徒步短裤，"
-                "但不把凉感或夏季通勤作为硬性准入条件。"
-            )
+            if request.note_id.endswith("-2"):
+                item["title"] = "夏季通勤穿搭记录"
+                item["content_text"] = "这条笔记没有出现核心产品对象。"
+            else:
+                item["title"] = "长袖衬衫与徒步短裤真实体验"
+                item["content_text"] = (
+                    "这条笔记明确讨论长袖衬衫和徒步短裤，"
+                    "但不把凉感或夏季通勤作为硬性准入条件。"
+                )
         return result
 
 

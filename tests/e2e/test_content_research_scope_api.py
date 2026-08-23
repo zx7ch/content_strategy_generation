@@ -1478,6 +1478,7 @@ async def test_confirm_scope_rejects_an_older_non_projected_draft_without_writes
             },
             created_at=current_record.created_at,
         ),
+        replaces_scope_draft_id=older_record.id,
     )
     current = {
         "id": current_record.id,

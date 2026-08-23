@@ -582,10 +582,10 @@ def _build_query_group(
 ) -> ScopeQueryGroup:
     suggested_query = _clean_query(value.suggested_query, field_name="suggested_query")
     final_query = _clean_query(value.final_query, field_name="final_query")
-    origin: QueryOrigin = value.origin or (
-        "system_suggested"
-        if _normalized(suggested_query) == _normalized(final_query)
-        else "user_edited"
+    origin: QueryOrigin = (
+        "user_edited"
+        if suggested_query != final_query
+        else value.origin or "system_suggested"
     )
     if origin not in {"system_suggested", "user_edited"}:
         raise ValueError("invalid query group origin")
