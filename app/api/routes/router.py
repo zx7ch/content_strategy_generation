@@ -1158,7 +1158,7 @@ async def get_content_research_scope_projection(
 ) -> ContentResearchScopeProjectionResponse:
     service = _get_content_research_service(request)
     try:
-        return service.get_scope_projection(workflow_run_id, version=version)
+        return await service.get_scope_projection(workflow_run_id, version=version)
     except Exception as exc:  # noqa: BLE001
         raise _content_research_error(exc) from exc
 

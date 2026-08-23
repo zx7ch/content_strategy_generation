@@ -23,6 +23,7 @@ import {
 import { useBrandContext } from "@/components/providers/BrandProvider";
 import {
   contentResearchCommand,
+  confirmContentResearchBrief,
   createContentResearchPresearch,
   createContentResearchCommandId,
   endContentResearchWorkflow,
@@ -34,14 +35,12 @@ import {
   getContentResearchScope,
   getContentResearchWorkflow,
   reviseContentResearchSubject,
+  replaceContentResearchScopeDraft,
   retryContentResearchPresearch,
   runContentResearchWorkflowAction,
   type ContentResearchDirectionEvidence,
   type ContentResearchLiteReportResponse,
   type ContentResearchPresearchResponse,
-  type ContentResearchConfirmScopeRequest,
-  type ContentResearchPrepareScopeRequest,
-  type ContentResearchResolveCoverageRequest,
   type ContentResearchScopeDraft,
   type ContentResearchScopeProjection,
   type ContentResearchTrace,
@@ -718,8 +717,17 @@ function liteDirectionLabel(value: string) {
 
 function ContentResearchIntentCard({
   intent,
+  busy,
+  onConfirm,
 }: {
   intent: ContentResearchIntentState;
+  busy: boolean;
+  onConfirm: (input: {
+    brief_id: string;
+    selected_competitors: string[];
+    custom_competitor_input: string;
+    selected_directions: string[];
+  }) => void;
 }) {
   const structure = intent.presearch.subject_structure ?? {};
   const subject = structure.canonical_subject?.trim() || intent.seed || "本轮调研";
@@ -858,8 +866,134 @@ function ContentResearchIntentCard({
               </button>
             ))}
           </div>
+          <div className="mt-5 flex justify-end">
+            <button
+              type="button"
+              disabled={busy || subjectConfirmed !== "yes" || selectedDirections.length === 0}
+              onClick={() => onConfirm({
+                brief_id: intent.presearch.brief_id,
+                selected_competitors: selectedCompetitors,
+                custom_competitor_input: extraCompetitors,
+                selected_directions: selectedDirections,
+              })}
+              className="rounded-xl bg-ink px-5 py-2.5 text-sm font-semibold text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-35"
+            >
+              {busy ? "正在生成检索词…" : "确认并继续"}
+            </button>
+          </div>
         </div>
       </div>
+    </div>
+  );
+}
+
+function ContentResearchScopeDraftCard({
+  projection,
+  busy,
+  onReplace,
+}: {
+  projection: ContentResearchScopeProjection;
+  busy: boolean;
+  onReplace: (input: {
+    scope_draft_id: string;
+    product_experience_aspect: string | null;
+    context_audience_aspect: string | null;
+    final_queries: string[];
+  }) => void;
+}) {
+  const draft = projection.draft;
+  const [productAspect, setProductAspect] = useState(draft.product_experience_aspect ?? "");
+  const [contextAspect, setContextAspect] = useState(draft.context_audience_aspect ?? "");
+  const [finalQueries, setFinalQueries] = useState(
+    draft.query_groups.map((group) => group.final_query),
+  );
+
+  useEffect(() => {
+    setProductAspect(draft.product_experience_aspect ?? "");
+    setContextAspect(draft.context_audience_aspect ?? "");
+    setFinalQueries(draft.query_groups.map((group) => group.final_query));
+  }, [draft]);
+
+  function suggestedQueries(nextProduct = productAspect, nextContext = contextAspect) {
+    return [
+      draft.core_object,
+      ...(nextProduct.trim() ? [`${draft.core_object} ${nextProduct.trim()}`] : []),
+      ...(nextContext.trim() ? [`${draft.core_object} ${nextContext.trim()}`] : []),
+    ];
+  }
+
+  function persist(nextQueries: string[], nextProduct = productAspect, nextContext = contextAspect) {
+    if (busy || nextQueries.some((query) => !query.trim())) return;
+    onReplace({
+      scope_draft_id: draft.id,
+      product_experience_aspect: nextProduct.trim() || null,
+      context_audience_aspect: nextContext.trim() || null,
+      final_queries: nextQueries.map((query) => query.trim()),
+    });
+  }
+
+  return (
+    <div className="flex justify-start">
+      <section className="w-full max-w-[92%] rounded-2xl border border-line bg-white px-5 py-5 shadow-sm" aria-label="检索范围确认">
+        <p className="text-xs font-semibold uppercase tracking-wider text-slate-400">检索范围确认</p>
+        <h2 className="mt-2 text-2xl font-semibold text-ink">确认本轮实际搜索词</h2>
+        <p className="mt-2 text-sm leading-6 text-quiet">
+          下方“最终搜索词”会按原文发送给小红书。现在仍是可编辑草稿，尚未冻结，也没有开始采集。
+        </p>
+
+        <div className="mt-5 grid gap-3 md:grid-cols-3">
+          <label className="rounded-xl bg-[#f4f7f5] p-3 text-sm">
+            <span className="font-semibold text-ink">核心对象 A</span>
+            <span className="mt-1 block text-xs leading-5 text-quiet">每组检索都围绕它展开，也是候选笔记唯一的硬性对象条件。</span>
+            <input readOnly value={draft.core_object} className="mt-3 h-10 w-full rounded-lg border border-line bg-white px-3 text-sm text-ink" />
+          </label>
+          <label className="rounded-xl bg-[#f4f7f5] p-3 text-sm">
+            <span className="font-semibold text-ink">产品／体验词 B（可选）</span>
+            <span className="mt-1 block text-xs leading-5 text-quiet">填写真实会搜索的具体词，例如“凉感”“显瘦”；不是分析目标。</span>
+            <input
+              value={productAspect}
+              onChange={(event) => setProductAspect(event.target.value)}
+              onBlur={() => {
+                const next = suggestedQueries(productAspect, contextAspect);
+                setFinalQueries(next);
+                persist(next, productAspect, contextAspect);
+              }}
+              placeholder="例如：凉感"
+              className="mt-3 h-10 w-full rounded-lg border border-line bg-white px-3 text-sm outline-none focus:border-[#789180]"
+            />
+          </label>
+          <label className="rounded-xl bg-[#f4f7f5] p-3 text-sm">
+            <span className="font-semibold text-ink">场景／人群词 C（可选）</span>
+            <span className="mt-1 block text-xs leading-5 text-quiet">填写具体使用语境、场景或人群，例如“夏季通勤”。</span>
+            <input
+              value={contextAspect}
+              onChange={(event) => setContextAspect(event.target.value)}
+              onBlur={() => {
+                const next = suggestedQueries(productAspect, contextAspect);
+                setFinalQueries(next);
+                persist(next, productAspect, contextAspect);
+              }}
+              placeholder="例如：夏季通勤"
+              className="mt-3 h-10 w-full rounded-lg border border-line bg-white px-3 text-sm outline-none focus:border-[#789180]"
+            />
+          </label>
+        </div>
+
+        <div className="mt-5 space-y-3">
+          {finalQueries.map((query, index) => (
+            <label key={`${draft.id}-${index}`} className="block rounded-xl border border-line bg-white p-3">
+              <span className="text-xs font-semibold text-slate-400">最终搜索词 {index + 1}</span>
+              <input
+                value={query}
+                onChange={(event) => setFinalQueries((current) => current.map((item, itemIndex) => itemIndex === index ? event.target.value : item))}
+                onBlur={() => persist(finalQueries)}
+                className="mt-2 h-11 w-full rounded-lg border border-line bg-slate-50 px-3 text-sm text-ink outline-none focus:border-[#789180] focus:bg-white"
+              />
+            </label>
+          ))}
+        </div>
+        <p className="mt-4 text-xs text-quiet">{busy ? "正在保存最新检索词…" : "修改后会自动保存；B/C 留空也可以继续。"}</p>
+      </section>
     </div>
   );
 }
@@ -2094,6 +2228,74 @@ function ContentResearchContextSidebar({
     return projection;
   }
 
+  async function confirmCurrentContentResearchBrief(input: {
+    brief_id: string;
+    selected_competitors: string[];
+    custom_competitor_input: string;
+    selected_directions: string[];
+  }) {
+    const intent = contentResearchIntent;
+    if (!intent || scopeActionBusy) return;
+    const runId = intent.presearch.run.run_id;
+    const ticket = contentResearchRequestEpochRef.current.ticket(runId, "confirm-brief");
+    setScopeActionBusy(true);
+    try {
+      const response = await confirmContentResearchBrief(intent.presearch.run, input);
+      if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
+      setScopeProjectionsByRun((current) => ({
+        ...current,
+        [runId]: response.result.scope,
+      }));
+      const [workflow, trace] = await Promise.all([
+        getContentResearchWorkflow(runId),
+        getContentResearchTrace(runId),
+      ]);
+      if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
+      setContentResearchIntent(null);
+      setContentResearchRun(contentResearchRunWithReport(runId, workflow, trace, null, null));
+      appendMessage({ role: "assistant", text: "调研 Brief 已确认，请确认本轮最终搜索词。" });
+    } catch (error) {
+      if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
+      appendMessage({
+        role: "system",
+        text: contentResearchErrorFeedback(error, "确认调研 Brief 失败"),
+      });
+    } finally {
+      if (contentResearchRequestEpochRef.current.accepts(ticket)) setScopeActionBusy(false);
+    }
+  }
+
+  async function replaceCurrentScopeDraft(input: {
+    scope_draft_id: string;
+    product_experience_aspect: string | null;
+    context_audience_aspect: string | null;
+    final_queries: string[];
+  }) {
+    const run = contentResearchRun?.summary.run;
+    if (!run || scopeActionBusy) return;
+    const ticket = contentResearchRequestEpochRef.current.ticket(run.run_id, "replace-scope-draft");
+    setScopeActionBusy(true);
+    try {
+      const response = await replaceContentResearchScopeDraft(run, input);
+      if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
+      setScopeProjectionsByRun((current) => ({
+        ...current,
+        [run.run_id]: response.result.scope,
+      }));
+      setContentResearchRun((current) => current && current.workflowRunId === run.run_id
+        ? { ...current, summary: { ...current.summary, run: response.result.run } }
+        : current);
+    } catch (error) {
+      if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
+      appendMessage({
+        role: "system",
+        text: contentResearchErrorFeedback(error, "保存检索词失败"),
+      });
+    } finally {
+      if (contentResearchRequestEpochRef.current.accepts(ticket)) setScopeActionBusy(false);
+    }
+  }
+
   async function restoreInterruptedContentResearchRun(threadId: string): Promise<boolean> {
     try {
       const { thread } = await getThreadTimeline(threadId);
@@ -2893,6 +3095,16 @@ function ContentResearchContextSidebar({
             {contentResearchIntent && (
               <ContentResearchIntentCard
                 intent={contentResearchIntent}
+                busy={scopeActionBusy}
+                onConfirm={(input) => void confirmCurrentContentResearchBrief(input)}
+              />
+            )}
+
+            {scopeProjection && contentResearchRun?.summary.run.state === "scope_confirmation_required" && (
+              <ContentResearchScopeDraftCard
+                projection={scopeProjection}
+                busy={scopeActionBusy}
+                onReplace={(input) => void replaceCurrentScopeDraft(input)}
               />
             )}
 

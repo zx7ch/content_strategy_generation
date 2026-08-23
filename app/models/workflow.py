@@ -36,6 +36,7 @@ class WorkflowPhase(str, Enum):
 class WorkflowStepStatus(str, Enum):
     PENDING = "pending"
     RUNNING = "running"
+    WAITING_USER = "waiting_user"
     RETRYING = "retrying"
     PAUSED = "paused"
     SKIPPED = "skipped"

@@ -528,6 +528,12 @@ class ContentResearchPersistenceCoordinator:
         brief_id = None
         if command.kind == "presearch_completed":
             brief_id = await self._persist_presearch_brief(conn, row, command.payload)
+        elif command.kind == "confirm_brief":
+            brief_id = await self._persist_confirmed_brief_and_scope_draft(
+                conn, row, command.payload
+            )
+        elif command.kind == "replace_scope_draft":
+            await self._persist_scope_draft_replacement(conn, row, command.payload)
         elif command.kind == "fail" and command.payload.get("brief_id"):
             brief_id = await self._persist_presearch_brief(conn, row, command.payload)
 
@@ -550,6 +556,8 @@ class ContentResearchPersistenceCoordinator:
         current_step = (
             "brief_confirm"
             if decision.to_state is ContentResearchState.BRIEF_CONFIRMATION_REQUIRED
+            else "scope_confirm"
+            if decision.to_state is ContentResearchState.SCOPE_CONFIRMATION_REQUIRED
             else row["current_step"]
         )
         await conn.execute(
@@ -576,6 +584,20 @@ class ContentResearchPersistenceCoordinator:
                 """UPDATE workflow_steps
                    SET status='succeeded', completed_at=?, updated_at=?
                    WHERE run_id=? AND step_name='presearch'""",
+                (now, now, command.run_id),
+            )
+        elif command.kind == "confirm_brief":
+            await conn.execute(
+                """UPDATE workflow_steps
+                   SET status='succeeded', completed_at=?, updated_at=?
+                   WHERE run_id=? AND step_name='brief_confirm'""",
+                (now, now, command.run_id),
+            )
+            await conn.execute(
+                """UPDATE workflow_steps
+                   SET status='waiting_user', attempt_count=CASE WHEN attempt_count=0 THEN 1 ELSE attempt_count END,
+                       started_at=COALESCE(started_at, ?), updated_at=?
+                   WHERE run_id=? AND step_name='scope_confirm'""",
                 (now, now, command.run_id),
             )
         elif command.kind in {"revise_subject", "retry_presearch"}:
@@ -630,12 +652,163 @@ class ContentResearchPersistenceCoordinator:
                 now,
             ),
         )
-        if brief_id is not None:
+        if brief_id is not None or command.kind == "replace_scope_draft":
             await conn.execute(
                 "UPDATE workflow_runs SET artifact_version=artifact_version+1 WHERE run_id=?",
                 (command.run_id,),
             )
         return decision.next_revision
+
+    async def _persist_confirmed_brief_and_scope_draft(
+        self,
+        conn: aiosqlite.Connection,
+        run_row: aiosqlite.Row,
+        payload: Any,
+    ) -> str:
+        brief_id = str(payload.get("brief_id") or "")
+        plan = dict(payload.get("plan") or {})
+        directions = list(payload.get("directions") or [])
+        draft = dict(payload.get("scope_draft") or {})
+        if not brief_id or not plan.get("id") or not draft.get("id") or not directions:
+            raise ValueError("confirm_brief requires Brief, Plan, directions, and Scope Draft")
+        if (
+            str(draft.get("workflow_run_id") or "") != str(run_row["run_id"])
+            or str(draft.get("research_plan_id") or "") != str(plan["id"])
+        ):
+            raise LifecycleCommandConflict("Scope Draft lineage does not match this Run and Plan")
+        cursor = await conn.execute(
+            "SELECT * FROM content_research_briefs WHERE id=? AND workflow_run_id=?",
+            (brief_id, run_row["run_id"]),
+        )
+        brief = await cursor.fetchone()
+        if brief is None:
+            raise LifecycleCommandConflict("Brief identity does not belong to this Run")
+        now = _now()
+        confirmed_payload = json.loads(str(brief["payload_json"]))
+        confirmed_payload.update(dict(payload.get("brief_confirmation") or {}))
+        confirmed_payload["confirmed_at"] = now
+        await conn.execute(
+            """UPDATE content_research_briefs
+               SET status='confirmed', payload_json=?, updated_at=? WHERE id=?""",
+            (_canonical_json(confirmed_payload), now, brief_id),
+        )
+        await conn.execute(
+            """INSERT INTO content_research_plans
+               (id, brief_id, workflow_run_id, thread_id, schema_version, status,
+                created_at, updated_at, payload_json, metadata_json)
+               VALUES (?, ?, ?, ?, ?, 'draft', ?, ?, ?, '{}')""",
+            (
+                plan["id"],
+                brief_id,
+                run_row["run_id"],
+                run_row["thread_id"],
+                str(plan.get("schema_version") or "content_research_plan_v2"),
+                now,
+                now,
+                _canonical_json(dict(plan.get("payload") or {})),
+            ),
+        )
+        for priority, direction in enumerate(directions):
+            direction = dict(direction)
+            await conn.execute(
+                """INSERT INTO content_research_directions
+                   (id, plan_id, workflow_run_id, thread_id, schema_version, status,
+                    priority, created_at, updated_at, payload_json, metadata_json)
+                   VALUES (?, ?, ?, ?, ?, 'draft', ?, ?, ?, ?, '{}')""",
+                (
+                    direction["id"],
+                    plan["id"],
+                    run_row["run_id"],
+                    run_row["thread_id"],
+                    str(direction.get("schema_version") or "content_research_direction_v2"),
+                    priority,
+                    now,
+                    now,
+                    _canonical_json(dict(direction.get("payload") or {})),
+                ),
+            )
+        await self._insert_scope_draft(conn, draft, now=now)
+        return brief_id
+
+    async def _persist_scope_draft_replacement(
+        self,
+        conn: aiosqlite.Connection,
+        run_row: aiosqlite.Row,
+        payload: Any,
+    ) -> None:
+        replaces_id = str(payload.get("replaces_scope_draft_id") or "")
+        draft = dict(payload.get("scope_draft") or {})
+        cursor = await conn.execute(
+            """SELECT id FROM content_research_scope_drafts
+               WHERE workflow_run_id=? ORDER BY created_at DESC, id DESC LIMIT 1""",
+            (run_row["run_id"],),
+        )
+        latest = await cursor.fetchone()
+        if latest is None or str(latest["id"]) != replaces_id:
+            raise LifecycleCommandConflict("stale Scope Draft replacement")
+        if str(draft.get("workflow_run_id") or "") != str(run_row["run_id"]):
+            raise LifecycleCommandConflict("Scope Draft lineage does not match this Run")
+        await self._insert_scope_draft(conn, draft, now=_now())
+
+    async def _insert_scope_draft(
+        self,
+        conn: aiosqlite.Connection,
+        draft: dict[str, Any],
+        *,
+        now: str,
+    ) -> None:
+        required = (
+            "id",
+            "workflow_run_id",
+            "research_plan_id",
+            "structure_hash",
+            "constraints",
+            "query_groups",
+        )
+        if any(not draft.get(key) for key in required):
+            raise ValueError("Scope Draft payload is incomplete")
+        await conn.execute(
+            """INSERT INTO content_research_scope_drafts
+               (id, workflow_run_id, research_plan_id, structure_hash, constraints_json,
+                query_groups_json, created_at, schema_version, core_object,
+                product_experience_aspect, context_audience_aspect)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                draft["id"],
+                draft["workflow_run_id"],
+                draft["research_plan_id"],
+                draft["structure_hash"],
+                _canonical_json(draft["constraints"]),
+                _canonical_json(draft["query_groups"]),
+                now,
+                str(draft.get("schema_version") or "content_research_scope_contract_v2"),
+                draft.get("core_object"),
+                draft.get("product_experience_aspect"),
+                draft.get("context_audience_aspect"),
+            ),
+        )
+        audit_id = str(draft.get("audit_event_id") or "")
+        if not audit_id:
+            raise ValueError("Scope Draft audit identity is required")
+        await conn.execute(
+            """INSERT INTO content_research_scope_draft_audit_events
+               (id, workflow_run_id, scope_draft_id, event_name, payload_json, created_at)
+               VALUES (?, ?, ?, 'scope_suggested', ?, ?)""",
+            (
+                audit_id,
+                draft["workflow_run_id"],
+                draft["id"],
+                _canonical_json(
+                    {
+                        "schema_version": "content_research_scope_audit_event_v1",
+                        "scope_draft_id": draft["id"],
+                        "replaces_scope_draft_id": draft.get("replaces_scope_draft_id"),
+                        "query_groups": draft["query_groups"],
+                    }
+                ),
+                now,
+            ),
+        )
 
     async def _persist_presearch_brief(
         self,

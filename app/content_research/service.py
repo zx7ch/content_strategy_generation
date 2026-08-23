@@ -20,7 +20,7 @@ from app.content_research.analysis import DirectionalAnalysisLLM
 from app.content_research.api_schemas import (
     CONTENT_RESEARCH_API_SCHEMA_VERSION,
     P0_WORKFLOW_ACTIONS,
-    ConfirmScopeRequest,
+    ContentResearchBriefConfirmationRequest,
     ContentResearchBriefResponse,
     ContentResearchDirectionEvidenceResponse,
     ContentResearchDirectionResponse,
@@ -30,6 +30,7 @@ from app.content_research.api_schemas import (
     ContentResearchLiteReportResponse,
     ContentResearchPlanResponse,
     ContentResearchPresearchResponse,
+    ContentResearchRunProjectionResponse,
     ContentResearchScopeProjectionResponse,
     ContentResearchSourceCollectionRequest,
     ContentResearchSubagentTaskResponse,
@@ -42,7 +43,7 @@ from app.content_research.api_schemas import (
     HumanDecisionRequest,
     HumanDecisionResponse,
     HumanDecisionsResponse,
-    PrepareScopeRequest,
+    ReplaceScopeDraftRequest,
     ResolveCoverageRequest,
     SnapshotResponse,
 )
@@ -1152,9 +1153,10 @@ class ContentResearchService:
             events=await self._workflow_runtime.list_events(workflow_run_id),
         )
 
-    def get_scope_projection(
+    async def get_scope_projection(
         self, workflow_run_id: str, *, version: int | None = None
     ) -> ContentResearchScopeProjectionResponse:
+        run_projection = await self._lifecycle.load(workflow_run_id)
         brief = self._store.get_brief_by_workflow(workflow_run_id)
         if brief is None:
             raise ContentResearchNotFoundError(
@@ -1192,7 +1194,6 @@ class ContentResearchService:
                     workflow_run_id, version=contract.version
                 )
             )
-        is_superseded = contract is not None and contract.version != contracts[-1].version
         authorizations = self._store.list_scope_execution_authorizations(workflow_run_id)
         current_authorization = max(
             (
@@ -1230,16 +1231,29 @@ class ContentResearchService:
                 and coverage_snapshot.execution_authorization_id is not None
             ):
                 coverage_snapshot = None
-        allowed_actions = _scope_projection_actions(
-            draft=draft,
-            contract=contract,
-            coverage_snapshot=coverage_snapshot,
-            authorizations=authorizations,
+        allowed_actions = (
+            [
+                {
+                    "action": "replace_scope_draft",
+                    "available": True,
+                    "scope_draft_id": draft.id,
+                    "query_groups": [
+                        _scope_query_input_payload(item) for item in draft.query_groups
+                    ],
+                }
+            ]
+            if run_projection.state is ContentResearchState.SCOPE_CONFIRMATION_REQUIRED
+            and "replace_scope_draft" in run_projection.allowed_actions
+            else []
         )
-        allowed_resolutions = _scope_projection_resolutions(
-            contract=contract,
-            coverage_snapshot=coverage_snapshot,
-            authorizations=authorizations,
+        allowed_resolutions = (
+            _scope_projection_resolutions(
+                contract=contract,
+                coverage_snapshot=coverage_snapshot,
+                authorizations=authorizations,
+            )
+            if run_projection.state is ContentResearchState.COVERAGE_DECISION_REQUIRED
+            else []
         )
         execution_unit = (
             self._store.get_scope_execution_unit(current_authorization.execution_unit_id)
@@ -1254,12 +1268,10 @@ class ContentResearchService:
         )
         return ContentResearchScopeProjectionResponse(
             workflow_run_id=workflow_run_id,
-            state=(
-                "awaiting_confirmation"
-                if contract is None
-                else "superseded"
-                if is_superseded
-                else "confirmed"
+            state=run_projection.state.value,
+            state_revision=run_projection.state_revision,
+            run=ContentResearchRunProjectionResponse(
+                **self._run_projection_payload(run_projection)
             ),
             draft=_scope_draft_payload(draft),
             scope_contract=_scope_contract_payload(contract) if contract is not None else None,
@@ -1278,7 +1290,7 @@ class ContentResearchService:
                 coverage_snapshot=coverage_snapshot,
                 authorizations=authorizations,
                 allowed_resolutions=allowed_resolutions,
-            ),
+            ) if run_projection.state is ContentResearchState.COVERAGE_DECISION_REQUIRED else None,
             execution_unit=_scope_execution_unit_projection(
                 execution_unit=execution_unit,
                 authorization=current_authorization,
@@ -2223,230 +2235,6 @@ class ContentResearchService:
             limit=limit,
         )
 
-    def _prepare_scope(self, *, brief: ResearchBriefRecord, request: PrepareScopeRequest) -> dict[str, Any]:
-        direction_id = request.direction_id
-        unresolved = self._store.get_unresolved_coverage_snapshot(brief.workflow_run_id)
-        if unresolved is not None:
-            raise ContentResearchValidationError(
-                "coverage_decision_required: resolve_coverage must resolve the current "
-                "Coverage before prepare_scope can create another Scope draft"
-            )
-        plans = self._store.list_plans_for_brief(brief.id)
-        if not plans:
-            raise ContentResearchValidationError(
-                "Cannot prepare scope before confirming the research brief"
-            )
-        plan = plans[-1]
-        direction_ids = {
-            str(item.payload.get("direction_id") or "")
-            for item in self._store.list_directions_for_plan(plan.id)
-        }
-        if direction_id not in direction_ids:
-            raise ContentResearchValidationError(
-                "Scope direction is not part of the confirmed research plan"
-            )
-        if "product_marketing" in direction_ids and direction_id != "product_marketing":
-            raise ContentResearchValidationError(
-                "Product-marketing runs must prepare the product-marketing Scope v2"
-            )
-        structure_payload = dict(brief.payload.get("subject_structure") or {})
-        normalized_input = " ".join(
-            str(item).strip()
-            for item in (
-                *(
-                    entry.get("canonical_name")
-                    for entry in structure_payload.get("core_entities") or ()
-                    if isinstance(entry, dict)
-                ),
-                *(structure_payload.get("research_intents") or ()),
-                *(structure_payload.get("context_modifiers") or ()),
-            )
-            if str(item).strip()
-        )
-        decision = parse_subject_structure(structure_payload, normalized_input=normalized_input)
-        if decision.state != "confirmed" or decision.structure is None:
-            raise ContentResearchValidationError(
-                "Cannot prepare scope from an unconfirmed subject structure"
-            )
-        structure = decision.structure
-        core = structure.core_entities[0]
-        if direction_id == "product_marketing":
-            proposed_product_aspect = (
-                request.product_experience_aspect
-                if request.product_experience_aspect is not None
-                else structure.research_intents[0]
-                if structure.research_intents
-                else None
-            )
-            product_aspect = concrete_product_marketing_aspect(proposed_product_aspect)
-            context_aspect = " ".join(
-                (
-                    request.context_audience_aspect,
-                )
-                if request.context_audience_aspect is not None
-                else structure.context_modifiers
-            ).strip() or None
-            suggestions = compile_product_marketing_query_portfolio(
-                core_object=core.canonical_name,
-                product_experience_aspect=product_aspect,
-                context_audience_aspect=context_aspect,
-            )
-            user_supplied_queries = {
-                query
-                for query in (
-                    (
-                        f"{core.canonical_name} {product_aspect}"
-                        if request.product_experience_aspect is not None and product_aspect
-                        else None
-                    ),
-                    (
-                        f"{core.canonical_name} {context_aspect}"
-                        if request.context_audience_aspect is not None and context_aspect
-                        else None
-                    ),
-                )
-                if query is not None
-            }
-            constraints = (
-                ScopeConstraint(
-                    "core_object",
-                    "核心对象",
-                    core.canonical_name,
-                    "required",
-                    tuple(value for value in core.raw_mentions if value != core.canonical_name),
-                ),
-            )
-            draft = build_scope_draft(
-                workflow_run_id=brief.workflow_run_id,
-                research_plan_id=plan.id,
-                structure_hash=str(brief.payload.get("subject_structure_hash") or ""),
-                schema_version=SCOPE_CONTRACT_SCHEMA_VERSION_V2,
-                core_object=core.canonical_name,
-                product_experience_aspect=product_aspect,
-                context_audience_aspect=context_aspect,
-                constraints=constraints,
-                query_groups=tuple(
-                    ScopeQueryGroupInput(
-                        query,
-                        query,
-                        (core.canonical_name,),
-                        "user_edited" if query in user_supplied_queries else "system_suggested",
-                    )
-                    for query in suggestions
-                ),
-            )
-            return self._persist_scope_draft(
-                draft,
-                replaces_scope_draft_id=request.replaces_scope_draft_id,
-            )
-        constraints = [
-            ScopeConstraint(
-                "core_object",
-                "核心对象",
-                core.canonical_name,
-                "required",
-                tuple(value for value in core.raw_mentions if value != core.canonical_name),
-            )
-        ]
-        required_terms = [core.canonical_name]
-        for index, context in enumerate(structure.context_modifiers, start=1):
-            constraint_id = "season" if _is_season_context(context) else f"context_{index}"
-            constraints.append(
-                ScopeConstraint(
-                    constraint_id,
-                    "季节" if constraint_id == "season" else "上下文",
-                    context,
-                    "required",
-                )
-            )
-            required_terms.append(context)
-        if structure.research_intents:
-            constraints.append(
-                ScopeConstraint("scenario", "研究场景", structure.research_intents[0], "required")
-            )
-            required_terms.append(structure.research_intents[0])
-        full_query = " ".join(required_terms)
-        intent_query = " ".join((core.canonical_name, *structure.research_intents[:1]))
-        draft = build_scope_draft(
-            workflow_run_id=brief.workflow_run_id,
-            research_plan_id=plan.id,
-            structure_hash=str(brief.payload.get("subject_structure_hash") or ""),
-            constraints=tuple(constraints),
-            query_groups=(
-                ScopeQueryGroupInput(full_query, full_query, tuple(required_terms)),
-                ScopeQueryGroupInput(
-                    core.canonical_name, core.canonical_name, (core.canonical_name,)
-                ),
-                ScopeQueryGroupInput(
-                    intent_query,
-                    intent_query,
-                    (core.canonical_name, *structure.research_intents[:1]),
-                ),
-            ),
-        )
-        return self._persist_scope_draft(draft)
-
-    def _persist_scope_draft(
-        self,
-        draft: ResearchScopeDraft,
-        *,
-        replaces_scope_draft_id: str | None = None,
-    ) -> dict[str, Any]:
-        event = ScopeDraftAuditEvent(
-            id=_new_id("sae"),
-            workflow_run_id=draft.workflow_run_id,
-            scope_draft_id=draft.id,
-            event_name="scope_suggested",
-            payload={
-                "schema_version": "content_research_scope_audit_event_v1",
-                "scope_draft_id": draft.id,
-                "structure_hash": draft.structure_hash,
-                "scope_contract_schema_version": draft.schema_version,
-                "core_object": draft.core_object,
-                "product_experience_aspect": draft.product_experience_aspect,
-                "context_audience_aspect": draft.context_audience_aspect,
-                "constraints": [_scope_constraint_payload(item) for item in draft.constraints],
-                "query_groups": [_scope_query_input_payload(item) for item in draft.query_groups],
-            },
-        )
-        self._store.save_scope_draft_with_audit_event(
-            draft,
-            event,
-            replaces_scope_draft_id=replaces_scope_draft_id,
-        )
-        return {**_scope_draft_payload(draft), "audit_event": _scope_draft_audit_payload(event)}
-
-    def _confirm_scope(
-        self, *, workflow_run_id: str, request: ConfirmScopeRequest
-    ) -> dict[str, Any]:
-        unresolved = self._store.get_unresolved_coverage_snapshot(workflow_run_id)
-        if unresolved is not None:
-            raise ContentResearchValidationError(
-                "coverage_decision_required: resolve_coverage must resolve the current "
-                "Coverage before confirm_scope can create another Scope"
-            )
-        draft = self._store.get_scope_draft(request.scope_draft_id)
-        if draft is None or draft.workflow_run_id != workflow_run_id:
-            raise ContentResearchValidationError("Scope draft was not found for this workflow")
-        if request.structure_hash != draft.structure_hash:
-            raise ContentResearchValidationError(
-                "Scope confirmation structure hash does not match the persisted draft"
-            )
-        if len(request.query_groups) != len(draft.query_groups):
-            raise ContentResearchValidationError(
-                "Scope confirmation final query count must match the persisted draft"
-            )
-
-        contract, event, _created = self._store.confirm_scope_atomically(
-            draft.id,
-            final_queries=tuple(item.final_query for item in request.query_groups),
-            event_id=_new_id("sae"),
-        )
-        return {
-            "scope_contract": _scope_contract_payload(contract),
-            "audit_event": _scope_audit_payload(event),
-        }
-
     async def _resolve_coverage(
         self, *, workflow_run_id: str, request: ResolveCoverageRequest
     ) -> dict[str, Any]:
@@ -2738,7 +2526,240 @@ class ContentResearchService:
                 local_cache_id=response.brief_id,
             )
 
+        if action == "confirm_brief":
+            confirmation = ContentResearchBriefConfirmationRequest(**request.payload)
+            declared_state = ContentResearchState(request.expected_state)
+            if declared_state is not ContentResearchState.BRIEF_CONFIRMATION_REQUIRED:
+                raise LifecycleCommandConflict(
+                    "confirm_brief requires expected_state brief_confirmation_required"
+                )
+            projection = await self._lifecycle.apply(
+                LifecycleCommand(
+                    command_id=request.command_id,
+                    run_id=workflow_run_id,
+                    expected_state=declared_state,
+                    expected_revision=request.expected_revision,
+                    kind="confirm_brief",
+                    payload=self._build_confirm_brief_command_payload(
+                        workflow_run_id=workflow_run_id,
+                        brief=brief,
+                        confirmation=confirmation,
+                        command_id=request.command_id,
+                    ),
+                )
+            )
+            scope = await self.get_scope_projection(workflow_run_id)
+            return self._action_response(
+                workflow_run_id=workflow_run_id,
+                action=action,
+                status="completed",
+                result={
+                    "run": self._run_projection_payload(projection),
+                    "scope": scope.model_dump(mode="json"),
+                },
+                local_cache_id=brief.id,
+            )
+
+        if action == "replace_scope_draft":
+            replacement = ReplaceScopeDraftRequest(**request.payload)
+            declared_state = ContentResearchState(request.expected_state)
+            if declared_state is not ContentResearchState.SCOPE_CONFIRMATION_REQUIRED:
+                raise LifecycleCommandConflict(
+                    "replace_scope_draft requires expected_state scope_confirmation_required"
+                )
+            latest = self._store.get_scope_draft(replacement.scope_draft_id)
+            if latest is None or latest.workflow_run_id != workflow_run_id:
+                raise LifecycleCommandConflict("Scope Draft does not belong to this Run")
+            projection = await self._lifecycle.apply(
+                LifecycleCommand(
+                    command_id=request.command_id,
+                    run_id=workflow_run_id,
+                    expected_state=declared_state,
+                    expected_revision=request.expected_revision,
+                    kind="replace_scope_draft",
+                    payload=self._build_scope_draft_replacement_payload(
+                        latest=latest,
+                        replacement=replacement,
+                        command_id=request.command_id,
+                    ),
+                )
+            )
+            scope = await self.get_scope_projection(workflow_run_id)
+            return self._action_response(
+                workflow_run_id=workflow_run_id,
+                action=action,
+                status="completed",
+                result={
+                    "run": self._run_projection_payload(projection),
+                    "scope": scope.model_dump(mode="json"),
+                },
+                local_cache_id=brief.id,
+            )
+
         raise AssertionError("validated P0 action did not return")
+
+    def _build_confirm_brief_command_payload(
+        self,
+        *,
+        workflow_run_id: str,
+        brief: ResearchBriefRecord,
+        confirmation: ContentResearchBriefConfirmationRequest,
+        command_id: str,
+    ) -> dict[str, Any]:
+        if confirmation.brief_id != brief.id:
+            raise LifecycleCommandConflict("Brief identity does not match current Run")
+        allowed_directions = {"product_marketing", "competitor_discovery", "content_performance"}
+        selected_directions = tuple(dict.fromkeys(confirmation.selected_directions))
+        if any(item not in allowed_directions for item in selected_directions):
+            raise ContentResearchValidationError("Brief contains an unsupported research direction")
+        structure_payload = dict(brief.payload.get("subject_structure") or {})
+        core_entries = [
+            item for item in structure_payload.get("core_entities") or [] if isinstance(item, dict)
+        ]
+        if len(core_entries) != 1:
+            raise ContentResearchValidationError("Brief requires one resolved core research object")
+        core_object = str(core_entries[0].get("canonical_name") or "").strip()
+        if not core_object:
+            raise ContentResearchValidationError("Brief core research object is empty")
+        raw_intents = [str(item).strip() for item in structure_payload.get("research_intents") or []]
+        product_aspect = concrete_product_marketing_aspect(raw_intents[0] if raw_intents else None)
+        context_aspect = " ".join(
+            str(item).strip() for item in structure_payload.get("context_modifiers") or []
+            if str(item).strip()
+        ) or None
+        plan_id = _stable_command_id("rp", command_id)
+        draft = self._build_scope_v2_draft(
+            workflow_run_id=workflow_run_id,
+            plan_id=plan_id,
+            structure_hash=str(brief.payload.get("subject_structure_hash") or "missing"),
+            core_object=core_object,
+            product_aspect=product_aspect,
+            context_aspect=context_aspect,
+            command_id=command_id,
+        )
+        return {
+            "brief_id": brief.id,
+            "brief_confirmation": {
+                "selected_competitors": list(dict.fromkeys(confirmation.selected_competitors)),
+                "custom_competitor_input": confirmation.custom_competitor_input,
+                "selected_directions": list(selected_directions),
+            },
+            "plan": {
+                "id": plan_id,
+                "schema_version": "content_research_plan_v2",
+                "payload": {
+                    "schema_version": "content_research_plan_v2",
+                    "direction_ids": list(selected_directions),
+                },
+            },
+            "directions": [
+                {
+                    "id": _stable_command_id("rd", f"{command_id}:{direction_id}"),
+                    "schema_version": "content_research_direction_v2",
+                    "payload": {
+                        "direction_id": direction_id,
+                        "name": direction_id,
+                        "direction_type": direction_id,
+                    },
+                }
+                for direction_id in selected_directions
+            ],
+            "scope_draft": draft,
+        }
+
+    def _build_scope_draft_replacement_payload(
+        self,
+        *,
+        latest: ResearchScopeDraft,
+        replacement: ReplaceScopeDraftRequest,
+        command_id: str,
+    ) -> dict[str, Any]:
+        product_aspect = concrete_product_marketing_aspect(
+            replacement.product_experience_aspect
+        )
+        context_aspect = " ".join(
+            str(replacement.context_audience_aspect or "").split()
+        ) or None
+        return {
+            "replaces_scope_draft_id": latest.id,
+            "scope_draft": self._build_scope_v2_draft(
+                workflow_run_id=latest.workflow_run_id,
+                plan_id=latest.research_plan_id,
+                structure_hash=latest.structure_hash,
+                core_object=latest.core_object,
+                product_aspect=product_aspect,
+                context_aspect=context_aspect,
+                command_id=command_id,
+                final_queries=tuple(replacement.final_queries),
+                replaces_scope_draft_id=latest.id,
+                predecessor_groups=latest.query_groups,
+            ),
+        }
+
+    def _build_scope_v2_draft(
+        self,
+        *,
+        workflow_run_id: str,
+        plan_id: str,
+        structure_hash: str,
+        core_object: str,
+        product_aspect: str | None,
+        context_aspect: str | None,
+        command_id: str,
+        final_queries: tuple[str, ...] | None = None,
+        replaces_scope_draft_id: str | None = None,
+        predecessor_groups: tuple[ScopeQueryGroupInput, ...] | None = None,
+    ) -> dict[str, Any]:
+        suggestions = compile_product_marketing_query_portfolio(
+            core_object=core_object,
+            product_experience_aspect=product_aspect,
+            context_audience_aspect=context_aspect,
+        )
+        final_values = final_queries or suggestions
+        if not 1 <= len(final_values) <= 3 or any(not str(item).strip() for item in final_values):
+            raise ContentResearchValidationError("Scope Draft requires one to three non-empty queries")
+        predecessor_origins = {
+            item.suggested_query: item.origin or "system_suggested"
+            for item in predecessor_groups or ()
+        }
+        groups = tuple(
+            ScopeQueryGroupInput(
+                suggested_query=(suggestions[index] if index < len(suggestions) else str(query).strip()),
+                final_query=str(query).strip(),
+                targeted_required_terms=(core_object,),
+                origin=(
+                    predecessor_origins.get(suggestions[index], "user_edited")
+                    if index < len(suggestions)
+                    and str(query).strip() == suggestions[index]
+                    and predecessor_groups is not None
+                    else "system_suggested"
+                    if index < len(suggestions)
+                    and str(query).strip() == suggestions[index]
+                    and predecessor_groups is None
+                    else "user_edited"
+                ),
+            )
+            for index, query in enumerate(final_values)
+        )
+        draft = build_scope_draft(
+            workflow_run_id=workflow_run_id,
+            research_plan_id=plan_id,
+            structure_hash=structure_hash,
+            schema_version=SCOPE_CONTRACT_SCHEMA_VERSION_V2,
+            core_object=core_object,
+            product_experience_aspect=product_aspect,
+            context_audience_aspect=context_aspect,
+            constraints=(ScopeConstraint("core_object", "核心对象", core_object, "required"),),
+            query_groups=groups,
+        )
+        draft = replace(draft, id=_stable_command_id("rsd", command_id))
+        durable_draft = _scope_draft_payload(draft)
+        durable_draft.pop("created_at", None)
+        return {
+            **durable_draft,
+            "audit_event_id": _stable_command_id("sae", command_id),
+            "replaces_scope_draft_id": replaces_scope_draft_id,
+        }
 
     async def _retry_failed_report_publication(
         self,
@@ -4946,6 +4967,10 @@ def _new_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex}"
 
 
+def _stable_command_id(prefix: str, value: str) -> str:
+    return f"{prefix}_{hashlib.sha256(value.encode('utf-8')).hexdigest()[:24]}"
+
+
 def _normalized_subject_term(value: str) -> str:
     return " ".join(str(value or "").strip().split())
 
@@ -5348,76 +5373,6 @@ def _coverage_snapshot_payload(snapshot: Any) -> dict[str, Any]:
         "constraint_counts": snapshot.constraint_counts,
         "unmet_constraint_ids": list(snapshot.unmet_constraint_ids),
         "created_at": snapshot.created_at.isoformat(),
-    }
-
-
-def _scope_projection_actions(
-    *,
-    draft: ResearchScopeDraft,
-    contract: Any | None,
-    coverage_snapshot: Any | None,
-    authorizations: list[ScopeExecutionAuthorization],
-) -> list[dict[str, Any]]:
-    if contract is None:
-        return [
-            {
-                "action": "confirm_scope",
-                "available": True,
-                "scope_draft_id": draft.id,
-                "structure_hash": draft.structure_hash,
-                "query_groups": [_scope_query_input_payload(item) for item in draft.query_groups],
-            }
-        ]
-    if (
-        coverage_snapshot is None
-        or coverage_snapshot.state != "awaiting_scope_decision"
-        or any(item.coverage_snapshot_id == coverage_snapshot.id for item in authorizations)
-    ):
-        return []
-    return [
-        {
-            "action": "prepare_scope",
-            "available": False,
-            "unavailable_reason": "coverage_decision_required",
-            "recovery_action": "resolve_coverage",
-        },
-        {
-            "action": "confirm_scope",
-            "available": False,
-            "unavailable_reason": "coverage_decision_required",
-            "recovery_action": "resolve_coverage",
-        },
-        {
-            "action": "resolve_coverage",
-            "available": True,
-            "scope_contract_version": contract.version,
-            "coverage_snapshot_id": coverage_snapshot.id,
-        }
-    ]
-
-
-def _scope_decision_recovery(
-    *,
-    coverage_snapshot: Any | None,
-    authorizations: list[ScopeExecutionAuthorization],
-    allowed_resolutions: list[dict[str, Any]],
-) -> dict[str, Any] | None:
-    if (
-        coverage_snapshot is None
-        or coverage_snapshot.state != "awaiting_scope_decision"
-        or any(item.coverage_snapshot_id == coverage_snapshot.id for item in authorizations)
-    ):
-        return None
-    return {
-        "state": "coverage_decision_required",
-        "message": (
-            "Current Coverage is awaiting a user decision; ordinary Scope preparation and "
-            "confirmation are unavailable."
-        ),
-        "required_action": "resolve_coverage",
-        "allowed_resolutions": [
-            str(item["action"]) for item in allowed_resolutions if item.get("available")
-        ],
     }
 
 

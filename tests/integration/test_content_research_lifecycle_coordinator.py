@@ -135,7 +135,7 @@ async def test_presearch_completion_atomically_persists_brief_and_state(tmp_path
     assert completed.state is ContentResearchState.BRIEF_CONFIRMATION_REQUIRED
     assert completed.state_revision == 2
     assert completed.brief_id == "brief-lifecycle-2"
-    assert completed.allowed_actions == ("revise_subject", "cancel")
+    assert completed.allowed_actions == ("confirm_brief", "revise_subject", "cancel")
     with sqlite3.connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
         brief = conn.execute(

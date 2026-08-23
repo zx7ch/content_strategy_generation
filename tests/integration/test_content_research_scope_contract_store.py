@@ -644,7 +644,7 @@ def test_scope_draft_and_suggestion_audit_event_commit_atomically(tmp_path) -> N
     store.save_scope_draft_with_audit_event(draft, event)
 
     assert store.get_scope_draft(draft.id) == draft
-    with pytest.raises(ValueError, match="append-only"):
+    with pytest.raises(ValueError, match="scope_draft_replacement_id_required"):
         store.save_scope_draft_with_audit_event(draft, event)
 
 
@@ -883,6 +883,7 @@ def test_unresolved_coverage_atomically_blocks_new_draft_and_confirmation(tmp_pa
         first_draft,
         created_at=pending_draft.created_at + timedelta(microseconds=1),
     )
+    predecessor_id: str | None = None
     for draft, event_id in (
         (first_draft, "sda_exclusion_first"),
         (pending_draft, "sda_exclusion_pending"),
@@ -896,7 +897,9 @@ def test_unresolved_coverage_atomically_blocks_new_draft_and_confirmation(tmp_pa
                 event_name="scope_suggested",
                 payload={"schema_version": "content_research_scope_audit_event_v1"},
             ),
+            replaces_scope_draft_id=predecessor_id,
         )
+        predecessor_id = draft.id
     _save_current_brief(
         store,
         workflow_run_id=template.workflow_run_id,
@@ -1188,6 +1191,7 @@ def test_two_connections_can_confirm_only_the_latest_projected_draft(tmp_path) -
                 event_name="scope_suggested",
                 payload={"schema_version": "content_research_scope_audit_event_v1"},
             ),
+            replaces_scope_draft_id=(drafts[index - 2].id if index > 1 else None),
         )
     _save_current_brief(
         first_store,

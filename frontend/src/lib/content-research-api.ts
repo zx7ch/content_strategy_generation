@@ -212,7 +212,12 @@ export interface ContentResearchWorkflowActionRequest {
   command_id: string;
   expected_state: ContentResearchLifecycleState;
   expected_revision: number;
-  action: "cancel" | "retry_presearch" | "revise_subject";
+  action:
+    | "cancel"
+    | "retry_presearch"
+    | "revise_subject"
+    | "confirm_brief"
+    | "replace_scope_draft";
   payload?: JsonObject;
 }
 
@@ -326,7 +331,9 @@ export interface ContentResearchScopeAuditEvent {
 export interface ContentResearchScopeProjection {
   schema_version: string;
   workflow_run_id: string;
-  state: "awaiting_confirmation" | "confirmed" | "superseded";
+  state: ContentResearchLifecycleState;
+  state_revision: number;
+  run: ContentResearchRunProjection;
   draft: ContentResearchScopeDraft;
   scope_contract: ContentResearchScopeContract | null;
   audit_events: ContentResearchScopeAuditEvent[];
@@ -384,17 +391,23 @@ function safeContentResearchExecutionUnit(
   return safeExecutionUnit;
 }
 
-export interface ContentResearchPrepareScopeRequest {
-  direction_id: string;
-  product_experience_aspect?: string | null;
-  context_audience_aspect?: string | null;
-  replaces_scope_draft_id?: string;
+export interface ContentResearchBriefConfirmationInput {
+  brief_id: string;
+  selected_competitors: string[];
+  custom_competitor_input: string;
+  selected_directions: string[];
 }
 
-export interface ContentResearchConfirmScopeRequest {
+export interface ContentResearchScopeDraftReplacementInput {
   scope_draft_id: string;
-  structure_hash: string;
-  query_groups: Array<{ final_query: string }>;
+  product_experience_aspect?: string | null;
+  context_audience_aspect?: string | null;
+  final_queries: string[];
+}
+
+export interface ContentResearchScopeDraftActionResult {
+  run: ContentResearchRunProjection;
+  scope: ContentResearchScopeProjection;
 }
 
 export type ContentResearchCoverageResolution =
@@ -701,6 +714,26 @@ export async function reviseContentResearchSubject(
   clarificationText: string
 ): Promise<ContentResearchWorkflowActionResponse<ContentResearchPresearchResponse>> {
   return runContentResearchWorkflowAction(run.run_id, contentResearchCommand(run, "revise_subject", { clarification_text: clarificationText }));
+}
+
+export async function confirmContentResearchBrief(
+  run: ContentResearchRunProjection,
+  input: ContentResearchBriefConfirmationInput,
+): Promise<ContentResearchWorkflowActionResponse<ContentResearchScopeDraftActionResult>> {
+  return runContentResearchWorkflowAction(
+    run.run_id,
+    contentResearchCommand(run, "confirm_brief", { ...input }),
+  );
+}
+
+export async function replaceContentResearchScopeDraft(
+  run: ContentResearchRunProjection,
+  input: ContentResearchScopeDraftReplacementInput,
+): Promise<ContentResearchWorkflowActionResponse<ContentResearchScopeDraftActionResult>> {
+  return runContentResearchWorkflowAction(
+    run.run_id,
+    contentResearchCommand(run, "replace_scope_draft", { ...input }),
+  );
 }
 
 export async function runContentResearchWorkflowAction<T = JsonObject>(

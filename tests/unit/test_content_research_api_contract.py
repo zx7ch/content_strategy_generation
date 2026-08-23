@@ -14,6 +14,8 @@ def test_p0_workflow_action_contract_lists_supported_actions():
         "cancel",
         "retry_presearch",
         "revise_subject",
+        "confirm_brief",
+        "replace_scope_draft",
     )
 
     request = ContentResearchWorkflowActionRequest(

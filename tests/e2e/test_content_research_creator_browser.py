@@ -218,6 +218,91 @@ def test_creator_submit_subject_reaches_only_the_approved_brief_and_restores_it(
     assert active_run_id == run_id
 
 
+def test_creator_confirms_brief_and_edits_scope_draft_without_collection(browser_page):
+    page, stack = browser_page
+    page.goto(stack["frontend_url"] + "/creator", wait_until="domcontentloaded")
+    page.get_by_role("button", name=re.compile("内容调研")).click(timeout=15000)
+    research_input = page.get_by_role(
+        "textbox", name="输入品类、品牌或 SKU，发送后开始内容调研"
+    )
+    research_input.fill("长袖衬衫")
+    with page.expect_response(
+        lambda response: response.url.endswith("/content-research/presearch")
+        and response.status == 201,
+        timeout=30000,
+    ) as presearch_response:
+        research_input.press("Enter")
+    run_id = presearch_response.value.json()["workflow_run_id"]
+
+    page.get_by_role("button", name="准确，继续").click()
+    page.get_by_role("button", name="产品营销").click()
+    with page.expect_response(
+        lambda response: response.url.endswith("/actions")
+        and '"action":"confirm_brief"' in (response.request.post_data or ""),
+        timeout=30000,
+    ) as confirmed:
+        page.get_by_role("button", name="确认并继续").click()
+    assert confirmed.value.status == 200, confirmed.value.text()
+
+    scope = page.get_by_role("region", name="检索范围确认")
+    expect(scope.get_by_role("heading", name="确认本轮实际搜索词")).to_be_visible(
+        timeout=30000
+    )
+    expect(scope.get_by_text("重点了解什么", exact=True)).to_have_count(0)
+    expect(page.get_by_text("已冻结检索范围", exact=True)).to_have_count(0)
+    expect(page.get_by_text("专家调研进行中", exact=True)).to_have_count(0)
+    final_queries = scope.locator("label").filter(has_text="最终搜索词").locator("input")
+    expect(final_queries).to_have_count(1)
+    expect(final_queries.nth(0)).to_have_value("长袖衬衫")
+
+    product_input = scope.get_by_label(re.compile("产品／体验词 B"))
+    with page.expect_response(
+        lambda response: response.url.endswith("/actions")
+        and '"action":"replace_scope_draft"' in (response.request.post_data or ""),
+        timeout=30000,
+    ) as product_saved:
+        product_input.fill("凉感")
+        product_input.press("Tab")
+    assert product_saved.value.status == 200, product_saved.value.text()
+
+    scope = page.get_by_role("region", name="检索范围确认")
+    context_input = scope.get_by_label(re.compile("场景／人群词 C"))
+    with page.expect_response(
+        lambda response: response.url.endswith("/actions")
+        and '"action":"replace_scope_draft"' in (response.request.post_data or ""),
+        timeout=30000,
+    ) as context_saved:
+        context_input.fill("夏季通勤")
+        context_input.press("Tab")
+    assert context_saved.value.status == 200, context_saved.value.text()
+
+    scope = page.get_by_role("region", name="检索范围确认")
+    final_queries = scope.locator("label").filter(has_text="最终搜索词").locator("input")
+    expect(final_queries).to_have_count(3)
+    expect(final_queries.nth(0)).to_have_value("长袖衬衫")
+    expect(final_queries.nth(1)).to_have_value("长袖衬衫 凉感")
+    expect(final_queries.nth(2)).to_have_value("长袖衬衫 夏季通勤")
+
+    page.reload(wait_until="domcontentloaded")
+    scope = page.get_by_role("region", name="检索范围确认")
+    expect(scope.get_by_role("heading", name="确认本轮实际搜索词")).to_be_visible(
+        timeout=30000
+    )
+    with sqlite3.connect(stack["db_path"]) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM content_research_scope_contracts WHERE workflow_run_id=?",
+            (run_id,),
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM content_research_dispatch_jobs WHERE workflow_run_id=?",
+            (run_id,),
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM content_research_subagent_tasks WHERE workflow_run_id=?",
+            (run_id,),
+        ).fetchone()[0] == 0
+
+
 
 
 

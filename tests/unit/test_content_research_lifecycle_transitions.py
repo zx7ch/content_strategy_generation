@@ -29,6 +29,11 @@ from app.content_research.lifecycle.transitions import (
         ),
         (
             ContentResearchState.SCOPE_CONFIRMATION_REQUIRED,
+            "replace_scope_draft",
+            ContentResearchState.SCOPE_CONFIRMATION_REQUIRED,
+        ),
+        (
+            ContentResearchState.SCOPE_CONFIRMATION_REQUIRED,
             "confirm_scope",
             ContentResearchState.RETRIEVAL_QUEUED,
         ),

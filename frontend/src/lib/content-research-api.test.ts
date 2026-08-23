@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   ContentResearchApiError,
+  confirmContentResearchBrief,
   contentResearchCommand,
   createContentResearchPresearch,
   endContentResearchWorkflow,
@@ -17,6 +18,7 @@ import {
   submitContentResearchContentDecision,
   isContentResearchReportPending,
   retryContentResearchPresearch,
+  replaceContentResearchScopeDraft,
   saveLLMConfiguration,
 } from "./content-research-api.ts";
 import { setWorkspaceContext } from "./api.ts";
@@ -215,6 +217,46 @@ test("retry presearch returns the same persisted identifiers", async () => {
   assert.match(requestBody, /"action":"retry_presearch"/);
   assert.equal(result.attempt_id, "att_1");
   assert.equal(result.brief_id, "rb_1");
+});
+
+test("Brief confirmation and Scope replacement use authoritative command envelopes", async () => {
+  const bodies: Array<Record<string, unknown>> = [];
+  globalThis.fetch = (async (_input, init) => {
+    const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+    bodies.push(body);
+    return jsonResponse({
+      schema_version: "content_research_workflow_action_response_v1",
+      workflow_run_id: "run_1",
+      action: body.action,
+      status: "completed",
+      result: { run: testRun, scope: { workflow_run_id: "run_1" } },
+      execution_mode: "local",
+      sync_status: "local_only",
+    });
+  }) as typeof fetch;
+
+  await confirmContentResearchBrief(testRun, {
+    brief_id: "brief_1",
+    selected_competitors: [],
+    custom_competitor_input: "",
+    selected_directions: ["product_marketing"],
+  });
+  await replaceContentResearchScopeDraft(
+    { ...testRun, state: "scope_confirmation_required", state_revision: 3 },
+    {
+      scope_draft_id: "draft_1",
+      product_experience_aspect: "凉感",
+      context_audience_aspect: "夏季通勤",
+      final_queries: ["T恤", "T恤 凉感", "T恤 夏季通勤"],
+    },
+  );
+
+  assert.equal(bodies[0].action, "confirm_brief");
+  assert.equal(bodies[0].expected_state, "brief_confirmation_required");
+  assert.equal(bodies[0].expected_revision, 2);
+  assert.equal(bodies[1].action, "replace_scope_draft");
+  assert.equal(bodies[1].expected_state, "scope_confirmation_required");
+  assert.equal(bodies[1].expected_revision, 3);
 });
 
 test("getContentResearchScope reads the persisted Scope projection and optional version", async () => {

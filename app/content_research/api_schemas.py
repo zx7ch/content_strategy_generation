@@ -14,6 +14,8 @@ P0_WORKFLOW_ACTIONS = (
     "cancel",
     "retry_presearch",
     "revise_subject",
+    "confirm_brief",
+    "replace_scope_draft",
 )
 
 
@@ -185,7 +187,9 @@ class ContentResearchScopeProjectionResponse(BaseModel):
 
     schema_version: str = CONTENT_RESEARCH_API_SCHEMA_VERSION
     workflow_run_id: str
-    state: Literal["awaiting_confirmation", "confirmed", "superseded"]
+    state: str
+    state_revision: int = Field(ge=1)
+    run: ContentResearchRunProjectionResponse
     draft: dict
     scope_contract: dict | None = None
     audit_events: list[dict] = Field(default_factory=list)
@@ -357,27 +361,22 @@ class ContentResearchWorkflowActionRequest(BaseModel):
     payload: dict = Field(default_factory=dict)
 
 
-class PrepareScopeRequest(BaseModel):
+class ContentResearchBriefConfirmationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
-    direction_id: str = Field(min_length=1)
-    product_experience_aspect: str | None = Field(default=None, max_length=200)
-    context_audience_aspect: str | None = Field(default=None, max_length=200)
-    replaces_scope_draft_id: str | None = Field(default=None, min_length=1)
+    brief_id: str = Field(min_length=1)
+    selected_competitors: list[str] = Field(default_factory=list)
+    custom_competitor_input: str = ""
+    selected_directions: list[str] = Field(min_length=1)
 
 
-class ScopeFinalQueryEdit(BaseModel):
-    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
-
-    final_query: str = Field(min_length=1)
-
-
-class ConfirmScopeRequest(BaseModel):
+class ReplaceScopeDraftRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
     scope_draft_id: str = Field(min_length=1)
-    structure_hash: str = Field(min_length=1)
-    query_groups: list[ScopeFinalQueryEdit] = Field(min_length=1, max_length=3)
+    product_experience_aspect: str | None = Field(default=None, max_length=200)
+    context_audience_aspect: str | None = Field(default=None, max_length=200)
+    final_queries: list[str] = Field(min_length=1, max_length=3)
 
 
 class ResolveCoverageRequest(BaseModel):

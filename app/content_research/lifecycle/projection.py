@@ -12,10 +12,14 @@ from app.content_research.lifecycle.models import ContentResearchState, RunProje
 _ALLOWED_ACTIONS: dict[ContentResearchState, tuple[str, ...]] = {
     ContentResearchState.PRESEARCH_RUNNING: ("cancel",),
     ContentResearchState.BRIEF_CONFIRMATION_REQUIRED: (
+        "confirm_brief",
         "revise_subject",
         "cancel",
     ),
-    ContentResearchState.SCOPE_CONFIRMATION_REQUIRED: ("confirm_scope", "cancel"),
+    ContentResearchState.SCOPE_CONFIRMATION_REQUIRED: (
+        "replace_scope_draft",
+        "cancel",
+    ),
     ContentResearchState.RETRIEVAL_QUEUED: ("cancel",),
     ContentResearchState.RETRIEVAL_RUNNING: ("cancel",),
     ContentResearchState.COVERAGE_EVALUATING: (),

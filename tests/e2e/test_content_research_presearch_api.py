@@ -303,7 +303,7 @@ async def test_presearch_owned_stack_creates_authoritative_brief_without_subject
                 "state": "brief_confirmation_required",
                 "state_revision": 2,
                 "entered_at": payload["run"]["entered_at"],
-                "allowed_actions": ["revise_subject", "cancel"],
+                    "allowed_actions": ["confirm_brief", "revise_subject", "cancel"],
                 "reason_code": None,
                 "error": None,
                 "brief_id": payload["brief_id"],

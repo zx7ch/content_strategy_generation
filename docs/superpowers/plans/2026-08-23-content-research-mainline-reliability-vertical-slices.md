@@ -270,11 +270,11 @@ git commit -m "refactor(content-research): establish the authoritative lifecycle
 
 **Acceptance RED:** `test_creator_confirms_brief_and_receives_editable_scope_without_collection` and `test_creator_missing_bc_replaces_only_the_latest_scope_draft`.
 
-- [ ] **Step 1: Write query-contract, atomic-confirmation, and browser REDs**
+- [x] **Step 1: Write query-contract, atomic-confirmation, and browser REDs**
 
 Assert `A/A B/A C`, A-only fallback, B/C labels, no abstract “重点了解什么”, no Scope Contract, no dispatch, and no frozen/running UI.
 
-- [ ] **Step 2: Run REDs**
+- [x] **Step 2: Run REDs**
 
 ```bash
 pytest -q \
@@ -286,15 +286,15 @@ pytest -q \
   -k 'scope_draft or missing_bc or without_collection' -vv
 ```
 
-- [ ] **Step 3: Implement the transition and current Scope UI**
+- [x] **Step 3: Implement the transition and current Scope UI**
 
 Route Brief confirmation and Draft replacement through the coordinator. Delete automatic `formal_research`, legacy Brief fields/forms, and `start_formal_research` from the new-Run schemas, service dispatch, frontend API, UI, and tests.
 
-- [ ] **Step 4: Verify reload, duplicate/stale commands, frontend, and foundations**
+- [x] **Step 4: Verify reload, duplicate/stale commands, frontend, and foundations**
 
 Reload at `scope_confirmation_required`; reorder two Draft responses; double-submit Brief; run test lanes and old-spec scan.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add app/content_research frontend/src tests
