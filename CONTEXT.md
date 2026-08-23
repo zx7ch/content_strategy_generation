@@ -52,6 +52,30 @@ Browser acceptance in which Creator reads only the real Lite report API;
 component fixtures cannot substitute for API or browser proof.
 _Avoid_: mocked E2E
 
+**Core search object (A)**:
+The sole required product-marketing scope condition and the broad retrieval
+anchor, such as `长袖衬衫`. Suggested queries retain it, while a user-edited
+query may omit it and becomes exploratory.
+_Avoid_: primary intent, mandatory query token
+
+**Product/experience query aspect (B)**:
+An optional concrete phrase people plausibly search with A to diversify the
+product or experience results, such as `凉感`. It is not an evidence-admission
+condition.
+_Avoid_: research goal, primary intent
+
+**Context/audience query aspect (C)**:
+An optional concrete phrase people plausibly search with A to diversify a
+scenario, audience, or occasion, such as `夏季通勤`. It is not an
+evidence-admission condition.
+_Avoid_: required context, analysis goal
+
+**Suggested query portfolio**:
+The non-authoritative product-marketing proposal `A`, `A B`, and `A C`, omitting
+groups whose optional aspect is unavailable. The user's frozen Scope query
+groups, not this proposal, authorize execution.
+_Avoid_: Boolean query, mandatory three-query set
+
 **Destructive UI-contract cutover**:
 The Gate 4A deletion of legacy Creator UI/API contract implementations and
 their tests, while preserving validated F003 workflow capabilities and Gate 2

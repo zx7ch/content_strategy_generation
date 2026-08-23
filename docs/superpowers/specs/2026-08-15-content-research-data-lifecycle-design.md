@@ -5,6 +5,9 @@
 Make every completed Content Research Lite run auditable and recoverable across
 Runtime restarts, while keeping credentials and provider-session data private.
 
+The companion visual release record is
+[`docs/release/2026-08-15-content-research-data-lifecycle-fix.html`](../../release/2026-08-15-content-research-data-lifecycle-fix.html).
+
 ## Confirmed product decisions
 
 - A user changing research directions or returning to the checklist archives the

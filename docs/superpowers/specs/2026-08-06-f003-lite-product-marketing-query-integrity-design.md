@@ -1,5 +1,14 @@
 # F003 Lite 产品营销查询完整性设计
 
+## 状态
+
+部分被替代。本文的作者字段合约与对应验收继续有效；Brief 中的
+`primary_marketing_goal`、`custom_research_question`、固定“上身感受” facet
+以及两组主查询编译规则，已由
+[`2026-08-15-lite-research-scope-contract-design.md`](./2026-08-15-lite-research-scope-contract-design.md)
+中的用户确认查询组合与 Scope 执行权威替代。新 run 不得继续把这些旧字段
+解释为可执行检索词。
+
 ## 目标
 
 保证产品营销正式调研的所有主查询都研究用户确认的核心对象与首要意图；修复作者值与 `field_availability` 的合约不一致，使后续结论门槛和数据质量诊断可信。

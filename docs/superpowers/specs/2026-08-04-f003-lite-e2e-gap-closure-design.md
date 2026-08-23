@@ -1,5 +1,13 @@
 # F003 Lite End-to-End Gap Closure Design
 
+## Status
+
+Partially superseded. The one-shot subject proposal and deterministic trust
+gate remain historical requirements. The `research_intents[0]` query compiler,
+optional fallback query, and structured-field-to-query mapping are superseded
+for new runs by the user-confirmed query portfolio in
+[`2026-08-15-lite-research-scope-contract-design.md`](./2026-08-15-lite-research-scope-contract-design.md).
+
 ## Goal
 
 Close the three remaining P0 gaps between the implemented Lite modules and a
