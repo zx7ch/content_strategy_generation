@@ -41,6 +41,7 @@ import {
   type ContentResearchDirectionEvidence,
   type ContentResearchLiteReportResponse,
   type ContentResearchPresearchResponse,
+  type ContentResearchRunProjection,
   type ContentResearchScopeDraft,
   type ContentResearchScopeProjection,
   type ContentResearchTrace,
@@ -48,11 +49,18 @@ import {
 } from "@/lib/content-research-api";
 import { ModelServiceCard } from "@/components/content-research/ModelServiceCard";
 import { XiaohongshuLoginCard } from "@/components/content-research/XiaohongshuLoginCard";
-import { traceExecutionDurationText } from "@/lib/content-research-trace";
+import {
+  traceExecutionDurationText,
+  traceStepGroup,
+  traceStepTitle,
+  workflowStatusLabel,
+} from "@/lib/content-research-trace";
 import { resolveContentResearchModelRecovery } from "@/lib/content-research-recovery";
 import { contentResearchErrorFeedback } from "@/lib/content-research-error-feedback";
 import {
   ContentResearchRequestEpoch,
+  LatestScopeDraftSaveQueue,
+  scopeDraftSnapshotMatches,
   frozenReportScopeQueries,
   projectedModelRecoveryVisible,
 } from "./page-state";
@@ -221,7 +229,7 @@ function contentResearchRunWithReport(
 function presearchFromWorkflowSummary(
   summary: ContentResearchWorkflowSummary,
 ): ContentResearchPresearchResponse {
-  if (!summary.brief) throw new Error("当前状态尚未生成 Brief");
+  if (!summary.brief) throw new Error("当前状态尚未生成调研需求");
   const payload = summary.brief.payload;
   const rawStructure = payload.subject_structure;
   const subjectStructure = rawStructure && typeof rawStructure === "object" && !Array.isArray(rawStructure)
@@ -264,17 +272,6 @@ function sourceFailureReasonText(reason: string | null | undefined) {
   if (reason === "rate_limited") return "当前访问过于频繁，请稍后再继续";
   if (reason) return "采集服务暂时不可用，请检查服务状态后继续";
   return "无";
-}
-
-function workflowStatusLabel(status: string) {
-  if (["completed", "succeeded", "success"].includes(status)) return "已完成";
-  if (["running", "collecting"].includes(status)) return "进行中";
-  if (status === "pending") return "等待开始";
-  if (status === "retrying") return "等待恢复";
-  if (status === "waiting_user") return "等待恢复";
-  if (status === "failed") return "未完成";
-  if (["cancelled", "cancelling"].includes(status)) return "已结束";
-  return "等待处理";
 }
 
 function contentResearchSubject(run: ContentResearchRunState): string {
@@ -739,8 +736,9 @@ function ContentResearchIntentCard({
   }) => void;
 }) {
   const structure = intent.presearch.subject_structure ?? {};
-  const subject = structure.canonical_subject?.trim() || intent.seed || "本轮调研";
-  const coreObject = structure.core_entities?.[0]?.canonical_name?.trim() || subject;
+  const canonicalSubject = structure.canonical_subject?.trim() || intent.seed || "本轮调研";
+  const coreObject = structure.core_entities?.[0]?.canonical_name?.trim() || canonicalSubject;
+  const subject = coreObject;
   const intents = (structure.research_intents ?? []).filter(Boolean).join("、") || "待确认";
   const contexts = (structure.context_modifiers ?? []).filter(Boolean).join("、") || "无特定场景";
   const presearchConclusion = intent.presearch.subject_confirmation.trim();
@@ -904,7 +902,6 @@ function ContentResearchScopeDraftCard({
   projection: ContentResearchScopeProjection;
   busy: boolean;
   onReplace: (input: {
-    scope_draft_id: string;
     core_object: string;
     product_experience_aspect: string | null;
     context_audience_aspect: string | null;
@@ -914,21 +911,33 @@ function ContentResearchScopeDraftCard({
   const [coreObject, setCoreObject] = useState(draft.core_object);
   const [productAspect, setProductAspect] = useState(draft.product_experience_aspect ?? "");
   const [contextAspect, setContextAspect] = useState(draft.context_audience_aspect ?? "");
+  const editRef = useRef({
+    core_object: draft.core_object,
+    product_experience_aspect: draft.product_experience_aspect ?? "",
+    context_audience_aspect: draft.context_audience_aspect ?? "",
+  });
+  const hasLocalEditsRef = useRef(false);
 
   useEffect(() => {
+    if (hasLocalEditsRef.current) return;
+    editRef.current = {
+      core_object: draft.core_object,
+      product_experience_aspect: draft.product_experience_aspect ?? "",
+      context_audience_aspect: draft.context_audience_aspect ?? "",
+    };
     setCoreObject(draft.core_object);
     setProductAspect(draft.product_experience_aspect ?? "");
     setContextAspect(draft.context_audience_aspect ?? "");
   }, [draft]);
 
-  function persist(
-    nextCore = coreObject,
-    nextProduct = productAspect,
-    nextContext = contextAspect,
-  ) {
-    if (busy || !nextCore.trim()) return;
+  function persist() {
+    const {
+      core_object: nextCore,
+      product_experience_aspect: nextProduct,
+      context_audience_aspect: nextContext,
+    } = editRef.current;
+    if (!nextCore.trim()) return;
     onReplace({
-      scope_draft_id: draft.id,
       core_object: nextCore.trim(),
       product_experience_aspect: nextProduct.trim() || null,
       context_audience_aspect: nextContext.trim() || null,
@@ -955,8 +964,12 @@ function ContentResearchScopeDraftCard({
             <span className="mt-1 block text-xs leading-5 text-quiet">每组检索都围绕它展开，也是候选笔记唯一的硬性对象条件。</span>
             <input
               value={coreObject}
-              onChange={(event) => setCoreObject(event.target.value)}
-              onBlur={() => persist(coreObject, productAspect, contextAspect)}
+              onChange={(event) => {
+                hasLocalEditsRef.current = true;
+                editRef.current.core_object = event.target.value;
+                setCoreObject(event.target.value);
+              }}
+              onBlur={persist}
               placeholder="例如：T恤"
               className="mt-3 h-10 w-full rounded-lg border border-line bg-white px-3 text-sm text-ink outline-none focus:border-[#789180]"
             />
@@ -966,8 +979,12 @@ function ContentResearchScopeDraftCard({
             <span className="mt-1 block text-xs leading-5 text-quiet">填写真实会搜索的具体词，例如“凉感”“显瘦”；不是分析目标。</span>
             <input
               value={productAspect}
-              onChange={(event) => setProductAspect(event.target.value)}
-              onBlur={() => persist(coreObject, productAspect, contextAspect)}
+              onChange={(event) => {
+                hasLocalEditsRef.current = true;
+                editRef.current.product_experience_aspect = event.target.value;
+                setProductAspect(event.target.value);
+              }}
+              onBlur={persist}
               placeholder="例如：凉感"
               className="mt-3 h-10 w-full rounded-lg border border-line bg-white px-3 text-sm outline-none focus:border-[#789180]"
             />
@@ -977,8 +994,12 @@ function ContentResearchScopeDraftCard({
             <span className="mt-1 block text-xs leading-5 text-quiet">填写具体使用语境、场景或人群，例如“夏季通勤”。</span>
             <input
               value={contextAspect}
-              onChange={(event) => setContextAspect(event.target.value)}
-              onBlur={() => persist(coreObject, productAspect, contextAspect)}
+              onChange={(event) => {
+                hasLocalEditsRef.current = true;
+                editRef.current.context_audience_aspect = event.target.value;
+                setContextAspect(event.target.value);
+              }}
+              onBlur={persist}
               placeholder="例如：夏季通勤"
               className="mt-3 h-10 w-full rounded-lg border border-line bg-white px-3 text-sm outline-none focus:border-[#789180]"
             />
@@ -999,6 +1020,17 @@ function ContentResearchScopeDraftCard({
       </section>
     </div>
   );
+}
+
+interface ScopeDraftEdit {
+  core_object: string;
+  product_experience_aspect: string | null;
+  context_audience_aspect: string | null;
+}
+
+interface ScopeDraftSaveAuthority {
+  run: ContentResearchRunProjection;
+  scope: ContentResearchScopeProjection;
 }
 
 function reportStateLabel(state: LitePublicationState) {
@@ -1491,20 +1523,6 @@ interface ContentResearchRecoveryState {
   recoverable: boolean;
 }
 
-function traceStepTitle(stepName: string) {
-  if (stepName === "presearch") return "识别调研主体与候选方向";
-  if (stepName === "brief_confirm") return "确认调研 Brief";
-  if (stepName === "plan_build") return "拆解调研计划";
-  if (stepName === "formal_research") return "并行执行专家调研";
-  return stepName.replaceAll("_", " ");
-}
-
-function traceStepGroup(stepName: string) {
-  if (["presearch", "brief_confirm", "plan_build"].includes(stepName)) return "研究范围与计划";
-  if (stepName === "formal_research") return "来源收集与字段提取";
-  return "安全执行阶段";
-}
-
 function contentResearchTraceTimeline(trace: ContentResearchTrace | null): TraceTimelineStep[] {
   const workflowEvents = recordList(trace?.workflow_events);
   return recordList(trace?.runtime_steps).map((step, index) => {
@@ -1562,7 +1580,7 @@ function contentResearchRecoveryState(run: ContentResearchRunState): ContentRese
 function contentResearchContextStatus(run: ContentResearchRunState): string {
   const lifecycleState = run.summary.run.state;
   if (lifecycleState === "presearch_running") return "轻量预检索进行中";
-  if (lifecycleState === "brief_confirmation_required") return "等待确认调研 Brief";
+  if (lifecycleState === "brief_confirmation_required") return "等待确认调研需求";
   if (lifecycleState === "scope_confirmation_required") return "等待确认检索范围";
   if (lifecycleState === "retrieval_queued") return "内容检索等待开始";
   if (lifecycleState === "retrieval_running") return "内容检索进行中";
@@ -1810,13 +1828,13 @@ function ContentResearchTraceInspector({
                           <div className="flex shrink-0 flex-col items-end gap-1 text-sm text-quiet"><span>{step.durationText}</span><span className="text-lg leading-none">{isExpanded ? "⌃" : "⌄"}</span></div>
                         </div>
                       </button>
-                      {isExpanded && <div className="mt-4 border-t border-line pt-4"><p className="text-xs font-semibold tracking-wide text-quiet">安全执行状态</p><pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap rounded-xl bg-slate-50 px-3 py-3 text-xs leading-5 text-ink">{step.output}</pre></div>}
+                      {isExpanded && <div className="mt-4 border-t border-line pt-4"><p className="text-xs font-semibold tracking-wide text-quiet">执行详情</p><pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap rounded-xl bg-slate-50 px-3 py-3 text-xs leading-5 text-ink">{step.output}</pre></div>}
                     </article>
                   );
                 })}
               </div>
             ) : (
-              <div className="rounded-2xl border border-line bg-slate-50 px-4 py-5 text-sm text-quiet">暂无 trace 记录。确认 brief 后会自动写入执行轨迹。</div>
+              <div className="rounded-2xl border border-line bg-slate-50 px-4 py-5 text-sm text-quiet">暂无调研记录。确认调研需求后会自动写入执行轨迹。</div>
             )}
           </section>
 
@@ -1949,6 +1967,7 @@ function ContentResearchContextSidebar({
   const [preparedScope, setPreparedScope] = useState<ContentResearchScopeDraft | null>(null);
   const [scopeProjectionsByRun, setScopeProjectionsByRun] = useState<Record<string, ContentResearchScopeProjection>>({});
   const [scopeActionBusy, setScopeActionBusy] = useState(false);
+  const [scopeDraftSaveBusy, setScopeDraftSaveBusy] = useState(false);
   const [traceExpanded, setTraceExpanded] = useState(false);
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
   const [editingText, setEditingText] = useState("");
@@ -1970,6 +1989,10 @@ function ContentResearchContextSidebar({
   const snapshotRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const snapshotRefreshInFlightRef = useRef(false);
   const contentResearchRequestEpochRef = useRef(new ContentResearchRequestEpoch());
+  const scopeDraftSaveQueueRef = useRef<{
+    runId: string;
+    queue: LatestScopeDraftSaveQueue<ScopeDraftEdit, ScopeDraftSaveAuthority>;
+  } | null>(null);
   const contentResearchSubmitEpochRef = useRef(0);
   const pendingPresearchCommandsRef = useRef(new Map<string, { seed: string; commandId: string }>());
   // Tracks the most recently *requested* thread load to discard stale responses
@@ -1977,6 +2000,14 @@ function ContentResearchContextSidebar({
   const scopeProjection = contentResearchRun
     ? scopeProjectionsByRun[contentResearchRun.workflowRunId] ?? null
     : null;
+
+  useEffect(() => {
+    const activeRunId = contentResearchRun?.workflowRunId ?? null;
+    if (scopeDraftSaveQueueRef.current?.runId !== activeRunId) {
+      scopeDraftSaveQueueRef.current = null;
+      setScopeDraftSaveBusy(false);
+    }
+  }, [contentResearchRun?.workflowRunId]);
 
   const activeThread = threads.find((t) => t.thread_id === activeThreadId) ?? null;
   const activeTopicPoolUrl = activeThread
@@ -2256,12 +2287,12 @@ function ContentResearchContextSidebar({
       if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
       setContentResearchIntent(null);
       setContentResearchRun(contentResearchRunWithReport(runId, workflow, trace, null, null));
-      appendMessage({ role: "assistant", text: "调研 Brief 已确认，请确认本轮最终搜索词。" });
+      appendMessage({ role: "assistant", text: "调研需求已确认，请确认本轮最终搜索词。" });
     } catch (error) {
       if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
       appendMessage({
         role: "system",
-        text: contentResearchErrorFeedback(error, "确认调研 Brief 失败"),
+        text: contentResearchErrorFeedback(error, "确认调研需求失败"),
       });
     } finally {
       if (contentResearchRequestEpochRef.current.accepts(ticket)) setScopeActionBusy(false);
@@ -2269,34 +2300,70 @@ function ContentResearchContextSidebar({
   }
 
   async function replaceCurrentScopeDraft(input: {
-    scope_draft_id: string;
     core_object: string;
     product_experience_aspect: string | null;
     context_audience_aspect: string | null;
   }) {
     const run = contentResearchRun?.summary.run;
-    if (!run || scopeActionBusy) return;
-    const ticket = contentResearchRequestEpochRef.current.ticket(run.run_id, "replace-scope-draft");
-    setScopeActionBusy(true);
-    try {
-      const response = await replaceContentResearchScopeDraft(run, input);
-      if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
-      setScopeProjectionsByRun((current) => ({
-        ...current,
-        [run.run_id]: response.result.scope,
-      }));
-      setContentResearchRun((current) => current && current.workflowRunId === run.run_id
-        ? { ...current, summary: { ...current.summary, run: response.result.run } }
-        : current);
-    } catch (error) {
-      if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
-      appendMessage({
-        role: "system",
-        text: contentResearchErrorFeedback(error, "保存检索词失败"),
+    const projection = run ? scopeProjectionsByRun[run.run_id] : null;
+    if (!run || !projection || scopeActionBusy) return;
+
+    let holder = scopeDraftSaveQueueRef.current;
+    if (!holder || holder.runId !== run.run_id) {
+      const staleResponse = Symbol("stale-scope-draft-response");
+      const runId = run.run_id;
+      const queue = new LatestScopeDraftSaveQueue<ScopeDraftEdit, ScopeDraftSaveAuthority>({
+        initialAuthority: { run, scope: projection },
+        send: async (authority, snapshot) => {
+          const ticket = contentResearchRequestEpochRef.current.ticket(
+            runId,
+            "replace-scope-draft",
+          );
+          const response = await replaceContentResearchScopeDraft(authority.run, {
+            scope_draft_id: authority.scope.draft.id,
+            ...snapshot,
+          });
+          if (!contentResearchRequestEpochRef.current.accepts(ticket)) throw staleResponse;
+          return { run: response.result.run, scope: response.result.scope };
+        },
+        recover: async (_error, _authority, snapshot) => {
+          const ticket = contentResearchRequestEpochRef.current.ticket(
+            runId,
+            "replace-scope-draft",
+          );
+          const scope = await getContentResearchScope(runId);
+          if (!contentResearchRequestEpochRef.current.accepts(ticket)) throw staleResponse;
+          return {
+            authority: { run: scope.run, scope },
+            accepted: scopeDraftSnapshotMatches(scope.draft, snapshot),
+          };
+        },
+        onAuthority: (authority) => {
+          setScopeProjectionsByRun((current) => ({
+            ...current,
+            [runId]: authority.scope,
+          }));
+          setContentResearchRun((current) => current && current.workflowRunId === runId
+            ? { ...current, summary: { ...current.summary, run: authority.run } }
+            : current);
+        },
+        onAccepted: () => undefined,
+        onError: (error) => {
+          if (error === staleResponse) return;
+          appendMessage({
+            role: "system",
+            text: contentResearchErrorFeedback(error, "保存检索词失败"),
+          });
+        },
       });
-    } finally {
-      if (contentResearchRequestEpochRef.current.accepts(ticket)) setScopeActionBusy(false);
+      holder = { runId, queue };
+      scopeDraftSaveQueueRef.current = holder;
     }
+    if (!holder) return;
+    setScopeDraftSaveBusy(true);
+    holder.queue.enqueue(input);
+    await holder.queue.idle();
+    if (scopeDraftSaveQueueRef.current === holder) setScopeDraftSaveBusy(false);
   }
 
   async function restoreInterruptedContentResearchRun(threadId: string): Promise<boolean> {
@@ -2773,7 +2840,7 @@ function ContentResearchContextSidebar({
         setContentResearchIntent({ seed: text, presearch: revised.result });
         appendMessage({
           role: "assistant",
-          text: "已根据你的补充重新完成轻量预检索，请确认更新后的 Brief。",
+          text: "已根据你的补充重新完成轻量预检索，请确认更新后的调研需求。",
         });
       } catch (error) {
         if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
@@ -3106,7 +3173,7 @@ function ContentResearchContextSidebar({
             {scopeProjection && contentResearchRun?.summary.run.state === "scope_confirmation_required" && (
               <ContentResearchScopeDraftCard
                 projection={scopeProjection}
-                busy={scopeActionBusy}
+                busy={scopeActionBusy || scopeDraftSaveBusy}
                 onReplace={(input) => void replaceCurrentScopeDraft(input)}
               />
             )}

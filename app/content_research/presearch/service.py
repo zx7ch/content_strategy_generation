@@ -262,12 +262,10 @@ class PresearchService:
         structure_data = data.get("subject_structure")
         if not isinstance(structure_data, dict):
             raise ValueError("presearch response missing subject_structure")
-        grounding_input = " ".join(
-            item for item in (seed_text.strip(), (user_note or "").strip()) if item
-        )
         structure_decision = parse_subject_structure(
             structure_data,
-            normalized_input=grounding_input,
+            normalized_input=seed_text.strip(),
+            require_term_mapping=True,
         )
         structure = structure_decision.structure
         return PresearchChecklist(

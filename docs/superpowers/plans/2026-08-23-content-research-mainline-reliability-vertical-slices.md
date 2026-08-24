@@ -305,15 +305,14 @@ git commit -m "feat(content-research): make brief confirmation produce the exact
 
 ### Slice 2.1: Grounded Search Structure and Server-Compiled Read-Only Preview
 
-**Outcome:** A model proposal such as `core=夏季凉感T恤` retains its
-`core_entity_is_complete_input` diagnosis instead of being presented as a reliable split. In
-the existing Scope card the user edits “核心搜索词 / 产品或体验补充词 / 场景或人群补充词”,
-and the backend atomically replaces the Draft with the exact derived queries. The query list is
-read-only. This slice ends in `scope_confirmation_required`; it does not add the Task 3 confirm
-button, Scope Contract, dispatch, Spider call, or running state.
+**Outcome:** 系统先把输入拆为有序 `source_terms`，再映射为“核心搜索词 / 产品或体验补充词 /
+场景或人群补充词”。模型把相邻词元重新拼成复合核心词时，后端机械剔除已映射到补充词的
+词元；可执行 Draft 只能来自这份 grounded mapping。在现有 Scope 卡中，用户编辑三个结构化词，
+后端原子替换精确派生的 Draft，query 列表只读。本切片结束在 `scope_confirmation_required`；
+不增加 Task 3 确认按钮、Scope Contract、dispatch、Spider 调用或 running 状态。
 
-**Contract IDs:** `STATE-CR-03`, `AUTH-CR-05`, `AUTH-CR-09..10`, `INV-CR-02..03`,
-`INV-CR-19`, `FAIL-CR-13..14`, `ACC-STATE-14..16`.
+**Contract IDs:** `STATE-CR-03`, `AUTH-CR-05`, `AUTH-CR-09..12`, `INV-CR-02..03`,
+`INV-CR-19..20`, `FAIL-CR-13..19`, `ACC-STATE-14..21`.
 
 **Files:**
 
@@ -355,22 +354,24 @@ revision/event together. The client never submits an executable query bundle.
 **Side effect:** None. No Scope Contract, dispatch, subagent, XHS request, or Task 3 confirmation
 action is reachable.
 
-**Failure rows:** Invalid system analysis is preserved; arbitrary explicit user wording is not
-semantically rejected; empty core is rejected; B/C remain optional; stale replacement has zero
-delta; late frontend response cannot overwrite the latest input; editing core replaces the core
-constraint, targeted terms, and every derived query together.
+**Failure rows:** Invalid system analysis is preserved but invented model terms cannot enter an
+executable Draft; arbitrary explicit user wording is not semantically rejected; empty core is
+rejected; B/C remain optional; stale replacement has zero delta; late frontend response cannot
+overwrite the latest input; an ambiguous save response first reloads backend authority and uses a
+bounded retry; editing core replaces the core constraint, targeted terms, and every derived query
+together.
 
 **Acceptance RED:**
-`test_invalid_complete_input_reaches_one_editable_server_compiled_scope_without_collection` and
-`test_creator_corrects_search_structure_and_reads_only_the_backend_query_preview`.
+`test_compound_core_is_reduced_by_terms_already_mapped_to_product_and_context`、
+`test_grounded_term_mapping_reaches_one_editable_server_compiled_scope_without_collection` 与
+`test_creator_corrects_search_structure_and_reads_only_the_backend_query_preview`。
 
 - [x] **Step 1: Write the PreResearch and owned-stack REDs**
 
-  Use an LLM response with `core=夏季凉感T恤`, `product=凉感`, and `context=夏季` whose
-  analysis contains `core_entity_is_complete_input`. Assert the diagnosis remains projected.
-  Replace the Scope with `core=T恤`, `product=凉感`, `context=夏季`; assert the stored constraint,
-  targeted terms, and final queries are exactly `T恤 / T恤 凉感 / T恤 夏季`, with zero contracts,
-  dispatches, subtasks, and provider requests.
+  使用 `source_terms=夏季/凉感/T恤` 且模型错误映射 `core=凉感T恤`、`product=凉感`、
+  `context=夏季` 的真实形态。断言机械归一化后 Scope 首次就是 `core=T恤`、`product=凉感`、
+  `context=夏季`；存储 constraint、targeted terms 和 query 精确为
+  `T恤 / T恤 凉感 / T恤 夏季`，且无 contract、dispatch、subtask 或来源调用。
 
 - [x] **Step 2: Write the Creator and API REDs**
 
@@ -429,6 +430,29 @@ cd frontend && npm test -- --runInBand && npm run build
 git add app/content_research frontend/src tests docs/superpowers
 git commit -m "fix(content-research): ground the editable scope query preview"
 ```
+
+#### Slice 2.1 Mission Ledger — Final Reliability Repair
+
+| Field | Content |
+|---|---|
+| Mission | 修复已复现的 LLM 拆解、连续编辑与 Trace 真实性问题，并用同等中文替换所有用户可见内部阶段名。 |
+| Current slice | 分词后映射搜索结构；最新输入串行保存；Trace 等待态和阶段名称真实、中文化；仍停在 `scope_confirmation_required`。 |
+| Contract IDs | `STATE-CR-03`, `AUTH-CR-09..12`, `INV-CR-19..20`, `FAIL-CR-13..19`, `ACC-STATE-14..21` |
+| Acceptance RED | PreResearch 分词映射 unit/API；受控延迟与响应丢失的 Creator latest-write-wins；Trace 等待态/中文阶段 unit；真实 browser-to-owned-stack。 |
+| Last green proof | 真实 LLM 新 Run 将 `夏季凉感T恤` 投影为 `T恤 / T恤 凉感 / T恤 夏季`；快速连续编辑持久化为 `短袖T恤 / 短袖T恤 冰感 / 短袖T恤 夏季通勤`，刷新一致；Trace 显示中文阶段与“等待用户操作”。 |
+| Finding route | 三项均为 `IMPLEMENTATION_DEFECT`；同一不变量跨 LLM/API/UI/Trace，触发当前切片内的系统性风险整改。 |
+| Return point | Slice 2.1 验收关闭后停止，不进入 Scope 冻结、dispatch、Spider 或 Task 3。 |
+| Next action | Task 2 已完成；等待明确授权后再进入 Task 3。 |
+| Open risk | L1；无持久化 schema 变化、无外部副作用、无迁移；最终独立复核无 Critical/Important，Readiness `READY`。 |
+
+**Task 2.1 final repair checklist**
+
+- [x] 词元分割与映射 RED
+- [x] latest-write-wins 保存 RED
+- [x] Trace 等待态与中文阶段 RED
+- [x] 最小实现与相关回归
+- [x] 真实浏览器端到端复测
+- [x] 提交并停止在 Task 2
 
 ---
 

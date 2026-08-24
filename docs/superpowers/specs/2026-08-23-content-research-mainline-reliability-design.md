@@ -194,6 +194,8 @@ stateDiagram-v2
 | `AUTH-CR-08` | 所有公共 mutation 必须提交预期状态与 revision；旧 revision、旧 Run、旧 Scope、旧 Draft 或旧 attempt 在第一笔业务写入前被拒绝。 |
 | `AUTH-CR-09` | 后端查询编译器是 Draft query bundle 的唯一权威；前端不得自行生成可提交的 `final_query`。结构化词、Scope constraint、`targeted_required_terms` 和 query groups 必须来自同一次编译。 |
 | `AUTH-CR-10` | 用户确认的 `final_query`、冻结 Scope、dispatch、Spider 实际参数和 Trace request fact 必须保持同一 query identity；Task 2 只负责确认前 Draft，Task 3 才建立冻结与执行链。 |
+| `AUTH-CR-11` | 系统生成搜索结构必须先产生有序词元，再将词元映射为核心对象、产品/体验词、场景/人群词；有空格输入以空格分段为词元，无空格输入由模型分词。可执行结构只能由这些词元组成，词元按原始顺序拼接必须机械还原用户输入。若模型把多个相邻词元重新拼为复合核心词，后端只做机械归一化：剔除已明确映射到产品/体验或场景/人群的词元，以剩余词元作为核心对象；该规则不作用于用户手工输入。 |
+| `AUTH-CR-12` | Creator 的结构化输入保存采用单一串行 latest-write-wins 队列。队列中的最新本地快照是未落库输入的临时权威；每次请求必须使用上一响应返回的最新 Draft ID 和 Run revision，旧响应不得覆盖更新的本地输入。若写入结果不确定，必须先读取后端当前 Scope 恢复 authority：已提交则继续最新快照，未提交且无更新快照时最多重试一次。 |
 
 ### 状态转换与原子边界
 
@@ -218,6 +220,7 @@ stateDiagram-v2
 | `INV-CR-17` | `recovery_required` → 精确恢复命令 → 对应阶段 | 仅服务端投影的动作；沿用精确 Run/Scope/attempt authority | 是否重放由 outcome 语义决定 |
 | `INV-CR-18` | 任意非终态 → cancel → `cancelled_or_failed` | 状态、取消原因和所有未开始执行一起提交；迟到 worker 被 fenced | 已记录 request 的未知外部结果只追加诊断 |
 | `INV-CR-19` | `scope_confirmation_required` → `replace_scope_draft` → `scope_confirmation_required` | 请求只提交核心词和两个可选补充词；后端在同一事务保存由它编译的 constraint、targeted terms、query groups、后继 Draft、state revision 和 event | 无 provider 调用；迟到响应由 request ticket 丢弃 |
+| `INV-CR-20` | `presearch_running` → 系统分词映射 → `presearch_completed` | 空格输入直接分段；无空格输入返回有序词元；映射结果只能引用词元。复合核心词先按 `AUTH-CR-11` 机械归一化；仍无法还原原文、有效词未映射或同一词元被冲突映射时最多定向修复一次，仍无效则保留诊断供 Scope 卡修正 | 无 provider 调用；用户后续显式编辑不经过系统语义校验 |
 
 ### 状态投影
 
@@ -378,6 +381,12 @@ Trace 不复制原始笔记正文，只引用持久化来源：
 | `FAIL-CR-12` | 历史 v1 数据只通过显式只读 decoder/projection 存在；不能重新启用旧新 Run 交互或 mutation。 |
 | `FAIL-CR-13` | SubjectStructure 已检测为 `needs_confirmation` 时不得丢弃 reason codes 或将候选结构投影成可靠拆解；删除旧确认阶段后，其修正职责必须由当前 Scope 卡承接。 |
 | `FAIL-CR-14` | 修改核心搜索词不得只改变页面或某一条 query；Scope core constraint、targeted required terms 和全部派生 query 必须整体替换。 |
+| `FAIL-CR-15` | 系统不得从 `夏季凉感T恤` 生成原始词元中不存在的 `透气性/舒适度`；这类映射必须进入一次定向修复，不能作为可靠建议投影。 |
+| `FAIL-CR-15A` | 模型已分出 `夏季/凉感/T恤`，但又把核心对象写成 `凉感T恤` 且把 `凉感` 重复分给体验词时，不得把复合词直接投影为核心对象；机械归一化后必须得到 `T恤/凉感/夏季`。 |
+| `FAIL-CR-16` | 上一份 Draft 保存进行中时产生的新输入不得静默丢弃、重复派发同一快照或被旧响应回滚；只允许串行提交最新未保存快照。 |
+| `FAIL-CR-17` | `waiting_user` 不得显示为等待恢复或执行中，也不得从 `started_at` 持续累计执行时长。 |
+| `FAIL-CR-18` | Creator Trace 不得暴露 `scope_confirm`、`formal_research`、`coverage`、`report` 或“安全执行阶段”等内部名称；必须投影为统一的中文用户阶段。 |
+| `FAIL-CR-19` | Scope 保存已在后端提交但响应丢失时，前端不得继续使用旧 Draft/revision 使最新编辑因 409 丢失；恢复读取失败或有界重试失败必须保留本地输入并显示错误。 |
 
 ## 旧规格删除契约
 
@@ -433,9 +442,14 @@ Trace 不复制原始笔记正文，只引用持久化来源：
 | `ACC-STATE-11` | dispatch/subagent 失败 | Run、相关任务、错误和 Trace 同步收敛 | Fault-controlled owned stack |
 | `ACC-STATE-12` | 非法组合构造 | Brief 待确认 + frozen Scope/running 等组合在写入与读取两端都被拒绝 | Transition unit + read model integration |
 | `ACC-STATE-13` | 旧规格删除扫描 | 旧命令、字段、组件和新 Run fixture 不再存在 | Static inventory + focused suites |
-| `ACC-STATE-14` | 模型把 `夏季凉感T恤` 整体作为核心词 | 保留 `core_entity_is_complete_input` 诊断；Scope 可修正为 `T恤 / 凉感 / 夏季`，不恢复旧主体确认阶段 | Browser-to-owned-stack + PreResearch unit |
+| `ACC-STATE-14` | 模型分词正确但把 `凉感T恤` 作为复合核心词并重复映射 `凉感` | 系统机械归一化为 `T恤 / 凉感 / 夏季`；Scope 首次投影即为三组正确检索词，不恢复旧主体确认阶段 | 真实 LLM browser-to-owned-stack + PreResearch unit |
 | `ACC-STATE-15` | Scope 修改核心词和可选补充词 | 后端返回只读 `T恤`、`T恤 凉感`、`T恤 夏季`；constraint 与 targeted terms 同步，零 Scope Contract/dispatch/XHS | Router/SQLite + browser |
 | `ACC-STATE-16` | 连续编辑产生乱序响应 | 旧 Draft 响应不能覆盖最新结构化词或 query 预览 | Frontend async ordering |
+| `ACC-STATE-17` | 无空格和有空格的同义输入 | `夏季凉感T恤` 先分为 `夏季/凉感/T恤`；`夏季 凉感 T恤` 直接使用三个分段；两者映射并编译为同一搜索结构 | PreResearch unit + API E2E |
+| `ACC-STATE-18` | 保存中连续修改两个或三个结构化字段 | 网络中最多一份替换请求；完成后只追加最新快照，使用最新 Draft/revision，最终 UI 与持久化 Draft 等于最后输入 | Frontend controlled-deferred test + browser-to-owned-stack |
+| `ACC-STATE-19` | Run 在 `scope_confirmation_required`，runtime step 为 `waiting_user` | Trace 显示“等待用户确认/等待用户操作”，不显示恢复或执行中，不累计等待时间 | Frontend Trace unit + browser-to-owned-stack |
+| `ACC-STATE-20` | Trace 包含所有主流程 runtime step | 用户只看到“识别调研主体与候选方向、确认调研需求、确认检索范围、采集与分析公开内容、检查证据完整性、生成调研报告”及对应中文分组 | Frontend Trace unit + browser-to-owned-stack |
+| `ACC-STATE-21` | Scope 写入已提交但响应丢失，期间又产生最新编辑 | GET 当前 Scope 恢复最新 Draft/revision；不重复旧快照，最新编辑使用恢复后的 authority 成功落库 | Frontend controlled failure/recovery test |
 
 ### Task 2：SQLite 主流程整改
 

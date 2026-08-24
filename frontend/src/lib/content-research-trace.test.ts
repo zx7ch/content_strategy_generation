@@ -1,7 +1,42 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { traceExecutionDurationText } from "./content-research-trace.ts";
+import {
+  traceExecutionDurationText,
+  traceStepGroup,
+  traceStepTitle,
+  workflowStatusLabel,
+} from "./content-research-trace.ts";
+
+test("waiting-user Trace is a user confirmation boundary, not running or recovery time", () => {
+  const value = traceExecutionDurationText(
+    {
+      step_id: "scope-confirm",
+      status: "waiting_user",
+      started_at: "2026-08-02T03:16:58",
+    },
+    [],
+    Date.parse("2026-08-02T11:17:01Z"),
+  );
+
+  assert.equal(value, "等待用户操作");
+  assert.equal(workflowStatusLabel("waiting_user"), "等待用户确认");
+});
+
+test("Trace exposes only user-facing Chinese phase and group names", () => {
+  assert.deepEqual(
+    ["presearch", "brief_confirm", "scope_confirm", "formal_research", "coverage", "report"]
+      .map((step) => [traceStepTitle(step), traceStepGroup(step)]),
+    [
+      ["识别调研主体与候选方向", "研究范围与计划"],
+      ["确认调研需求", "研究范围与计划"],
+      ["确认检索范围", "研究范围与计划"],
+      ["采集与分析公开内容", "来源采集与分析"],
+      ["检查证据完整性", "证据质量检查"],
+      ["生成调研报告", "报告生成"],
+    ],
+  );
+});
 
 test("trace duration treats backend UTC timestamps without a suffix as UTC", () => {
   const value = traceExecutionDurationText(

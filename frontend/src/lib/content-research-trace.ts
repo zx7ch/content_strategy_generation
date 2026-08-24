@@ -74,6 +74,7 @@ export function traceExecutionDurationText(
   now = Date.now()
 ): string {
   const status = stringValue(step, "status");
+  if (status === "waiting_user") return "等待用户操作";
   const projectedTiming = objectValue(step, "timing");
   const projectedText = projectedTiming ? recordedDurationText(projectedTiming, status) : null;
   if (projectedText) return projectedText;
@@ -97,4 +98,36 @@ export function traceExecutionDurationText(
       ? "（等待恢复）"
       : "（执行中）";
   return `${Math.max(0, (endAt - startedAt) / 1000).toFixed(1)}s${suffix}`;
+}
+
+export function workflowStatusLabel(status: string) {
+  if (["completed", "succeeded", "success"].includes(status)) return "已完成";
+  if (["running", "collecting"].includes(status)) return "进行中";
+  if (status === "pending") return "等待开始";
+  if (status === "retrying") return "等待恢复";
+  if (status === "waiting_user") return "等待用户确认";
+  if (status === "failed") return "未完成";
+  if (["cancelled", "cancelling"].includes(status)) return "已结束";
+  return "等待处理";
+}
+
+export function traceStepTitle(stepName: string) {
+  if (stepName === "presearch") return "识别调研主体与候选方向";
+  if (stepName === "brief_confirm") return "确认调研需求";
+  if (stepName === "scope_confirm") return "确认检索范围";
+  if (stepName === "plan_build") return "准备调研计划";
+  if (stepName === "formal_research") return "采集与分析公开内容";
+  if (stepName === "coverage") return "检查证据完整性";
+  if (stepName === "report") return "生成调研报告";
+  return "处理调研任务";
+}
+
+export function traceStepGroup(stepName: string) {
+  if (["presearch", "brief_confirm", "scope_confirm", "plan_build"].includes(stepName)) {
+    return "研究范围与计划";
+  }
+  if (stepName === "formal_research") return "来源采集与分析";
+  if (stepName === "coverage") return "证据质量检查";
+  if (stepName === "report") return "报告生成";
+  return "调研任务";
 }

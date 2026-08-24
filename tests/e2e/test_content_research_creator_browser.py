@@ -8,10 +8,7 @@ import os
 import re
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import replace
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 import pytest
@@ -19,41 +16,14 @@ from playwright.sync_api import Page, expect, sync_playwright
 
 from app.content_research.contracts import (
     DIRECTION_CATALOG_V1,
-    build_default_snapshot,
 )
-from app.content_research.models import ResearchBriefRecord, SubagentTaskRecord
 from app.content_research.lifecycle.coordinator import ContentResearchPersistenceCoordinator
 from app.content_research.lifecycle.models import ContentResearchState, LifecycleCommand
-from app.content_research.persistence_models import StageCheckpointRecord
-from app.content_research.reporting.composer import ResearchReportComposer
-from app.content_research.reporting.publication_materializer import (
-    ReportPublicationMaterializer,
-)
-from app.content_research.scope_contract import (
-    SCOPE_CONTRACT_SCHEMA_VERSION_V2,
-    CoverageSnapshot,
-    ScopeAuditEvent,
-    ScopeConstraint,
-    ScopeDraftAuditEvent,
-    ScopeQueryGroupInput,
-    build_scope_contract,
-    build_scope_draft,
-)
-from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
 from app.memory.thread_store import ThreadStore
-from app.models.workflow import WorkflowPhase
-from app.services.workflow_run_manager import WorkflowRunManager
 from tests.browser_process import (
     chrome_executable,
     reserve_port,
     run_process,
-)
-from tests.integration.test_content_research_report_store import (
-    _decision,
-    _publication,
-)
-from tests.unit.test_content_research_report_composer import (
-    _snapshot as governed_snapshot,
 )
 
 WORKSPACE_ID = "00000000-0000-0000-0000-000000000001"
@@ -257,42 +227,29 @@ def test_creator_corrects_search_structure_and_reads_only_the_backend_query_prev
     expect(page.get_by_text("已冻结检索范围", exact=True)).to_have_count(0)
     expect(page.get_by_text("专家调研进行中", exact=True)).to_have_count(0)
     expect(scope.get_by_role("button", name="确认并开始调研")).to_have_count(0)
+    page.get_by_role("button", name="查看 Trace").click()
+    trace_dialog = page.get_by_role("dialog", name="Agent 决策日志 · Trace")
+    expect(trace_dialog.get_by_text("确认检索范围", exact=True)).to_be_visible()
+    expect(trace_dialog.get_by_text("等待用户操作", exact=True)).to_be_visible()
+    expect(trace_dialog.get_by_text("scope_confirm", exact=False)).to_have_count(0)
+    expect(trace_dialog.get_by_text("等待恢复", exact=False)).to_have_count(0)
+    page.get_by_role("button", name="关闭 Trace 对话框").click()
     final_queries = scope.get_by_test_id("scope-final-query")
     expect(final_queries).to_have_count(1)
     expect(final_queries.nth(0)).to_have_text("长袖衬衫")
     expect(scope.locator("label").filter(has_text="最终搜索词").locator("input")).to_have_count(0)
 
     core_input = scope.get_by_label("核心搜索词")
-    with page.expect_response(
-        lambda response: response.url.endswith("/actions")
-        and '"action":"replace_scope_draft"' in (response.request.post_data or ""),
-        timeout=30000,
-    ) as core_saved:
-        core_input.fill("T恤")
-        core_input.press("Tab")
-    assert core_saved.value.status == 200, core_saved.value.text()
-
-    scope = page.get_by_role("region", name="检索范围确认")
     product_input = scope.get_by_label("产品或体验补充词（可选）")
-    with page.expect_response(
-        lambda response: response.url.endswith("/actions")
-        and '"action":"replace_scope_draft"' in (response.request.post_data or ""),
-        timeout=30000,
-    ) as product_saved:
-        product_input.fill("凉感")
-        product_input.press("Tab")
-    assert product_saved.value.status == 200, product_saved.value.text()
-
-    scope = page.get_by_role("region", name="检索范围确认")
     context_input = scope.get_by_label("场景或人群补充词（可选）")
-    with page.expect_response(
-        lambda response: response.url.endswith("/actions")
-        and '"action":"replace_scope_draft"' in (response.request.post_data or ""),
-        timeout=30000,
-    ) as context_saved:
-        context_input.fill("夏季")
-        context_input.press("Tab")
-    assert context_saved.value.status == 200, context_saved.value.text()
+    # Reproduce the manual rapid-focus sequence that used to dispatch three
+    # overlapping writes with stale draft IDs and revisions.
+    core_input.fill("T恤")
+    product_input.click()
+    product_input.fill("凉感")
+    context_input.click()
+    context_input.fill("夏季")
+    context_input.press("Tab")
 
     scope = page.get_by_role("region", name="检索范围确认")
     final_queries = scope.get_by_test_id("scope-final-query")
@@ -306,7 +263,25 @@ def test_creator_corrects_search_structure_and_reads_only_the_backend_query_prev
     expect(scope.get_by_role("heading", name="确认本轮实际搜索词")).to_be_visible(
         timeout=30000
     )
+    expect(scope.get_by_label("核心搜索词")).to_have_value("T恤")
+    expect(scope.get_by_label("产品或体验补充词（可选）")).to_have_value("凉感")
+    expect(scope.get_by_label("场景或人群补充词（可选）")).to_have_value("夏季")
+    restored_queries = scope.get_by_test_id("scope-final-query")
+    expect(restored_queries).to_have_count(3)
+    expect(restored_queries.nth(0)).to_have_text("T恤")
+    expect(restored_queries.nth(1)).to_have_text("T恤 凉感")
+    expect(restored_queries.nth(2)).to_have_text("T恤 夏季")
     with sqlite3.connect(stack["db_path"]) as connection:
+        latest_queries = json.loads(connection.execute(
+            "SELECT query_groups_json FROM content_research_scope_drafts "
+            "WHERE workflow_run_id=? ORDER BY created_at DESC LIMIT 1",
+            (run_id,),
+        ).fetchone()[0])
+        assert [group["final_query"] for group in latest_queries] == [
+            "T恤",
+            "T恤 凉感",
+            "T恤 夏季",
+        ]
         assert connection.execute(
             "SELECT COUNT(*) FROM content_research_scope_contracts WHERE workflow_run_id=?",
             (run_id,),

@@ -28,15 +28,21 @@ def _presearch_payload(*, resolution_state: str = "resolved") -> str:
                 "schema_version": "content_research_subject_structure_v1",
                 "canonical_subject": "夏季凉感T恤",
                 "subject_type": "category",
+                "source_terms": ["夏季", "凉感", "T恤"],
+                "term_roles": {
+                    "core_object": ["T恤"],
+                    "product_experience": ["凉感"],
+                    "context_audience": ["夏季"],
+                },
                 "core_entities": [
                     {
-                        "canonical_name": "凉感T恤",
-                        "raw_mentions": ["夏季凉感T恤"],
+                        "canonical_name": "T恤",
+                        "raw_mentions": ["T恤"],
                     }
                 ],
                 "research_intents": ["凉感"],
                 "context_modifiers": ["夏季"],
-                "synonym_groups": {"凉感T恤": ["冰感T恤"]},
+                "synonym_groups": {"T恤": ["冰感T恤"]},
                 "ambiguities": ambiguities,
                 "resolution_state": resolution_state,
             },
@@ -141,7 +147,7 @@ async def test_presearch_success_uses_the_owned_lifecycle_and_returns_only_brief
     assert response.run.state == "brief_confirmation_required"
     assert response.run.state_revision == 2
     assert response.run.brief_id == response.brief_id
-    assert response.subject_structure["core_entities"][0]["canonical_name"] == "凉感T恤"
+    assert response.subject_structure["core_entities"][0]["canonical_name"] == "T恤"
     assert llm.requests[0].temperature == 1.0
     assert llm.requests[0].model_policy == "balanced"
     assert "只输出一个合法 JSON 对象" in llm.requests[0].messages[0].content
@@ -181,6 +187,12 @@ async def test_ambiguous_model_interpretation_does_not_create_a_user_confirmatio
     ambiguous["subject_structure"].update(
         {
             "canonical_subject": "苹果",
+            "source_terms": ["苹果", "年轻人"],
+            "term_roles": {
+                "core_object": ["苹果"],
+                "product_experience": [],
+                "context_audience": ["年轻人"],
+            },
             "core_entities": [
                 {"canonical_name": "苹果", "raw_mentions": ["苹果"]}
             ],
@@ -194,7 +206,7 @@ async def test_ambiguous_model_interpretation_does_not_create_a_user_confirmatio
 
     response = await service.submit_presearch(
         command_id="submit-presearch-ambiguous",
-        seed_text="苹果适合年轻人吗",
+        seed_text="苹果年轻人",
         user_note=None,
         thread_id=thread["id"],
         user_id="user-test",
@@ -212,19 +224,11 @@ async def test_ambiguous_model_interpretation_does_not_create_a_user_confirmatio
 
 
 @pytest.mark.asyncio
-async def test_complete_input_core_keeps_its_analysis_diagnosis_without_old_stage(
+async def test_invalid_term_mapping_keeps_its_analysis_diagnosis_without_old_stage(
     tmp_path,
 ):
     invalid = json.loads(_presearch_payload())
-    invalid["subject_structure"]["core_entities"] = [
-        {
-            "canonical_name": "夏季凉感T恤",
-            "raw_mentions": ["夏季凉感T恤"],
-        }
-    ]
-    invalid["subject_structure"]["synonym_groups"] = {
-        "夏季凉感T恤": ["冰感T恤"]
-    }
+    invalid["subject_structure"]["term_roles"]["product_experience"] = ["透气性"]
     llm = RecordingLLM(content=json.dumps(invalid, ensure_ascii=False))
     service, _db_path, thread = await _owned_service(tmp_path, llm)
 
@@ -241,23 +245,18 @@ async def test_complete_input_core_keeps_its_analysis_diagnosis_without_old_stag
     assert response.run.state == "brief_confirmation_required"
     assert response.subject_structure_analysis_state == "needs_confirmation"
     assert response.subject_structure_analysis_reason_codes == (
-        "core_entity_is_complete_input",
+        "source_term_mapping_invalid",
     )
+    assert response.subject_structure["research_intents"] == []
+    assert response.subject_structure["context_modifiers"] == ["夏季"]
+    assert "透气性" not in str(response.subject_structure)
     assert "confirm_subject_structure" not in response.run.allowed_actions
 
 
 @pytest.mark.asyncio
 async def test_invalid_system_structure_gets_one_reason_directed_repair_attempt(tmp_path):
     invalid = json.loads(_presearch_payload())
-    invalid["subject_structure"]["core_entities"] = [
-        {
-            "canonical_name": "夏季凉感T恤",
-            "raw_mentions": ["夏季凉感T恤"],
-        }
-    ]
-    invalid["subject_structure"]["synonym_groups"] = {
-        "夏季凉感T恤": ["冰感T恤"]
-    }
+    invalid["subject_structure"]["term_roles"]["product_experience"] = ["舒适度"]
     repaired = json.loads(_presearch_payload())
     repaired["subject_structure"]["core_entities"] = [
         {"canonical_name": "T恤", "raw_mentions": ["T恤"]}
@@ -281,10 +280,44 @@ async def test_invalid_system_structure_gets_one_reason_directed_repair_attempt(
     )
 
     assert len(llm.requests) == 2
-    assert "core_entity_is_complete_input" in llm.requests[1].messages[-1].content
+    assert "source_term_mapping_invalid" in llm.requests[1].messages[-1].content
     assert response.subject_structure_analysis_state == "confirmed"
     assert response.subject_structure_analysis_reason_codes == ()
     assert response.subject_structure["core_entities"][0]["canonical_name"] == "T恤"
+
+
+@pytest.mark.asyncio
+async def test_presearch_repairs_a_role_mapping_that_invents_unsegmented_terms(tmp_path):
+    invalid = json.loads(_presearch_payload())
+    invalid["subject_structure"]["term_roles"]["product_experience"] = [
+        "透气性",
+        "舒适度",
+    ]
+    repaired = json.loads(_presearch_payload())
+    llm = SequenceLLM(
+        [
+            json.dumps(invalid, ensure_ascii=False),
+            json.dumps(repaired, ensure_ascii=False),
+        ]
+    )
+    service, _db_path, thread = await _owned_service(tmp_path, llm)
+
+    response = await service.submit_presearch(
+        command_id="submit-repaired-term-mapping",
+        seed_text="夏季凉感T恤",
+        user_note=None,
+        thread_id=thread["id"],
+        user_id="user-test",
+        workspace_id="ws-test",
+    )
+
+    assert len(llm.requests) == 2
+    assert "source_term_mapping_invalid" in llm.requests[1].messages[-1].content
+    assert response.subject_structure_analysis_state == "confirmed"
+    assert response.subject_structure["source_terms"] == ["夏季", "凉感", "T恤"]
+    assert response.subject_structure["core_entities"][0]["canonical_name"] == "T恤"
+    assert response.subject_structure["research_intents"] == ["凉感"]
+    assert response.subject_structure["context_modifiers"] == ["夏季"]
 
 
 @pytest.mark.asyncio
@@ -422,7 +455,7 @@ async def test_presearch_retry_recovers_the_same_run_after_model_repair(tmp_path
 
 
 @pytest.mark.asyncio
-async def test_duplicate_submit_command_returns_one_run_and_one_bounded_repair(tmp_path):
+async def test_duplicate_submit_command_returns_one_run_and_one_presearch_call(tmp_path):
     llm = RecordingLLM()
     service, db_path, thread = await _owned_service(tmp_path, llm)
 
@@ -442,8 +475,8 @@ async def test_duplicate_submit_command_returns_one_run_and_one_bounded_repair(t
     assert first.workflow_run_id == duplicate.workflow_run_id
     assert first.brief_id == duplicate.brief_id
     assert first.run.state_revision == duplicate.run.state_revision == 2
-    assert len(llm.requests) == 2
-    assert llm.requests[1].task_type == "content_research.presearch.repair"
+    assert len(llm.requests) == 1
+    assert llm.requests[0].task_type == "content_research.presearch"
     with sqlite3.connect(db_path) as connection:
         assert connection.execute("SELECT COUNT(*) FROM workflow_runs").fetchone()[0] == 1
         assert connection.execute(
@@ -477,7 +510,7 @@ async def test_stale_public_action_is_rejected_before_presearch_or_brief_changes
         )
 
     initial_request_count = len(llm.requests)
-    assert initial_request_count == 2
+    assert initial_request_count == 1
     with sqlite3.connect(db_path) as connection:
         assert connection.execute(
             "SELECT state_revision FROM workflow_runs WHERE run_id=?",

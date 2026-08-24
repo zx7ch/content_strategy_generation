@@ -6,7 +6,6 @@ import json
 import os
 import re
 from contextlib import asynccontextmanager
-from pathlib import Path
 
 import app.main as production
 from app.content_research.presearch.service import PresearchService
@@ -46,16 +45,24 @@ class DeterministicPresearchLLM:
         seed_match = re.search(r"用户输入:\s*(.+)", user_prompt)
         subject = seed_match.group(1).strip() if seed_match else "夏季通勤短裤"
         if subject == "长袖衬衫 凉感 夏季通勤":
+            source_terms = ["长袖衬衫", "凉感", "夏季通勤"]
             core_object = "长袖衬衫"
             research_intents = ["凉感"]
             context_modifiers = ["夏季通勤"]
         elif subject == "长袖衬衫":
+            source_terms = ["长袖衬衫"]
             core_object = "长袖衬衫"
-            research_intents = ["上身感受"]
+            research_intents = []
             context_modifiers = []
+        elif subject == "夏季凉感T恤":
+            source_terms = ["夏季", "凉感", "T恤"]
+            core_object = "T恤"
+            research_intents = ["凉感"]
+            context_modifiers = ["夏季"]
         else:
+            source_terms = [subject]
             core_object = subject
-            research_intents = ["内容调研"]
+            research_intents = []
             context_modifiers = []
         return LLMResponse(
             content=json.dumps(
@@ -73,6 +80,12 @@ class DeterministicPresearchLLM:
                         "schema_version": "content_research_subject_structure_v1",
                         "canonical_subject": subject,
                         "subject_type": "category",
+                        "source_terms": source_terms,
+                        "term_roles": {
+                            "core_object": [core_object],
+                            "product_experience": research_intents,
+                            "context_audience": context_modifiers,
+                        },
                         "core_entities": [
                             {"canonical_name": core_object, "raw_mentions": [core_object]}
                         ],

@@ -10,10 +10,9 @@ import pytest
 from app.api.routes.router import app
 from app.config import settings
 from app.content_research.presearch.service import PresearchService
-from app.content_research.service import ContentResearchService
+from app.content_research.service import ContentResearchService, WorkflowRunManagerRuntime
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
 from app.memory.thread_store import ThreadStore
-from app.content_research.service import WorkflowRunManagerRuntime
 from app.services.llm import (
     CredentialResolver,
     LLMService,
@@ -53,13 +52,19 @@ class FakeLLM:
                         "schema_version": "content_research_subject_structure_v1",
                         "canonical_subject": "Satisfy Running",
                         "subject_type": "brand",
+                        "source_terms": ["Satisfy", "Running"],
+                        "term_roles": {
+                            "core_object": ["Satisfy", "Running"],
+                            "product_experience": [],
+                            "context_audience": [],
+                        },
                         "core_entities": [
                             {
                                 "canonical_name": "Satisfy Running",
                                 "raw_mentions": ["Satisfy Running"],
                             }
                         ],
-                        "research_intents": ["品牌内容"],
+                        "research_intents": [],
                         "context_modifiers": [],
                         "synonym_groups": {},
                         "ambiguities": [],

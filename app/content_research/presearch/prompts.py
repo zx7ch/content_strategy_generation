@@ -16,11 +16,15 @@ PRESEARCH_SYSTEM_PROMPT = (
     '- research_directions: string[]，本轮可选调研方向；如果无法确定，返回空数组。\n'
     '- custom_competitor_input: string，可选用户补充竞品；没有则返回空字符串。\n'
     '- subject_structure: object，必须包含 schema_version、canonical_subject、subject_type、'
-    'core_entities（每项包含 canonical_name、raw_mentions）、research_intents、'
+    'source_terms、term_roles、core_entities（每项包含 canonical_name、raw_mentions）、research_intents、'
     'context_modifiers、synonym_groups、ambiguities、resolution_state。raw_mentions 必须来自用户原文。\n'
-    "结构拆分规则：核心对象只保留可被调研的实体（品牌、品类、产品或型号）；"
-    "research_intents 只放用户会直接和核心对象一起检索的具体产品属性或体验短词；"
-    "不要放产品卖点、购买考虑、研究目标等分析概念。季节、人群、地点、场合等放入 context_modifiers。\n"
+    "结构拆分必须分两步完成。第一步生成 source_terms：如果用户输入已经用空格分隔，"
+    "source_terms 必须逐项等于这些分段，不得再次拆分；如果没有空格，拆成可独立搜索的完整短词，"
+    "所有短词按原顺序连接后必须能还原用户输入。第二步把每个 source_term 恰好一次映射到 term_roles："
+    "core_object 是品牌、品类、产品或型号，至少一个；product_experience 是具体产品属性或体验短词，可为空；"
+    "context_audience 是季节、人群、地点或场合，可为空。不得创造 source_terms 之外的词。\n"
+    "core_entities、research_intents、context_modifiers 必须分别与上述三类映射保持一致；"
+    "不要放产品卖点、购买考虑、研究目标等分析概念。\n"
     "不要把包含意图或场景修饰的完整用户句子直接复制为核心对象。"
     "raw_mentions 必须是用户原文中连续出现的实体片段；canonical_name 可对该片段做品类归一化。\n"
     "示例输出：\n"
@@ -30,6 +34,9 @@ PRESEARCH_SYSTEM_PROMPT = (
     '"custom_competitor_input":"",'
     '"subject_structure":{"schema_version":"content_research_subject_structure_v1",'
     '"canonical_subject":"徒步短裤","subject_type":"category",'
+    '"source_terms":["夏季","轻量","徒步短裤"],'
+    '"term_roles":{"core_object":["徒步短裤"],"product_experience":["轻量"],'
+    '"context_audience":["夏季"]},'
     '"core_entities":[{"canonical_name":"徒步短裤","raw_mentions":["徒步短裤"]}],'
     '"research_intents":["轻量"],"context_modifiers":["夏季户外"],'
     '"synonym_groups":{"徒步短裤":["户外短裤"]},"ambiguities":[],'
@@ -71,8 +78,8 @@ def build_presearch_repair_messages(
 质量问题: {json.dumps(list(reason_codes), ensure_ascii=False)}
 上一次输出: {invalid_response}
 
-特别注意：核心对象只保留品牌、品类、产品或型号；产品属性或体验短词放入
-research_intents；季节、人群、地点和场合放入 context_modifiers。
+特别注意：先按规则生成 source_terms，再把每个 source_term 恰好一次映射到 term_roles；
+不得创造分词结果之外的属性、体验、场景或人群词。
 """
     return [
         Message(role="system", content=PRESEARCH_SYSTEM_PROMPT),

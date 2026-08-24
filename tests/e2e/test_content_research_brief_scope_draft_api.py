@@ -27,10 +27,16 @@ class ScopeDraftLLM:
                         "schema_version": "content_research_subject_structure_v1",
                         "canonical_subject": "夏季凉感T恤",
                         "subject_type": "category",
+                        "source_terms": ["夏季", "凉感", "T恤"],
+                        "term_roles": {
+                            "core_object": ["T恤"],
+                            "product_experience": ["凉感"],
+                            "context_audience": ["夏季"],
+                        },
                         "core_entities": [
                             {
-                                "canonical_name": "夏季凉感T恤",
-                                "raw_mentions": ["夏季凉感T恤"],
+                                "canonical_name": "T恤",
+                                "raw_mentions": ["T恤"],
                             }
                         ],
                         "research_intents": ["凉感"],
@@ -46,6 +52,42 @@ class ScopeDraftLLM:
             model="fake-model",
             usage=TokenUsage(total_tokens=10),
             latency_ms=1,
+        )
+
+
+class InvalidScopeDraftLLM(ScopeDraftLLM):
+    async def generate(self, request):
+        response = await super().generate(request)
+        payload = json.loads(response.content)
+        payload["subject_structure"]["term_roles"]["product_experience"] = [
+            "透气性"
+        ]
+        return LLMResponse(
+            content=json.dumps(payload, ensure_ascii=False),
+            provider=response.provider,
+            model=response.model,
+            usage=response.usage,
+            latency_ms=response.latency_ms,
+        )
+
+
+class LegacyScopeDraftLLM(ScopeDraftLLM):
+    async def generate(self, request):
+        response = await super().generate(request)
+        payload = json.loads(response.content)
+        structure = payload["subject_structure"]
+        structure.pop("source_terms")
+        structure.pop("term_roles")
+        structure["core_entities"] = [
+            {"canonical_name": "服装", "raw_mentions": ["服装"]}
+        ]
+        structure["research_intents"] = ["透气性"]
+        return LLMResponse(
+            content=json.dumps(payload, ensure_ascii=False),
+            provider=response.provider,
+            model=response.model,
+            usage=response.usage,
+            latency_ms=response.latency_ms,
         )
 
 
@@ -103,7 +145,84 @@ def _rows(db_path: str, table: str) -> int:
 
 
 @pytest.mark.asyncio
-async def test_invalid_complete_input_reaches_one_editable_server_compiled_scope_without_collection(
+async def test_failed_system_mapping_cannot_reach_an_executable_scope_query(
+    scope_client,
+):
+    client, _db_path, thread_id = scope_client
+    app.state.content_research_service._presearch = PresearchService(
+        InvalidScopeDraftLLM(),
+        first_feedback_timeout_seconds=0.05,
+        hard_cutoff_seconds=0.1,
+    )
+    presearch = await _presearch(client, thread_id)
+
+    assert presearch["subject_structure_analysis_state"] == "needs_confirmation"
+    assert presearch["subject_structure"]["research_intents"] == []
+    assert "透气性" not in str(presearch["subject_structure"])
+    run = presearch["run"]
+    confirmed = await client.post(
+        f"/content-research/workflows/{run['run_id']}/actions",
+        json={
+            "command_id": "confirm-invalid-system-mapping",
+            "expected_state": run["state"],
+            "expected_revision": run["state_revision"],
+            "action": "confirm_brief",
+            "payload": {
+                "brief_id": presearch["brief_id"],
+                "selected_competitors": [],
+                "custom_competitor_input": "",
+                "selected_directions": ["product_marketing"],
+            },
+        },
+    )
+
+    assert confirmed.status_code == 200, confirmed.text
+    queries = [
+        group["final_query"]
+        for group in confirmed.json()["result"]["scope"]["draft"]["query_groups"]
+    ]
+    assert queries == ["T恤", "T恤 夏季"]
+    assert all("透气性" not in query for query in queries)
+
+
+@pytest.mark.asyncio
+async def test_legacy_system_structure_cannot_fall_back_into_a_scope_draft(
+    scope_client,
+):
+    client, db_path, thread_id = scope_client
+    app.state.content_research_service._presearch = PresearchService(
+        LegacyScopeDraftLLM(),
+        first_feedback_timeout_seconds=0.05,
+        hard_cutoff_seconds=0.1,
+    )
+    presearch = await _presearch(client, thread_id)
+
+    assert presearch["subject_structure"]["core_entities"] == []
+    assert presearch["subject_structure"]["research_intents"] == []
+    run = presearch["run"]
+    confirmed = await client.post(
+        f"/content-research/workflows/{run['run_id']}/actions",
+        json={
+            "command_id": "reject-legacy-system-structure",
+            "expected_state": run["state"],
+            "expected_revision": run["state_revision"],
+            "action": "confirm_brief",
+            "payload": {
+                "brief_id": presearch["brief_id"],
+                "selected_competitors": [],
+                "custom_competitor_input": "",
+                "selected_directions": ["product_marketing"],
+            },
+        },
+    )
+
+    assert confirmed.status_code == 422
+    assert _rows(db_path, "content_research_plans") == 0
+    assert _rows(db_path, "content_research_scope_drafts") == 0
+
+
+@pytest.mark.asyncio
+async def test_grounded_term_mapping_reaches_one_editable_server_compiled_scope_without_collection(
     scope_client,
 ):
     client, db_path, thread_id = scope_client
@@ -149,17 +268,15 @@ async def test_invalid_complete_input_reaches_one_editable_server_compiled_scope
     assert [action["action"] for action in scope["allowed_actions"]] == [
         "replace_scope_draft"
     ]
-    assert scope["subject_structure_analysis_state"] == "needs_confirmation"
-    assert scope["subject_structure_analysis_reason_codes"] == [
-        "core_entity_is_complete_input"
-    ]
-    assert scope["draft"]["core_object"] == "夏季凉感T恤"
+    assert scope["subject_structure_analysis_state"] == "confirmed"
+    assert scope["subject_structure_analysis_reason_codes"] == []
+    assert scope["draft"]["core_object"] == "T恤"
     assert scope["draft"]["product_experience_aspect"] == "凉感"
     assert scope["draft"]["context_audience_aspect"] == "夏季"
     assert [group["final_query"] for group in scope["draft"]["query_groups"]] == [
-        "夏季凉感T恤",
-        "夏季凉感T恤 凉感",
-        "夏季凉感T恤 夏季",
+        "T恤",
+        "T恤 凉感",
+        "T恤 夏季",
     ]
     assert _rows(db_path, "content_research_plans") == 1
     assert _rows(db_path, "content_research_scope_drafts") == 1
