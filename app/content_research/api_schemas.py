@@ -16,6 +16,7 @@ P0_WORKFLOW_ACTIONS = (
     "revise_subject",
     "confirm_brief",
     "replace_scope_draft",
+    "confirm_scope",
 )
 
 

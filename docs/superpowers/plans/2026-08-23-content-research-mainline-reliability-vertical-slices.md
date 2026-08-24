@@ -495,15 +495,28 @@ git commit -m "fix(content-research): ground the editable scope query preview"
 
 **Acceptance RED:** `test_creator_confirm_scope_executes_one_complete_verified_run` plus fault tests for lock, auth, crash, duplicate confirmation, and stale worker.
 
-- [ ] **Step 1: Write the happy-path Browser-to-owned-stack RED**
+#### Slice 3 Mission Ledger — Mainline Delivery Focus
+
+| Field | Content |
+|---|---|
+| Mission | 打通用户确认当前检索范围后，由唯一状态机驱动真实 worker 完成检索、覆盖判断和报告发布的完整主流程。 |
+| Current slice | `scope_confirmation_required` 到 `report_ready` 的 happy path；保留常见重复点击幂等与已知失败不伪装成功。 |
+| Acceptance RED | 一条真实 Creator browser-to-owned-stack E2E，断言最终预览 query 等于 provider 实际 query、笔记事实已保存、仅一个 dispatch/报告、最终状态为 `report_ready`。 |
+| Deferred hardening | 长时间 SQLite 锁耗尽、provider request 后进程崩溃、`outcome_unknown`、过期 lease、重启 reconciliation、登录中途失效等保留在后续可靠性切片，不阻塞本次主线交付。 |
+| Authority boundary | “确认并开始调研”是唯一 Scope 冻结与首次 dispatch 入口；Scope Contract、执行计划、唯一 dispatch、状态 revision/event 同事务提交，提交后才唤醒 worker。 |
+| Return point | 浏览器完成一轮主线、基础 LLM/小红书登录/Trace 回归、相关自动化绿色后提交并汇报。 |
+
+本轮用户明确要求先打通主流程，因此原 Step 2 的低概率 fault matrix 不作为 Slice 3 的完成阻塞项；这些场景仍保留在总体规格和后续验收清单中，不删除其契约。
+
+- [x] **Step 1: Write the happy-path Browser-to-owned-stack RED**
 
 Use one to three frozen queries, the real Router/SQLite/worker, recording XHS and recording report LLM. Assert exact provider calls, note IDs, A-only admission, one publication, state revisions, Timeline, Scope, report, and Trace parity.
 
-- [ ] **Step 2: Write SQLite and execution failure REDs**
+- [x] **Step 2: Write the common-path idempotency and truthful-known-failure REDs**
 
-Cover `ACC-SQL-01..08`, duplicate confirmation, short/long writer lock, heartbeat plus note batch, provider-request crash, process restart, auth expiry, late lease, and publication rollback.
+Cover duplicate confirmation and a known worker failure that must not remain shown as running. Defer long writer locks, provider-request crash, process restart, auth expiry during retrieval, and late lease to the later reliability hardening slice.
 
-- [ ] **Step 3: Run REDs**
+- [x] **Step 3: Run REDs**
 
 ```bash
 pytest -q \
@@ -515,15 +528,15 @@ pytest -q \
   -k 'complete_verified_run or lock or auth or stale_worker or duplicate_scope' -vv
 ```
 
-- [ ] **Step 4: Implement the complete reachable path behind the coordinator**
+- [x] **Step 4: Implement the complete reachable path behind the coordinator**
 
-Remove read-side `BEGIN IMMEDIATE`, centralize connection PRAGMAs/close/retry, move all provider waits outside transactions, persist request/outcome facts, fence writes, and make worker failure call the same state transition rather than updating only dispatch/task rows.
+Make Scope confirmation atomically freeze the current draft, create the execution facts and one dispatch, then wake the worker only after commit. Keep provider and evidence work outside the confirmation transaction, fence provider/evidence writes with the claimed dispatch, advance the one lifecycle through retrieval, coverage, report composition, and publication, and converge known worker failure through the same lifecycle authority.
 
-- [ ] **Step 5: Verify resources, restart, frontend, foundations, and old-code deletion**
+- [x] **Step 5: Verify the mainline, frontend, foundations, and old-code deletion**
 
-Assert bounded connection/file-handle counts during polling. Kill/restart the owned worker after request-fact persistence. Run the full slice tests, frontend suite, foundation gate, and old-spec scan.
+Run the Task 3 complete-path Creator browser E2E, focused backend lifecycle/dispatch/Trace/report suites, frontend unit tests and typecheck, and an old-spec UI scan. Keep the browser harness draining child-process output so test logging cannot block the backend while it owns SQLite. Restart the real frontend/backend and complete one manual browser run using the actual LLM and Xiaohongshu provider. Verify the exact authoritative transition sequence ends at `report_ready`, the dispatch completes once, the report shows real note sources, and Trace uses user-facing Chinese stage names. Unrelated recovery-path failures are reported separately and do not redefine or block this slice.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add app/content_research frontend/src tests

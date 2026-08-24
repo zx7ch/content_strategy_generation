@@ -17,6 +17,7 @@ _ALLOWED_ACTIONS: dict[ContentResearchState, tuple[str, ...]] = {
         "cancel",
     ),
     ContentResearchState.SCOPE_CONFIRMATION_REQUIRED: (
+        "confirm_scope",
         "replace_scope_draft",
         "cancel",
     ),

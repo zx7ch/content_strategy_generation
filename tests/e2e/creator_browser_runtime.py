@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from pathlib import Path
 from contextlib import asynccontextmanager
 
 import app.main as production
@@ -151,6 +152,94 @@ class DeterministicAuthRequiredSource:
         raise AssertionError("comment collection must not follow auth-required discovery")
 
 
+class DeterministicSuccessfulSource:
+    """Return complete, relevant note facts and record the exact submitted queries."""
+
+    def __init__(self, call_log: str) -> None:
+        self._call_log = Path(call_log)
+
+    def capabilities(self):
+        return DeterministicAuthRequiredSource().capabilities()
+
+    async def discover_candidates(self, request):
+        with self._call_log.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    {
+                        "operation": "discover_candidates",
+                        "workflow_run_id": request.workflow_run_id,
+                        "query": request.query,
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+        query_key = re.sub(r"\s+", "-", request.query.strip())
+        return SourceOperationResult(
+            provider="xiaohongshu",
+            operation="discover_candidates",
+            source_kind="search_result_minimal",
+            status="completed",
+            items=[
+                {
+                    "canonical_id": f"note-{query_key}-{index}",
+                    "canonical_source_id": f"note-{query_key}-{index}",
+                    "source_url": f"https://www.xiaohongshu.com/explore/note-{query_key}-{index}",
+                    "source_kind": "search_result_minimal",
+                    "title": f"T恤真实体验 {index}",
+                    "author_id": f"author-{query_key}-{index}",
+                }
+                for index in range(1, 4)
+            ],
+            cookie_status="valid",
+            completeness="complete",
+        )
+
+    async def collect_note_detail(self, request):
+        index = request.note_id.rsplit("-", 1)[-1]
+        item = {
+            "canonical_id": request.note_id,
+            "canonical_source_id": request.note_id,
+            "source_url": request.note_url,
+            "source_kind": "note_detail",
+            "author_id": f"detail-author-{request.note_id}",
+            "author": f"体验作者 {index}",
+            "title": f"夏季 T恤凉感体验 {index}",
+            "content_text": f"这件 T恤在夏季通勤中穿着凉爽，样本 {index}。",
+            "tags": ["T恤", "凉感", "夏季"],
+            "note_type": "image_text",
+            "source_published_at": "2026-08-20T00:00:00+00:00",
+            "metrics": {"like_count": 100 + int(index)},
+            "metrics_observed_at": "2026-08-24T00:00:00+00:00",
+            "ip_location": "上海",
+            "media": {"cover_count": 1},
+            "field_availability": {
+                field: "present" for field in request.required_fields
+            },
+        }
+        return SourceOperationResult(
+            provider="xiaohongshu",
+            operation="collect_note_detail",
+            source_kind="note_detail",
+            status="completed",
+            items=[item],
+            cookie_status="valid",
+            completeness="complete",
+            field_availability=item["field_availability"],
+        )
+
+    async def collect_comments(self, _request):
+        return SourceOperationResult(
+            provider="xiaohongshu",
+            operation="collect_comments",
+            source_kind="comment",
+            status="empty",
+            items=[],
+            cookie_status="valid",
+            completeness="complete",
+        )
+
+
 class DeterministicWorkflowRestoreFailure:
     def __init__(self, delegate) -> None:
         self._delegate = delegate
@@ -211,7 +300,11 @@ async def deterministic_lifespan(application):
         production.JobWorker.run_loop = original_job_worker_loop
         service = application.state.content_research_service
         configuration_store = SQLiteLLMConfigurationStore(os.environ["SQLITE_DB_PATH"])
-        source = DeterministicAuthRequiredSource()
+        source = (
+            DeterministicSuccessfulSource(os.environ["CREATOR_E2E_SOURCE_CALL_LOG"])
+            if os.getenv("CREATOR_E2E_SOURCE_SCENARIO") == "complete"
+            else DeterministicAuthRequiredSource()
+        )
         registry = SourceAdapterRegistry({"xiaohongshu": source})
         service._presearch = PresearchService(
             DeterministicPresearchLLM(configuration_store),

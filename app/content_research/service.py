@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import sqlite3
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, replace
@@ -2602,6 +2603,55 @@ class ContentResearchService:
                 local_cache_id=brief.id,
             )
 
+        if action == "confirm_scope":
+            declared_state = ContentResearchState(request.expected_state)
+            if declared_state is not ContentResearchState.SCOPE_CONFIRMATION_REQUIRED:
+                raise LifecycleCommandConflict(
+                    "confirm_scope requires expected_state scope_confirmation_required"
+                )
+            latest = self._store.get_latest_scope_draft(workflow_run_id)
+            if latest is None:
+                raise LifecycleCommandConflict("Scope Draft does not belong to this Run")
+            requested_draft_id = str(request.payload.get("scope_draft_id") or "")
+            if requested_draft_id != latest.id:
+                raise LifecycleCommandConflict("Scope confirmation requires the latest draft")
+            projection = await self._lifecycle.apply(
+                LifecycleCommand(
+                    command_id=request.command_id,
+                    run_id=workflow_run_id,
+                    expected_state=declared_state,
+                    expected_revision=request.expected_revision,
+                    kind="confirm_scope",
+                    payload={
+                        "scope_draft_id": latest.id,
+                        "provider": "xiaohongshu",
+                        "source_kind": "search_result",
+                        "limit": 20,
+                        "provider_capabilities": _freeze_adapter_capabilities(
+                            self._source_registry
+                        )
+                        or {},
+                    },
+                )
+            )
+            scope = await self.get_scope_projection(workflow_run_id)
+            # Finish the authoritative read projection before waking the local
+            # worker. Otherwise a synchronous BEGIN IMMEDIATE in the worker's
+            # claim-recovery boundary can block this coroutine from releasing
+            # its SQLite read connection on the same event loop.
+            if self._dispatch_wake_event is not None:
+                self._dispatch_wake_event.set()
+            return self._action_response(
+                workflow_run_id=workflow_run_id,
+                action=action,
+                status="queued",
+                result={
+                    "run": self._run_projection_payload(projection),
+                    "scope": scope.model_dump(mode="json"),
+                },
+                local_cache_id=brief.id,
+            )
+
         raise AssertionError("validated P0 action did not return")
 
     def _build_confirm_brief_command_payload(
@@ -2953,6 +3003,13 @@ class ContentResearchService:
             for item in self._store.list_scope_execution_authorizations(workflow_run_id)
         )
 
+        # A satisfied initial Coverage is already the authority to compose the
+        # report for that frozen Scope. The initial-collection eligibility
+        # predicate intentionally becomes false once Coverage exists, so it
+        # must not be reused as a report-publication gate.
+        if coverage is not None and coverage.state != "awaiting_scope_decision":
+            return
+
         if execution_authorization is None and not self._store.initial_execution_eligibility(
             workflow_run_id, contract.id
         ):
@@ -2964,8 +3021,6 @@ class ContentResearchService:
         if coverage is None:
             if execution_authorization is None and has_persisted_continuation_authority:
                 raise ContentResearchValidationError("scope_execution_authorization_required")
-            return
-        if coverage.state != "awaiting_scope_decision":
             return
         if execution_authorization is None:
             raise ContentResearchValidationError("scope_execution_authorization_required")
@@ -3334,7 +3389,11 @@ class ContentResearchService:
             bind_runtime(context) if callable(bind_runtime) else self._workflow_runtime
         )
         scoped_service = ContentResearchService(
-            store=self._store.for_dispatch_context(context),
+            # Provider/evidence writes are fenced by the explicit dispatch
+            # context passed into the async pipeline below. Binding every
+            # synchronous read to BEGIN IMMEDIATE can deadlock the event loop
+            # against the async lifecycle writer before retrieval even starts.
+            store=self._store,
             presearch=self._presearch,
             workflow_runtime=scoped_runtime,
             source_registry=self._source_registry,
@@ -3360,6 +3419,11 @@ class ContentResearchService:
             raise ContentResearchNotFoundError(
                 f"Content research workflow not found: {workflow_run_id}"
             )
+        await self._advance_lifecycle_if_current(
+            workflow_run_id,
+            expected_state=ContentResearchState.RETRIEVAL_QUEUED,
+            event="worker_claimed",
+        )
         self._require_scope_execution_authority(workflow_run_id=workflow_run_id)
         async with ThreadStore(self._store._db_path) as thread_store:
             if await thread_store.get_thread(brief.thread_id) is None:
@@ -3398,7 +3462,59 @@ class ContentResearchService:
             limit_per_specialist=request.limit,
         )
 
-    def _persist_scope_coverage(
+    async def record_dispatch_failure(
+        self, workflow_run_id: str, error: BaseException | str
+    ) -> None:
+        current = await self._lifecycle.load(workflow_run_id)
+        if current.state in {
+            ContentResearchState.REPORT_READY,
+            ContentResearchState.RECOVERY_REQUIRED,
+            ContentResearchState.CANCELLED_OR_FAILED,
+        }:
+            return
+        message = str(error) or "Content research dispatch failed"
+        await self._lifecycle.apply(
+            LifecycleCommand(
+                command_id=f"dispatch-failed:{workflow_run_id}:{current.state_revision}",
+                run_id=workflow_run_id,
+                expected_state=current.state,
+                expected_revision=current.state_revision,
+                kind="fail",
+                payload={
+                    "error": {
+                        "code": "FORMAL_RESEARCH_DISPATCH_FAILED",
+                        "stage": current.state.value,
+                        "operation": "formal_research_dispatch",
+                        "message": message,
+                        "retryable": True,
+                        "recovery_action": "retry_retrieval",
+                    }
+                },
+            )
+        )
+
+    async def _advance_lifecycle_if_current(
+        self,
+        workflow_run_id: str,
+        *,
+        expected_state: ContentResearchState,
+        event: str,
+    ) -> RunProjection | None:
+        current = await self._lifecycle.load(workflow_run_id)
+        if current.state is not expected_state:
+            return None
+        return await self._lifecycle.apply(
+            LifecycleCommand(
+                command_id=f"worker:{workflow_run_id}:{event}:{current.state_revision}",
+                run_id=workflow_run_id,
+                expected_state=current.state,
+                expected_revision=current.state_revision,
+                kind=event,
+                payload={},
+            )
+        )
+
+    async def _persist_scope_coverage(
         self,
         workflow_run_id: str,
         *,
@@ -3561,18 +3677,27 @@ class ContentResearchService:
             packet_ids=tuple(sorted(packet.id for packet in packets)),
             checkpoint_ids=tuple(sorted(checkpoint.id for checkpoint in owned_checkpoints)),
         )
-        return persist_scope_coverage_evaluation(
-            store=self._store,
-            contract=scope_contract,
-            candidates=candidates,
-            query_group_outcomes=query_group_outcomes,
-            minimum_samples=sample_policy.minimum_samples,
-            minimum_independent_authors=sample_policy.minimum_independent_authors,
-            execution_authorization=execution_authorization,
-            source_snapshot=source_snapshot,
-            execution_context=execution_context,
-            manifest=manifest,
-        )
+        for attempt in range(3):
+            try:
+                return persist_scope_coverage_evaluation(
+                    store=self._store,
+                    contract=scope_contract,
+                    candidates=candidates,
+                    query_group_outcomes=query_group_outcomes,
+                    minimum_samples=sample_policy.minimum_samples,
+                    minimum_independent_authors=sample_policy.minimum_independent_authors,
+                    execution_authorization=execution_authorization,
+                    source_snapshot=source_snapshot,
+                    execution_context=execution_context,
+                    manifest=manifest,
+                )
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
+                    raise
+                if attempt == 2:
+                    raise
+                await asyncio.sleep(0.1 * (attempt + 1))
+        raise AssertionError("unreachable")
 
     async def execute_execution_unit(
         self,
@@ -4054,7 +4179,13 @@ class ContentResearchService:
                 )
             return
 
-        scope_coverage = self._persist_scope_coverage(
+        await self._advance_lifecycle_if_current(
+            brief.workflow_run_id,
+            expected_state=ContentResearchState.RETRIEVAL_RUNNING,
+            event="retrieval_completed",
+        )
+
+        scope_coverage = await self._persist_scope_coverage(
             brief.workflow_run_id,
             execution_authorization=execution_authorization,
             execution_context=execution_context,
@@ -4079,7 +4210,19 @@ class ContentResearchService:
                     "message": "Required Scope Contract coverage is unmet.",
                 },
             )
+            await self._advance_lifecycle_if_current(
+                brief.workflow_run_id,
+                expected_state=ContentResearchState.COVERAGE_EVALUATING,
+                event="coverage_insufficient",
+            )
             return
+
+
+        await self._advance_lifecycle_if_current(
+            brief.workflow_run_id,
+            expected_state=ContentResearchState.COVERAGE_EVALUATING,
+            event="coverage_satisfied",
+        )
 
         plans = self._store.list_plans_for_brief(brief.id)
         if not plans:
@@ -4185,6 +4328,11 @@ class ContentResearchService:
                             execution_context=execution_context,
                             dispatch_context=dispatch_context,
                         ).publish_timeline_message(report_artifact_ref["id"])
+                        await self._advance_lifecycle_if_current(
+                            brief.workflow_run_id,
+                            expected_state=ContentResearchState.REPORT_COMPOSING,
+                            event="report_published",
+                        )
             except Exception as exc:
                 failed_publication_id = (
                     report_artifact_ref["id"]

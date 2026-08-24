@@ -84,6 +84,7 @@ class ContentResearchDispatchWorker:
             )
         )
         result = None
+        service = None
         execution_error: Exception | None = None
         try:
             dispatch_context = DispatchLeaseContext(
@@ -127,6 +128,16 @@ class ContentResearchDispatchWorker:
             )
             return True
         if execution_error is not None:
+            try:
+                if service is not None:
+                    await service.record_dispatch_failure(
+                        str(job["workflow_run_id"]), execution_error
+                    )
+            except Exception:
+                logger.exception(
+                    "content research lifecycle failure projection failed",
+                    extra={"workflow_run_id": job["workflow_run_id"]},
+                )
             await self._dispatch.complete(
                 workflow_run_id=str(job["workflow_run_id"]),
                 owner=self._owner,
@@ -143,6 +154,10 @@ class ContentResearchDispatchWorker:
                 if result.status == "failed"
                 else None
             )
+            if error:
+                await service.record_dispatch_failure(
+                    str(job["workflow_run_id"]), error
+                )
         finally:
             await self._dispatch.complete(
                 workflow_run_id=str(job["workflow_run_id"]),

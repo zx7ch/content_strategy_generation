@@ -226,7 +226,7 @@ def test_creator_corrects_search_structure_and_reads_only_the_backend_query_prev
     expect(scope.get_by_text("场景／人群词 C（可选）", exact=True)).to_have_count(0)
     expect(page.get_by_text("已冻结检索范围", exact=True)).to_have_count(0)
     expect(page.get_by_text("专家调研进行中", exact=True)).to_have_count(0)
-    expect(scope.get_by_role("button", name="确认并开始调研")).to_have_count(0)
+    expect(scope.get_by_role("button", name="确认并开始调研")).to_be_enabled()
     page.get_by_role("button", name="查看 Trace").click()
     trace_dialog = page.get_by_role("dialog", name="Agent 决策日志 · Trace")
     expect(trace_dialog.get_by_text("确认检索范围", exact=True)).to_be_visible()
@@ -294,6 +294,87 @@ def test_creator_corrects_search_structure_and_reads_only_the_backend_query_prev
             "SELECT COUNT(*) FROM content_research_subagent_tasks WHERE workflow_run_id=?",
             (run_id,),
         ).fetchone()[0] == 0
+
+
+@pytest.mark.parametrize(
+    "real_creator_stack",
+    [{"source_scenario": "complete"}],
+    indirect=True,
+)
+def test_creator_confirm_scope_executes_one_complete_verified_run(browser_page):
+    page, stack = browser_page
+    page.goto(stack["frontend_url"] + "/creator", wait_until="domcontentloaded")
+    page.get_by_role("button", name=re.compile("内容调研")).click(timeout=15000)
+    research_input = page.get_by_role(
+        "textbox", name="输入品类、品牌或 SKU，发送后开始内容调研"
+    )
+    research_input.fill("夏季凉感T恤")
+    with page.expect_response(
+        lambda response: response.url.endswith("/content-research/presearch")
+        and response.status == 201,
+        timeout=30000,
+    ) as presearch_response:
+        research_input.press("Enter")
+    run_id = presearch_response.value.json()["workflow_run_id"]
+
+    page.get_by_role("button", name="准确，继续").click()
+    page.get_by_role("button", name="产品营销").click()
+    with page.expect_response(
+        lambda response: response.url.endswith("/actions")
+        and '"action":"confirm_brief"' in (response.request.post_data or ""),
+        timeout=30000,
+    ):
+        page.get_by_role("button", name="确认并继续").click()
+
+    scope = page.get_by_role("region", name="检索范围确认")
+    expect(scope.get_by_test_id("scope-final-query")).to_have_count(3, timeout=30000)
+    expected_queries = ["T恤", "T恤 凉感", "T恤 夏季"]
+    for index, query in enumerate(expected_queries):
+        expect(scope.get_by_test_id("scope-final-query").nth(index)).to_have_text(query)
+
+    confirm = scope.get_by_role("button", name="确认并开始调研")
+    expect(confirm).to_be_enabled()
+    with page.expect_response(
+        lambda response: response.url.endswith("/actions")
+        and '"action":"confirm_scope"' in (response.request.post_data or ""),
+        timeout=30000,
+    ) as confirmation:
+        confirm.evaluate("(button) => { button.click(); button.click(); }")
+    assert confirmation.value.status == 200, confirmation.value.text()
+
+    expect(page.get_by_text("调研报告已完成", exact=True)).to_be_visible(timeout=120000)
+    expect(page.get_by_role("article", name="Content Research published report")).to_be_visible(timeout=30000)
+
+    source_calls = [
+        json.loads(line)
+        for line in stack["source_call_log"].read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert [call["query"] for call in source_calls] == expected_queries
+    assert all(call["workflow_run_id"] == run_id for call in source_calls)
+
+    with sqlite3.connect(stack["db_path"]) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM content_research_scope_contracts WHERE workflow_run_id=?",
+            (run_id,),
+        ).fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT COUNT(*) FROM content_research_dispatch_jobs WHERE workflow_run_id=?",
+            (run_id,),
+        ).fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT COUNT(*) FROM content_research_directional_evidence_packets WHERE workflow_run_id=?",
+            (run_id,),
+        ).fetchone()[0] >= 3
+        assert connection.execute(
+            "SELECT COUNT(*) FROM content_research_report_publications WHERE workflow_run_id=?",
+            (run_id,),
+        ).fetchone()[0] == 1
+        state, status = connection.execute(
+            "SELECT content_research_state, status FROM workflow_runs WHERE run_id=?",
+            (run_id,),
+        ).fetchone()
+    assert (state, status) == ("report_ready", "succeeded")
 
 
 

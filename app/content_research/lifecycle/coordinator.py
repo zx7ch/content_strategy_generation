@@ -8,12 +8,13 @@ import sqlite3
 import uuid
 import asyncio
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import aiosqlite
 
 from app.content_research.bootstrap import bootstrap_content_research_schema
+from app.content_research.contracts import DIRECTION_CATALOG_V1, build_default_snapshot
 from app.content_research.lifecycle.models import (
     ContentResearchState,
     ExecutionEvent,
@@ -25,6 +26,12 @@ from app.content_research.lifecycle.transitions import (
     LifecycleTransitionError,
     transition,
 )
+from app.content_research.scope_contract import (
+    ScopeConstraint,
+    ScopeQueryGroupInput,
+    build_scope_contract,
+)
+from app.content_research.workflow.direction_registry import ResearchDirectionRegistry
 from app.memory.workflow_store import WorkflowStore
 
 
@@ -534,6 +541,10 @@ class ContentResearchPersistenceCoordinator:
             )
         elif command.kind == "replace_scope_draft":
             await self._persist_scope_draft_replacement(conn, row, command.payload)
+        elif command.kind == "confirm_scope":
+            await self._persist_scope_confirmation_and_dispatch(
+                conn, row, command.payload, command_id=command.command_id
+            )
         elif command.kind == "fail" and command.payload.get("brief_id"):
             brief_id = await self._persist_presearch_brief(conn, row, command.payload)
 
@@ -558,12 +569,40 @@ class ContentResearchPersistenceCoordinator:
             if decision.to_state is ContentResearchState.BRIEF_CONFIRMATION_REQUIRED
             else "scope_confirm"
             if decision.to_state is ContentResearchState.SCOPE_CONFIRMATION_REQUIRED
+            else "formal_research"
+            if decision.to_state in {
+                ContentResearchState.RETRIEVAL_QUEUED,
+                ContentResearchState.RETRIEVAL_RUNNING,
+                ContentResearchState.COVERAGE_EVALUATING,
+            }
+            else "coverage"
+            if decision.to_state is ContentResearchState.COVERAGE_DECISION_REQUIRED
+            else "report"
+            if decision.to_state in {
+                ContentResearchState.REPORT_COMPOSING,
+                ContentResearchState.REPORT_READY,
+            }
             else row["current_step"]
+        )
+        phase = (
+            "retrieval"
+            if decision.to_state in {
+                ContentResearchState.RETRIEVAL_QUEUED,
+                ContentResearchState.RETRIEVAL_RUNNING,
+                ContentResearchState.COVERAGE_EVALUATING,
+                ContentResearchState.COVERAGE_DECISION_REQUIRED,
+            }
+            else "finalization"
+            if decision.to_state in {
+                ContentResearchState.REPORT_COMPOSING,
+                ContentResearchState.REPORT_READY,
+            }
+            else str(row["phase"] or "intake")
         )
         await conn.execute(
             """UPDATE workflow_runs
                SET content_research_state=?, state_revision=?, state_entered_at=?,
-                   status=?, current_step=?, error_code=?, error_message=?,
+                   status=?, phase=?, current_step=?, error_code=?, error_message=?,
                    lifecycle_error_json=?, updated_at=?
                WHERE run_id=?""",
             (
@@ -571,6 +610,7 @@ class ContentResearchPersistenceCoordinator:
                 decision.next_revision,
                 now,
                 status,
+                phase,
                 current_step,
                 reason_code,
                 str(error_payload.get("message") or "") or None,
@@ -598,6 +638,56 @@ class ContentResearchPersistenceCoordinator:
                    SET status='waiting_user', attempt_count=CASE WHEN attempt_count=0 THEN 1 ELSE attempt_count END,
                        started_at=COALESCE(started_at, ?), updated_at=?
                    WHERE run_id=? AND step_name='scope_confirm'""",
+                (now, now, command.run_id),
+            )
+        elif command.kind == "confirm_scope":
+            await conn.execute(
+                """UPDATE workflow_steps
+                   SET status='succeeded', completed_at=?, updated_at=?
+                   WHERE run_id=? AND step_name='scope_confirm'""",
+                (now, now, command.run_id),
+            )
+            await conn.execute(
+                """UPDATE workflow_steps
+                   SET status='running', attempt_count=CASE WHEN attempt_count=0 THEN 1 ELSE attempt_count END,
+                       started_at=COALESCE(started_at, ?), updated_at=?
+                   WHERE run_id=? AND step_name='formal_research'""",
+                (now, now, command.run_id),
+            )
+        elif command.kind == "worker_claimed":
+            await conn.execute(
+                """UPDATE workflow_steps SET status='running', updated_at=?
+                   WHERE run_id=? AND step_name='formal_research'""",
+                (now, command.run_id),
+            )
+        elif command.kind == "retrieval_completed":
+            await conn.execute(
+                """UPDATE workflow_steps
+                   SET status='running', attempt_count=CASE WHEN attempt_count=0 THEN 1 ELSE attempt_count END,
+                       started_at=COALESCE(started_at, ?), updated_at=?
+                   WHERE run_id=? AND step_name='coverage'""",
+                (now, now, command.run_id),
+            )
+        elif command.kind in {"coverage_satisfied", "coverage_insufficient"}:
+            await conn.execute(
+                """UPDATE workflow_steps
+                   SET status='succeeded', completed_at=?, updated_at=?
+                   WHERE run_id=? AND step_name='coverage'""",
+                (now, now, command.run_id),
+            )
+            if command.kind == "coverage_satisfied":
+                await conn.execute(
+                    """UPDATE workflow_steps
+                       SET status='running', attempt_count=CASE WHEN attempt_count=0 THEN 1 ELSE attempt_count END,
+                           started_at=COALESCE(started_at, ?), updated_at=?
+                       WHERE run_id=? AND step_name='report'""",
+                    (now, now, command.run_id),
+                )
+        elif command.kind == "report_published":
+            await conn.execute(
+                """UPDATE workflow_steps
+                   SET status='succeeded', completed_at=?, updated_at=?
+                   WHERE run_id=? AND step_name='report'""",
                 (now, now, command.run_id),
             )
         elif command.kind in {"revise_subject", "retry_presearch"}:
@@ -652,12 +742,357 @@ class ContentResearchPersistenceCoordinator:
                 now,
             ),
         )
-        if brief_id is not None or command.kind == "replace_scope_draft":
+        if brief_id is not None or command.kind in {"replace_scope_draft", "confirm_scope"}:
             await conn.execute(
                 "UPDATE workflow_runs SET artifact_version=artifact_version+1 WHERE run_id=?",
                 (command.run_id,),
             )
         return decision.next_revision
+
+    async def _persist_scope_confirmation_and_dispatch(
+        self,
+        conn: aiosqlite.Connection,
+        run_row: aiosqlite.Row,
+        payload: Any,
+        *,
+        command_id: str,
+    ) -> None:
+        """Freeze the latest draft and create its complete executable request atomically."""
+
+        run_id = str(run_row["run_id"])
+        draft_id = str(payload.get("scope_draft_id") or "")
+        cursor = await conn.execute(
+            """SELECT * FROM content_research_scope_drafts
+               WHERE workflow_run_id=? ORDER BY created_at DESC, id DESC LIMIT 1""",
+            (run_id,),
+        )
+        draft_row = await cursor.fetchone()
+        if draft_row is None or str(draft_row["id"]) != draft_id:
+            raise LifecycleCommandConflict("Scope confirmation requires the latest draft")
+
+        brief_cursor = await conn.execute(
+            """SELECT * FROM content_research_briefs
+               WHERE workflow_run_id=? ORDER BY updated_at DESC, id DESC LIMIT 1""",
+            (run_id,),
+        )
+        brief_row = await brief_cursor.fetchone()
+        if brief_row is None:
+            raise LifecycleCommandConflict("Scope confirmation requires a current Brief")
+        brief_payload = json.loads(str(brief_row["payload_json"]))
+        if str(draft_row["structure_hash"]) != str(
+            brief_payload.get("subject_structure_hash") or ""
+        ):
+            raise LifecycleCommandConflict("Scope draft does not match the current Brief")
+
+        plan_cursor = await conn.execute(
+            "SELECT * FROM content_research_plans WHERE id=? AND workflow_run_id=?",
+            (draft_row["research_plan_id"], run_id),
+        )
+        plan_row = await plan_cursor.fetchone()
+        if plan_row is None:
+            raise LifecycleCommandConflict("Scope confirmation requires its current Plan")
+        plan_payload = json.loads(str(plan_row["payload_json"]))
+        selected_direction_ids = tuple(
+            str(item)
+            for item in plan_payload.get("direction_ids") or ()
+            if str(item)
+        )
+        if not selected_direction_ids or not set(selected_direction_ids).issubset(
+            DIRECTION_CATALOG_V1
+        ):
+            raise LifecycleCommandConflict("Scope Plan has no executable Lite directions")
+
+        constraints = tuple(
+            ScopeConstraint(
+                str(item["id"]),
+                str(item["label"]),
+                str(item["value"]),
+                str(item["mode"]),
+                tuple(item.get("allowed_aliases") or ()),
+            )
+            for item in json.loads(str(draft_row["constraints_json"]))
+        )
+        draft_groups = tuple(
+            ScopeQueryGroupInput(
+                suggested_query=str(item["suggested_query"]),
+                final_query=str(item["final_query"]),
+                targeted_required_terms=tuple(item.get("targeted_required_terms") or ()),
+                origin=item.get("origin"),
+            )
+            for item in json.loads(str(draft_row["query_groups_json"]))
+        )
+        contract = build_scope_contract(
+            workflow_run_id=run_id,
+            research_plan_id=str(plan_row["id"]),
+            version=1,
+            schema_version=str(draft_row["schema_version"]),
+            constraints=constraints,
+            query_groups=draft_groups,
+        )
+        now = _now()
+        await conn.execute(
+            """INSERT INTO content_research_scope_contracts
+               (id, workflow_run_id, research_plan_id, version, schema_version,
+                constraints_json, query_groups_json, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                contract.id,
+                run_id,
+                contract.research_plan_id,
+                contract.version,
+                contract.schema_version,
+                _canonical_json([item.__dict__ for item in contract.constraints]),
+                _canonical_json([item.__dict__ for item in contract.query_groups]),
+                now,
+            ),
+        )
+        audit_id = f"sae_{hashlib.sha256(command_id.encode()).hexdigest()[:24]}"
+        audit_payload = {
+            "schema_version": "content_research_scope_audit_event_v1",
+            "scope_draft_id": draft_id,
+            "structure_hash": str(draft_row["structure_hash"]),
+            "scope_contract_id": contract.id,
+            "scope_contract_version": contract.version,
+            "query_groups": [item.__dict__ for item in contract.query_groups],
+            "queries": [
+                {
+                    "query_group_id": item.id,
+                    "suggested_query": item.suggested_query,
+                    "final_query": item.final_query,
+                    "changed": item.origin == "user_edited",
+                }
+                for item in contract.query_groups
+            ],
+        }
+        await conn.execute(
+            """INSERT INTO content_research_scope_audit_events
+               (id, workflow_run_id, scope_contract_id, scope_contract_version,
+                event_name, payload_json, metadata_json, created_at)
+               VALUES (?, ?, ?, ?, 'scope_confirmed', ?, '{}', ?)""",
+            (audit_id, run_id, contract.id, contract.version, _canonical_json(audit_payload), now),
+        )
+        await conn.execute(
+            """INSERT INTO content_research_scope_draft_confirmations
+               (scope_draft_id, workflow_run_id, scope_contract_id, created_at)
+               VALUES (?, ?, ?, ?)""",
+            (draft_id, run_id, contract.id, now),
+        )
+
+        definitions = {
+            item.id: item for item in ResearchDirectionRegistry().list_directions()
+        }
+        core_query = contract.query_groups[0].final_query
+        as_of = datetime.now(timezone.utc)
+        window = {
+            "start_at": (as_of - timedelta(days=365)).isoformat(),
+            "end_at": as_of.isoformat(),
+        }
+        query_groups_by_direction = {
+            direction_id: (
+                {
+                    "id": f"qplan_{hashlib.sha256(f'{run_id}:{direction_id}'.encode()).hexdigest()[:16]}",
+                    "direction_id": direction_id,
+                    "normalized_query": core_query,
+                    "priority": 0,
+                    "sort": "likes",
+                    "time_window": window,
+                    "candidate_cap": 20,
+                    "roles": ["core_object"],
+                    "activation": "primary",
+                },
+            )
+            for direction_id in selected_direction_ids
+        }
+        snapshot, policies, direction_contracts = build_default_snapshot(
+            snapshot_id=f"rps_{hashlib.sha256(command_id.encode()).hexdigest()[:24]}",
+            workflow_run_id=run_id,
+            brief_id=str(brief_row["id"]),
+            plan_id=str(plan_row["id"]),
+            run_as_of_at=as_of,
+            direction_ids=selected_direction_ids,
+            direction_catalog=DIRECTION_CATALOG_V1,
+            report_compose_mode="template_only",
+            provider_capabilities=dict(payload.get("provider_capabilities") or {}),
+            confirmed_subject=str(
+                draft_row["core_object"]
+                or brief_payload.get("seed_text")
+                or brief_payload.get("subject_confirmation")
+            ),
+            query_groups_by_direction=query_groups_by_direction,
+            subject_structure=dict(brief_payload.get("subject_structure") or {}),
+            subject_structure_hash=str(brief_payload.get("subject_structure_hash") or ""),
+        )
+        await conn.execute(
+            "INSERT INTO content_research_run_policy_snapshots VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                snapshot.id,
+                snapshot.workflow_run_id,
+                snapshot.research_brief_id,
+                snapshot.research_plan_id,
+                snapshot.schema_version,
+                _canonical_json(snapshot.effective_policy),
+                snapshot.effective_policy_hash,
+                snapshot.run_as_of_at.isoformat(),
+                _canonical_json(snapshot.base_policy_ids_and_versions),
+                _canonical_json(snapshot.requested_overrides),
+                _canonical_json(snapshot.validation_result),
+                snapshot.created_at.isoformat(),
+                _canonical_json(snapshot.metadata),
+            ),
+        )
+        for policy in policies:
+            await conn.execute(
+                "INSERT INTO content_research_sample_policies VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    policy.id,
+                    policy.schema_version,
+                    policy.direction_id,
+                    policy.minimum_samples,
+                    policy.minimum_independent_authors,
+                    policy.author_cap,
+                    _canonical_json(policy.metadata),
+                ),
+            )
+        for direction_contract in direction_contracts:
+            await conn.execute(
+                "INSERT INTO content_research_direction_contracts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    direction_contract.id,
+                    direction_contract.snapshot_id,
+                    direction_contract.direction_id,
+                    direction_contract.schema_version,
+                    direction_contract.sample_policy_id,
+                    _canonical_json(list(direction_contract.required_note_fields)),
+                    _canonical_json(list(direction_contract.optional_note_fields)),
+                    _canonical_json(list(direction_contract.required_comment_fields)),
+                    _canonical_json(list(direction_contract.claim_rules)),
+                    direction_contract.analysis_schema_version,
+                    direction_contract.resume_contract_version,
+                    _canonical_json(direction_contract.metadata),
+                ),
+            )
+
+        formal_cursor = await conn.execute(
+            "SELECT step_id FROM workflow_steps WHERE run_id=? AND step_name='formal_research'",
+            (run_id,),
+        )
+        formal_step = await formal_cursor.fetchone()
+        if formal_step is None:
+            raise LifecycleCommandConflict("formal research step is missing")
+        subject_structure = dict(brief_payload.get("subject_structure") or {})
+        competitors = list(brief_payload.get("selected_competitors") or [])
+        custom_competitor = str(brief_payload.get("custom_competitor_input") or "").strip()
+        if custom_competitor:
+            competitors.append(custom_competitor)
+        task_ids: list[str] = []
+        for index, direction_id in enumerate(selected_direction_ids):
+            definition = definitions[direction_id]
+            child_id = f"child_{hashlib.sha256(f'{command_id}:{direction_id}'.encode()).hexdigest()[:24]}"
+            task_id = f"sat_{hashlib.sha256(f'{command_id}:{direction_id}'.encode()).hexdigest()[:24]}"
+            task_ids.append(task_id)
+            await conn.execute(
+                """INSERT INTO workflow_child_tasks
+                   (child_task_id, run_id, step_id, task_type, slot_index, status,
+                    attempt_count, max_attempts, checkpoint_json, timing_json,
+                    created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, 'pending', 0, 3, ?, '{}', ?, ?)""",
+                (
+                    child_id,
+                    run_id,
+                    formal_step["step_id"],
+                    definition.task_type,
+                    index + 1,
+                    _canonical_json({"direction_id": direction_id}),
+                    now,
+                    now,
+                ),
+            )
+            task_payload = {
+                "schema_version": "content_research_subagent_task_v1",
+                "workflow_run_id": run_id,
+                "research_brief_id": str(brief_row["id"]),
+                "research_plan_id": str(plan_row["id"]),
+                "research_direction_id": direction_id,
+                "agent_name": definition.agent_name,
+                "agent_version": "p0_spec_v1",
+                "task_type": definition.task_type,
+                "input_payload": {
+                    "schema_version": "content_research_subagent_input_v1",
+                    "confirmed_subject": str(draft_row["core_object"]),
+                    "subject_structure": subject_structure,
+                    "subject_structure_hash": str(brief_payload.get("subject_structure_hash") or ""),
+                    "competitors": competitors,
+                    "custom_research_question": "",
+                    "direction": {
+                        "id": direction_id,
+                        "label": definition.label,
+                        "direction_type": definition.direction_type,
+                        "questions": definition.default_questions,
+                        "source_scope": definition.source_scope,
+                    },
+                },
+                "expected_output_schema": {
+                    "schema_version": "content_research_subagent_output_schema_v1",
+                    "required": ["finding", "evidence_refs", "missing_evidence"],
+                },
+                "status": "queued",
+                "sequence_no": index + 1,
+                "workflow_child_task_id": child_id,
+            }
+            await conn.execute(
+                """INSERT INTO content_research_subagent_tasks
+                   (id, workflow_run_id, thread_id, schema_version, status, plan_id,
+                    direction_id, created_at, updated_at, payload_json, metadata_json)
+                   VALUES (?, ?, ?, 'content_research_subagent_task_v1', 'queued', ?, ?, ?, ?, ?, '{}')""",
+                (
+                    task_id,
+                    run_id,
+                    run_row["thread_id"],
+                    plan_row["id"],
+                    direction_id,
+                    now,
+                    now,
+                    _canonical_json(task_payload),
+                ),
+            )
+
+        brief_payload.update(
+            {
+                "status": "ready",
+                "confirmed_subject": str(draft_row["core_object"]),
+                "requested_direction_ids": list(selected_direction_ids),
+                "selected_directions": list(selected_direction_ids),
+            }
+        )
+        await conn.execute(
+            "UPDATE content_research_briefs SET status='ready', payload_json=?, updated_at=? WHERE id=?",
+            (_canonical_json(brief_payload), now, brief_row["id"]),
+        )
+        plan_payload.update(
+            {
+                "selected_directions": list(selected_direction_ids),
+                "subagent_task_ids": task_ids,
+                "scope_contract_id": contract.id,
+            }
+        )
+        await conn.execute(
+            "UPDATE content_research_plans SET status='ready', payload_json=?, updated_at=? WHERE id=?",
+            (_canonical_json(plan_payload), now, plan_row["id"]),
+        )
+        await conn.execute(
+            """INSERT INTO content_research_dispatch_jobs
+               (workflow_run_id, provider, source_kind, limit_per_specialist,
+                status, attempt_count, created_at, updated_at)
+               VALUES (?, ?, ?, ?, 'queued', 0, ?, ?)""",
+            (
+                run_id,
+                str(payload.get("provider") or "xiaohongshu"),
+                str(payload.get("source_kind") or "search_result"),
+                int(payload.get("limit") or 20),
+                now,
+                now,
+            ),
+        )
 
     async def _persist_confirmed_brief_and_scope_draft(
         self,

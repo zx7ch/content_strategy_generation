@@ -219,7 +219,8 @@ export interface ContentResearchWorkflowActionRequest {
     | "retry_presearch"
     | "revise_subject"
     | "confirm_brief"
-    | "replace_scope_draft";
+    | "replace_scope_draft"
+    | "confirm_scope";
   payload?: JsonObject;
 }
 
@@ -410,6 +411,11 @@ export interface ContentResearchScopeDraftReplacementInput {
 }
 
 export interface ContentResearchScopeDraftActionResult {
+  run: ContentResearchRunProjection;
+  scope: ContentResearchScopeProjection;
+}
+
+export interface ContentResearchScopeConfirmationActionResult {
   run: ContentResearchRunProjection;
   scope: ContentResearchScopeProjection;
 }
@@ -737,6 +743,16 @@ export async function replaceContentResearchScopeDraft(
   return runContentResearchWorkflowAction(
     run.run_id,
     contentResearchCommand(run, "replace_scope_draft", { ...input }),
+  );
+}
+
+export async function confirmContentResearchScope(
+  run: ContentResearchRunProjection,
+  scopeDraftId: string,
+): Promise<ContentResearchWorkflowActionResponse<ContentResearchScopeConfirmationActionResult>> {
+  return runContentResearchWorkflowAction(
+    run.run_id,
+    contentResearchCommand(run, "confirm_scope", { scope_draft_id: scopeDraftId }),
   );
 }
 

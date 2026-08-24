@@ -24,6 +24,7 @@ import { useBrandContext } from "@/components/providers/BrandProvider";
 import {
   contentResearchCommand,
   confirmContentResearchBrief,
+  confirmContentResearchScope,
   createContentResearchPresearch,
   createContentResearchCommandId,
   endContentResearchWorkflow,
@@ -898,6 +899,7 @@ function ContentResearchScopeDraftCard({
   projection,
   busy,
   onReplace,
+  onConfirm,
 }: {
   projection: ContentResearchScopeProjection;
   busy: boolean;
@@ -906,6 +908,7 @@ function ContentResearchScopeDraftCard({
     product_experience_aspect: string | null;
     context_audience_aspect: string | null;
   }) => void;
+  onConfirm: () => void;
 }) {
   const draft = projection.draft;
   const [coreObject, setCoreObject] = useState(draft.core_object);
@@ -1016,7 +1019,17 @@ function ContentResearchScopeDraftCard({
             </div>
           ))}
         </div>
-        <p className="mt-4 text-xs text-quiet">{busy ? "正在由后端生成最新搜索词…" : "修改后会自动保存并刷新预览；补充词留空也可以继续。"}</p>
+        <div className="mt-4 flex items-center justify-between gap-4">
+          <p className="text-xs text-quiet">{busy ? "正在由后端生成最新搜索词…" : "修改后会自动保存并刷新预览；补充词留空也可以继续。"}</p>
+          <button
+            type="button"
+            disabled={busy || !coreObject.trim()}
+            onClick={onConfirm}
+            className="shrink-0 rounded-xl bg-ink px-5 py-2.5 text-sm font-semibold text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-35"
+          >
+            {busy ? "正在确认…" : "确认并开始调研"}
+          </button>
+        </div>
       </section>
     </div>
   );
@@ -2366,6 +2379,60 @@ function ContentResearchContextSidebar({
     if (scopeDraftSaveQueueRef.current === holder) setScopeDraftSaveBusy(false);
   }
 
+  async function confirmCurrentContentResearchScope() {
+    if (scopeActionBusy || scopeDraftSaveBusy) return;
+    const run = contentResearchRun?.summary.run;
+    const scope = run ? scopeProjectionsByRun[run.run_id] : null;
+    if (!run || !scope || run.state !== "scope_confirmation_required") return;
+    setScopeActionBusy(true);
+    try {
+      const response = await confirmContentResearchScope(run, scope.draft.id);
+      setScopeProjectionsByRun((current) => ({
+        ...current,
+        [run.run_id]: response.result.scope,
+      }));
+      setContentResearchRun((current) => current && current.workflowRunId === run.run_id
+        ? {
+            ...current,
+            summary: { ...current.summary, run: response.result.run },
+          }
+        : current);
+      appendMessage({ role: "assistant", text: "检索范围已确认，正在检索并生成调研报告。" });
+      void pollContentResearchMainline(run.run_id);
+    } catch (error) {
+      appendMessage({
+        role: "system",
+        text: contentResearchErrorFeedback(error, "开始调研失败"),
+      });
+    } finally {
+      setScopeActionBusy(false);
+    }
+  }
+
+  async function pollContentResearchMainline(workflowRunId: string) {
+    for (let attempt = 0; attempt < 120; attempt += 1) {
+      const ticket = contentResearchRequestEpochRef.current.ticket(workflowRunId, "mainline");
+      try {
+        const [workflow, trace] = await Promise.all([
+          getContentResearchWorkflow(workflowRunId),
+          getContentResearchTrace(workflowRunId),
+        ]);
+        if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
+        setContentResearchRun((current) => current && current.workflowRunId === workflowRunId
+          ? { ...current, summary: workflow, trace }
+          : current);
+        if (workflow.run.state === "report_ready") {
+          await refreshContentResearchReport(workflowRunId);
+          return;
+        }
+        if (["recovery_required", "cancelled_or_failed"].includes(workflow.run.state)) return;
+      } catch {
+        // The next bounded poll re-reads the authoritative workflow projection.
+      }
+      await new Promise<void>((resolve) => window.setTimeout(resolve, 1000));
+    }
+  }
+
   async function restoreInterruptedContentResearchRun(threadId: string): Promise<boolean> {
     try {
       const { thread } = await getThreadTimeline(threadId);
@@ -3175,6 +3242,7 @@ function ContentResearchContextSidebar({
                 projection={scopeProjection}
                 busy={scopeActionBusy || scopeDraftSaveBusy}
                 onReplace={(input) => void replaceCurrentScopeDraft(input)}
+                onConfirm={() => void confirmCurrentContentResearchScope()}
               />
             )}
 

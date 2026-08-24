@@ -16,6 +16,7 @@ def test_p0_workflow_action_contract_lists_supported_actions():
         "revise_subject",
         "confirm_brief",
         "replace_scope_draft",
+        "confirm_scope",
     )
 
     request = ContentResearchWorkflowActionRequest(
