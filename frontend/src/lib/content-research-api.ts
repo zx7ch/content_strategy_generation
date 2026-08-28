@@ -131,6 +131,12 @@ export interface ContentResearchWorkflowSummary {
 export interface ContentResearchTrace {
   schema_version: string;
   workflow_run_id: string;
+  trace_revision: number;
+  effective_attempt?: {
+    kind: "analysis";
+    attempt_no: number;
+    state: string;
+  } | null;
   state?: ContentResearchLifecycleState | null;
   state_revision?: number | null;
   state_transitions?: JsonObject[];
@@ -192,10 +198,23 @@ export interface ContentResearchTrace {
 }
 
 export interface ContentResearchMarketingConclusionTraceTrack {
-  state: "selected" | "directional" | "qualified" | "insufficient_evidence" | "no_single_primary_conclusion" | "analysis_unavailable";
+  state: "selected" | "contested" | "directional" | "qualified" | "insufficient_evidence" | "no_single_primary_conclusion" | "analysis_unavailable";
   supporting_note_count?: number;
   independent_author_count?: number;
+  counter_note_count?: number;
+  counter_author_count?: number;
+  verifier_state?: "verified" | "contested" | "rejected";
   reason_codes?: string[];
+  execution?: "completed" | "failed";
+  decision?: string;
+  publication_role?: string;
+  publication_disposition?: {
+    state: "published" | "withheld_by_faithfulness" | "omitted_by_publication_policy";
+    reason_code?: "faithfulness_not_verified";
+  };
+  failure_code?: string;
+  failure_detail?: string;
+  recovery_action?: "repair_model_configuration_and_resume";
 }
 
 export interface ContentResearchMarketingConclusionTraceCheckpoint {
@@ -217,6 +236,9 @@ export interface ContentResearchWorkflowActionRequest {
   action:
     | "cancel"
     | "retry_presearch"
+    | "retry_analysis"
+    | "retry_report"
+    | "repair_publication"
     | "revise_subject"
     | "confirm_brief"
     | "replace_scope_draft"
@@ -508,7 +530,27 @@ export type ContentResearchMarketingConclusionTrack =
       verification_direction: string;
     }
   | {
+      state: "contested";
+      conclusion_id: string;
+      statement: string;
+      citation_group_ids: string[];
+      counter_citation_group_ids: string[];
+      supporting_note_count: number;
+      independent_author_count: number;
+      counter_note_count: number;
+      counter_author_count: number;
+      additional_qualified_count: number;
+      reason_codes: string[];
+      verification_direction: string;
+    }
+  | {
       state: "insufficient_evidence" | "no_single_primary_conclusion" | "analysis_unavailable";
+      reason_codes: string[];
+      verification_direction: string;
+    }
+  | {
+      state: "withheld_by_faithfulness" | "omitted_by_publication_policy";
+      analysis_state: "selected" | "directional";
       reason_codes: string[];
       verification_direction: string;
     };
@@ -621,6 +663,24 @@ export async function deleteLLMConfiguration(): Promise<LLMConfiguration> {
 export async function retryContentResearchPresearch(run: ContentResearchRunProjection): Promise<ContentResearchPresearchResponse> {
   const response = await runContentResearchWorkflowAction<ContentResearchPresearchResponse>(run.run_id, contentResearchCommand(run, "retry_presearch"));
   return response.result;
+}
+
+export async function retryContentResearchAnalysis(
+  run: ContentResearchRunProjection
+): Promise<ContentResearchWorkflowActionResponse<JsonObject>> {
+  return runContentResearchWorkflowAction<JsonObject>(
+    run.run_id,
+    contentResearchCommand(run, "retry_analysis")
+  );
+}
+
+export async function retryContentResearchReport(
+  run: ContentResearchRunProjection
+): Promise<ContentResearchWorkflowActionResponse<JsonObject>> {
+  return runContentResearchWorkflowAction<JsonObject>(
+    run.run_id,
+    contentResearchCommand(run, "retry_report")
+  );
 }
 
 export async function getContentResearchPresearch(attemptId: string): Promise<ContentResearchPresearchResponse> {

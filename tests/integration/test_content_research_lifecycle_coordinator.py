@@ -1,10 +1,16 @@
 from __future__ import annotations
 
-import sqlite3
 import asyncio
+import json
+import sqlite3
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from app.content_research.analysis_persistence import (
+    FrozenEvidenceNoteInput,
+    SQLiteMarketingAnalysisRepository,
+)
 from app.content_research.lifecycle.coordinator import (
     ContentResearchPersistenceCoordinator,
     LifecycleCommandConflict,
@@ -164,6 +170,126 @@ async def test_presearch_completion_atomically_persists_brief_and_state(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_scope_confirmation_keeps_one_query_identity_in_policy_and_scope(tmp_path) -> None:
+    db_path = str(tmp_path / "scope-query-identity.db")
+    thread_id = await _create_thread(db_path)
+    coordinator = ContentResearchPersistenceCoordinator(db_path)
+    run_id = "run-scope-query-identity"
+    await coordinator.apply(
+        LifecycleCommand(
+            command_id="submit-scope-query-identity",
+            run_id=run_id,
+            expected_state=None,
+            expected_revision=0,
+            kind="submit_research_subject",
+            payload={"thread_id": thread_id, "user_id": "user", "seed_text": "夏季凉感T恤"},
+        )
+    )
+    await coordinator.apply(
+        LifecycleCommand(
+            command_id="presearch-scope-query-identity",
+            run_id=run_id,
+            expected_state=ContentResearchState.PRESEARCH_RUNNING,
+            expected_revision=1,
+            kind="presearch_completed",
+            payload={
+                "brief_id": "brief-scope-query-identity",
+                "schema_version": "content_research_brief_v1",
+                "status": "draft",
+                "subject": "夏季凉感T恤",
+                "directions": ["product_marketing"],
+                "attempt_id": "attempt-scope-query-identity",
+                "subject_structure_hash": "structure-scope-query-identity",
+                "subject_structure": {
+                    "core_entities": [{"canonical_name": "T恤"}],
+                },
+            },
+        )
+    )
+    await coordinator.apply(
+        LifecycleCommand(
+            command_id="brief-scope-query-identity",
+            run_id=run_id,
+            expected_state=ContentResearchState.BRIEF_CONFIRMATION_REQUIRED,
+            expected_revision=2,
+            kind="confirm_brief",
+            payload={
+                "brief_id": "brief-scope-query-identity",
+                "brief_confirmation": {"selected_directions": ["product_marketing"]},
+                "plan": {
+                    "id": "plan-scope-query-identity",
+                    "schema_version": "content_research_plan_v2",
+                    "payload": {"direction_ids": ["product_marketing"]},
+                },
+                "directions": [
+                    {
+                        "id": "direction-scope-query-identity",
+                        "schema_version": "content_research_direction_v2",
+                        "payload": {"direction_id": "product_marketing"},
+                    }
+                ],
+                "scope_draft": {
+                    "id": "draft-scope-query-identity",
+                    "workflow_run_id": run_id,
+                    "research_plan_id": "plan-scope-query-identity",
+                    "structure_hash": "structure-scope-query-identity",
+                    "schema_version": "content_research_scope_contract_v2",
+                    "core_object": "T恤",
+                    "product_experience_aspect": "凉感",
+                    "context_audience_aspect": "夏季",
+                    "constraints": [
+                        {"id": "core_object", "label": "核心对象", "value": "T恤", "mode": "required"}
+                    ],
+                    "query_groups": [
+                        {
+                            "suggested_query": query,
+                            "final_query": query,
+                            "targeted_required_terms": ["T恤"],
+                            "origin": "system_suggested",
+                        }
+                        for query in ("T恤", "T恤 凉感", "T恤 夏季")
+                    ],
+                    "audit_event_id": "audit-scope-query-identity",
+                },
+            },
+        )
+    )
+    await coordinator.apply(
+        LifecycleCommand(
+            command_id="confirm-scope-query-identity",
+            run_id=run_id,
+            expected_state=ContentResearchState.SCOPE_CONFIRMATION_REQUIRED,
+            expected_revision=3,
+            kind="confirm_scope",
+            payload={"scope_draft_id": "draft-scope-query-identity"},
+        )
+    )
+
+    with sqlite3.connect(db_path) as connection:
+        scope_groups = json.loads(
+            connection.execute(
+                "SELECT query_groups_json FROM content_research_scope_contracts "
+                "WHERE workflow_run_id=?",
+                (run_id,),
+            ).fetchone()[0]
+        )
+        locked_groups = json.loads(
+            connection.execute(
+                "SELECT effective_policy_json FROM content_research_run_policy_snapshots "
+                "WHERE workflow_run_id=?",
+                (run_id,),
+            ).fetchone()[0]
+        )["locked_query_plan"]["directions"]["product_marketing"]["query_groups"]
+
+    assert [group["id"] for group in locked_groups] == [
+        group["id"] for group in scope_groups
+    ]
+    assert [group["normalized_query"] for group in locked_groups] == [
+        group["final_query"] for group in scope_groups
+    ]
+
+
+@pytest.mark.asyncio
 async def test_stale_command_has_zero_business_write_delta(tmp_path) -> None:
     db_path = str(tmp_path / "stale.db")
     thread_id = await _create_thread(db_path)
@@ -258,6 +384,270 @@ async def test_startup_reconciliation_converges_interrupted_presearch_without_re
         ).fetchone()[0]
     assert "夏季凉感T恤" in brief_payload
     assert "关注通勤" in brief_payload
+
+
+@pytest.mark.asyncio
+async def test_retry_analysis_atomically_advances_run_and_creates_one_successor(
+    tmp_path,
+) -> None:
+    db_path = str(tmp_path / "retry-analysis.db")
+    thread_id = await _create_thread(db_path)
+    coordinator = ContentResearchPersistenceCoordinator(db_path)
+    run_id = "run-retry-analysis"
+    await coordinator.apply(
+        LifecycleCommand(
+            command_id="submit-retry-analysis",
+            run_id=run_id,
+            expected_state=None,
+            expected_revision=0,
+            kind="submit_research_subject",
+            payload={
+                "thread_id": thread_id,
+                "user_id": "user",
+                "seed_text": "凉感T恤",
+            },
+        )
+    )
+    failed_run = await coordinator.apply(
+        LifecycleCommand(
+            command_id="fail-retry-analysis",
+            run_id=run_id,
+            expected_state=ContentResearchState.PRESEARCH_RUNNING,
+            expected_revision=1,
+            kind="fail",
+            payload={
+                "error": {
+                    "code": "MARKETING_ANALYSIS_FAILED",
+                    "recovery_action": "retry_analysis",
+                }
+            },
+        )
+    )
+    repository = SQLiteMarketingAnalysisRepository(db_path)
+    snapshot = repository.freeze_evidence_snapshot(
+        workflow_run_id=run_id,
+        scope_contract_id="scope-retry",
+        retrieval_execution_unit_id="retrieval-retry",
+        retrieval_attempt_no=1,
+        query_groups=({"id": "query", "query": "凉感T恤"},),
+        notes=(
+            FrozenEvidenceNoteInput(
+                note_id="note",
+                account_id="account",
+                title="凉感",
+                body="通勤不闷",
+                source_url="https://example.test/note",
+                captured_at=datetime(2026, 8, 26, tzinfo=timezone.utc),
+                query_provenance=("query",),
+            ),
+        ),
+    )
+    unit = repository.get_or_create_analysis_unit(
+        evidence_snapshot_id=snapshot.id,
+        policy_version="policy",
+        prompt_hash="prompt",
+        response_schema_hash="schema",
+        embedding_fingerprint={"model": "test"},
+        algorithm_version="algorithm",
+        verifier_version="verifier",
+    )
+    repository.save_analysis_job_context(
+        analysis_unit_id=unit.id,
+        workflow_run_id=run_id,
+        research_plan_id="plan",
+        coverage_snapshot_id="coverage",
+        execution_authorization_id=None,
+        manifest={
+            "workflow_run_id": run_id,
+            "scope_contract_id": "scope-retry",
+            "execution_unit_id": "retrieval-retry",
+            "attempt_no": 1,
+            "execution_revision": 1,
+            "packet_ids": [],
+            "checkpoint_ids": [],
+        },
+    )
+    predecessor = repository.create_analysis_attempt(unit.id)
+    predecessor = repository.claim_analysis_attempt(
+        predecessor.id,
+        lease_owner="worker",
+        lease_token="lease",
+        lease_expires_at=datetime(2026, 8, 26, 10, tzinfo=timezone.utc),
+        now=datetime(2026, 8, 26, 9, tzinfo=timezone.utc),
+    )
+    repository.fail_analysis_attempt(
+        predecessor.id,
+        lease_token="lease",
+        now=datetime(2026, 8, 26, 9, 1, tzinfo=timezone.utc),
+    )
+    command = LifecycleCommand(
+        command_id="retry-analysis-command",
+        run_id=run_id,
+        expected_state=ContentResearchState.RECOVERY_REQUIRED,
+        expected_revision=failed_run.state_revision,
+        kind="retry_analysis",
+        payload={"predecessor_attempt_id": predecessor.id},
+    )
+
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """CREATE TRIGGER fail_analysis_successor_insert
+               BEFORE INSERT ON content_research_analysis_attempts
+               WHEN NEW.successor_of_attempt_id IS NOT NULL
+               BEGIN SELECT RAISE(ABORT, 'fault injected successor write'); END"""
+        )
+    with pytest.raises(sqlite3.IntegrityError, match="fault injected successor write"):
+        await coordinator.retry_analysis(
+            command,
+            expected_attempt_id=predecessor.id,
+            expected_contract_fingerprint=unit.contract_fingerprint,
+        )
+    rolled_back = await coordinator.load(run_id)
+    assert rolled_back.state is ContentResearchState.RECOVERY_REQUIRED
+    assert rolled_back.state_revision == failed_run.state_revision
+    latest_after_rollback = repository.get_latest_attempt_for_unit(unit.id)
+    assert latest_after_rollback is not None
+    assert latest_after_rollback.id == predecessor.id
+    assert latest_after_rollback.state == "failed"
+    with sqlite3.connect(db_path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM content_research_lifecycle_commands WHERE command_id=?",
+            (command.command_id,),
+        ).fetchone() == (0,)
+        connection.execute("DROP TRIGGER fail_analysis_successor_insert")
+
+    projection, successor_id = await coordinator.retry_analysis(
+        command,
+        expected_attempt_id=predecessor.id,
+        expected_contract_fingerprint=unit.contract_fingerprint,
+    )
+    replayed, replayed_successor_id = await coordinator.retry_analysis(
+        command,
+        expected_attempt_id=predecessor.id,
+        expected_contract_fingerprint=unit.contract_fingerprint,
+    )
+
+    assert projection.state is ContentResearchState.REPORT_COMPOSING
+    assert replayed == projection
+    assert replayed_successor_id == successor_id
+    successor = repository.get_analysis_attempt(successor_id)
+    assert successor is not None
+    assert successor.state == "queued"
+    assert successor.successor_of_attempt_id == predecessor.id
+    cancelled = await coordinator.apply(
+        LifecycleCommand(
+            command_id="cancel-queued-analysis",
+            run_id=run_id,
+            expected_state=ContentResearchState.REPORT_COMPOSING,
+            expected_revision=projection.state_revision,
+            kind="cancel",
+            payload={},
+        )
+    )
+    assert cancelled.state is ContentResearchState.CANCELLED_OR_FAILED
+    cancelled_successor = repository.get_analysis_attempt(successor_id)
+    assert cancelled_successor is not None
+    assert cancelled_successor.state == "cancelled"
+    assert repository.claim_next_analysis_job(
+        lease_owner="late-worker",
+        lease_token="late-token",
+        lease_expires_at=datetime(2026, 8, 26, 11, tzinfo=timezone.utc),
+        now=datetime(2026, 8, 26, 10, tzinfo=timezone.utc),
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_analysis_failure_atomically_closes_attempt_and_moves_run_to_recovery(
+    tmp_path,
+) -> None:
+    db_path = str(tmp_path / "atomic-analysis-failure.db")
+    thread_id = await _create_thread(db_path)
+    coordinator = ContentResearchPersistenceCoordinator(db_path)
+    run_id = "run-atomic-analysis-failure"
+    await coordinator.apply(
+        LifecycleCommand(
+            command_id="submit-atomic-analysis-failure",
+            run_id=run_id,
+            expected_state=None,
+            expected_revision=0,
+            kind="submit_research_subject",
+            payload={"thread_id": thread_id, "user_id": "user", "seed_text": "凉感T恤"},
+        )
+    )
+    repository = SQLiteMarketingAnalysisRepository(db_path)
+    snapshot = repository.freeze_evidence_snapshot(
+        workflow_run_id=run_id,
+        scope_contract_id="scope-atomic-failure",
+        retrieval_execution_unit_id="retrieval-atomic-failure",
+        retrieval_attempt_no=1,
+        query_groups=({"id": "query", "query": "凉感T恤"},),
+        notes=(),
+    )
+    unit = repository.get_or_create_analysis_unit(
+        evidence_snapshot_id=snapshot.id,
+        policy_version="policy",
+        prompt_hash="prompt",
+        response_schema_hash="schema",
+        embedding_fingerprint={"model": "test"},
+        algorithm_version="algorithm",
+        verifier_version="verifier",
+    )
+    attempt = repository.create_analysis_attempt(unit.id)
+    attempt = repository.claim_analysis_attempt(
+        attempt.id,
+        lease_owner="worker",
+        lease_token="lease",
+        lease_expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+    )
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "UPDATE workflow_runs SET content_research_state='report_composing', "
+            "state_revision=2 WHERE run_id=?",
+            (run_id,),
+        )
+        connection.execute(
+            """CREATE TRIGGER fail_atomic_attempt_close
+               BEFORE UPDATE OF state ON content_research_analysis_attempts
+               WHEN NEW.state='failed'
+               BEGIN SELECT RAISE(ABORT, 'fault injected attempt close'); END"""
+        )
+    command = LifecycleCommand(
+        command_id="atomic-analysis-failure-command",
+        run_id=run_id,
+        expected_state=ContentResearchState.REPORT_COMPOSING,
+        expected_revision=2,
+        kind="fail",
+        payload={
+            "attempt_id": attempt.id,
+            "error": {
+                "code": "MARKETING_ANALYSIS_FAILED",
+                "message": "模型返回无法解析",
+                "retryable": True,
+                "recovery_action": "retry_analysis",
+            },
+        },
+    )
+
+    with pytest.raises(sqlite3.IntegrityError, match="fault injected attempt close"):
+        await coordinator.fail_analysis_attempt(
+            command,
+            attempt_id=attempt.id,
+            lease_token="lease",
+        )
+    assert (await coordinator.load(run_id)).state is ContentResearchState.REPORT_COMPOSING
+    assert repository.get_analysis_attempt(attempt.id).state == "running"
+
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("DROP TRIGGER fail_atomic_attempt_close")
+    recovered = await coordinator.fail_analysis_attempt(
+        command,
+        attempt_id=attempt.id,
+        lease_token="lease",
+    )
+
+    assert recovered.state is ContentResearchState.RECOVERY_REQUIRED
+    assert repository.get_analysis_attempt(attempt.id).state == "failed"
+    assert repository.get_effective_attempt_for_run(run_id).id == attempt.id
 
 
 @pytest.mark.asyncio

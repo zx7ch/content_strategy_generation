@@ -8,9 +8,12 @@ from typing import Any
 
 from openai import AsyncOpenAI
 
+from app.services.llm.failures import (
+    LLMProviderFailure,
+    classify_provider_exception,
+    unsupported_optional_parameters,
+)
 from app.services.llm.types import LLMRequest, LLMResponse, TokenUsage
-from app.services.llm.failures import LLMProviderFailure, classify_provider_exception, unsupported_optional_parameters
-
 
 DEFAULT_BASE_URLS: dict[str, str] = {
     "openai": "https://api.openai.com/v1",
@@ -105,4 +108,5 @@ class OpenAICompatibleAdapter:
             usage=_parse_usage(_read_value(response, "usage", None)),
             latency_ms=latency_ms,
             raw_response_id=_read_value(response, "id", None),
+            finish_reason=_read_value(first_choice, "finish_reason", None),
         )

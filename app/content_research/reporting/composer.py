@@ -390,6 +390,7 @@ def _marketing_track_section(
     policy_scope: dict[str, Any],
 ) -> ReportSection:
     selected = [item for item in records if item.get("state") == "selected"]
+    contested = [item for item in records if item.get("state") == "contested"]
     directional = [item for item in records if item.get("state") == "directional"]
     qualified = [item for item in records if item.get("state") == "qualified"]
     terminal = [
@@ -402,11 +403,12 @@ def _marketing_track_section(
             "analysis_unavailable",
         }
     ]
-    if len(selected) > 1 or len(directional) > 1 or (selected and (directional or terminal)) or (directional and terminal) or len(terminal) > 1:
+    supported = selected + contested + directional
+    if len(supported) > 1 or (supported and terminal) or len(terminal) > 1:
         raise ValueError(f"marketing conclusion track {track} has ambiguous decisions")
     section_id = _section_id(snapshot, f"marketing_{track}")
-    if selected or directional:
-        decision = (selected or directional)[0]
+    if supported:
+        decision = supported[0]
         conclusion_state = str(decision["state"])
         statement = _required_string(decision.get("statement"), "marketing conclusion statement")
         claim_ids_value = decision.get("supporting_claim_ids")
@@ -431,6 +433,28 @@ def _marketing_track_section(
             dict.fromkeys(
                 citation_id
                 for claim_id in claim_ids
+                for citation_id in claim_citations[claim_id]
+            )
+        )
+        counter_claim_ids_value = decision.get("counter_claim_ids") or []
+        if not isinstance(counter_claim_ids_value, list) or any(
+            not isinstance(item, str) or not item for item in counter_claim_ids_value
+        ):
+            raise ValueError("marketing conclusion counter claims must be a string list")
+        counter_claim_ids = tuple(dict.fromkeys(counter_claim_ids_value))
+        for claim_id in counter_claim_ids:
+            card = cards_by_id.get(claim_id)
+            if (
+                card is None
+                or card.get("admission_state") != "admitted"
+                or card.get("direction_id") != "product_marketing"
+                or claim_id not in claim_citations
+            ):
+                raise ValueError("marketing conclusion has invalid counter evidence")
+        counter_citation_ids = tuple(
+            dict.fromkeys(
+                citation_id
+                for claim_id in counter_claim_ids
                 for citation_id in claim_citations[claim_id]
             )
         )
@@ -466,7 +490,9 @@ def _marketing_track_section(
             section_kind=f"marketing_{track}",
             prose=statement,
             claim_candidate_ids=claim_ids,
-            citation_group_ids=citation_ids,
+            counter_claim_candidate_ids=counter_claim_ids,
+            citation_group_ids=tuple(dict.fromkeys((*citation_ids, *counter_citation_ids))),
+            counter_citation_group_ids=counter_citation_ids,
             citation_anchors=anchors,
             marketing_conclusion_ids=(conclusion_id,),
             conclusion_state=conclusion_state,
@@ -477,11 +503,17 @@ def _marketing_track_section(
                 decision.get("independent_author_count"),
                 "independent_author_count",
             ),
+            counter_note_count=_nonnegative_int(
+                decision.get("counter_note_count") or 0, "counter_note_count"
+            ),
+            counter_author_count=_nonnegative_int(
+                decision.get("counter_author_count") or 0, "counter_author_count"
+            ),
             additional_qualified_count=additional_count,
             reason_codes=tuple(decision.get("reason_codes") or ()),
             verification_direction=(
-                _verification_direction("directional")
-                if conclusion_state == "directional"
+                _verification_direction(conclusion_state)
+                if conclusion_state in {"directional", "contested"}
                 else None
             ),
         )
@@ -537,6 +569,7 @@ def _verification_direction(state: str) -> str:
         "insufficient_evidence": "补充至少 3 篇合格笔记，并覆盖至少 2 位独立作者后重新验证。",
         "no_single_primary_conclusion": "增加能够区分候选结论的合格笔记后重新评估主结论。",
         "analysis_unavailable": "恢复结论分析能力并继续本轮分析，不新增未经治理的判断。",
+        "contested": "支持与反向证据同时达到门槛；仅作为存在分歧的样本结论使用。",
     }[state]
 
 

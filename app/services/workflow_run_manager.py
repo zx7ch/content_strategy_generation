@@ -551,11 +551,16 @@ class WorkflowRunManager:
         async def op() -> WorkflowRun:
             assert self._conn is not None
             run = await self._fetch_run_row(run_id)
+            step = await self._fetch_step_row(run_id, step_name)
+            if (
+                run["status"] == WorkflowRunStatus.WAITING_USER.value
+                and step["status"] == WorkflowStepStatus.RETRYING.value
+            ):
+                return self._run(run)
             if run["status"] != WorkflowRunStatus.RUNNING.value:
                 raise WorkflowTransitionError(
                     f"wait_for_user_recovery requires running run, got {run['status']}"
                 )
-            step = await self._fetch_step_row(run_id, step_name)
             if step["status"] != WorkflowStepStatus.RUNNING.value:
                 raise WorkflowTransitionError(
                     f"wait_for_user_recovery not allowed from {step['status']}"
@@ -934,14 +939,9 @@ class WorkflowRunManager:
         return await self._transaction(op)
 
     async def retry_failed_report_finalization(
-        self, run_id: str, *, publication_id: str
+        self, run_id: str, *, publication_id: str | None
     ) -> WorkflowRun:
         """Reopen only a report-publication failure with completed research."""
-
-        if not publication_id:
-            raise WorkflowTransitionError(
-                "retry_failed_report_finalization requires an exact publication"
-            )
 
         async def op() -> WorkflowRun:
             assert self._conn is not None
@@ -968,7 +968,13 @@ class WorkflowRunManager:
                 )
             except (TypeError, json.JSONDecodeError):
                 failure_payload = {}
-            if failure_payload.get("publication_id") != publication_id:
+            failed_publication_id = failure_payload.get("publication_id")
+            if (
+                publication_id is not None
+                and failed_publication_id != publication_id
+                or publication_id is None
+                and failed_publication_id is not None
+            ):
                 raise WorkflowTransitionError(
                     "retry_failed_report_finalization requires the exact failed publication"
                 )

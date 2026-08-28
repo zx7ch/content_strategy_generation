@@ -25,15 +25,16 @@ test("waiting-user Trace is a user confirmation boundary, not running or recover
 
 test("Trace exposes only user-facing Chinese phase and group names", () => {
   assert.deepEqual(
-    ["presearch", "brief_confirm", "scope_confirm", "formal_research", "coverage", "report"]
+    ["presearch", "brief_confirm", "scope_confirm", "formal_research", "coverage", "marketing_analysis", "report"]
       .map((step) => [traceStepTitle(step), traceStepGroup(step)]),
     [
       ["识别调研主体与候选方向", "研究范围与计划"],
       ["确认调研需求", "研究范围与计划"],
       ["确认检索范围", "研究范围与计划"],
-      ["采集与分析公开内容", "来源采集与分析"],
+      ["采集公开内容", "来源采集"],
       ["检查证据完整性", "证据质量检查"],
-      ["生成调研报告", "报告生成"],
+      ["营销结论分析", "结论分析"],
+      ["组装并发布调研报告", "报告生成"],
     ],
   );
 });

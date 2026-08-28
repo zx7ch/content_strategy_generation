@@ -5,16 +5,96 @@ from __future__ import annotations
 import json
 from typing import Any, Protocol
 
-from app.content_research.runtime import LLMCostLedger
 from app.content_research.llm_scope import content_research_llm_context
-from app.services.llm.pricing import PricingCalculator, UsageCost
+from app.content_research.runtime import LLMCostLedger
 from app.services.llm.failures import LLMProviderFailure
+from app.services.llm.pricing import PricingCalculator, UsageCost
 from app.services.llm.types import LLMRequest, LLMResponse, Message, TokenUsage
 from app.services.llm.usage_tracker import LLMUsageEventInput, LLMUsageTracker
 
 
 class DirectionalAnalysisLLM(Protocol):
     async def generate(self, request: LLMRequest) -> LLMResponse: ...
+
+
+class TrackedDirectionalAnalysisLLM:
+    """Record every Task 3.1 model call with its Run-scoped context."""
+
+    def __init__(self, *, llm: DirectionalAnalysisLLM, db_path: str) -> None:
+        self._llm = llm
+        self._db_path = db_path
+
+    async def generate(self, request: LLMRequest) -> LLMResponse:
+        try:
+            response = await self._llm.generate(request)
+        except LLMProviderFailure as exc:
+            await self._record(
+                request=request,
+                provider=exc.provider or "unknown",
+                model=exc.model or "unknown",
+                usage=TokenUsage(),
+                latency_ms=None,
+                status="failed",
+                error_message=exc.code,
+            )
+            raise
+        except Exception as exc:
+            await self._record(
+                request=request,
+                provider="unknown",
+                model="unknown",
+                usage=TokenUsage(),
+                latency_ms=None,
+                status="failed",
+                error_message=type(exc).__name__,
+            )
+            raise
+        await self._record(
+            request=request,
+            provider=response.provider,
+            model=response.model,
+            usage=response.usage,
+            latency_ms=response.latency_ms,
+            status="success",
+            error_message=None,
+        )
+        return response
+
+    async def _record(
+        self,
+        *,
+        request: LLMRequest,
+        provider: str,
+        model: str,
+        usage: TokenUsage,
+        latency_ms: int | None,
+        status: str,
+        error_message: str | None,
+    ) -> None:
+        cost = (
+            PricingCalculator().calculate(
+                provider=provider,
+                model=model,
+                prompt_tokens=usage.prompt_tokens,
+                completion_tokens=usage.completion_tokens,
+            )
+            if status == "success"
+            else UsageCost()
+        )
+        async with LLMUsageTracker(self._db_path) as tracker:
+            await tracker.record(
+                LLMUsageEventInput(
+                    context=request.context,
+                    provider=provider,
+                    model=model,
+                    model_policy=request.model_policy,
+                    usage=usage,
+                    cost=cost,
+                    latency_ms=latency_ms,
+                    status=status,
+                    error_message=error_message,
+                )
+            )
 
 
 class DirectionalAnalysisService:

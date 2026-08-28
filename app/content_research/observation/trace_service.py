@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 from typing import Any
 
 from pydantic import BaseModel
 
+from app.content_research.analysis_persistence import SQLiteMarketingAnalysisRepository
 from app.content_research.api_schemas import ContentResearchTraceResponse
 from app.content_research.models import ObservationEventRecord, ResearchBriefRecord, TraceRecord
 from app.content_research.persistence_models import (
@@ -19,6 +21,8 @@ from app.content_research.persistence_models import (
     MARKETING_CONCLUSION_TRACE_REASON_CODES,
     MARKETING_CONCLUSION_TRACE_RECOVERY_ACTIONS,
     MARKETING_CONCLUSION_TRACKS,
+    ReportDraftRecord,
+    ReportPublicationRecord,
     StageCheckpointRecord,
 )
 from app.content_research.scope_contract import thaw_execution_payload
@@ -39,6 +43,7 @@ class ContentResearchTraceService:
         *,
         workflow_run_id: str,
         brief: ResearchBriefRecord | None,
+        current_publication_id: str | None = None,
     ) -> ContentResearchTraceResponse:
         traces = self._store.list_traces_for_workflow(workflow_run_id)
         observation_events = [
@@ -89,9 +94,28 @@ class ContentResearchTraceService:
             _source_operation_event_dict(event) for event in observation_events
         ]
         trace_as_of = datetime.now(timezone.utc)
+        analysis_repository = SQLiteMarketingAnalysisRepository(self._db_path)
+        effective_attempt = analysis_repository.get_effective_attempt_for_run(
+            workflow_run_id
+        )
+        runtime_step_dicts = _runtime_step_projection(
+            runtime_steps,
+            effective_attempt=effective_attempt,
+            as_of=trace_as_of,
+        )
 
         return ContentResearchTraceResponse(
             workflow_run_id=workflow_run_id,
+            trace_revision=self._trace_revision(workflow_run_id),
+            effective_attempt=(
+                {
+                    "kind": "analysis",
+                    "attempt_no": effective_attempt.attempt_no,
+                    "state": effective_attempt.state,
+                }
+                if effective_attempt is not None
+                else None
+            ),
             thread_id=thread_id,
             current_stage=current_stage,
             run_status=run_status,
@@ -108,9 +132,7 @@ class ContentResearchTraceService:
             traces=[_safe_trace_dict(trace) for trace in traces],
             observation_events=observation_event_dicts,
             workflow_events=[_safe_workflow_event_dict(event) for event in workflow_event_dicts],
-            runtime_steps=[
-                _safe_runtime_step_dict(step, as_of=trace_as_of) for step in runtime_steps
-            ],
+            runtime_steps=runtime_step_dicts,
             runtime_child_tasks=[
                 _safe_runtime_child_task_dict(task, as_of=trace_as_of)
                 for task in runtime_child_tasks
@@ -123,7 +145,15 @@ class ContentResearchTraceService:
             provider_operations=[
                 _safe_provider_operation_dict(item) for item in provider_operations
             ],
-            logical_checkpoints=_logical_checkpoint_projection(self._store, workflow_run_id),
+            logical_checkpoints=_logical_checkpoint_projection(
+                self._store,
+                workflow_run_id,
+                analysis_repository=analysis_repository,
+                effective_attempt=effective_attempt,
+                publication_dispositions=_publication_track_dispositions(
+                    self._store, current_publication_id
+                ),
+            ),
             usage_steps=[],
             usage_events=[],
             llm_recovery=_llm_recovery_projection(
@@ -134,6 +164,103 @@ class ContentResearchTraceService:
                 brief=brief,
             ),
         )
+
+    def _trace_revision(self, workflow_run_id: str) -> int:
+        with sqlite3.connect(self._db_path) as conn:
+            row = conn.execute(
+                "SELECT revision FROM content_research_trace_revisions WHERE workflow_run_id=?",
+                (workflow_run_id,),
+            ).fetchone()
+        return max(1, int(row[0])) if row is not None else 1
+
+
+def _runtime_step_projection(
+    runtime_steps: list[Any],
+    *,
+    effective_attempt: Any | None,
+    as_of: datetime,
+) -> list[dict[str, Any]]:
+    projected = [_safe_runtime_step_dict(step, as_of=as_of) for step in runtime_steps]
+    if effective_attempt is None:
+        return projected
+
+    analysis_created_at = effective_attempt.created_at
+    for step in projected:
+        if step.get("step_name") == "formal_research":
+            step.update(
+                {
+                    "status": "succeeded",
+                    "completed_at": _json_safe(analysis_created_at),
+                    "error_code": None,
+                }
+            )
+            timing = dict(step.get("timing") or {})
+            started_at = _parse_dt(timing.get("execution_started_at"))
+            if started_at is not None:
+                timing.update(
+                    {
+                        "execution_finished_at": analysis_created_at.isoformat(),
+                        "active_duration_ms": max(
+                            0,
+                            int(
+                                (analysis_created_at - started_at).total_seconds()
+                                * 1000
+                            ),
+                        ),
+                    }
+                )
+            step["timing"] = timing
+        elif step.get("step_name") == "report":
+            if effective_attempt.state != "succeeded":
+                step.update(
+                    {
+                        "status": "pending",
+                        "attempt_count": 0,
+                        "started_at": None,
+                        "completed_at": None,
+                        "error_code": None,
+                        "timing": {"timing_source": "recorded"},
+                    }
+                )
+            elif step.get("status") == "succeeded":
+                step["error_code"] = None
+
+    analysis_status = (
+        "pending" if effective_attempt.state == "queued" else effective_attempt.state
+    )
+    analysis_step = {
+        "step_id": f"analysis:{effective_attempt.id}",
+        "step_name": "marketing_analysis",
+        "phase": "analysis",
+        "status": analysis_status,
+        "attempt_count": effective_attempt.attempt_no,
+        "max_attempts": 3,
+        "started_at": _json_safe(effective_attempt.created_at),
+        "completed_at": _json_safe(effective_attempt.terminal_at),
+        "error_code": (
+            "MARKETING_ANALYSIS_FAILED"
+            if effective_attempt.state == "failed"
+            else None
+        ),
+        "timing": _project_timing(
+            {
+                "status": analysis_status,
+                "started_at": effective_attempt.created_at,
+                "completed_at": effective_attempt.terminal_at,
+            },
+            as_of=as_of,
+        ),
+    }
+    report_index = next(
+        (
+            index
+            for index, step in enumerate(projected)
+            if step.get("step_name") == "report"
+        ),
+        len(projected),
+    )
+    projected.insert(report_index, analysis_step)
+    return projected
 
 
 def _json_dict(value: Any) -> dict:
@@ -633,7 +760,12 @@ def _provider_operations(store: SQLiteContentResearchStore, workflow_run_id: str
 
 
 def _logical_checkpoint_projection(
-    store: SQLiteContentResearchStore, workflow_run_id: str
+    store: SQLiteContentResearchStore,
+    workflow_run_id: str,
+    *,
+    analysis_repository: SQLiteMarketingAnalysisRepository | None = None,
+    effective_attempt: Any | None = None,
+    publication_dispositions: dict[str, dict[str, str]] | None = None,
 ) -> list[dict[str, Any]]:
     """Project logical decisions newest-first without executable/user data."""
     supported = {
@@ -653,7 +785,11 @@ def _logical_checkpoint_projection(
     for record in sorted(records, key=lambda item: (item.created_at, item.id), reverse=True):
         payload = dict(record.payload or {})
         if record.stage_name == "marketing_conclusion":
-            projected.append(_safe_marketing_conclusion_checkpoint(record, payload))
+            marketing = _safe_marketing_conclusion_checkpoint(record, payload)
+            _attach_publication_dispositions(
+                marketing, publication_dispositions or {}
+            )
+            projected.append(marketing)
             continue
         item: dict[str, Any] = {
             "stage": record.stage_name,
@@ -700,7 +836,118 @@ def _logical_checkpoint_projection(
                 if isinstance(counts.get(key), int) and counts[key] >= 0
             }
         projected.append(item)
+    if (
+        not any(item.get("stage") == "marketing_conclusion" for item in projected)
+        and analysis_repository is not None
+        and effective_attempt is not None
+    ):
+        analysis = _in_progress_marketing_conclusion_checkpoint(
+            store,
+            analysis_repository,
+            workflow_run_id=workflow_run_id,
+            effective_attempt=effective_attempt,
+        )
+        if analysis is not None:
+            _attach_publication_dispositions(
+                analysis, publication_dispositions or {}
+            )
+            projected.insert(0, analysis)
     return projected
+
+
+def _in_progress_marketing_conclusion_checkpoint(
+    store: SQLiteContentResearchStore,
+    repository: SQLiteMarketingAnalysisRepository,
+    *,
+    workflow_run_id: str,
+    effective_attempt: Any,
+) -> dict[str, Any] | None:
+    """Project current analysis facts even when no terminal report checkpoint exists."""
+    unit = repository.get_analysis_unit(effective_attempt.analysis_unit_id)
+    context = repository.get_analysis_job_context(effective_attempt.analysis_unit_id)
+    if unit is None or context is None or unit.workflow_run_id != workflow_run_id:
+        return None
+    snapshot = repository.get_evidence_snapshot(unit.evidence_snapshot_id)
+    if snapshot is None:
+        return None
+    checkpoints = repository.list_analysis_checkpoints(unit.id)
+    completed_tracks = {
+        checkpoint.track
+        for checkpoint in checkpoints
+        if checkpoint.stage == "verifier" and checkpoint.status == "completed"
+    }
+    decisions = [
+        item
+        for item in store.list_marketing_conclusion_decisions(
+            workflow_run_id, context.research_plan_id
+        )
+        if item.payload.get("input_fingerprint") == unit.contract_fingerprint
+    ]
+    completed_decisions = {
+        item.track: item
+        for item in decisions
+        if item.track in completed_tracks and item.payload.get("execution") == "completed"
+    }
+    failed_decisions = {
+        item.track: item
+        for item in decisions
+        if item.payload.get("analysis_attempt_id") == effective_attempt.id
+        and item.payload.get("execution") == "failed"
+    }
+    tracks: dict[str, dict[str, Any]] = {}
+    for track in MARKETING_CONCLUSION_TRACKS:
+        decision = completed_decisions.get(track) or failed_decisions.get(track)
+        if decision is None:
+            continue
+        tracks[track] = {
+            "state": decision.state,
+            "execution": decision.payload.get("execution"),
+            "decision": decision.payload.get("decision"),
+            "publication_role": decision.payload.get("publication_role"),
+            "reason_codes": list(decision.payload.get("reason_codes") or ()),
+            "supporting_note_count": decision.payload.get("supporting_note_count"),
+            "independent_author_count": decision.payload.get(
+                "independent_author_count"
+            ),
+            "counter_note_count": decision.payload.get("counter_note_count"),
+            "counter_author_count": decision.payload.get("counter_author_count"),
+            "verifier_state": decision.payload.get("verifier_state"),
+            "failure_code": decision.payload.get("failure_code"),
+            "failure_detail": decision.payload.get("failure_detail"),
+            "recovery_action": decision.payload.get("recovery_action"),
+        }
+    embedding_completed = any(
+        checkpoint.track == "shared"
+        and checkpoint.stage == "embedding"
+        and checkpoint.status == "completed"
+        for checkpoint in checkpoints
+    )
+    payload: dict[str, Any] = {
+        "analysis_attempt_id": effective_attempt.id,
+        "analysis_attempt_no": effective_attempt.attempt_no,
+        "evidence_snapshot_id": snapshot.id,
+        "retrieval_execution_unit_id": snapshot.retrieval_execution_unit_id,
+        "tracks": tracks,
+    }
+    if embedding_completed:
+        payload["embedding"] = {
+            "fingerprint": unit.embedding_fingerprint,
+            "document_count": len(snapshot.notes),
+        }
+    record = StageCheckpointRecord(
+        id=f"trace-{effective_attempt.id}",
+        schema_version="content_research_stage_checkpoint_v1",
+        payload=payload,
+        workflow_run_id=workflow_run_id,
+        subagent_task_id=f"marketing-conclusion:{context.research_plan_id}",
+        stage_name="marketing_conclusion",
+        input_fingerprint=unit.contract_fingerprint,
+        status=effective_attempt.state,
+        retry_count=max(effective_attempt.attempt_no - 1, 0),
+        started_at=effective_attempt.created_at,
+        finished_at=effective_attempt.terminal_at,
+    )
+    return _safe_marketing_conclusion_checkpoint(record, payload)
 
 
 def _safe_marketing_conclusion_checkpoint(
@@ -711,6 +958,47 @@ def _safe_marketing_conclusion_checkpoint(
         "stage": "marketing_conclusion",
         "status": record.status,
     }
+    for key in (
+        "analysis_attempt_id",
+        "analysis_attempt_no",
+        "evidence_snapshot_id",
+        "retrieval_execution_unit_id",
+    ):
+        value = payload.get(key)
+        if isinstance(value, str) and value or (
+            key == "analysis_attempt_no"
+            and isinstance(value, int)
+            and not isinstance(value, bool)
+            and value >= 1
+        ):
+            item[key] = value
+    embedding = payload.get("embedding")
+    if isinstance(embedding, dict):
+        fingerprint = embedding.get("fingerprint")
+        document_count = embedding.get("document_count")
+        safe_embedding: dict[str, Any] = {}
+        if isinstance(fingerprint, dict):
+            safe_embedding["fingerprint"] = {
+                key: fingerprint[key]
+                for key in (
+                    "provider",
+                    "model",
+                    "revision",
+                    "dimensions",
+                    "normalization",
+                    "input_format_version",
+                )
+                if isinstance(fingerprint.get(key), str | int)
+                and not isinstance(fingerprint.get(key), bool)
+            }
+        if (
+            isinstance(document_count, int)
+            and not isinstance(document_count, bool)
+            and document_count >= 0
+        ):
+            safe_embedding["document_count"] = document_count
+        if safe_embedding:
+            item["embedding"] = safe_embedding
     tracks = payload.get("tracks")
     if isinstance(tracks, dict):
         safe_tracks: dict[str, dict[str, Any]] = {}
@@ -722,6 +1010,26 @@ def _safe_marketing_conclusion_checkpoint(
             if state not in MARKETING_CONCLUSION_DECISION_STATES:
                 continue
             safe_track: dict[str, Any] = {"state": state}
+            for key in ("execution", "decision", "publication_role", "verifier_state"):
+                value = source.get(key)
+                if isinstance(value, str) and value:
+                    safe_track[key] = value
+            disposition = source.get("publication_disposition")
+            if isinstance(disposition, dict):
+                disposition_state = disposition.get("state")
+                reason_code = disposition.get("reason_code")
+                if disposition_state in {
+                    "published",
+                    "withheld_by_faithfulness",
+                    "omitted_by_publication_policy",
+                }:
+                    safe_disposition = {"state": disposition_state}
+                    if (
+                        disposition_state == "withheld_by_faithfulness"
+                        and reason_code == "faithfulness_not_verified"
+                    ):
+                        safe_disposition["reason_code"] = reason_code
+                    safe_track["publication_disposition"] = safe_disposition
             reason_codes = _safe_marketing_conclusion_reason_codes(
                 source.get("reason_codes")
             )
@@ -729,13 +1037,40 @@ def _safe_marketing_conclusion_checkpoint(
                 {"conclusion_note_count_unmet", "conclusion_author_count_unmet"}
                 & set(reason_codes)
             )
-            if state == "selected" or explain_sample_threshold:
+            if state in {"selected", "contested"} or explain_sample_threshold:
                 for key in ("supporting_note_count", "independent_author_count"):
                     value = source.get(key)
                     if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
                         safe_track[key] = value
+            if state == "contested":
+                for key in ("counter_note_count", "counter_author_count"):
+                    value = source.get(key)
+                    if (
+                        isinstance(value, int)
+                        and not isinstance(value, bool)
+                        and value >= 0
+                    ):
+                        safe_track[key] = value
             if reason_codes:
                 safe_track["reason_codes"] = reason_codes
+            failure_code = source.get("failure_code")
+            if (
+                "marketing_analysis_unavailable" in reason_codes
+                and failure_code in MARKETING_CONCLUSION_TRACE_FAILURE_CODES
+            ):
+                safe_track["failure_code"] = failure_code
+            failure_detail = source.get("failure_detail")
+            if (
+                failure_code == "llm_protocol_incompatible"
+                and failure_detail in MARKETING_CONCLUSION_TRACE_PROTOCOL_DETAILS
+            ):
+                safe_track["failure_detail"] = failure_detail
+            recovery_action = source.get("recovery_action")
+            if (
+                "marketing_analysis_unavailable" in reason_codes
+                and recovery_action in MARKETING_CONCLUSION_TRACE_RECOVERY_ACTIONS
+            ):
+                safe_track["recovery_action"] = recovery_action
             safe_tracks[track] = safe_track
         item["tracks"] = safe_tracks
 
@@ -778,6 +1113,82 @@ def _safe_marketing_conclusion_reason_codes(value: Any) -> list[str]:
         for reason in value
         if isinstance(reason, str) and reason in MARKETING_CONCLUSION_TRACE_REASON_CODES
     ]
+
+
+def _attach_publication_dispositions(
+    checkpoint: dict[str, Any], dispositions: dict[str, dict[str, str]]
+) -> None:
+    tracks = checkpoint.get("tracks")
+    if not isinstance(tracks, dict):
+        return
+    for track, disposition in dispositions.items():
+        value = tracks.get(track)
+        if isinstance(value, dict):
+            value["publication_disposition"] = dict(disposition)
+
+
+def _publication_track_dispositions(
+    store: SQLiteContentResearchStore, publication_id: str | None
+) -> dict[str, dict[str, str]]:
+    if not publication_id:
+        return {}
+    publication = store.get_typed_record(ReportPublicationRecord, publication_id)
+    if publication is None:
+        return {}
+    raw = publication.payload.get("track_publication_dispositions")
+    result: dict[str, dict[str, str]] = {}
+    if isinstance(raw, list):
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            track = item.get("track")
+            state = item.get("state")
+            if track not in MARKETING_CONCLUSION_TRACKS or state not in {
+                "published",
+                "withheld_by_faithfulness",
+                "omitted_by_publication_policy",
+            }:
+                continue
+            projected = {"state": str(state)}
+            if (
+                state == "withheld_by_faithfulness"
+                and item.get("reason_code") == "faithfulness_not_verified"
+            ):
+                projected["reason_code"] = "faithfulness_not_verified"
+            result[str(track)] = projected
+        if result:
+            return result
+
+    # Read-only compatibility for publication_v1 records created before the
+    # explicit disposition field.  Derive from the frozen draft and omission;
+    # never select a newer publication or mutate historical rows.
+    draft = store.get_typed_record(ReportDraftRecord, publication.report_draft_id)
+    if draft is None:
+        return {}
+    omitted = set(publication.payload.get("omitted_section_ids") or ())
+    audit_exhausted = (
+        publication.payload.get("audit_recovery_state")
+        == "audit_rewrite_exhausted"
+    )
+    for section in draft.payload.get("sections") or ():
+        if not isinstance(section, dict):
+            continue
+        kind = section.get("section_kind")
+        if not isinstance(kind, str) or not kind.startswith("marketing_"):
+            continue
+        track = kind.removeprefix("marketing_")
+        if track not in MARKETING_CONCLUSION_TRACKS:
+            continue
+        if section.get("section_id") not in omitted:
+            result[track] = {"state": "published"}
+        elif audit_exhausted:
+            result[track] = {
+                "state": "withheld_by_faithfulness",
+                "reason_code": "faithfulness_not_verified",
+            }
+        else:
+            result[track] = {"state": "omitted_by_publication_policy"}
+    return result
 
 
 def _json_safe(value: Any) -> Any:

@@ -1,5 +1,6 @@
 import asyncio
 from dataclasses import replace
+from types import SimpleNamespace
 
 from app.content_research.persistence_models import (
     ReportDraftRecord,
@@ -137,6 +138,22 @@ class OneSectionFailingAudit:
         return SemanticAuditResult("failed", ("semantic_scope_expansion",), (section.section_id,))
 
 
+class MarketingNeedFailingEvaluator:
+    async def evaluate(self, _snapshot, draft, _semantic_auditor):
+        section = next(
+            item for item in draft.sections if item.section_kind == "marketing_need"
+        )
+        semantic_result = SemanticAuditResult(
+            "failed", ("marketing_conclusion_prose_mismatch",), (section.section_id,)
+        )
+        return SimpleNamespace(
+            passed=False,
+            reason_codes=("marketing_conclusion_prose_mismatch",),
+            affected_section_ids=(section.section_id,),
+            semantic_result=semantic_result,
+        )
+
+
 class OneSectionThenPassingAudit:
     def __init__(self):
         self.calls = 0
@@ -147,6 +164,64 @@ class OneSectionThenPassingAudit:
             section = next(item for item in draft.sections if item.section_kind == "main_findings")
             return SemanticAuditResult("failed", ("semantic_scope_expansion",), (section.section_id,))
         return SemanticAuditResult("passed", model_version="fake", prompt_version="v1", usage={"total_tokens": 1})
+
+
+def test_faithfulness_withdrawal_keeps_analysis_truth_and_publishes_remaining_tracks(tmp_path):
+    store = SQLiteContentResearchStore(str(tmp_path / "withheld-marketing-track.db"))
+    directional = _directional_marketing_snapshot()
+    governed = directional.metadata["governed_snapshot"]
+    snapshot = replace(
+        directional,
+        metadata={
+            **directional.metadata,
+            "governed_snapshot": {
+                **governed,
+                "marketing_conclusions": [
+                    {
+                        "track": "need",
+                        "state": "selected",
+                        "candidate_id": "mc_need_selected",
+                        "statement": "夏季活动后需要快速散热",
+                        "supporting_claim_ids": ["cc_1"],
+                        "supporting_note_count": 3,
+                        "independent_author_count": 2,
+                        "reason_codes": [],
+                    },
+                    {**governed["marketing_conclusions"][0], "track": "value"},
+                    {**governed["marketing_conclusions"][0], "track": "message"},
+                ],
+            },
+        },
+    )
+    store.save_result_snapshot(snapshot)
+
+    publication = asyncio.run(
+        ReportExecutionService(
+            store, evaluator=MarketingNeedFailingEvaluator()
+        ).execute(snapshot, PassingAudit())
+    )
+
+    assert snapshot.metadata["governed_snapshot"]["marketing_conclusions"][0][
+        "state"
+    ] == "selected"
+    assert publication.publication_state == "directional_report"
+    assert publication.track_publication_dispositions == (
+        ("need", "withheld_by_faithfulness", "faithfulness_not_verified"),
+        ("value", "published", None),
+        ("message", "published", None),
+    )
+
+    record = store.get_typed_record(type(publication.to_record()), publication.id)
+    assert record is not None
+    assert record.payload["track_publication_dispositions"] == [
+        {
+            "track": "need",
+            "state": "withheld_by_faithfulness",
+            "reason_code": "faithfulness_not_verified",
+        },
+        {"track": "value", "state": "published", "reason_code": None},
+        {"track": "message", "state": "published", "reason_code": None},
+    ]
 
 
 def test_execution_exhausts_rewrites_and_publishes_evidence_only(tmp_path):

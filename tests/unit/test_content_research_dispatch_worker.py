@@ -36,6 +36,36 @@ from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
 from app.content_research.worker import ContentResearchDispatchWorker
 
 
+@pytest.mark.asyncio
+async def test_dispatch_lease_renewal_keeps_sqlite_transaction_off_event_loop(
+    tmp_path, monkeypatch
+) -> None:
+    repository = AsyncFormalResearchDispatchRepository(str(tmp_path / "dispatch-renew.db"))
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocking_renew_sync(**_kwargs) -> bool:
+        entered.set()
+        assert release.wait(2)
+        return True
+
+    monkeypatch.setattr(repository, "_renew_sync", blocking_renew_sync)
+    renewal = asyncio.create_task(
+        repository.renew(
+            workflow_run_id="run-renew",
+            owner="worker-renew",
+            token="token-renew",
+        )
+    )
+    assert await asyncio.to_thread(entered.wait, 1)
+
+    # A synchronous SQLite transaction in the heartbeat must never own the
+    # event loop while it waits for another writer.
+    await asyncio.wait_for(asyncio.sleep(0), timeout=0.1)
+    release.set()
+    assert await renewal is True
+
+
 class FakeFormalResearchService:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str, int]] = []
@@ -741,7 +771,11 @@ async def test_live_context_write_serializes_takeover_and_rejects_later_stale_ch
 
     first_write = asyncio.create_task(asyncio.to_thread(scoped.save_stage_checkpoint, before_takeover))
     assert await asyncio.to_thread(entered_insert.wait, 2)
-    await asyncio.sleep(1.05)
+    assert claim_a.lease_expires_at is not None
+    seconds_until_expiry = (
+        claim_a.lease_expires_at - datetime.now(timezone.utc)
+    ).total_seconds()
+    await asyncio.sleep(max(0.0, seconds_until_expiry) + 0.25)
     takeover = asyncio.create_task(
         asyncio.to_thread(
             store.claim_execution_unit,

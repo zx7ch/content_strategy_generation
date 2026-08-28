@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from datetime import datetime
-from typing import Any, Mapping
+from typing import Any
 
 from app.content_research.lifecycle.models import ContentResearchState, RunProjection
-
 
 _ALLOWED_ACTIONS: dict[ContentResearchState, tuple[str, ...]] = {
     ContentResearchState.PRESEARCH_RUNNING: ("cancel",),
@@ -57,6 +57,7 @@ def projection_from_row(
     scope_contract_id: str | None = None,
     has_dispatch: bool = False,
     execution_attempt_id: str | None = None,
+    publication_id: str | None = None,
 ) -> RunProjection:
     raw_state = row["content_research_state"]
     raw_revision = row["state_revision"]
@@ -76,16 +77,34 @@ def projection_from_row(
         raise ValueError(
             f"{state.value} cannot own frozen Scope, dispatch, or execution artifacts"
         )
+    error = _json_mapping(row["lifecycle_error_json"])
+    allowed_actions = _ALLOWED_ACTIONS[state]
+    if (
+        state is ContentResearchState.RECOVERY_REQUIRED
+        and error is not None
+        and error.get("code") == "MARKETING_ANALYSIS_FAILED"
+    ):
+        allowed_actions = ("retry_analysis", "cancel")
+    elif (
+        state is ContentResearchState.RECOVERY_REQUIRED
+        and error is not None
+        and (
+            error.get("code") == "REPORT_FINALIZATION_FAILED"
+            or error.get("stage") == ContentResearchState.REPORT_COMPOSING.value
+        )
+    ):
+        allowed_actions = ("retry_report", "cancel")
     return RunProjection(
         run_id=str(row["run_id"]),
         thread_id=str(row["thread_id"]),
         state=state,
         state_revision=int(raw_revision),
         entered_at=_parse_datetime(row["state_entered_at"]),
-        allowed_actions=_ALLOWED_ACTIONS[state],
+        allowed_actions=allowed_actions,
         reason_code=str(row["error_code"]) if row["error_code"] else None,
-        error=_json_mapping(row["lifecycle_error_json"]),
+        error=error,
         brief_id=current_brief_id,
         scope_contract_id=scope_contract_id,
         execution_attempt_id=execution_attempt_id,
+        publication_id=publication_id,
     )

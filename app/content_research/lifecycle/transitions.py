@@ -77,6 +77,10 @@ _TRANSITIONS: dict[tuple[ContentResearchState, str], ContentResearchState] = {
         ContentResearchState.RECOVERY_REQUIRED,
         "retry_report",
     ): ContentResearchState.REPORT_COMPOSING,
+    (
+        ContentResearchState.RECOVERY_REQUIRED,
+        "retry_analysis",
+    ): ContentResearchState.REPORT_COMPOSING,
 }
 
 _TERMINAL_STATES = {

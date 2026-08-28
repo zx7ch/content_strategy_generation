@@ -6,9 +6,12 @@ from pathlib import Path
 import pytest
 
 from app.content_research.admission.candidates import source_text_hash
+from app.content_research.api_schemas import ContentResearchWorkflowActionRequest
 from app.content_research.bootstrap import _bootstrap_legacy_content_research_schema
 from app.content_research.contracts import build_default_snapshot
 from app.content_research.evidence.models import EvidenceRecord
+from app.content_research.lifecycle.coordinator import ContentResearchPersistenceCoordinator
+from app.content_research.lifecycle.models import LifecycleCommand
 from app.content_research.migrations import apply_content_research_migrations
 from app.content_research.models import TraceRecord, utcnow
 from app.content_research.persistence_models import (
@@ -24,10 +27,12 @@ from app.content_research.persistence_models import (
 )
 from app.content_research.reporting.composer import ResearchReportComposer
 from app.content_research.reporting.publication_materializer import ReportPublicationMaterializer
+from app.content_research.reporting.read_model import PublishedReportReader
 from app.content_research.scope_contract import (
     DispatchLeaseContext,
     ExecutionLeaseFencedError,
 )
+from app.content_research.service import ContentResearchService, WorkflowRunManagerRuntime
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
 from app.memory.thread_store import ThreadStore
 from app.memory.workflow_store import WorkflowStore
@@ -80,6 +85,116 @@ def _take_over_dispatch(db_path: str, workflow_run_id: str) -> None:
                SET lease_owner='worker-b', lease_token='token-b'
                WHERE workflow_run_id=?""",
             (workflow_run_id,),
+        )
+
+
+@pytest.mark.asyncio
+async def test_integrity_repair_creates_one_successor_from_still_valid_outputs(
+    tmp_path: Path,
+) -> None:
+    db_path = str(tmp_path / "integrity-repair.db")
+    async with ThreadStore(db_path) as threads:
+        thread = await threads.create_thread(title="integrity repair")
+    coordinator = ContentResearchPersistenceCoordinator(db_path)
+    run = await coordinator.apply(
+        LifecycleCommand(
+            command_id="submit-integrity-repair",
+            run_id="run-integrity-repair",
+            expected_state=None,
+            expected_revision=0,
+            kind="submit_research_subject",
+            payload={
+                "thread_id": thread["id"],
+                "user_id": "user-integrity",
+                "seed_text": "凉感衬衫",
+            },
+        )
+    )
+    store = SQLiteContentResearchStore(db_path)
+    snapshot = replace(_snapshot(), workflow_run_id=run.run_id)
+    draft = replace(_draft(), workflow_run_id=run.run_id)
+    decision = replace(_decision(draft), workflow_run_id=run.run_id)
+    publication = replace(_publication(draft, decision), workflow_run_id=run.run_id)
+    store.save_result_snapshot(snapshot)
+    store.save_report_draft(draft.to_record())
+    store.save_report_faithfulness_decision(decision.to_record())
+    store.save_report_publication(publication.to_record())
+    async with WorkflowRunManager(db_path) as manager:
+        await manager.begin_report_finalization(run.run_id)
+    await ReportPublicationMaterializer(store, db_path).materialize(publication.id)
+    async with WorkflowRunManager(db_path) as manager:
+        await manager.complete_report_finalization(run.run_id)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE workflow_runs SET content_research_state='report_ready', "
+            "state_revision=2, state_entered_at=CURRENT_TIMESTAMP WHERE run_id=?",
+            (run.run_id,),
+        )
+    store.append_report_integrity_event(
+        ReportIntegrityEventRecord(
+            id="rie-artifact-invalid",
+            publication_id=publication.id,
+            workflow_run_id=run.run_id,
+            event_type="integrity_flagged",
+            reason_code="materialized_artifact_invalid",
+            recovery_guidance="publish_successor_report",
+        )
+    )
+    service = ContentResearchService(
+        store=store,
+        presearch=None,
+        workflow_runtime=WorkflowRunManagerRuntime(db_path),
+    )
+    request = ContentResearchWorkflowActionRequest(
+        command_id="repair-publication-command",
+        expected_state="report_ready",
+        expected_revision=2,
+        action="repair_publication",
+        payload={"publication_id": publication.id},
+    )
+
+    repaired = await service.run_workflow_action(
+        workflow_run_id=run.run_id, request=request
+    )
+    replayed = await service.run_workflow_action(
+        workflow_run_id=run.run_id, request=request
+    )
+
+    assert replayed.result == repaired.result
+    successor_id = repaired.result["publication_id"]
+    successor = store.get_typed_record(ReportPublicationRecord, successor_id)
+    assert successor is not None and successor.previous_version_id == publication.id
+    assert len(
+        [
+            item
+            for item in store.list_typed_records(ReportPublicationRecord)
+            if item.previous_version_id == publication.id
+        ]
+    ) == 1
+    current = await PublishedReportReader(store, db_path).read(
+        workflow_run_id=run.run_id
+    )
+    assert current["publication"]["report_publication_id"] == successor_id
+    store.append_report_integrity_event(
+        ReportIntegrityEventRecord(
+            id="rie-successor-output-invalid",
+            publication_id=successor_id,
+            workflow_run_id=run.run_id,
+            event_type="integrity_flagged",
+            reason_code="frozen_execution_attempt_failed",
+            recovery_guidance="publish_successor_report",
+        )
+    )
+    with pytest.raises(Exception, match="verified outputs are no longer valid"):
+        await service.run_workflow_action(
+            workflow_run_id=run.run_id,
+            request=ContentResearchWorkflowActionRequest(
+                command_id="repair-invalid-outputs",
+                expected_state="report_ready",
+                expected_revision=2,
+                action="repair_publication",
+                payload={"publication_id": successor_id},
+            ),
         )
 
 
@@ -287,6 +402,12 @@ async def test_materializes_published_report_as_one_creator_snapshot_and_timelin
         assert artifact.payload_json["faithfulness_decision_id"] == decision.id
         assert artifact.payload_json["governed_snapshot_id"] == snapshot.id
         assert "items" not in artifact.payload_json
+
+        assert await thread_store.get_thread_messages(thread["id"]) == []
+        async with WorkflowRunManager(db_path) as manager:
+            await manager.complete_report_finalization(run.run_id)
+        await materializer.publish_timeline_message(publication.id)
+        await materializer.publish_timeline_message(publication.id)
 
         messages = await thread_store.get_thread_messages(thread["id"])
         result_messages = [item for item in messages if item["message_type"] == "artifact_result"]
@@ -772,6 +893,11 @@ async def test_migration_purges_legacy_report_lineage_but_preserves_same_run_non
         async with WorkflowRunManager(db_path) as manager:
             await manager.begin_report_finalization(run.run_id)
         report_artifact = await ReportPublicationMaterializer(store, db_path).materialize(
+            publication.id
+        )
+        async with WorkflowRunManager(db_path) as manager:
+            await manager.complete_report_finalization(run.run_id)
+        await ReportPublicationMaterializer(store, db_path).publish_timeline_message(
             publication.id
         )
         report_message = (await thread_store.get_thread_messages(thread["id"]))[0]

@@ -47,6 +47,34 @@ export class ContentResearchRequestEpoch {
   }
 }
 
+export class ContentResearchTraceRevisionGuard {
+  private revision = -1;
+  private consecutiveFailures = 0;
+
+  accept(revision: number) {
+    if (!Number.isSafeInteger(revision) || revision < 0 || revision < this.revision) {
+      return false;
+    }
+    this.revision = revision;
+    this.consecutiveFailures = 0;
+    return true;
+  }
+
+  recordFailure() {
+    this.consecutiveFailures += 1;
+    return this.consecutiveFailures >= 3;
+  }
+
+  isUncertain() {
+    return this.consecutiveFailures >= 3;
+  }
+
+  reset() {
+    this.revision = -1;
+    this.consecutiveFailures = 0;
+  }
+}
+
 export class LatestScopeDraftSaveQueue<Snapshot, Authority> {
   private authority: Authority;
   private pending: Snapshot | null = null;
@@ -76,6 +104,10 @@ export class LatestScopeDraftSaveQueue<Snapshot, Authority> {
 
   async idle() {
     while (this.draining) await this.draining;
+  }
+
+  currentAuthority() {
+    return this.authority;
   }
 
   private async drain() {

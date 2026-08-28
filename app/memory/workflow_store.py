@@ -88,6 +88,12 @@ async def migrate_workflow_compat_columns(conn: aiosqlite.Connection) -> None:
             column_name=column_name,
             column_sql=f"{column_name} TEXT",
         )
+    await ensure_column(
+        conn,
+        table_name="workflow_runs",
+        column_name="effective_analysis_attempt_id",
+        column_sql="effective_analysis_attempt_id TEXT",
+    )
 
 
 class WorkflowStore:
@@ -167,7 +173,8 @@ class WorkflowStore:
                 state_revision INTEGER,
                 state_entered_at TEXT,
                 lifecycle_error_json TEXT,
-                lifecycle_schema_version TEXT
+                lifecycle_schema_version TEXT,
+                effective_analysis_attempt_id TEXT
             )
             """
         )

@@ -3,6 +3,11 @@ from dataclasses import replace
 
 import pytest
 
+from app.content_research.lifecycle.coordinator import (
+    ContentResearchPersistenceCoordinator,
+    LifecycleCommandConflict,
+)
+from app.content_research.lifecycle.models import ContentResearchState, LifecycleCommand
 from app.content_research.models import ResearchResultSnapshotRecord
 from app.content_research.persistence_models import (
     MarketingConclusionCandidateRecord,
@@ -18,6 +23,7 @@ from app.content_research.reporting.contracts import (
     ReportSection,
 )
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
+from app.memory.thread_store import ThreadStore
 
 
 def test_marketing_conclusion_records_round_trip_all_terminal_states(tmp_path):
@@ -43,6 +49,52 @@ def test_marketing_conclusion_records_round_trip_all_terminal_states(tmp_path):
     for decision in decisions:
         assert store.save_marketing_conclusion_decision(decision) == decision
     assert store.list_marketing_conclusion_decisions("run_1", "rp_1") == decisions
+
+
+def test_unknown_provider_result_is_not_committed_and_retry_is_business_idempotent(
+    tmp_path,
+):
+    store = SQLiteContentResearchStore(str(tmp_path / "marketing-replay.db"))
+    # An unknown provider outcome reaches no business persistence boundary.
+    assert store.list_typed_records(MarketingConclusionCandidateRecord) == []
+    assert store.list_typed_records(MarketingConclusionDecisionRecord) == []
+    candidate = MarketingConclusionCandidateRecord(
+        "mc_replay",
+        "marketing_conclusion_candidate_v1",
+        {"statement": "通勤场景体感凉爽", "supporting_claim_ids": ["claim-1"]},
+        workflow_run_id="run-replay",
+        research_plan_id="plan-replay",
+        track="need",
+    )
+    decision = MarketingConclusionDecisionRecord(
+        "mcd_replay",
+        "marketing_conclusion_decision_v2",
+        {
+            "input_fingerprint": "contract-1",
+            "execution": "completed",
+            "decision": "selected",
+            "publication_role": "verified",
+        },
+        workflow_run_id="run-replay",
+        research_plan_id="plan-replay",
+        candidate_id=candidate.id,
+        track="need",
+        state="selected",
+    )
+
+    assert store.save_marketing_conclusion_candidate(candidate) == candidate
+    assert store.save_marketing_conclusion_candidate(candidate) == candidate
+    assert store.save_marketing_conclusion_decision(decision) == decision
+    assert store.save_marketing_conclusion_decision(decision) == decision
+
+    with pytest.raises(ValueError, match="candidate identity conflict"):
+        store.save_marketing_conclusion_candidate(
+            replace(candidate, payload={**candidate.payload, "statement": "漂移的结论"})
+        )
+    with pytest.raises(ValueError, match="decision identity conflict"):
+        store.save_marketing_conclusion_decision(
+            replace(decision, payload={**decision.payload, "decision": "directional"})
+        )
 
 
 def test_marketing_conclusion_migration_removes_superseded_lite_report_rows(tmp_path):
@@ -117,6 +169,76 @@ def _publication(
         compose_mode=compose_mode,
     )
     return publication
+
+
+async def _submit_lifecycle_run(db_path: str, run_id: str) -> ContentResearchPersistenceCoordinator:
+    async with ThreadStore(db_path) as threads:
+        thread = await threads.create_thread(title="publication race")
+    coordinator = ContentResearchPersistenceCoordinator(db_path)
+    await coordinator.apply(
+        LifecycleCommand(
+            command_id=f"submit:{run_id}",
+            run_id=run_id,
+            expected_state=None,
+            expected_revision=0,
+            kind="submit_research_subject",
+            payload={
+                "thread_id": thread["id"],
+                "user_id": "user-race",
+                "seed_text": "凉感衬衫",
+            },
+        )
+    )
+    return coordinator
+
+
+def _save_publication_lineage(store: SQLiteContentResearchStore, run_id: str) -> ReportPublicationRecord:
+    snapshot = replace(_snapshot(), workflow_run_id=run_id)
+    draft = replace(_draft(), workflow_run_id=run_id)
+    decision = replace(_decision(draft), workflow_run_id=run_id)
+    publication = replace(_publication(draft, decision), workflow_run_id=run_id)
+    store.save_result_snapshot(snapshot)
+    store.save_report_draft(draft.to_record())
+    store.save_report_faithfulness_decision(decision.to_record())
+    return store.save_report_publication(publication.to_record())
+
+
+@pytest.mark.asyncio
+async def test_cancel_and_publication_first_commit_wins(tmp_path):
+    publication_first_db = str(tmp_path / "publication-first.db")
+    coordinator = await _submit_lifecycle_run(publication_first_db, "run_1")
+    store = SQLiteContentResearchStore(publication_first_db)
+    publication = _save_publication_lineage(store, "run_1")
+    with pytest.raises(LifecycleCommandConflict, match="publication already committed"):
+        await coordinator.apply(
+            LifecycleCommand(
+                command_id="cancel-after-publication",
+                run_id="run_1",
+                expected_state=ContentResearchState.PRESEARCH_RUNNING,
+                expected_revision=1,
+                kind="cancel",
+                payload={},
+            )
+        )
+    assert store.get_typed_record(ReportPublicationRecord, publication.id) == publication
+
+    cancel_first_db = str(tmp_path / "cancel-first.db")
+    coordinator = await _submit_lifecycle_run(cancel_first_db, "run_2")
+    cancelled = await coordinator.apply(
+        LifecycleCommand(
+            command_id="cancel-before-publication",
+            run_id="run_2",
+            expected_state=ContentResearchState.PRESEARCH_RUNNING,
+            expected_revision=1,
+            kind="cancel",
+            payload={},
+        )
+    )
+    assert cancelled.state is ContentResearchState.CANCELLED_OR_FAILED
+    store = SQLiteContentResearchStore(cancel_first_db)
+    with pytest.raises(ValueError, match="after cancellation"):
+        _save_publication_lineage(store, "run_2")
+    assert store.list_typed_records(ReportPublicationRecord) == []
 
 
 def test_report_versions_round_trip_append_only_and_keep_previous_version_readable(tmp_path):

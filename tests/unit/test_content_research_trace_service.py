@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import json
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 
@@ -11,6 +12,7 @@ from app.content_research.observation.trace_service import (
     _llm_recovery_projection,
     _logical_checkpoint_projection,
     _project_timing,
+    _runtime_step_projection,
 )
 from app.content_research.persistence_models import StageCheckpointRecord
 from app.content_research.presearch.service import PresearchService
@@ -20,8 +22,8 @@ from app.content_research.service import (
     WorkflowRunManagerRuntime,
 )
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
-from app.memory.workflow_store import WorkflowStore
 from app.memory.thread_store import ThreadStore
+from app.memory.workflow_store import WorkflowStore
 from app.services.llm.pricing import UsageCost
 from app.services.llm.types import LLMCallContext, LLMResponse, TokenUsage
 from app.services.llm.usage_tracker import LLMUsageEventInput, LLMUsageTracker
@@ -177,6 +179,11 @@ def test_marketing_conclusion_checkpoint_projects_only_actionable_facts(store):
                         "statement": "private conclusion",
                         "note_id": "secret-note-id",
                         "author_id": "secret-author-id",
+                        "publication_disposition": {
+                            "state": "withheld_by_faithfulness",
+                            "reason_code": "faithfulness_not_verified",
+                            "private_audit_payload": "secret-audit",
+                        },
                     },
                     "value": {
                         "state": "directional",
@@ -216,6 +223,10 @@ def test_marketing_conclusion_checkpoint_projects_only_actionable_facts(store):
                 "state": "selected",
                 "supporting_note_count": 3,
                 "independent_author_count": 2,
+                "publication_disposition": {
+                    "state": "withheld_by_faithfulness",
+                    "reason_code": "faithfulness_not_verified",
+                },
             },
             "value": {
                 "state": "directional",
@@ -242,6 +253,7 @@ def test_marketing_conclusion_checkpoint_projects_only_actionable_facts(store):
         "policy_hash",
         "prompt",
         "private-input-fingerprint",
+        "secret-audit",
     ):
         assert forbidden not in serialized
 
@@ -509,6 +521,38 @@ def test_terminal_trace_duration_ignores_later_metadata_timestamps():
     )
 
     assert duration_ms == 1_000
+
+
+def test_runtime_step_projection_clears_stale_report_error_after_analysis_success():
+    now = datetime(2026, 8, 26, 16, 34, tzinfo=timezone.utc)
+
+    projected = _runtime_step_projection(
+        [
+            {
+                "step_id": "step_report",
+                "step_name": "report",
+                "phase": "finalization",
+                "status": "succeeded",
+                "attempt_count": 1,
+                "max_attempts": 3,
+                "started_at": now - timedelta(seconds=5),
+                "completed_at": now,
+                "error_code": "MARKETING_ANALYSIS_FAILED",
+            }
+        ],
+        effective_attempt=SimpleNamespace(
+            id="analysis_attempt_3",
+            attempt_no=3,
+            state="succeeded",
+            created_at=now - timedelta(seconds=40),
+            terminal_at=now - timedelta(seconds=6),
+        ),
+        as_of=now,
+    )
+
+    report_step = next(step for step in projected if step["step_name"] == "report")
+    assert report_step["status"] == "succeeded"
+    assert report_step["error_code"] is None
 
 
 @pytest.mark.parametrize(

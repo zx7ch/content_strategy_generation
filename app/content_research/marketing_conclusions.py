@@ -64,6 +64,13 @@ class MarketingConclusionTrackEvaluation:
     independent_author_count: int
     body_quote_note_count: int
     reason_codes: tuple[str, ...]
+    verifier_state: str = "verified"
+    cluster_ids: tuple[str, ...] = ()
+    supporting_atom_ids: tuple[str, ...] = ()
+    counter_atom_ids: tuple[str, ...] = ()
+    counter_claim_ids: tuple[str, ...] = ()
+    counter_note_count: int = 0
+    counter_author_count: int = 0
 
 
 @dataclass(frozen=True)

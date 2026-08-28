@@ -373,13 +373,14 @@ def _marketing_conclusion_reasons(
         item
         for item in conclusions
         if item.get("track") == track
-        and item.get("state") in {"selected", "directional"}
+        and item.get("state") in {"selected", "directional", "contested"}
     ]
     if len(supported) != 1:
         return ["marketing_conclusion_decision_invalid"]
     decision = supported[0]
     expected_id = _marketing_conclusion_id(snapshot, decision)
     expected_claim_ids = decision.get("supporting_claim_ids")
+    expected_counter_claim_ids = decision.get("counter_claim_ids") or []
     reasons: list[str] = []
     if (
         section.marketing_conclusion_ids != (expected_id,)
@@ -405,8 +406,16 @@ def _marketing_conclusion_reasons(
         for citation_id in section.citation_group_ids
         if citation_id in citations
     }
-    if not isinstance(expected_claim_ids, list) or cited_claim_ids != set(
-        expected_claim_ids
+    counter_cited_claim_ids = {
+        citations[citation_id].get("claim_candidate_id")
+        for citation_id in section.counter_citation_group_ids
+        if citation_id in citations
+    }
+    if (
+        not isinstance(expected_claim_ids, list)
+        or cited_claim_ids != set(expected_claim_ids) | set(expected_counter_claim_ids)
+        or tuple(expected_counter_claim_ids) != section.counter_claim_candidate_ids
+        or counter_cited_claim_ids != set(expected_counter_claim_ids)
     ):
         reasons.append("marketing_conclusion_citation_coverage_invalid")
     return reasons

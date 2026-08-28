@@ -2041,6 +2041,13 @@ class SQLiteContentResearchStore:
             if state == "outcome_unknown"
             else "frozen_execution_attempt_failed"
         )
+        owned_publication = conn.execute(
+            """SELECT 1 FROM content_research_report_publications
+               WHERE execution_unit_id=? AND attempt_no=? LIMIT 1""",
+            (execution_unit_id, attempt_no),
+        ).fetchone()
+        if owned_publication is None:
+            return
         publications = conn.execute(
             """SELECT publication.id, publication.workflow_run_id
                FROM content_research_report_publications AS publication
@@ -3072,6 +3079,32 @@ class SQLiteContentResearchStore:
         if not isinstance(record, TypedPersistenceRecord):
             raise TypeError("new persistence APIs require typed records")
         with self._connect() as conn:
+            lifecycle_guarded_tables = {
+                "content_research_marketing_conclusion_candidates",
+                "content_research_marketing_conclusion_decisions",
+                "content_research_report_publications",
+            }
+            if table in lifecycle_guarded_tables:
+                if not conn.in_transaction:
+                    conn.execute("BEGIN IMMEDIATE")
+                has_workflow_runs = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow_runs'"
+                ).fetchone()
+                run = (
+                    conn.execute(
+                        "SELECT content_research_state FROM workflow_runs WHERE run_id=?",
+                        (str(values["workflow_run_id"]),),
+                    ).fetchone()
+                    if has_workflow_runs is not None
+                    else None
+                )
+                if (
+                    run is not None
+                    and run["content_research_state"] == "cancelled_or_failed"
+                ):
+                    raise ValueError(
+                        "content research worker output cannot commit after cancellation"
+                    )
             self._insert_typed_record(conn, table, record, values)
             if (
                 table == "content_research_report_publications"
@@ -3565,15 +3598,21 @@ class SQLiteContentResearchStore:
     def save_marketing_conclusion_candidate(
         self, record: MarketingConclusionCandidateRecord
     ) -> MarketingConclusionCandidateRecord:
-        return self._save_typed_record(
-            "content_research_marketing_conclusion_candidates",
-            record,
-            {
-                "workflow_run_id": record.workflow_run_id,
-                "research_plan_id": record.research_plan_id,
-                "track": record.track,
-            },
-        )  # type: ignore[return-value]
+        try:
+            return self._save_typed_record(
+                "content_research_marketing_conclusion_candidates",
+                record,
+                {
+                    "workflow_run_id": record.workflow_run_id,
+                    "research_plan_id": record.research_plan_id,
+                    "track": record.track,
+                },
+            )  # type: ignore[return-value]
+        except sqlite3.IntegrityError:
+            existing = self.get_typed_record(MarketingConclusionCandidateRecord, record.id)
+            if existing == record:
+                return record
+            raise ValueError("marketing conclusion candidate identity conflict") from None
 
     def list_marketing_conclusion_candidates(
         self, workflow_run_id: str, research_plan_id: str
@@ -3595,17 +3634,23 @@ class SQLiteContentResearchStore:
     def save_marketing_conclusion_decision(
         self, record: MarketingConclusionDecisionRecord
     ) -> MarketingConclusionDecisionRecord:
-        return self._save_typed_record(
-            "content_research_marketing_conclusion_decisions",
-            record,
-            {
-                "workflow_run_id": record.workflow_run_id,
-                "research_plan_id": record.research_plan_id,
-                "candidate_id": record.candidate_id,
-                "track": record.track,
-                "state": record.state,
-            },
-        )  # type: ignore[return-value]
+        try:
+            return self._save_typed_record(
+                "content_research_marketing_conclusion_decisions",
+                record,
+                {
+                    "workflow_run_id": record.workflow_run_id,
+                    "research_plan_id": record.research_plan_id,
+                    "candidate_id": record.candidate_id,
+                    "track": record.track,
+                    "state": record.state,
+                },
+            )  # type: ignore[return-value]
+        except sqlite3.IntegrityError:
+            existing = self.get_typed_record(MarketingConclusionDecisionRecord, record.id)
+            if existing == record:
+                return record
+            raise ValueError("marketing conclusion decision identity conflict") from None
 
     def list_marketing_conclusion_decisions(
         self, workflow_run_id: str, research_plan_id: str

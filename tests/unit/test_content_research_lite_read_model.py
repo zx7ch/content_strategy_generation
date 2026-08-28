@@ -247,10 +247,13 @@ def test_lite_projection_uses_only_selected_governed_marketing_conclusion():
         ],
         "sections": [
             {
+                "section_id": "section_need",
                 "section_kind": "marketing_need",
                 "prose": "高温通勤场景中的凉感需求…",
                 "claim_candidate_ids": ["claim_1", "claim_2", "claim_3"],
                 "citation_group_ids": ["citation_1", "citation_2", "citation_3"],
+                "counter_claim_candidate_ids": [],
+                "counter_citation_group_ids": [],
                 "marketing_conclusion_ids": ["mc_need_primary"],
                 "conclusion_state": "selected",
             }
@@ -340,7 +343,7 @@ def test_lite_projection_keeps_terminal_marketing_tracks_for_evidence_only_repor
     assert projected["sections"]["weak_signals"] == []
 
 
-def test_lite_projection_never_returns_withdrawn_marketing_conclusion_prose():
+def test_lite_projection_preserves_selected_analysis_when_publication_omits_prose():
     report = {
         "workflow_run_id": "run_withdrawn",
         "workflow_terminal_state": "succeeded",
@@ -410,6 +413,8 @@ def test_lite_projection_never_returns_withdrawn_marketing_conclusion_prose():
                 "prose": None,
                 "claim_candidate_ids": ["claim_1", "claim_2", "claim_3"],
                 "citation_group_ids": ["citation_1", "citation_2", "citation_3"],
+                "counter_claim_candidate_ids": [],
+                "counter_citation_group_ids": [],
                 "marketing_conclusion_ids": ["mc_need"],
                 "conclusion_state": "selected",
             }
@@ -421,7 +426,9 @@ def test_lite_projection_never_returns_withdrawn_marketing_conclusion_prose():
     )
 
     need = projected["sections"]["marketing_conclusions"]["need"]
-    assert need["state"] == "analysis_unavailable"
+    assert need["state"] == "omitted_by_publication_policy"
+    assert need["analysis_state"] == "selected"
+    assert need["reason_codes"] == ["publication_policy_omitted"]
     assert "statement" not in need
     assert "mc_need" not in projected["sections"]["priority_action"][
         "supporting_conclusion_ids"

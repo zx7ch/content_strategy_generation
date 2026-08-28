@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import json
 import asyncio
+import json
 from dataclasses import replace
 
 import pytest
@@ -15,8 +15,8 @@ from app.content_research.persistence_models import (
     ClaimAdmissionDecisionRecord,
     ClaimCandidateRecord,
 )
-from app.services.llm.types import LLMResponse, TokenUsage
 from app.services.llm.failures import LLMProviderFailure
+from app.services.llm.types import LLMResponse, TokenUsage
 
 
 def marketing_policy() -> dict:
@@ -32,7 +32,18 @@ def marketing_policy() -> dict:
     }
 
 
-def admitted_claim(claim_id: str, *, quote: str = "样本明确提到轻量透气"):
+def admitted_claim(
+    claim_id: str,
+    *,
+    quote: str = "样本明确提到轻量透气",
+    claim_type: str = "product_value_expression",
+):
+    intent_by_type = {
+        "product_value_expression": "value_proposition",
+        "use_context": "usage_context",
+        "target_audience_framing": "target_audience",
+        "message_angle": "message_angle",
+    }
     claim = ClaimCandidateRecord(
         claim_id,
         "claim",
@@ -56,8 +67,8 @@ def admitted_claim(claim_id: str, *, quote: str = "样本明确提到轻量透�
         research_direction_id="product_marketing",
         evidence_packet_id=f"packet_{claim_id}",
         statement=quote,
-        intent_id="value_proposition",
-        claim_type="product_value_expression",
+        intent_id=intent_by_type[claim_type],
+        claim_type=claim_type,
     )
     decision = ClaimAdmissionDecisionRecord(
         f"decision_{claim_id}",
@@ -72,8 +83,9 @@ def admitted_claim(claim_id: str, *, quote: str = "样本明确提到轻量透�
 
 
 class RecordingLLM:
-    def __init__(self, response: dict | str) -> None:
+    def __init__(self, response: dict | str, *, finish_reason: str | None = None) -> None:
         self.response = response
+        self.finish_reason = finish_reason
         self.requests = []
 
     async def generate(self, request):
@@ -85,6 +97,7 @@ class RecordingLLM:
             model="fake",
             usage=TokenUsage(total_tokens=1),
             latency_ms=1,
+            finish_reason=self.finish_reason,
         )
 
 
@@ -99,7 +112,7 @@ async def test_conclusion_analysis_receives_only_safe_admitted_claim_fields():
         {
             "candidates": [
                 {
-                    "track": "need",
+                    "track": "value",
                     "statement": "样本明确表达轻量透气需求",
                     "supporting_claim_ids": ["claim_1", "claim_2", "claim_3"],
                 }
@@ -120,6 +133,9 @@ async def test_conclusion_analysis_receives_only_safe_admitted_claim_fields():
     )
 
     request = llm.requests[-1]
+    assert request.response_format == {"type": "json_object"}
+    assert request.max_tokens == 3200
+    assert "at most 5 candidates" in request.messages[0].content
     payload = json.loads(request.messages[-1].content)
     assert payload == {
         "primary_marketing_goal": "content_seeding",
@@ -131,6 +147,9 @@ async def test_conclusion_analysis_receives_only_safe_admitted_claim_fields():
                 "intent_id": "value_proposition",
                 "quote": "样本明确提到轻量透气",
                 "field_path": "content_text",
+                "eligible_tracks": ["value"],
+                "polarity": "support",
+                "qualifiers": {"scenes": [], "audiences": []},
             },
             {
                 "claim_id": "claim_2",
@@ -138,6 +157,9 @@ async def test_conclusion_analysis_receives_only_safe_admitted_claim_fields():
                 "intent_id": "value_proposition",
                 "quote": "样本明确提到轻量透气",
                 "field_path": "content_text",
+                "eligible_tracks": ["value"],
+                "polarity": "support",
+                "qualifiers": {"scenes": [], "audiences": []},
             },
             {
                 "claim_id": "claim_3",
@@ -145,6 +167,9 @@ async def test_conclusion_analysis_receives_only_safe_admitted_claim_fields():
                 "intent_id": "value_proposition",
                 "quote": "样本明确提到轻量透气",
                 "field_path": "content_text",
+                "eligible_tracks": ["value"],
+                "polarity": "support",
+                "qualifiers": {"scenes": [], "audiences": []},
             },
         ],
     }
@@ -161,7 +186,7 @@ async def test_conclusion_analysis_receives_only_safe_admitted_claim_fields():
     assert len(records) == 1
     assert records[0].workflow_run_id == "run_1"
     assert records[0].research_plan_id == "plan_1"
-    assert records[0].track == "need"
+    assert records[0].track == "value"
     assert records[0].payload == {
         "statement": "样本明确表达轻量透气需求",
         "supporting_claim_ids": ["claim_1", "claim_2", "claim_3"],
@@ -196,6 +221,23 @@ async def test_conclusion_analysis_rejects_untrusted_model_lineage(
 
 
 @pytest.mark.asyncio
+async def test_conclusion_analysis_classifies_length_limited_json_as_truncated():
+    service = MarketingConclusionAnalysisService(
+        llm=RecordingLLM('{"candidates":[', finish_reason="length")
+    )
+
+    with pytest.raises(MarketingConclusionAnalysisError, match="truncated") as exc_info:
+        await service.generate(
+            workflow_run_id="run_1",
+            research_plan_id="plan_1",
+            policy=marketing_policy(),
+            admitted_claims=[admitted_claim("claim_1")],
+        )
+
+    assert exc_info.value.detail_code == "response_truncated"
+
+
+@pytest.mark.asyncio
 async def test_conclusion_analysis_keeps_multiple_candidates_for_the_same_track():
     service = MarketingConclusionAnalysisService(
         llm=RecordingLLM(
@@ -220,7 +262,7 @@ async def test_conclusion_analysis_keeps_multiple_candidates_for_the_same_track(
         workflow_run_id="run_1",
         research_plan_id="plan_1",
         policy=marketing_policy(),
-        admitted_claims=[admitted_claim("claim_1")],
+        admitted_claims=[admitted_claim("claim_1", claim_type="use_context")],
     )
 
     assert [record.track for record in records] == ["need", "need"]
@@ -228,6 +270,90 @@ async def test_conclusion_analysis_keeps_multiple_candidates_for_the_same_track(
         "样本描述高温通勤时的闷热感",
         "样本提到出汗后的黏腻体验",
     ]
+
+
+@pytest.mark.asyncio
+async def test_conclusion_analysis_rejects_more_than_five_candidates_per_track():
+    service = MarketingConclusionAnalysisService(
+        llm=RecordingLLM(
+            {
+                "candidates": [
+                    {
+                        "track": "need",
+                        "statement": f"样本需求 {index}",
+                        "supporting_claim_ids": ["claim_1"],
+                    }
+                    for index in range(6)
+                ]
+            }
+        )
+    )
+
+    with pytest.raises(MarketingConclusionAnalysisError) as exc_info:
+        await service.generate(
+            workflow_run_id="run_1",
+            research_plan_id="plan_1",
+            policy=marketing_policy(),
+            admitted_claims=[admitted_claim("claim_1", claim_type="use_context")],
+            track="need",
+        )
+
+    assert exc_info.value.detail_code == "too_many_candidates"
+
+
+@pytest.mark.asyncio
+async def test_conclusion_analysis_isolated_track_call_rejects_cross_track_output():
+    llm = RecordingLLM(
+        {
+            "candidates": [
+                {
+                    "track": "value",
+                    "statement": "样本提到轻量体验",
+                    "supporting_claim_ids": ["claim_1"],
+                }
+            ]
+        }
+    )
+    service = MarketingConclusionAnalysisService(llm=llm)
+
+    with pytest.raises(MarketingConclusionAnalysisError) as exc_info:
+        await service.generate(
+            workflow_run_id="run_1",
+            research_plan_id="plan_1",
+            policy=marketing_policy(),
+            admitted_claims=[admitted_claim("claim_1", claim_type="use_context")],
+            track="need",
+        )
+
+    assert json.loads(llm.requests[-1].messages[-1].content)["tracks"] == ["need"]
+    assert exc_info.value.detail_code == "unexpected_track"
+
+
+@pytest.mark.asyncio
+async def test_conclusion_analysis_rejects_support_from_an_incompatible_track():
+    service = MarketingConclusionAnalysisService(
+        llm=RecordingLLM(
+            {
+                "candidates": [
+                    {
+                        "track": "need",
+                        "statement": "把面料卖点误写成用户需求",
+                        "supporting_claim_ids": ["value_claim"],
+                    }
+                ]
+            }
+        )
+    )
+
+    with pytest.raises(MarketingConclusionAnalysisError) as exc_info:
+        await service.generate(
+            workflow_run_id="run_1",
+            research_plan_id="plan_1",
+            policy=marketing_policy(),
+            admitted_claims=[admitted_claim("value_claim")],
+        )
+
+    assert exc_info.value.detail_code == "supporting_claim_track_mismatch"
 
 
 @pytest.mark.asyncio

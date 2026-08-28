@@ -5,9 +5,9 @@ Production settings must stay aligned with `.env.example`.
 
 from __future__ import annotations
 
-from importlib.metadata import PackageNotFoundError, version as _pkg_version
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _pkg_version
 from pathlib import Path
-from typing import List
 
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -108,7 +108,7 @@ class Settings(BaseSettings):
     )
 
     # Generation
-    PARALLEL_TEMPERATURES: List[float] = Field(
+    PARALLEL_TEMPERATURES: list[float] = Field(
         default_factory=lambda: [0.3, 0.5, 0.7, 0.9, 1.1],
         validation_alias=_env_alias("PARALLEL_TEMPERATURES"),
     )
@@ -175,6 +175,21 @@ class Settings(BaseSettings):
     RAG_CHUNK_MAX_LENGTH: int = Field(default=1000, validation_alias=_env_alias("RAG_CHUNK_MAX_LENGTH"), ge=1)
     REINDEX_MAX_ATTEMPTS: int = Field(default=3, validation_alias=_env_alias("REINDEX_MAX_ATTEMPTS"), ge=1)
 
+    # Content Research analysis (independent from RAG/Chroma)
+    CONTENT_RESEARCH_EMBEDDING_MODEL: str = Field(
+        default="BAAI/bge-base-zh-v1.5",
+        validation_alias=_env_alias("CONTENT_RESEARCH_EMBEDDING_MODEL"),
+    )
+    CONTENT_RESEARCH_EMBEDDING_REVISION: str = Field(
+        default="f03589ceff5aac7111bd60cfc7d497ca17ecac65",
+        validation_alias=_env_alias("CONTENT_RESEARCH_EMBEDDING_REVISION"),
+    )
+    CONTENT_RESEARCH_EMBEDDING_DIMENSIONS: int = Field(
+        default=768,
+        validation_alias=_env_alias("CONTENT_RESEARCH_EMBEDDING_DIMENSIONS"),
+        ge=1,
+    )
+
     # Storage
     SQLITE_DB_PATH: str = Field(default="./data/xhs_agent.db", validation_alias=_env_alias("SQLITE_DB_PATH"))
     CHROMA_PERSIST_DIR: str = Field(default="./data/chroma", validation_alias=_env_alias("CHROMA_PERSIST_DIR"))
@@ -200,7 +215,7 @@ class Settings(BaseSettings):
         return [origin.strip() for origin in self.CORS_ALLOWED_ORIGINS.split(",") if origin.strip()]
 
     @model_validator(mode="after")
-    def _validate_paths(self) -> "Settings":
+    def _validate_paths(self) -> Settings:
         sqlite = Path(self.SQLITE_DB_PATH).expanduser()
         if str(sqlite) != ":memory:":
             # Auto-create parent directory if not exists

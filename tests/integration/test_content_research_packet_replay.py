@@ -7,7 +7,9 @@ from datetime import datetime, timezone
 import pytest
 
 from app.content_research.admission.candidates import source_text_hash
+from app.content_research.analysis_persistence import SQLiteMarketingAnalysisRepository
 from app.content_research.contracts import build_default_snapshot, policy_hash
+from app.content_research.marketing_analysis_execution import MarketingAnalysisExecutionError
 from app.content_research.models import ResearchBriefRecord, SubagentTaskRecord
 from app.content_research.persisted_packet_replay import (
     PersistedPacketReplayInput,
@@ -17,10 +19,18 @@ from app.content_research.persistence_models import (
     CanonicalSourceRecord,
     ClaimAdmissionDecisionRecord,
     ClaimCandidateRecord,
+    CoverageManifest,
     DirectionalEvidencePacketRecord,
+    ReportPublicationRecord,
     StageCheckpointRecord,
 )
 from app.content_research.presearch.service import PresearchService
+from app.content_research.research_embedding import (
+    ResearchEmbeddingBatch,
+    ResearchEmbeddingFingerprint,
+    ResearchEmbeddingHealth,
+)
+from app.content_research.scope_contract import ResearchScopeContract, ScopeQueryGroup
 from app.content_research.service import (
     ContentResearchService,
     ContentResearchValidationError,
@@ -510,6 +520,52 @@ class _ConclusionLLM:
 
     async def generate(self, request):
         self.calls += 1
+        payload = json.loads(request.messages[-1].content)
+        if request.task_type == "content_research.marketing_evidence_extraction":
+            evidence = []
+            for note in payload["notes"]:
+                body = note["content_text"]
+                title = note["title"]
+                if body:
+                    evidence.extend(
+                        {
+                            "note_id": note["note_id"],
+                            "field_path": "content_text",
+                            "quote": body,
+                            "text_start": 0,
+                            "text_end": len(body),
+                            "track": track,
+                            "aspect": "轻量透气体验",
+                            "evidence_type": "experience",
+                            "polarity": "support",
+                            "scenes": [],
+                            "audiences": [],
+                        }
+                        for track in ("need", "value")
+                    )
+                if title:
+                    evidence.append(
+                        {
+                            "note_id": note["note_id"],
+                            "field_path": "title",
+                            "quote": title,
+                            "text_start": 0,
+                            "text_end": len(title),
+                            "track": "message",
+                            "aspect": "标题表达",
+                            "evidence_type": "message_expression",
+                            "polarity": "support",
+                            "scenes": [],
+                            "audiences": [],
+                        }
+                    )
+            return LLMResponse(
+                content=json.dumps({"evidence": evidence}, ensure_ascii=False),
+                provider="fake",
+                model="fake",
+                usage=TokenUsage(total_tokens=1),
+                latency_ms=1,
+            )
         if self.failures_remaining:
             self.failures_remaining -= 1
             raise LLMProviderFailure(
@@ -518,14 +574,14 @@ class _ConclusionLLM:
                 True,
                 None,
             )
-        payload = json.loads(request.messages[-1].content)
+        track = payload["tracks"][0]
         return LLMResponse(
             content=json.dumps(
                 {
                     "candidates": [
                         {
-                            "track": "need",
-                            "statement": "样本明确表达轻量透气需求",
+                            "track": track,
+                            "statement": f"样本明确表达 {track} 方向的轻量透气体验",
                             "supporting_claim_ids": [
                                 item["claim_id"] for item in payload["claims"]
                             ],
@@ -541,8 +597,30 @@ class _ConclusionLLM:
         )
 
 
+class _DeterministicResearchEmbedding:
+    def __init__(self) -> None:
+        self._fingerprint = ResearchEmbeddingFingerprint(
+            provider="deterministic",
+            model="analysis-replay",
+            revision="v1",
+            dimensions=3,
+        )
+
+    @property
+    def health(self):
+        return ResearchEmbeddingHealth("ready", self._fingerprint)
+
+    def embed_documents(self, documents):
+        return ResearchEmbeddingBatch(
+            document_ids=tuple(item.note_id for item in documents),
+            input_fingerprints=tuple(f"input-{item.note_id}" for item in documents),
+            vectors=tuple((1.0, 0.0, 0.0) for _item in documents),
+            embedding_fingerprint=self._fingerprint,
+        )
+
+
 @pytest.mark.asyncio
-async def test_conclusion_packet_replay_reuses_checkpoint_without_collection_delta(
+async def test_one_track_failure_blocks_publication_and_retry_reuses_successful_tracks(
     tmp_path,
 ):
     db_path = str(tmp_path / "marketing-conclusion-replay.db")
@@ -558,6 +636,25 @@ async def test_conclusion_packet_replay_reuses_checkpoint_without_collection_del
         primary_marketing_goal="content_seeding",
     )
     store.save_run_policy_snapshot(snapshot)
+    scope = ResearchScopeContract(
+        id="scope-conclusion-replay",
+        workflow_run_id="run-conclusion-replay",
+        research_plan_id="rp-conclusion-replay",
+        version=1,
+        schema_version="content_research_scope_contract_v2",
+        constraints=(),
+        query_groups=(
+            ScopeQueryGroup(
+                id="query-core",
+                suggested_query="轻量透气上衣",
+                final_query="轻量透气上衣",
+                origin="system_suggested",
+                execution_role="primary",
+            ),
+        ),
+        created_at=frozen_at,
+    )
+    store.save_scope_contract(scope)
     store.save_brief(
         ResearchBriefRecord(
             id="rb-conclusion-replay",
@@ -578,7 +675,6 @@ async def test_conclusion_packet_replay_reuses_checkpoint_without_collection_del
     ):
         source_id = f"source-{index}"
         packet_id = f"packet-{index}"
-        claim_id = f"claim-{index}"
         store.save_canonical_source(
             CanonicalSourceRecord(
                 source_id,
@@ -595,64 +691,91 @@ async def test_conclusion_packet_replay_reuses_checkpoint_without_collection_del
                 "directional-packet-v1",
                 {
                     "field_projection": {
+                        "title": "轻量透气体验",
                         "content_text": quote,
                         "source_url": f"https://example.test/{index}",
                         "author_id": author_id,
                     },
+                    "retrieval_context": {"query_group_ids": ["query-core"]},
                     "field_availability": {"content_text": "present"},
                 },
                 workflow_run_id="run-conclusion-replay",
                 research_direction_id="product_marketing",
                 canonical_source_id=source_id,
                 field_projection_hash=f"projection-{index}",
+                scope_contract_id=scope.id,
+                execution_unit_id="retrieval-unit-replay",
+                attempt_no=1,
             )
         )
-        store.save_claim_candidate(
-            ClaimCandidateRecord(
-                claim_id,
-                "claim-candidate-v1",
-                {
-                    "quote_refs": [
-                        {
-                            "field_path": "content_text",
-                            "quote": quote,
-                            "text_start": 0,
-                            "text_end": len(quote),
-                            "source_text_hash": source_text_hash(quote),
-                            "source_url": f"https://example.test/{index}",
-                        }
-                    ],
-                    "scope": {"sample": "selected_packets"},
-                },
-                workflow_run_id="run-conclusion-replay",
-                research_direction_id="product_marketing",
-                evidence_packet_id=packet_id,
-                statement=quote,
-                intent_id="value_proposition",
-                claim_type="product_value_expression",
+        for track, claim_type, intent_id in (
+            ("need", "use_context", "usage_context"),
+            ("value", "product_value_expression", "value_proposition"),
+            ("message", "message_angle", "message_angle"),
+        ):
+            claim_id = f"claim-{track}-{index}"
+            store.save_claim_candidate(
+                ClaimCandidateRecord(
+                    claim_id,
+                    "claim-candidate-v1",
+                    {
+                        "quote_refs": [
+                            {
+                                "field_path": "content_text",
+                                "quote": quote,
+                                "text_start": 0,
+                                "text_end": len(quote),
+                                "source_text_hash": source_text_hash(quote),
+                                "source_url": f"https://example.test/{index}",
+                            }
+                        ],
+                        "scope": {
+                            "sample": "selected_packets",
+                            "qualifiers": {"scenes": [], "audiences": []},
+                            "polarity": "support",
+                        },
+                    },
+                    workflow_run_id="run-conclusion-replay",
+                    research_direction_id="product_marketing",
+                    evidence_packet_id=packet_id,
+                    statement=quote,
+                    intent_id=intent_id,
+                    claim_type=claim_type,
+                    scope_contract_id=scope.id,
+                    execution_unit_id="retrieval-unit-replay",
+                    attempt_no=1,
+                )
             )
-        )
-        store.save_claim_admission_decision(
-            ClaimAdmissionDecisionRecord(
-                f"decision-{index}",
-                "admission-decision-v1",
-                {
-                    "policy_snapshot_hash": snapshot.effective_policy_hash,
-                    "reason_codes": [],
-                },
-                research_direction_id="product_marketing",
-                claim_candidate_id=claim_id,
-                decision="admitted",
-                policy_snapshot_id=snapshot.id,
+            store.save_claim_admission_decision(
+                ClaimAdmissionDecisionRecord(
+                    f"decision-{track}-{index}",
+                    "admission-decision-v1",
+                    {
+                        "policy_snapshot_hash": snapshot.effective_policy_hash,
+                        "reason_codes": [],
+                    },
+                    research_direction_id="product_marketing",
+                    claim_candidate_id=claim_id,
+                    decision="admitted",
+                    policy_snapshot_id=snapshot.id,
+                )
             )
-        )
 
-    llm = _ConclusionLLM(failures_remaining=2)
+    manifest = CoverageManifest(
+        workflow_run_id="run-conclusion-replay",
+        scope_contract_id=scope.id,
+        execution_unit_id="retrieval-unit-replay",
+        attempt_no=1,
+        execution_revision=1,
+        packet_ids=tuple(f"packet-{index}" for index in range(1, 5)),
+    )
+    llm = _ConclusionLLM(failures_remaining=1)
     service = ContentResearchService(
         store=store,
         presearch=PresearchService(None),
         workflow_runtime=WorkflowRunManagerRuntime(db_path),
         analysis_llm=llm,
+        research_embedding_runtime=_DeterministicResearchEmbedding(),
     )
     operation_ids_before = {
         item.id
@@ -663,24 +786,56 @@ async def test_conclusion_packet_replay_reuses_checkpoint_without_collection_del
         item.id for item in store.list_typed_records(DirectionalEvidencePacketRecord)
     }
 
-    for _ in range(2):
-        with pytest.raises(LLMProviderFailure, match="llm_service_unavailable"):
-            await service._govern_marketing_conclusions(
-                workflow_run_id="run-conclusion-replay",
-                research_plan_id="rp-conclusion-replay",
-            )
+    with pytest.raises(MarketingAnalysisExecutionError) as failure:
+        await service._govern_marketing_conclusions(
+            workflow_run_id="run-conclusion-replay",
+            research_plan_id="rp-conclusion-replay",
+            manifest=manifest,
+        )
+    assert failure.value.failures == {"need": "llm_service_unavailable"}
     unavailable = store.list_marketing_conclusion_decisions(
         "run-conclusion-replay", "rp-conclusion-replay"
     )
     assert {(item.track, item.state) for item in unavailable} == {
-        ("message", "analysis_unavailable"),
         ("need", "analysis_unavailable"),
-        ("value", "analysis_unavailable"),
+        ("message", "selected"),
+        ("value", "selected"),
     }
+    assert store.list_typed_records(ReportPublicationRecord) == []
+    assert llm.calls == 4  # one structured extraction + three independent tracks
+    packet_ids_after_failure = {
+        item.id
+        for item in store.list_typed_records(DirectionalEvidencePacketRecord)
+    }
+    assert packet_ids_before < packet_ids_after_failure
+    assert len(packet_ids_after_failure - packet_ids_before) == 4
+
+    # The lifecycle Coordinator owns successor creation. This execution-layer
+    # test simulates the already-authorized retry before proving checkpoint reuse.
+    analysis_repository = SQLiteMarketingAnalysisRepository(db_path)
+    with store._connect() as connection:
+        analysis_unit_id = str(
+            connection.execute(
+                "SELECT id FROM content_research_analysis_units WHERE workflow_run_id=?",
+                ("run-conclusion-replay",),
+            ).fetchone()[0]
+        )
+    failed_attempt = analysis_repository.get_latest_attempt_for_unit(analysis_unit_id)
+    assert failed_attempt is not None
+    assert failed_attempt.state == "running"
+    failed_attempt = analysis_repository.fail_analysis_attempt(
+        failed_attempt.id,
+        lease_token=str(failed_attempt.lease_token),
+    )
+    analysis_repository.create_analysis_attempt(
+        failed_attempt.analysis_unit_id,
+        successor_of_attempt_id=failed_attempt.id,
+    )
 
     first = await service._govern_marketing_conclusions(
         workflow_run_id="run-conclusion-replay",
         research_plan_id="rp-conclusion-replay",
+        manifest=manifest,
     )
     candidates_after_first = store.list_marketing_conclusion_candidates(
         "run-conclusion-replay", "rp-conclusion-replay"
@@ -695,10 +850,23 @@ async def test_conclusion_packet_replay_reuses_checkpoint_without_collection_del
     replay = await service._govern_marketing_conclusions(
         workflow_run_id="run-conclusion-replay",
         research_plan_id="rp-conclusion-replay",
+        manifest=manifest,
     )
 
     assert replay.id == first.id
-    assert llm.calls == 3
+    assert llm.calls == 5
+    with store._connect() as connection:
+        attempts = connection.execute(
+            "SELECT attempt_no, state FROM content_research_analysis_attempts "
+            "ORDER BY attempt_no"
+        ).fetchall()
+        checkpoints = connection.execute(
+            "SELECT track, completed_by_attempt_id FROM content_research_analysis_checkpoints "
+            "WHERE stage='verifier' ORDER BY track"
+        ).fetchall()
+    assert [tuple(row) for row in attempts] == [(1, "failed"), (2, "succeeded")]
+    assert {row[0] for row in checkpoints} == {"need", "value", "message"}
+    assert len({row[1] for row in checkpoints}) == 2
     assert store.list_marketing_conclusion_candidates(
         "run-conclusion-replay", "rp-conclusion-replay"
     ) == candidates_after_first
@@ -719,4 +887,4 @@ async def test_conclusion_packet_replay_reuses_checkpoint_without_collection_del
     } == operation_ids_before
     assert {
         item.id for item in store.list_typed_records(DirectionalEvidencePacketRecord)
-    } == packet_ids_before
+    } == packet_ids_after_failure

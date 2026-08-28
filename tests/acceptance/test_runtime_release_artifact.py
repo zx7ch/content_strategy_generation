@@ -9,17 +9,25 @@ import time
 import urllib.request
 import zipfile
 from pathlib import Path
+from urllib.error import HTTPError
 
 import pytest
 
+from app.content_research.lifecycle.coordinator import ContentResearchPersistenceCoordinator
+from app.content_research.lifecycle.models import LifecycleCommand
 from app.content_research.models import ResearchBriefRecord, TraceRecord, utcnow
 from app.content_research.persistence_models import StageCheckpointRecord
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
-from app.services.workflow_run_manager import WorkflowRunManager
+from app.memory.thread_store import ThreadStore
+
+RELEASE_GATE_HEADERS = {
+    "X-Workspace-Id": "00000000-0000-0000-0000-000000000001",
+    "X-User-Id": "release-gate",
+}
 
 
 def _release_archive() -> Path:
-    return Path("dist/xhs-runtime.zip")
+    return Path(os.getenv("RELEASE_ARCHIVE_PATH", "dist/xhs-runtime.zip"))
 
 
 @pytest.mark.acceptance
@@ -28,7 +36,7 @@ def test_release_archive_contains_runtime_and_launcher():
     if not archive.exists() and os.getenv("RELEASE_GATE_REQUIRE_ARTIFACT") != "1":
         pytest.skip("release artifact is built by the release gate")
 
-    assert archive.is_file(), "release gate requires dist/xhs-runtime.zip"
+    assert archive.is_file(), f"release gate requires {archive}"
     with zipfile.ZipFile(archive) as bundle:
         names = set(bundle.namelist())
 
@@ -52,9 +60,14 @@ def _free_local_port() -> int:
         return int(listener.getsockname()[1])
 
 
-def _get_json(url: str) -> dict:
-    with urllib.request.urlopen(url, timeout=1) as response:  # noqa: S310 -- local Runtime only
-        return json.loads(response.read().decode("utf-8"))
+def _get_json(url: str, *, headers: dict[str, str] | None = None) -> dict:
+    request = urllib.request.Request(url, headers=headers or {})
+    try:
+        with urllib.request.urlopen(request, timeout=1) as response:  # noqa: S310 -- local Runtime only
+            return json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise AssertionError(f"{url} returned HTTP {exc.code}: {detail}") from exc
 
 
 def _wait_for_health(port: int, process: subprocess.Popen) -> dict:
@@ -82,21 +95,39 @@ def _stop(process: subprocess.Popen) -> None:
 
 
 def _seed_persisted_content_research_fixture(db_path: str) -> str:
-    async def create_run() -> str:
-        async with WorkflowRunManager(db_path) as manager:
-            run = await manager.start_run(thread_id="thread-release-gate", user_id="release-gate")
-        return run.run_id
+    async def create_run() -> tuple[str, str]:
+        async with ThreadStore(db_path) as threads:
+            thread = await threads.create_thread(
+                title="Release gate fixture",
+                workspace_id=RELEASE_GATE_HEADERS["X-Workspace-Id"],
+            )
+        thread_id = str(thread["id"])
+        workflow_run_id = "run-release-artifact-restart"
+        coordinator = ContentResearchPersistenceCoordinator(db_path)
+        await coordinator.apply(LifecycleCommand(
+            command_id="release-artifact-submit",
+            run_id=workflow_run_id,
+            expected_state=None,
+            expected_revision=0,
+            kind="submit_research_subject",
+            payload={
+                "thread_id": thread_id,
+                "user_id": RELEASE_GATE_HEADERS["X-User-Id"],
+                "seed_text": "防晒长袖",
+            },
+        ))
+        return workflow_run_id, thread_id
 
-    workflow_run_id = asyncio.run(create_run())
+    workflow_run_id, thread_id = asyncio.run(create_run())
     store = SQLiteContentResearchStore(db_path)
     store.save_brief(ResearchBriefRecord(
         id="brief-release-gate", workflow_run_id=workflow_run_id,
-        thread_id="thread-release-gate", schema_version="content_research_brief_v1",
+        thread_id=thread_id, schema_version="content_research_brief_v1",
         status="ready", payload={"schema_version": "content_research_brief_v1", "seed_text": "防晒长袖"},
     ))
     store.save_trace(TraceRecord(
         id="trace-release-gate", workflow_run_id=workflow_run_id,
-        thread_id="thread-release-gate", schema_version="content_research_trace_v1",
+        thread_id=thread_id, schema_version="content_research_trace_v1",
         status="completed", started_at=utcnow(),
         payload={"schema_version": "content_research_trace_v1", "stage": "formal_research"},
     ))
@@ -124,7 +155,7 @@ def test_frozen_runtime_restart_preserves_content_research_fixture(tmp_path):
         pytest.skip("set RUN_FROZEN_RUNTIME_RESTART_GATE=1 after packaging")
 
     archive = _release_archive()
-    assert archive.is_file(), "release gate requires dist/xhs-runtime.zip"
+    assert archive.is_file(), f"release gate requires {archive}"
     extracted = tmp_path / "runtime"
     # Python's zipfile turns the bundle's dylib symlinks into text files.
     # Use the macOS extractor users invoke so Mach-O dependency links survive.
@@ -162,8 +193,14 @@ def test_frozen_runtime_restart_preserves_content_research_fixture(tmp_path):
     try:
         first_health = _wait_for_health(port, first)
         assert first_health["runtime_diagnostics"]["sqlite_db_path"] == db_path
-        assert _get_json(f"http://127.0.0.1:{port}/content-research/workflows/{workflow_run_id}/trace")["workflow_run_id"] == workflow_run_id
-        assert _get_json(f"http://127.0.0.1:{port}/content-research/workflows/{workflow_run_id}/lite-report")["workflow_run_id"] == workflow_run_id
+        assert _get_json(
+            f"http://127.0.0.1:{port}/content-research/workflows/{workflow_run_id}/trace",
+            headers=RELEASE_GATE_HEADERS,
+        )["workflow_run_id"] == workflow_run_id
+        assert _get_json(
+            f"http://127.0.0.1:{port}/content-research/workflows/{workflow_run_id}/lite-report",
+            headers=RELEASE_GATE_HEADERS,
+        )["workflow_run_id"] == workflow_run_id
     finally:
         _stop(first)
 
@@ -171,8 +208,14 @@ def test_frozen_runtime_restart_preserves_content_research_fixture(tmp_path):
     try:
         second_health = _wait_for_health(port, second)
         assert second_health["runtime_diagnostics"]["sqlite_db_path"] == db_path
-        assert _get_json(f"http://127.0.0.1:{port}/content-research/workflows/{workflow_run_id}/trace")["workflow_run_id"] == workflow_run_id
-        assert _get_json(f"http://127.0.0.1:{port}/content-research/workflows/{workflow_run_id}/lite-report")["workflow_run_id"] == workflow_run_id
+        assert _get_json(
+            f"http://127.0.0.1:{port}/content-research/workflows/{workflow_run_id}/trace",
+            headers=RELEASE_GATE_HEADERS,
+        )["workflow_run_id"] == workflow_run_id
+        assert _get_json(
+            f"http://127.0.0.1:{port}/content-research/workflows/{workflow_run_id}/lite-report",
+            headers=RELEASE_GATE_HEADERS,
+        )["workflow_run_id"] == workflow_run_id
         checkpoints = [
             checkpoint
             for checkpoint in SQLiteContentResearchStore(db_path).list_typed_records(StageCheckpointRecord)

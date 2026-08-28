@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -370,9 +371,28 @@ class AsyncFormalResearchDispatchRepository:
     async def renew(
         self, *, workflow_run_id: str, owner: str, token: str, lease_seconds: int = 120
     ) -> bool:
+        # Keep the write reservation and its commit on the same worker thread.
+        # The formal-research pipeline still contains synchronous SQLite store
+        # calls.  An aiosqlite heartbeat can acquire the only writer lock, then
+        # yield before commit; if the event loop next enters one of those
+        # synchronous calls, both sides wait for each other until busy_timeout.
+        # Running this tiny transaction atomically off-loop removes that
+        # self-deadlock without weakening the lease predicate.
+        return await asyncio.to_thread(
+            self._renew_sync,
+            workflow_run_id=workflow_run_id,
+            owner=owner,
+            token=token,
+            lease_seconds=lease_seconds,
+        )
+
+    def _renew_sync(
+        self, *, workflow_run_id: str, owner: str, token: str, lease_seconds: int
+    ) -> bool:
         now = _now()
-        async with self._connect() as conn:
-            result = await conn.execute(
+        with sqlite3.connect(self._db_path, timeout=30) as conn:
+            conn.execute("PRAGMA busy_timeout=30000")
+            result = conn.execute(
                 """UPDATE content_research_dispatch_jobs
                    SET lease_heartbeat_at=?, lease_expires_at=?, updated_at=?
                    WHERE workflow_run_id=? AND status='running' AND lease_owner=? AND lease_token=?""",
@@ -385,7 +405,6 @@ class AsyncFormalResearchDispatchRepository:
                     token,
                 ),
             )
-            await conn.commit()
         return result.rowcount == 1
 
     async def complete(

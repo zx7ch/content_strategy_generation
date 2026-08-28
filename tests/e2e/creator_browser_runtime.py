@@ -5,11 +5,18 @@ from __future__ import annotations
 import json
 import os
 import re
-from pathlib import Path
 from contextlib import asynccontextmanager
+from pathlib import Path
+from types import SimpleNamespace
 
 import app.main as production
 from app.content_research.presearch.service import PresearchService
+from app.content_research.reporting.faithfulness import SemanticAuditResult
+from app.content_research.research_embedding import (
+    ResearchEmbeddingBatch,
+    ResearchEmbeddingFingerprint,
+    ResearchEmbeddingHealth,
+)
 from app.content_research.sources import SourceAdapterRegistry
 from app.content_research.sources.base import ProviderCapability, SourceOperationResult
 from app.services.llm.configuration_service import LiteLLMConfigurationService
@@ -21,8 +28,108 @@ from app.services.llm.types import LLMResponse, TokenUsage
 class DeterministicPresearchLLM:
     def __init__(self, configuration_store: SQLiteLLMConfigurationStore) -> None:
         self._configuration_store = configuration_store
+        self._invalid_analysis_tracks = {
+            item.strip()
+            for item in os.getenv("CREATOR_E2E_INVALID_ANALYSIS_TRACKS", "").split(",")
+            if item.strip()
+        }
+        self._empty_analysis_tracks = {
+            item.strip()
+            for item in os.getenv("CREATOR_E2E_EMPTY_ANALYSIS_TRACKS", "").split(",")
+            if item.strip()
+        }
 
     async def generate(self, request):
+        if request.task_type == "content_research.marketing_evidence_extraction":
+            payload = json.loads(request.messages[-1].content)
+            evidence = []
+            for note in payload["notes"]:
+                body = note["content_text"]
+                title = note["title"]
+                polarity = "counter" if any(term in body for term in ("闷", "不凉")) else "support"
+                scenes = [term for term in ("夏季", "通勤", "运动") if term in body]
+                audiences = [term for term in ("儿童", "上班族") if term in body]
+                if body:
+                    for track in ("need", "value"):
+                        evidence.append(
+                            {
+                                "note_id": note["note_id"],
+                                "field_path": "content_text",
+                                "quote": body,
+                                "text_start": 0,
+                                "text_end": len(body),
+                                "track": track,
+                                "aspect": "夏季凉感体验",
+                                "evidence_type": "limitation" if polarity == "counter" else "experience",
+                                "polarity": polarity,
+                                "scenes": scenes,
+                                "audiences": audiences,
+                            }
+                        )
+                if title:
+                    evidence.append(
+                        {
+                            "note_id": note["note_id"],
+                            "field_path": "title",
+                            "quote": title,
+                            "text_start": 0,
+                            "text_end": len(title),
+                            "track": "message",
+                            "aspect": "标题表达",
+                            "evidence_type": "message_expression",
+                            "polarity": "support",
+                            "scenes": [term for term in ("夏季", "通勤", "运动") if term in title],
+                            "audiences": [term for term in ("儿童", "上班族") if term in title],
+                        }
+                    )
+            return LLMResponse(
+                content=json.dumps({"evidence": evidence}, ensure_ascii=False),
+                provider="deterministic-e2e",
+                model="deterministic-e2e",
+                usage=TokenUsage(total_tokens=1),
+                latency_ms=1,
+            )
+        if request.task_type == "content_research.marketing_conclusion_analysis":
+            payload = json.loads(request.messages[-1].content)
+            track = payload["tracks"][0]
+            if track in self._invalid_analysis_tracks:
+                return LLMResponse(
+                    content="not-json",
+                    provider="deterministic-e2e",
+                    model="deterministic-e2e",
+                    usage=TokenUsage(total_tokens=1),
+                    latency_ms=1,
+                )
+            if track in self._empty_analysis_tracks:
+                return LLMResponse(
+                    content='{"candidates":[]}',
+                    provider="deterministic-e2e",
+                    model="deterministic-e2e",
+                    usage=TokenUsage(total_tokens=1),
+                    latency_ms=1,
+                )
+            return LLMResponse(
+                content=json.dumps(
+                    {
+                        "candidates": [
+                            {
+                                "track": track,
+                                "statement": f"样本支持 {track} 方向的夏季凉感体验",
+                                "supporting_claim_ids": [
+                                    item["claim_id"]
+                                    for item in payload["claims"]
+                                    if item.get("polarity") != "counter"
+                                ],
+                            }
+                        ]
+                    },
+                    ensure_ascii=False,
+                ),
+                provider="deterministic-e2e",
+                model="deterministic-e2e",
+                usage=TokenUsage(total_tokens=1),
+                latency_ms=1,
+            )
         is_recovery_probe = any("模型失败恢复" in message.content for message in request.messages)
         context = request.context
         if (
@@ -111,6 +218,59 @@ class DeterministicConfigurationProbe:
         return LLMResponse(content='{"ok":true}', provider="openai_compatible", model=model, usage=TokenUsage(), latency_ms=1)
 
 
+class DeterministicResearchEmbeddingRuntime:
+    def __init__(self) -> None:
+        self._fingerprint = ResearchEmbeddingFingerprint(
+            provider="deterministic",
+            model="creator-e2e",
+            revision="v1",
+            dimensions=3,
+        )
+
+    @property
+    def health(self):
+        return ResearchEmbeddingHealth("ready", self._fingerprint)
+
+    def start(self):
+        return self.health
+
+    def stop(self):
+        return ResearchEmbeddingHealth(
+            "unavailable", self._fingerprint, error_code="RESEARCH_EMBEDDING_STOPPED"
+        )
+
+    def embed_documents(self, documents):
+        return ResearchEmbeddingBatch(
+            document_ids=tuple(item.note_id for item in documents),
+            input_fingerprints=tuple(f"input-{item.note_id}" for item in documents),
+            vectors=tuple((1.0, 0.0, 0.0) for _item in documents),
+            embedding_fingerprint=self._fingerprint,
+        )
+
+
+class DeterministicTrackWithholdingEvaluator:
+    """Fault-controlled faithfulness result for the publication/UI E2E."""
+
+    def __init__(self, track: str) -> None:
+        self._section_kind = f"marketing_{track}"
+
+    async def evaluate(self, _snapshot, draft, _semantic_auditor):
+        section = next(
+            item for item in draft.sections if item.section_kind == self._section_kind
+        )
+        semantic = SemanticAuditResult(
+            "failed",
+            ("marketing_conclusion_prose_mismatch",),
+            (section.section_id,),
+        )
+        return SimpleNamespace(
+            passed=False,
+            reason_codes=semantic.reason_codes,
+            affected_section_ids=semantic.affected_section_ids,
+            semantic_result=semantic,
+        )
+
+
 class DeterministicAuthRequiredSource:
     """A local fake that cannot make network calls and always pauses safely."""
 
@@ -155,8 +315,9 @@ class DeterministicAuthRequiredSource:
 class DeterministicSuccessfulSource:
     """Return complete, relevant note facts and record the exact submitted queries."""
 
-    def __init__(self, call_log: str) -> None:
+    def __init__(self, call_log: str, *, scenario: str = "complete") -> None:
         self._call_log = Path(call_log)
+        self._scenario = scenario
 
     def capabilities(self):
         return DeterministicAuthRequiredSource().capabilities()
@@ -197,6 +358,9 @@ class DeterministicSuccessfulSource:
 
     async def collect_note_detail(self, request):
         index = request.note_id.rsplit("-", 1)[-1]
+        content_text = f"这件 T恤在夏季通勤中穿着凉爽，样本 {index}。"
+        if self._scenario == "contested" and index in {"2", "3"}:
+            content_text = f"这件 T恤在夏季通勤中一点也不凉爽，样本 {index}。"
         item = {
             "canonical_id": request.note_id,
             "canonical_source_id": request.note_id,
@@ -205,7 +369,7 @@ class DeterministicSuccessfulSource:
             "author_id": f"detail-author-{request.note_id}",
             "author": f"体验作者 {index}",
             "title": f"夏季 T恤凉感体验 {index}",
-            "content_text": f"这件 T恤在夏季通勤中穿着凉爽，样本 {index}。",
+            "content_text": content_text,
             "tags": ["T恤", "凉感", "夏季"],
             "note_type": "image_text",
             "source_published_at": "2026-08-20T00:00:00+00:00",
@@ -295,24 +459,38 @@ async def _idle_unrelated_job_worker(_worker, *, stop_event) -> None:
 @asynccontextmanager
 async def deterministic_lifespan(application):
     production.schedule_embedding_prewarm = lambda: None
+    production.build_research_embedding_runtime = (
+        lambda _settings: DeterministicResearchEmbeddingRuntime()
+    )
     original_job_worker_loop = production.JobWorker.run_loop
     async with _production_lifespan(application):
         production.JobWorker.run_loop = original_job_worker_loop
         service = application.state.content_research_service
         configuration_store = SQLiteLLMConfigurationStore(os.environ["SQLITE_DB_PATH"])
+        source_scenario = os.getenv("CREATOR_E2E_SOURCE_SCENARIO")
         source = (
-            DeterministicSuccessfulSource(os.environ["CREATOR_E2E_SOURCE_CALL_LOG"])
-            if os.getenv("CREATOR_E2E_SOURCE_SCENARIO") == "complete"
+            DeterministicSuccessfulSource(
+                os.environ["CREATOR_E2E_SOURCE_CALL_LOG"],
+                scenario=source_scenario,
+            )
+            if source_scenario in {"complete", "contested"}
             else DeterministicAuthRequiredSource()
         )
         registry = SourceAdapterRegistry({"xiaohongshu": source})
+        deterministic_llm = DeterministicPresearchLLM(configuration_store)
         service._presearch = PresearchService(
-            DeterministicPresearchLLM(configuration_store),
+            deterministic_llm,
             first_feedback_timeout_seconds=0.05,
             hard_cutoff_seconds=0.1,
         )
         service._source_registry = registry
         service._task_router._source_registry = registry
+        service._analysis_llm = deterministic_llm
+        withheld_track = os.getenv("CREATOR_E2E_WITHHOLD_MARKETING_TRACK", "").strip()
+        if withheld_track:
+            service._report_execution._evaluator = (
+                DeterministicTrackWithholdingEvaluator(withheld_track)
+            )
         application.state.llm_configuration_service = LiteLLMConfigurationService(
             store=configuration_store,
             probe_adapter=DeterministicConfigurationProbe(),

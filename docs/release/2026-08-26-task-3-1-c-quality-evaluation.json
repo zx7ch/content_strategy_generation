@@ -1,0 +1,28 @@
+{
+  "schema_version": "marketing_conclusion_quality_result_v1",
+  "fixture": "tests/fixtures/content_research/marketing_conclusion_quality_v1.json",
+  "fixture_note_count": 100,
+  "scenario_template_count": 5,
+  "algorithm_version": "atomic_qualifier_cluster_v2",
+  "verifier_version": "groundedness_counter_evidence_v2",
+  "metrics": {
+    "exact_span_precision": 1.0,
+    "exact_span_recall": 1.0,
+    "track_mapping_macro_f1": 1.0,
+    "cluster_pairwise_precision": 1.0,
+    "cluster_pairwise_recall": 1.0,
+    "contradiction_precision": 1.0,
+    "contradiction_recall": 1.0,
+    "citation_correctness": 1.0,
+    "citation_completeness": 1.0
+  },
+  "zero_tolerance_failures": {
+    "fabricated_quote_or_wrong_lineage": 0
+  },
+  "gate": "passed",
+  "limitations": [
+    "The fixed pack is synthetic and deterministic; it is a regression/calibration gate, not a production-quality estimate.",
+    "Unsupported causality and secret redaction are covered by separate verifier and Trace security tests, not claimed as metrics of this pack.",
+    "Authenticated canary evidence remains a separate Task 3.1-D release gate."
+  ]
+}

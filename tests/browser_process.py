@@ -8,13 +8,19 @@ import socket
 import subprocess
 import time
 from collections import deque
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from threading import Thread
-from typing import Iterator
 
 import httpx
 import pytest
+
+
+def _browser_requirement_unavailable(reason: str) -> None:
+    if os.getenv("CREATOR_BROWSER_E2E_REQUIRED") == "1":
+        pytest.fail(reason)
+    pytest.skip(reason)
 
 
 def reserve_port() -> int:
@@ -22,7 +28,9 @@ def reserve_port() -> int:
         try:
             sock.bind(("127.0.0.1", 0))
         except PermissionError as exc:  # pragma: no cover - environment specific
-            pytest.skip(f"socket bind unavailable in current environment: {exc}")
+            _browser_requirement_unavailable(
+                f"socket bind unavailable in current environment: {exc}"
+            )
         return int(sock.getsockname()[1])
 
 
@@ -34,7 +42,10 @@ def chrome_executable() -> str:
     for candidate in candidates:
         if candidate and Path(candidate).exists():
             return candidate
-    pytest.skip("Chrome executable unavailable for browser-driven test")
+    _browser_requirement_unavailable(
+        "Chrome executable unavailable for browser-driven test"
+    )
+    raise AssertionError("unreachable")
 
 
 @contextmanager
@@ -54,6 +65,7 @@ def run_process(
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        start_new_session=os.name != "nt",
     )
     # A child process whose stdout pipe is never drained eventually blocks in
     # logging. For the Creator E2E stack that can pause the backend while it
@@ -84,22 +96,33 @@ def run_process(
                 pass
             time.sleep(0.1)
         else:  # pragma: no cover - startup failure
-            if process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait(timeout=5)
+            _stop_process_group(process)
             output_reader.join(timeout=1)
             raise AssertionError(f"{name} did not start in time:\n{''.join(output)}")
         yield
     finally:
-        if process.poll() is None:
-            process.send_signal(signal.SIGTERM)
-            try:
-                process.wait(timeout=10)
-            except subprocess.TimeoutExpired:  # pragma: no cover - shutdown failure
-                process.kill()
-                process.wait(timeout=5)
+        _stop_process_group(process)
         output_reader.join(timeout=1)
+
+
+def _stop_process_group(process: subprocess.Popen[str]) -> None:
+    """Stop npm/Next and every child even when the npm parent exited first."""
+    if os.name != "nt":
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    elif process.poll() is None:  # pragma: no cover - Windows fallback
+        process.terminate()
+    if process.poll() is None:
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:  # pragma: no cover - shutdown failure
+            if os.name != "nt":
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            else:
+                process.kill()
+            process.wait(timeout=5)

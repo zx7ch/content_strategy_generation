@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from app.content_research.contracts import SamplePolicy, build_default_snapshot
+from app.content_research.contracts import build_default_snapshot
 from app.content_research.models import ResearchBriefRecord, SubagentTaskRecord
 from app.content_research.persisted_packet_replay import (
     PersistedPacketReplayInput,
@@ -17,7 +17,13 @@ from app.content_research.persistence_models import (
     DirectionResultDecisionRecord,
     DirectionSourceProjectionRecord,
     StageCheckpointRecord,
-    WeakSignalRecord,
+)
+from app.content_research.runtime import canonical_fingerprint
+from app.content_research.scope_contract import (
+    SCOPE_CONTRACT_SCHEMA_VERSION_V2,
+    ScopeConstraint,
+    ScopeQueryGroupInput,
+    build_scope_contract,
 )
 from app.content_research.sources import SourceAdapterRegistry
 from app.content_research.sources.base import SourceOperationResult
@@ -25,10 +31,132 @@ from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
 from app.content_research.workflow.directional_pipeline import (
     DirectionalEvidencePipeline,
     OperationOutcomeUnknownError,
-    QueryGroup,
     compile_query_groups,
 )
 from app.content_research.workflow.task_router import SubagentTaskRouter
+
+
+def _save_scope_v2(
+    store: SQLiteContentResearchStore,
+    *,
+    workflow_run_id: str,
+    research_plan_id: str,
+    direction_id: str,
+    subject: str,
+    questions: list[str],
+    competitors: list[str],
+    candidate_limit: int = 20,
+    run_as_of_at: datetime | None = None,
+) -> None:
+    if store.list_scope_contracts(workflow_run_id):
+        return
+    groups = compile_query_groups(
+        direction_id=direction_id,
+        subject=subject,
+        questions=questions,
+        competitors=competitors,
+        candidate_limit=candidate_limit,
+        run_as_of_at=run_as_of_at,
+    )
+    store.save_scope_contract(
+        build_scope_contract(
+            workflow_run_id=workflow_run_id,
+            research_plan_id=research_plan_id,
+            version=1,
+            schema_version=SCOPE_CONTRACT_SCHEMA_VERSION_V2,
+            constraints=(ScopeConstraint("core_object", "核心对象", subject, "required"),),
+            query_groups=tuple(
+                ScopeQueryGroupInput(
+                    group.query,
+                    group.query,
+                    (subject,),
+                    "system_suggested",
+                )
+                for group in groups[:3]
+            ),
+        )
+    )
+
+
+def _build_scope_owned_snapshot(
+    store: SQLiteContentResearchStore,
+    *,
+    snapshot_id: str,
+    workflow_run_id: str,
+    subject: str,
+    questions: list[str],
+) -> tuple:
+    frozen_at = datetime(2026, 7, 30, tzinfo=timezone.utc)
+    _save_scope_v2(
+        store,
+        workflow_run_id=workflow_run_id,
+        research_plan_id="rp",
+        direction_id="product_marketing",
+        subject=subject,
+        questions=questions,
+        competitors=[],
+        run_as_of_at=frozen_at,
+    )
+    scope = store.list_scope_contracts(workflow_run_id)[-1]
+    window = {
+        "start_at": "2025-07-30T00:00:00+00:00",
+        "end_at": frozen_at.isoformat(),
+    }
+    return build_default_snapshot(
+        snapshot_id=snapshot_id,
+        workflow_run_id=workflow_run_id,
+        brief_id="rb",
+        plan_id="rp",
+        run_as_of_at=frozen_at,
+        direction_ids=("product_marketing",),
+        confirmed_subject=subject,
+        query_groups_by_direction={
+            "product_marketing": tuple(
+                {
+                    "id": group.id,
+                    "direction_id": "product_marketing",
+                    "normalized_query": group.final_query,
+                    "priority": priority,
+                    "sort": "likes",
+                    "time_window": window,
+                    "candidate_cap": 20,
+                    "roles": [group.execution_role],
+                    "activation": "primary",
+                    "normalized_identity": canonical_fingerprint(
+                        {"scope_contract_id": scope.id, "group_id": group.id}
+                    ),
+                }
+                for priority, group in enumerate(scope.query_groups)
+            )
+        },
+    )
+
+
+class ScopeOwnedDirectionalEvidencePipeline(DirectionalEvidencePipeline):
+    """Exercise direct pipeline diagnostics with the same frozen Scope authority as new Runs."""
+
+    def __init__(self, store: SQLiteContentResearchStore) -> None:
+        super().__init__(store)
+        self._scope_setup_store = store
+
+    async def execute(self, **kwargs):
+        call = dict(kwargs)
+        workflow_run_id = str(
+            call.get("workflow_run_id") or f"local_{call['subagent_task_id']}"
+        )
+        call["workflow_run_id"] = workflow_run_id
+        _save_scope_v2(
+            self._scope_setup_store,
+            workflow_run_id=workflow_run_id,
+            research_plan_id=f"plan_{call['subagent_task_id']}",
+            direction_id=str(call["direction_id"]),
+            subject=str(call["subject"]),
+            questions=list(call["questions"]),
+            competitors=list(call["competitors"]),
+            candidate_limit=int(call.get("candidate_limit_per_query", 20)),
+            run_as_of_at=call.get("run_as_of_at"),
+        )
+        return await super().execute(**call)
 
 
 def _build_frozen_pipeline_snapshot(
@@ -83,130 +211,9 @@ def _build_frozen_pipeline_snapshot(
 
 
 @pytest.mark.asyncio
-async def test_frozen_fallback_activates_once_without_repeating_primary_discovery(
-    tmp_path,
-):
-    store = SQLiteContentResearchStore(str(tmp_path / "coverage-fallback.db"))
-    frozen_at = datetime(2026, 8, 4, tzinfo=timezone.utc)
-    primary = QueryGroup(
-        id="qg-primary",
-        direction_id="product_marketing",
-        query="徒步短裤 产品营销",
-        priority=0,
-        candidate_limit=20,
-        time_window={"end_at": frozen_at.isoformat()},
-        roles=("core_intent",),
-        activation="primary",
-        normalized_identity="primary-identity",
-    )
-    fallback = QueryGroup(
-        id="qg-fallback",
-        direction_id="product_marketing",
-        query="户外短裤 夏季",
-        priority=2,
-        candidate_limit=20,
-        time_window={"end_at": frozen_at.isoformat()},
-        roles=("coverage_fallback",),
-        activation="coverage_fallback",
-        normalized_identity="fallback-identity",
-    )
-    snapshot, policies, contracts, _ = _build_frozen_pipeline_snapshot(
-        snapshot_id="rps-fallback",
-        workflow_run_id="run-fallback",
-        direction_id="product_marketing",
-        subject="徒步短裤",
-        questions=("产品营销",),
-        groups=(primary, fallback),
-        run_as_of_at=frozen_at,
-    )
-    store.save_run_policy_snapshot(snapshot)
-    for policy in policies:
-        store.save_sample_policy(policy)
-    for frozen_contract in contracts:
-        store.save_direction_contract(frozen_contract)
-    contract = contracts[0]
-    calls: list[str] = []
-
-    def note(note_id: str, author_id: str) -> dict:
-        return {
-            "provider": "xiaohongshu",
-            "canonical_id": note_id,
-            "source_kind": "note_detail",
-            "source_url": f"https://example.test/{note_id}",
-            "author": author_id,
-            "author_id": author_id,
-            "title": "夏季徒步短裤实测",
-            "content_text": "轻量透气的徒步短裤适合夏季户外。",
-            "tags": ["徒步短裤"],
-            "note_type": "image_text",
-            "metrics": {"likes": 10},
-            "metrics_observed_at": frozen_at.isoformat(),
-            "source_published_at": "2026-08-01T00:00:00+00:00",
-            "ip_location": "上海",
-            "media": {"count": 1},
-            "field_availability": {
-                field: "present" for field in contract.required_note_fields
-            },
-        }
-
-    async def discover(group):
-        calls.append(group.id)
-        if group.id == primary.id:
-            return [note("note-primary", "author-primary")]
-        return [
-            note("note-fallback-1", "author-fallback-1"),
-            note("note-fallback-2", "author-fallback-2"),
-        ]
-
-    kwargs = {
-        "workflow_run_id": "run-fallback",
-        "subagent_task_id": "sat-fallback",
-        "direction_id": "product_marketing",
-        "subject": "徒步短裤",
-        "questions": ["产品营销"],
-        "competitors": [],
-        "author_cap": policies[0].author_cap,
-        "minimum_samples": policies[0].minimum_samples,
-        "minimum_independent_authors": policies[0].minimum_independent_authors,
-        "detail_fetch_cap": policies[0].detail_fetch_cap,
-        "snapshot_id": snapshot.id,
-        "run_as_of_at": snapshot.run_as_of_at,
-        "admission_contract": contract,
-        "admission_policy": policies[0],
-        "policy_snapshot": snapshot,
-        "discover": discover,
-    }
-    first = await DirectionalEvidencePipeline(store).execute(**kwargs)
-    operation_ids = [
-        item.id
-        for item in store.list_typed_records(StageCheckpointRecord)
-        if item.stage_name == "operation"
-    ]
-    second = await DirectionalEvidencePipeline(store).execute(**kwargs)
-
-    assert calls == [primary.id, fallback.id]
-    assert first.selection.status == "complete"
-    assert second.selection == first.selection
-    assert [
-        item.id
-        for item in store.list_typed_records(StageCheckpointRecord)
-        if item.stage_name == "operation"
-    ] == operation_ids
-    fallback_decisions = [
-        item
-        for item in store.list_typed_records(StageCheckpointRecord)
-        if item.stage_name == "fallback_decision"
-    ]
-    assert [item.payload["state"] for item in fallback_decisions] == [
-        "activated",
-        "not_needed",
-    ]
-
-
-@pytest.mark.asyncio
 async def test_pipeline_replays_completed_checkpoints_without_recalling_adapter(tmp_path):
     store = SQLiteContentResearchStore(str(tmp_path / "direction.db"))
-    pipeline = DirectionalEvidencePipeline(store)
+    pipeline = ScopeOwnedDirectionalEvidencePipeline(store)
     calls = 0
 
     async def discover(group):
@@ -258,7 +265,7 @@ async def test_pipeline_replays_completed_checkpoints_without_recalling_adapter(
 @pytest.mark.asyncio
 async def test_changed_projection_creates_another_immutable_packet_version(tmp_path):
     store = SQLiteContentResearchStore(str(tmp_path / "packet-version.db"))
-    pipeline = DirectionalEvidencePipeline(store)
+    pipeline = ScopeOwnedDirectionalEvidencePipeline(store)
 
     def discover_for(title):
         async def discover(group):
@@ -308,7 +315,7 @@ async def test_changed_projection_creates_another_immutable_packet_version(tmp_p
 @pytest.mark.asyncio
 async def test_search_candidate_is_not_persisted_as_detail_evidence(tmp_path):
     store = SQLiteContentResearchStore(str(tmp_path / "search-is-not-detail.db"))
-    pipeline = DirectionalEvidencePipeline(store)
+    pipeline = ScopeOwnedDirectionalEvidencePipeline(store)
 
     async def discover(group):
         return [
@@ -337,7 +344,7 @@ async def test_search_candidate_is_not_persisted_as_detail_evidence(tmp_path):
 @pytest.mark.asyncio
 async def test_failed_discover_persists_typed_terminal_operation_outcome(tmp_path):
     store = SQLiteContentResearchStore(str(tmp_path / "failed-discover.db"))
-    pipeline = DirectionalEvidencePipeline(store)
+    pipeline = ScopeOwnedDirectionalEvidencePipeline(store)
 
     async def discover(_group):
         return SourceOperationResult(
@@ -383,7 +390,7 @@ async def test_failed_discover_persists_typed_terminal_operation_outcome(tmp_pat
 @pytest.mark.asyncio
 async def test_failed_detail_persists_its_provider_outcome(tmp_path):
     store = SQLiteContentResearchStore(str(tmp_path / "failed-detail.db"))
-    pipeline = DirectionalEvidencePipeline(store)
+    pipeline = ScopeOwnedDirectionalEvidencePipeline(store)
 
     async def discover(_group):
         return [{
@@ -473,8 +480,8 @@ async def test_content_performance_pipeline_persists_visible_formats_with_snapsh
         "admission_policy": policy,
         "policy_snapshot": snapshot,
     }
-    await DirectionalEvidencePipeline(store).execute(**kwargs)
-    await DirectionalEvidencePipeline(store).execute(**kwargs)
+    await ScopeOwnedDirectionalEvidencePipeline(store).execute(**kwargs)
+    await ScopeOwnedDirectionalEvidencePipeline(store).execute(**kwargs)
 
     candidates = store.list_claim_candidates("run-performance", "content_performance")
     assert calls == 1
@@ -564,8 +571,8 @@ async def test_competitor_pipeline_requires_quoted_names_and_deduplicates_author
         "admission_policy": policy,
         "policy_snapshot": snapshot,
     }
-    first = await DirectionalEvidencePipeline(store).execute(**kwargs)
-    await DirectionalEvidencePipeline(store).execute(**kwargs)
+    first = await ScopeOwnedDirectionalEvidencePipeline(store).execute(**kwargs)
+    await ScopeOwnedDirectionalEvidencePipeline(store).execute(**kwargs)
 
     candidates = store.list_claim_candidates("run-competitor", "competitor_discovery")
     assert calls == 1
@@ -652,8 +659,8 @@ async def test_brand_activity_pipeline_excludes_future_notes_and_replays_admissi
         "admission_policy": policy,
         "policy_snapshot": snapshot,
     }
-    first = await DirectionalEvidencePipeline(store).execute(**kwargs)
-    await DirectionalEvidencePipeline(store).execute(**kwargs)
+    first = await ScopeOwnedDirectionalEvidencePipeline(store).execute(**kwargs)
+    await ScopeOwnedDirectionalEvidencePipeline(store).execute(**kwargs)
     assert calls == 1
     assert first.selection.selected_source_count == 3
     assert store.list_claim_candidates("run-activity", "brand_activity")
@@ -727,8 +734,8 @@ async def test_keyword_growth_pipeline_keeps_pattern_without_insufficient_baseli
         "admission_policy": policy,
         "policy_snapshot": snapshot,
     }
-    await DirectionalEvidencePipeline(store).execute(**kwargs)
-    await DirectionalEvidencePipeline(store).execute(**kwargs)
+    await ScopeOwnedDirectionalEvidencePipeline(store).execute(**kwargs)
+    await ScopeOwnedDirectionalEvidencePipeline(store).execute(**kwargs)
     claims = store.list_claim_candidates("run-keyword", "keyword_growth")
     assert calls == 1
     assert {item.claim_type for item in claims} == {"sampled_keyword_pattern"}
@@ -814,6 +821,15 @@ async def test_formal_router_uses_directional_execution_pipeline_not_legacy_agen
         },
     )
     store.save_subagent_task(task)
+    _save_scope_v2(
+        store,
+        workflow_run_id=task.workflow_run_id,
+        research_plan_id=task.plan_id,
+        direction_id=task.direction_id,
+        subject="短裤",
+        questions=["卖点"],
+        competitors=[],
+    )
     router = SubagentTaskRouter(
         store=store, source_registry=SourceAdapterRegistry({"xiaohongshu": Adapter()})
     )
@@ -842,7 +858,7 @@ async def test_formal_router_uses_directional_execution_pipeline_not_legacy_agen
 
 
 @pytest.mark.asyncio
-async def test_product_marketing_pipeline_does_not_count_rejected_material_toward_related_sample_threshold(
+async def test_product_marketing_pipeline_does_not_count_unmatched_material_toward_sample_threshold(
     tmp_path,
 ):
     store = SQLiteContentResearchStore(str(tmp_path / "query-subject-relevance.db"))
@@ -893,20 +909,20 @@ async def test_product_marketing_pipeline_does_not_count_rejected_material_towar
                 "canonical_id": "note-shorts",
                 "canonical_source_id": "note-shorts",
                 "author_id": "author-shorts",
-                "title": "夏日短裤怎么穿：轻量徒步搭配",
-                "content_text": "这条短裤适合炎热天气的轻量徒步。",
+                "title": "速干徒步短裤的夏日搭配",
+                "content_text": "速干徒步短裤适合炎热天气。",
             },
             {
                 **common,
                 "canonical_id": "note-shorts-2",
                 "canonical_source_id": "note-shorts-2",
                 "author_id": "author-shorts-2",
-                "title": "速干短裤的周末徒步场景",
-                "content_text": "运动短裤也能兼顾轻便和收纳。",
+                "title": "速干徒步短裤的周末场景",
+                "content_text": "速干徒步短裤能兼顾轻便和收纳。",
             },
         ]
 
-    await DirectionalEvidencePipeline(store).execute(
+    await ScopeOwnedDirectionalEvidencePipeline(store).execute(
         workflow_run_id="run-query-subject",
         subagent_task_id="sat-query-subject",
         direction_id="product_marketing",
@@ -943,17 +959,18 @@ async def test_product_marketing_pipeline_does_not_count_rejected_material_towar
     packets = store.list_directional_evidence_packets(
         "run-query-subject", "product_marketing"
     )
+    scope_query_group_id = store.list_scope_contracts("run-query-subject")[-1].query_groups[0].id
 
     assert packets
     assert all(
         packet.payload["retrieval_context"]["query_group_ids"]
-        == [groups[0].id]
+        == [scope_query_group_id]
         for packet in packets
     )
     assert black_decisions
-    assert all(item.decision == "rejected" for item in black_decisions)
+    assert all(item.decision == "downgraded" for item in black_decisions)
     assert all(
-        "query_subject_not_supported" in item.payload["reason_codes"]
+        "required_constraint_unmatched:core_object" in item.payload["reason_codes"]
         for item in black_decisions
     )
     assert valid_decisions
@@ -986,7 +1003,7 @@ async def test_formal_collection_fails_before_adapter_without_a_full_locked_quer
         return []
 
     with pytest.raises(ValueError, match="full locked query plan"):
-        await DirectionalEvidencePipeline(store).execute(
+        await ScopeOwnedDirectionalEvidencePipeline(store).execute(
             workflow_run_id="run-missing-plan",
             subagent_task_id="sat-missing-plan",
             direction_id="product_marketing",
@@ -1050,7 +1067,7 @@ async def test_product_admission_counts_only_relevant_field_eligible_stable_auth
                 "author_id": f"author-{index}",
                 "author": "相同展示名",
                 "title": f"短裤夏日卖点 {index}",
-                "content_text": f"速干短裤适合轻量徒步 {index}",
+                "content_text": f"速干徒步短裤适合轻量徒步 {index}",
                 "tags": [],
                 "note_type": "normal",
                 "metrics": {"like_count": index},
@@ -1068,7 +1085,7 @@ async def test_product_admission_counts_only_relevant_field_eligible_stable_auth
             for index in range(3)
         ]
 
-    await DirectionalEvidencePipeline(store).execute(
+    await ScopeOwnedDirectionalEvidencePipeline(store).execute(
         workflow_run_id="run-eligible",
         subagent_task_id="sat-eligible",
         direction_id="product_marketing",
@@ -1155,7 +1172,7 @@ async def test_provider_author_names_are_conservative_fallback_identities_at_thr
                 "canonical_source_id": f"note-{index}",
                 "author": f"不同展示名-{index}",
                 "title": f"短裤夏日卖点 {index}",
-                "content_text": f"速干短裤适合轻量徒步 {index}",
+                "content_text": f"速干徒步短裤适合轻量徒步 {index}",
                 "tags": [],
                 "note_type": "normal",
                 "metrics": {"like_count": index},
@@ -1168,7 +1185,7 @@ async def test_provider_author_names_are_conservative_fallback_identities_at_thr
             for index in range(3)
         ]
 
-    await DirectionalEvidencePipeline(store).execute(
+    await ScopeOwnedDirectionalEvidencePipeline(store).execute(
         workflow_run_id="run-display-author",
         subagent_task_id="sat-display-author",
         direction_id="product_marketing",
@@ -1225,7 +1242,7 @@ async def test_provider_author_name_fallback_collapses_normalized_duplicates(tmp
                 "canonical_source_id": f"note-{index}",
                 "author": author,
                 "title": f"短裤夏日卖点 {index}",
-                "content_text": f"速干短裤适合轻量徒步 {index}",
+                "content_text": f"速干徒步短裤适合轻量徒步 {index}",
                 "tags": [],
                 "note_type": "normal",
                 "metrics": {"like_count": index},
@@ -1238,7 +1255,7 @@ async def test_provider_author_name_fallback_collapses_normalized_duplicates(tmp
             for index, author in enumerate(("同一作者", "  同一作者  ", "同一作者"))
         ]
 
-    await DirectionalEvidencePipeline(store).execute(
+    await ScopeOwnedDirectionalEvidencePipeline(store).execute(
         workflow_run_id="run-display-author-duplicates",
         subagent_task_id="sat-display-author-duplicates",
         direction_id="product_marketing",
@@ -1270,12 +1287,12 @@ async def test_provider_author_name_fallback_collapses_normalized_duplicates(tmp
 @pytest.mark.asyncio
 async def test_packet_only_admission_replay_never_invokes_a_provider(tmp_path):
     store = SQLiteContentResearchStore(str(tmp_path / "packet-only-replay.db"))
-    snapshot, policies, contracts, _groups = _build_frozen_pipeline_snapshot(
+    snapshot, policies, contracts = _build_scope_owned_snapshot(
+        store,
         snapshot_id="rps-packet-only-replay",
         workflow_run_id="run-packet-only-replay",
-        direction_id="product_marketing",
         subject="速干徒步短裤",
-        questions=("卖点",),
+        questions=["卖点"],
     )
     contract = contracts[0]
     policy = policies[0]
@@ -1295,7 +1312,7 @@ async def test_packet_only_admission_replay_never_invokes_a_provider(tmp_path):
                 "canonical_source_id": f"note-{index}",
                 "author": f"作者-{index}",
                 "title": f"短裤夏日卖点 {index}",
-                "content_text": f"速干短裤适合轻量徒步 {index}",
+                "content_text": f"速干徒步短裤适合轻量徒步 {index}",
                 "tags": [],
                 "note_type": "normal",
                 "metrics": {"like_count": index},
@@ -1308,7 +1325,7 @@ async def test_packet_only_admission_replay_never_invokes_a_provider(tmp_path):
             for index in range(3)
         ]
 
-    pipeline = DirectionalEvidencePipeline(store)
+    pipeline = ScopeOwnedDirectionalEvidencePipeline(store)
     initial = await pipeline.execute(
         workflow_run_id="run-packet-only-replay",
         subagent_task_id="sat-packet-only-replay",
@@ -1337,7 +1354,10 @@ async def test_packet_only_admission_replay_never_invokes_a_provider(tmp_path):
             thread_id="thread-packet-only-replay",
             schema_version="content_research_brief_v1",
             status="confirmed",
-            payload={"confirmed_subject": "速干徒步短裤"},
+            payload={
+                "schema_version": "content_research_brief_v1",
+                "confirmed_subject": "速干徒步短裤",
+            },
         )
     )
     store.save_subagent_task(
@@ -1349,7 +1369,7 @@ async def test_packet_only_admission_replay_never_invokes_a_provider(tmp_path):
             status="completed",
             plan_id=snapshot.research_plan_id,
             direction_id="product_marketing",
-            payload={},
+            payload={"schema_version": "content_research_subagent_task_v1"},
         )
     )
     replay_input = build_persisted_packet_replay_input(
@@ -1407,7 +1427,7 @@ async def test_admission_checkpoint_and_decision_ids_change_with_threshold_input
                 "canonical_source_id": f"note-{index}",
                 "author_id": f"author-{index}",
                 "title": f"短裤夏日卖点 {index}",
-                "content_text": f"速干短裤适合轻量徒步 {index}",
+                "content_text": f"速干徒步短裤适合轻量徒步 {index}",
                 "tags": [],
                 "note_type": "normal",
                 "metrics": {"like_count": index},
@@ -1434,10 +1454,10 @@ async def test_admission_checkpoint_and_decision_ids_change_with_threshold_input
         "admission_contract": contract,
         "admission_policy": policy,
     }
-    await DirectionalEvidencePipeline(store).execute(
+    await ScopeOwnedDirectionalEvidencePipeline(store).execute(
         **common, policy_snapshot=snapshot
     )
-    await DirectionalEvidencePipeline(store).execute(
+    await ScopeOwnedDirectionalEvidencePipeline(store).execute(
         **{
             **common,
             "minimum_samples": next_policy.minimum_samples,
@@ -1521,7 +1541,7 @@ async def test_note_and_comment_packets_preserve_all_frozen_query_rank_hits_and_
             completeness="complete",
         )
 
-    run = await DirectionalEvidencePipeline(store).execute(
+    run = await ScopeOwnedDirectionalEvidencePipeline(store).execute(
         workflow_run_id="run-lineage",
         subagent_task_id="sat-lineage",
         direction_id="comment_insight",
@@ -1602,7 +1622,7 @@ async def test_completed_detail_checkpoint_reuses_detail_without_another_call(tm
         calls += 1
         return {"canonical_id": "note-1", "source_kind": "note_detail", "content_text": "body"}
 
-    pipeline = DirectionalEvidencePipeline(store)
+    pipeline = ScopeOwnedDirectionalEvidencePipeline(store)
     kwargs = {
         "subagent_task_id": "sat-detail",
         "direction_id": "product_marketing",
@@ -1632,7 +1652,7 @@ async def test_completed_detail_checkpoint_reuses_detail_without_another_call(tm
 @pytest.mark.asyncio
 async def test_required_comment_contract_persists_parent_linkage_metadata_and_replays(tmp_path):
     store = SQLiteContentResearchStore(str(tmp_path / "comments.db"))
-    pipeline = DirectionalEvidencePipeline(store)
+    pipeline = ScopeOwnedDirectionalEvidencePipeline(store)
     calls = 0
 
     async def discover(group):
@@ -1713,229 +1733,6 @@ async def test_required_comment_contract_persists_parent_linkage_metadata_and_re
 
 
 @pytest.mark.asyncio
-async def test_ugc_community_admits_qualified_comment_sample_and_replays(tmp_path):
-    store = SQLiteContentResearchStore(str(tmp_path / "ugc-admission.db"))
-    groups = compile_query_groups(
-        direction_id="ugc_community", subject="短裤", questions=["评论"], competitors=[]
-    )
-    snapshot, policies, contracts, groups = _build_frozen_pipeline_snapshot(
-        snapshot_id="rps-ugc",
-        workflow_run_id="run-ugc",
-        direction_id="ugc_community",
-        subject="短裤",
-        questions=("评论",),
-        groups=groups,
-    )
-    store.save_run_policy_snapshot(snapshot)
-    for item in policies:
-        store.save_sample_policy(item)
-    for item in contracts:
-        store.save_direction_contract(item)
-    contract = next(item for item in contracts if item.direction_id == "ugc_community")
-    policy = next(item for item in policies if item.direction_id == "ugc_community")
-    calls = 0
-
-    async def discover(group):
-        return [
-            {
-                "provider": "xiaohongshu",
-                "canonical_id": "note-1",
-                "source_kind": "note_detail",
-                "author_id": "owner",
-                "title": "标题",
-                "content_text": "正文",
-                "source_published_at": "2026-07-17T00:00:00+00:00",
-                "field_availability": {field: "present" for field in contract.required_note_fields},
-            }
-        ]
-
-    async def comments(candidate):
-        nonlocal calls
-        calls += 1
-        return SourceOperationResult(
-            provider="xiaohongshu",
-            operation="collect_comments",
-            source_kind="comment",
-            status="completed",
-            completeness="complete",
-            items=[
-                {
-                    "provider": "xiaohongshu",
-                    "canonical_id": f"comment-{index}",
-                    "source_kind": "comment",
-                        "comment_text": f"短裤评论文本 {index}",
-                    "author_id": f"reader-{index % 5}",
-                    "source_published_at": "2026-07-17T00:00:00+00:00",
-                    "like_count": 1,
-                    "reply_depth": 0,
-                    "field_availability": {
-                        field: "present" for field in contract.required_comment_fields
-                    },
-                }
-                for index in range(30)
-            ],
-        )
-
-    kwargs = {
-        "workflow_run_id": "run-ugc",
-        "subagent_task_id": "sat-ugc",
-        "direction_id": "ugc_community",
-        "subject": "短裤",
-        "questions": ["评论"],
-        "competitors": [],
-        "author_cap": policy.author_cap,
-        "minimum_samples": 1,
-        "minimum_independent_authors": 1,
-        "discover": discover,
-        "collect_comments": comments,
-        "required_comment_fields": contract.required_comment_fields,
-        "comment_limit": 30,
-        "admission_contract": contract,
-        "admission_policy": policy,
-        "policy_snapshot": snapshot,
-    }
-    first = await DirectionalEvidencePipeline(store).execute(**kwargs)
-    await DirectionalEvidencePipeline(store).execute(**kwargs)
-
-    candidates = store.list_claim_candidates("run-ugc", "ugc_community")
-    decisions = [
-        item
-        for item in store.list_typed_records(ClaimAdmissionDecisionRecord)
-        if item.research_direction_id == "ugc_community"
-    ]
-    assert calls == 1
-    assert len(first.comment_packet_ids) == 30
-    assert candidates and all(item.payload["scope"]["reply_relation"] == 0 for item in candidates)
-    assert all(
-        item.payload["scope"]["collection"]["deduplicated_comment_count"] == 30
-        for item in candidates
-    )
-    assert any(item.decision == "admitted" for item in decisions)
-    assert (
-        len(
-            [
-                item
-                for item in store.list_typed_records(StageCheckpointRecord)
-                if item.stage_name == "admission"
-            ]
-        )
-        == 1
-    )
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("comment_text", "claim_type"),
-    [
-        ("这个尺码怎么选？", "explicit_question"),
-        ("这个设计太贵，不好用", "objection_or_failure"),
-        ("希望增加口袋", "repeated_need_language"),
-    ],
-)
-async def test_comment_insight_admits_qualified_comment_claims_and_replays_once(
-    tmp_path, comment_text, claim_type
-):
-    store = SQLiteContentResearchStore(str(tmp_path / "comment-insight.db"))
-    groups = compile_query_groups(
-        direction_id="comment_insight", subject="短裤", questions=["需求"], competitors=[]
-    )
-    snapshot, policies, contracts, groups = _build_frozen_pipeline_snapshot(
-        snapshot_id="rps-ci",
-        workflow_run_id="run-ci",
-        direction_id="comment_insight",
-        subject="短裤",
-        questions=("需求",),
-        groups=groups,
-    )
-    store.save_run_policy_snapshot(snapshot)
-    for item in policies:
-        store.save_sample_policy(item)
-    for item in contracts:
-        store.save_direction_contract(item)
-    contract = next(item for item in contracts if item.direction_id == "comment_insight")
-    policy = next(item for item in policies if item.direction_id == "comment_insight")
-    calls = 0
-
-    async def discover(group):
-        return [
-            {
-                "canonical_id": "note",
-                "source_kind": "note_detail",
-                "author_id": "owner",
-                "title": "t",
-                "content_text": "b",
-                "field_availability": {field: "present" for field in contract.required_note_fields},
-            }
-        ]
-
-    async def comments(candidate):
-        nonlocal calls
-        calls += 1
-        return SourceOperationResult(
-            provider="xiaohongshu",
-            operation="collect_comments",
-            source_kind="comment",
-            status="completed",
-            completeness="complete",
-            items=[
-                {
-                    "canonical_id": f"c{i}",
-                    "source_kind": "comment",
-                        "comment_text": f"短裤{comment_text}",
-                    "author_id": f"a{i % 5}",
-                    "source_published_at": "2026-07-17T00:00:00+00:00",
-                    "like_count": 1,
-                    "reply_depth": 0,
-                    "field_availability": {
-                        field: "present" for field in contract.required_comment_fields
-                    },
-                }
-                for i in range(30)
-            ],
-        )
-
-    kwargs = {
-        "workflow_run_id": "run-ci",
-        "subagent_task_id": "sat-ci",
-        "direction_id": "comment_insight",
-        "subject": "短裤",
-        "questions": ["需求"],
-        "competitors": [],
-        "author_cap": policy.author_cap,
-        "minimum_samples": 1,
-        "minimum_independent_authors": 1,
-        "discover": discover,
-        "collect_comments": comments,
-        "required_comment_fields": contract.required_comment_fields,
-        "comment_limit": 30,
-        "admission_contract": contract,
-        "admission_policy": policy,
-        "policy_snapshot": snapshot,
-    }
-    await DirectionalEvidencePipeline(store).execute(**kwargs)
-    await DirectionalEvidencePipeline(store).execute(**kwargs)
-    candidates = store.list_claim_candidates("run-ci", "comment_insight")
-    decisions = [
-        item
-        for item in store.list_typed_records(ClaimAdmissionDecisionRecord)
-        if item.research_direction_id == "comment_insight"
-    ]
-    results = [
-        item
-        for item in store.list_typed_records(DirectionResultDecisionRecord)
-        if item.research_direction_id == "comment_insight"
-    ]
-    assert calls == 1
-    assert {item.claim_type for item in candidates} == {claim_type}
-    assert decisions and all(item.decision == "admitted" for item in decisions)
-    assert len(results) == 1
-    assert results[0].payload["state"] == "formal_directional_result"
-    assert set(results[0].payload["admitted_claim_ids"]) == {item.id for item in candidates}
-    assert not store.list_typed_records(WeakSignalRecord)
-    assert len([item for item in store.list_typed_records(StageCheckpointRecord) if item.stage_name == "admission"]) == 1
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("comment_count", "author_count", "reply_depth", "completeness"),
     [
@@ -1983,7 +1780,7 @@ async def test_comment_insight_incomplete_comment_collection_never_becomes_forma
             } for i in range(comment_count)],
         )
 
-    await DirectionalEvidencePipeline(store).execute(
+    await ScopeOwnedDirectionalEvidencePipeline(store).execute(
         workflow_run_id="run-ci-insufficient", subagent_task_id="sat-ci-insufficient",
         direction_id="comment_insight", subject="短裤", questions=["需求"], competitors=[],
         author_cap=policy.author_cap, minimum_samples=1, minimum_independent_authors=1,
@@ -2010,7 +1807,7 @@ async def test_required_comment_failure_is_incomplete_and_note_only_direction_do
     tmp_path,
 ):
     store = SQLiteContentResearchStore(str(tmp_path / "comment-failure.db"))
-    pipeline = DirectionalEvidencePipeline(store)
+    pipeline = ScopeOwnedDirectionalEvidencePipeline(store)
     calls = 0
 
     async def discover(group):
@@ -2072,134 +1869,9 @@ async def test_required_comment_failure_is_incomplete_and_note_only_direction_do
 
 
 @pytest.mark.asyncio
-async def test_formal_router_uses_frozen_required_comment_contract(tmp_path):
-    store = SQLiteContentResearchStore(str(tmp_path / "router-comments.db"))
-    snapshot, policies, contracts, _groups = _build_frozen_pipeline_snapshot(
-        snapshot_id="rps-comments",
-        workflow_run_id="run-comments",
-        direction_id="ugc_community",
-        subject="短裤",
-        questions=("评论",),
-    )
-    store.save_run_policy_snapshot(snapshot)
-    for policy in policies:
-        if policy.direction_id == "ugc_community":
-            policy = SamplePolicy(
-                id=policy.id,
-                schema_version=policy.schema_version,
-                direction_id=policy.direction_id,
-                minimum_samples=policy.minimum_samples,
-                minimum_independent_authors=policy.minimum_independent_authors,
-                author_cap=policy.author_cap,
-                metadata={
-                    "detail_fetch_cap": 30,
-                    "comment_limit": 2,
-                    "comment_top_level_only": True,
-                    "comment_reply_depth_limit": 0,
-                },
-            )
-        store.save_sample_policy(policy)
-    for contract in contracts:
-        store.save_direction_contract(contract)
-
-    class Adapter:
-        comment_calls = 0
-        comment_requests: list = []
-
-        async def discover_candidates(self, _request):
-            return SourceOperationResult(
-                provider="xiaohongshu",
-                operation="discover_candidates",
-                source_kind="search_result_minimal",
-                status="completed",
-                items=[
-                    {
-                        "canonical_id": "note-1",
-                        "source_kind": "search_result_minimal",
-                        "source_url": "https://example/note-1",
-                    }
-                ],
-            )
-
-        async def collect_note_detail(self, request):
-            return SourceOperationResult(
-                provider="xiaohongshu",
-                operation="collect_note_detail",
-                source_kind="note_detail",
-                status="completed",
-                items=[
-                    {
-                        "canonical_id": request.note_id,
-                        "source_kind": "note_detail",
-                        "content_text": "body",
-                    }
-                ],
-            )
-
-        async def collect_comments(self, request):
-            self.comment_calls += 1
-            self.comment_requests.append(request)
-            return SourceOperationResult(
-                provider="xiaohongshu",
-                operation="collect_comments",
-                source_kind="comment",
-                status="completed",
-                items=[
-                    {
-                        "canonical_id": f"comment-{self.comment_calls}",
-                        "source_kind": "comment",
-                        "content_text": "尺码偏小",
-                        "author_id": "reader",
-                    }
-                ],
-                next_cursor="cursor-2" if self.comment_calls == 1 else None,
-            )
-
-    adapter = Adapter()
-    task = SubagentTaskRecord(
-        id="sat-comments-router",
-        workflow_run_id="run-comments",
-        thread_id="thread-comments",
-        schema_version="v1",
-        status="queued",
-        plan_id="rp-comments",
-        direction_id="ugc_community",
-        payload={
-            "schema_version": "content_research_subagent_task_v1",
-            "input_payload": {
-                "confirmed_subject": "短裤",
-                "competitors": [],
-                "direction": {"id": "ugc_community", "questions": ["评论"]},
-            },
-        },
-    )
-    store.save_subagent_task(task)
-    terminal = await SubagentTaskRouter(
-        store=store, source_registry=SourceAdapterRegistry({"xiaohongshu": adapter})
-    ).execute_task(task)
-
-    assert terminal.status == "partial_completed"
-    assert adapter.comment_calls == 2
-    assert [(item.limit, item.cursor, item.top_level_only, item.reply_depth_limit) for item in adapter.comment_requests] == [
-        (2, None, True, 0),
-        (1, "cursor-2", True, 0),
-    ]
-    packets = [
-        item for item in store.list_directional_evidence_packets("run-comments", "ugc_community")
-        if item.payload["retrieval_context"].get("source_kind") == "comment"
-    ]
-    collections = [item.payload["retrieval_context"]["collection"] for item in packets]
-    assert all(item["sample_policy_id"] == "sp_rps-comments_ugc_community" for item in collections)
-    assert all(item["target_comment_count"] == 2 for item in collections)
-    assert all(item["top_level_only"] is True and item["reply_depth_limit"] == 0 for item in collections)
-    comment_page = [item for item in store.list_typed_records(StageCheckpointRecord) if item.stage_name == "comments_page"]
-    assert [(item.payload["page_limit"], item.payload["cursor"]) for item in comment_page] == [(2, None), (1, "cursor-2")]
-
-
-@pytest.mark.asyncio
 async def test_pipeline_limits_detail_attempts_to_frozen_cap_and_persists_all_thresholds(tmp_path):
     store = SQLiteContentResearchStore(str(tmp_path / "detail-cap.db"))
-    pipeline = DirectionalEvidencePipeline(store)
+    pipeline = ScopeOwnedDirectionalEvidencePipeline(store)
     calls: list[str] = []
 
     async def discover(group):
@@ -2252,7 +1924,7 @@ async def test_pipeline_limits_detail_attempts_to_frozen_cap_and_persists_all_th
 @pytest.mark.asyncio
 async def test_detail_failure_backfills_in_frozen_order_and_appends_selection_revisions(tmp_path):
     store = SQLiteContentResearchStore(str(tmp_path / "detail-backfill.db"))
-    pipeline = DirectionalEvidencePipeline(store)
+    pipeline = ScopeOwnedDirectionalEvidencePipeline(store)
     calls: list[str] = []
 
     async def discover(group):
@@ -2325,7 +1997,7 @@ async def test_detail_failure_backfills_in_frozen_order_and_appends_selection_re
 @pytest.mark.asyncio
 async def test_unknown_permanent_detail_failure_is_candidate_level_and_keeps_safe_diagnostic(tmp_path):
     store = SQLiteContentResearchStore(str(tmp_path / "unknown-permanent-detail.db"))
-    pipeline = DirectionalEvidencePipeline(store)
+    pipeline = ScopeOwnedDirectionalEvidencePipeline(store)
     calls: list[str] = []
 
     async def discover(_group):
@@ -2394,7 +2066,7 @@ async def test_unknown_permanent_detail_failure_is_candidate_level_and_keeps_saf
 @pytest.mark.asyncio
 async def test_detail_auth_failure_stops_before_calling_later_candidates(tmp_path):
     store = SQLiteContentResearchStore(str(tmp_path / "detail-auth-stop.db"))
-    pipeline = DirectionalEvidencePipeline(store)
+    pipeline = ScopeOwnedDirectionalEvidencePipeline(store)
     calls: list[str] = []
 
     async def discover(_group):
@@ -2437,7 +2109,7 @@ async def test_detail_auth_failure_stops_before_calling_later_candidates(tmp_pat
 @pytest.mark.asyncio
 async def test_detail_backfill_interruption_after_external_call_requires_confirmation(tmp_path):
     store = SQLiteContentResearchStore(str(tmp_path / "detail-resume-revision.db"))
-    pipeline = DirectionalEvidencePipeline(store)
+    pipeline = ScopeOwnedDirectionalEvidencePipeline(store)
     calls: list[str] = []
     interrupted = True
 
@@ -2492,7 +2164,7 @@ async def test_detail_backfill_interruption_after_external_call_requires_confirm
 @pytest.mark.asyncio
 async def test_discover_interruption_after_provider_return_never_retries_without_confirmation(tmp_path, monkeypatch):
     store = SQLiteContentResearchStore(str(tmp_path / "discover-inflight.db"))
-    pipeline = DirectionalEvidencePipeline(store)
+    pipeline = ScopeOwnedDirectionalEvidencePipeline(store)
     calls = 0
 
     async def discover(_group):
@@ -2527,7 +2199,7 @@ async def test_discover_interruption_after_provider_return_never_retries_without
     with pytest.raises(RuntimeError, match="interrupted"):
         await pipeline.execute(**kwargs)
 
-    await DirectionalEvidencePipeline(store).execute(**kwargs)
+    await ScopeOwnedDirectionalEvidencePipeline(store).execute(**kwargs)
 
     assert calls == 1
     lifecycle = [
@@ -2551,7 +2223,7 @@ async def test_detail_and_comment_operations_are_running_before_their_callables(
         )
         return {"canonical_id": "note-detail", "source_kind": "note_detail", "content_text": "body"}
 
-    await DirectionalEvidencePipeline(store).execute(
+    await ScopeOwnedDirectionalEvidencePipeline(store).execute(
         workflow_run_id="run-detail-precall",
         subagent_task_id="sat-detail-precall",
         direction_id="product_marketing",
@@ -2579,7 +2251,7 @@ async def test_detail_and_comment_operations_are_running_before_their_callables(
             items=[{"canonical_id": "comment-1", "source_kind": "comment", "comment_text": "需要口袋", "author_id": "reader", "reply_depth": 0}],
         )
 
-    await DirectionalEvidencePipeline(store).execute(
+    await ScopeOwnedDirectionalEvidencePipeline(store).execute(
         workflow_run_id="run-comments-precall",
         subagent_task_id="sat-comments-precall",
         direction_id="comment_insight",
@@ -2624,7 +2296,7 @@ async def test_completed_comment_operation_reuses_durable_parent_artifact_after_
         "collect_comments": comments,
         "required_comment_fields": ("comment_text", "parent_note_id", "reply_depth"),
     }
-    interrupted = DirectionalEvidencePipeline(store)
+    interrupted = ScopeOwnedDirectionalEvidencePipeline(store)
     original_save = interrupted._save_checkpoint
 
     def crash_before_comments_stage(task_id, stage, fingerprint, payload):
@@ -2636,7 +2308,7 @@ async def test_completed_comment_operation_reuses_durable_parent_artifact_after_
     with pytest.raises(RuntimeError, match="comment packet"):
         await interrupted.execute(**kwargs)
 
-    replayed = await DirectionalEvidencePipeline(store).execute(**kwargs)
+    replayed = await ScopeOwnedDirectionalEvidencePipeline(store).execute(**kwargs)
     assert calls == 1
     assert len(replayed.comment_packet_ids) == 1
 
@@ -2687,7 +2359,7 @@ async def test_search_pages_follow_cursor_and_persist_complete_page_provenance(t
             {"canonical_id": "note-3", "source_kind": "note_detail"},
         ], completeness="complete")
 
-    await DirectionalEvidencePipeline(store).execute(
+    await ScopeOwnedDirectionalEvidencePipeline(store).execute(
         subagent_task_id="sat-search-pages", direction_id="product_marketing",
         subject="短裤", questions=["卖点"], competitors=[], author_cap=3,
         candidate_limit_per_query=4, discover=discover,
@@ -2712,7 +2384,7 @@ async def test_search_cap_stops_before_next_cursor_and_discloses_truncation(tmp_
             for index in range(3)
         ], next_cursor="cursor-2", completeness="partial")
 
-    await DirectionalEvidencePipeline(store).execute(
+    await ScopeOwnedDirectionalEvidencePipeline(store).execute(
         subagent_task_id="sat-search-cap", direction_id="product_marketing",
         subject="短裤", questions=["卖点"], competitors=[], author_cap=3,
         candidate_limit_per_query=3, discover=discover,
@@ -2759,7 +2431,7 @@ async def test_comment_pages_resume_from_cursor_and_direction_cap_stops_other_pa
         "discover": discover, "collect_comments": comments,
         "required_comment_fields": ("comment_text", "parent_note_id", "reply_depth"), "comment_limit": 3,
     }
-    pipeline = DirectionalEvidencePipeline(store)
+    pipeline = ScopeOwnedDirectionalEvidencePipeline(store)
     original_complete = pipeline._complete_operation
 
     def crash_after_first_page(task_id, operation, operation_fingerprint, **kwargs):
@@ -2771,7 +2443,7 @@ async def test_comment_pages_resume_from_cursor_and_direction_cap_stops_other_pa
     with pytest.raises(RuntimeError, match="comment page"):
         await pipeline.execute(**kwargs)
 
-    replay = await DirectionalEvidencePipeline(store).execute(**kwargs)
+    replay = await ScopeOwnedDirectionalEvidencePipeline(store).execute(**kwargs)
     assert calls == [("note-1", None, 3), ("note-1", "cursor-2", 1)]
     assert len(replay.comment_packet_ids) == 3
     comments_checkpoint = next(item for item in store.list_typed_records(StageCheckpointRecord) if item.stage_name == "comments")

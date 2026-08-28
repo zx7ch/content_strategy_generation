@@ -13,6 +13,9 @@ WORKFLOW_ACTION_RESPONSE_SCHEMA_VERSION = "content_research_workflow_action_resp
 P0_WORKFLOW_ACTIONS = (
     "cancel",
     "retry_presearch",
+    "retry_analysis",
+    "retry_report",
+    "repair_publication",
     "revise_subject",
     "confirm_brief",
     "replace_scope_draft",
@@ -227,6 +230,8 @@ class ContentResearchExecutionUnitTraceResponse(BaseModel):
 class ContentResearchTraceResponse(BaseModel):
     schema_version: str = CONTENT_RESEARCH_API_SCHEMA_VERSION
     workflow_run_id: str
+    trace_revision: int = Field(ge=1)
+    effective_attempt: dict | None = None
     state: str | None = None
     state_revision: int | None = None
     state_transitions: list[dict] = Field(default_factory=list)

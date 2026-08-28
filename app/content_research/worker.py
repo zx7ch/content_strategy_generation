@@ -6,8 +6,12 @@ import asyncio
 import logging
 import uuid
 from collections.abc import Callable
-from datetime import datetime
+from datetime import datetime, timedelta
 
+from app.content_research.analysis_persistence import (
+    AnalysisLeaseFencedError,
+    SQLiteMarketingAnalysisRepository,
+)
 from app.content_research.api_schemas import ContentResearchSourceCollectionRequest
 from app.content_research.async_dispatch import (
     AsyncFormalResearchDispatchRepository,
@@ -92,7 +96,14 @@ class ContentResearchDispatchWorker:
                 lease_owner=self._owner,
                 lease_token=str(job["lease_token"]),
             )
-            if not self._recover_interrupted_tasks(dispatch_context):
+            # This repository check uses the synchronous SQLite store.  Run it
+            # off the event loop so a concurrent idempotent confirm request can
+            # finish and release its transaction instead of deadlocking behind
+            # this connection's busy timeout.
+            recovered = await asyncio.to_thread(
+                self._recover_interrupted_tasks, dispatch_context
+            )
+            if not recovered:
                 lease_lost.set()
                 return True
             service = self._service_factory()
@@ -353,6 +364,183 @@ class ContentResearchDispatchWorker:
                 self._wake_event.clear()
                 # Closing the clear/wait race matters: a confirmed job may be
                 # committed between the empty claim and `clear()`.
+                if await self.run_once():
+                    continue
+                try:
+                    await asyncio.wait_for(
+                        self._wake_event.wait(), timeout=self._recovery_scan_seconds
+                    )
+                except asyncio.TimeoutError:
+                    pass
+
+
+class ContentResearchAnalysisWorker:
+    """Claims durable analysis attempts independently from retrieval work."""
+
+    def __init__(
+        self,
+        *,
+        store: SQLiteContentResearchStore,
+        service_factory: Callable[[], ContentResearchService],
+        wake_event: asyncio.Event | None = None,
+        recovery_scan_seconds: float = 5.0,
+        lease_seconds: int = 120,
+        clock: Callable[[], datetime] = utcnow,
+    ) -> None:
+        self._repository = SQLiteMarketingAnalysisRepository(store._db_path)
+        self._service_factory = service_factory
+        self._wake_event = wake_event or asyncio.Event()
+        self._recovery_scan_seconds = recovery_scan_seconds
+        self._lease_seconds = lease_seconds
+        self._clock = clock
+        self._owner = f"content-research-analysis-worker:{uuid.uuid4().hex}"
+
+    async def run_once(self) -> bool:
+        expired = await asyncio.to_thread(
+            self._repository.list_expired_analysis_jobs,
+            now=self._clock(),
+        )
+        if expired:
+            service = self._service_factory()
+            for attempt in expired:
+                context = await asyncio.to_thread(
+                    self._repository.get_analysis_job_context,
+                    attempt.analysis_unit_id,
+                )
+                if context is not None:
+                    await service.record_analysis_failure(
+                        context.workflow_run_id,
+                        "analysis_lease_expired",
+                        attempt_id=attempt.id,
+                        lease_token=attempt.lease_token,
+                        allow_expired_lease=True,
+                    )
+            return True
+        token = uuid.uuid4().hex
+        claim = await asyncio.to_thread(
+            self._repository.claim_next_analysis_job,
+            lease_owner=self._owner,
+            lease_token=token,
+            lease_expires_at=self._clock()
+            + timedelta(seconds=self._lease_seconds),
+            now=self._clock(),
+        )
+        if claim is None:
+            return False
+        lease_stop = asyncio.Event()
+        lease_lost = asyncio.Event()
+        heartbeat = asyncio.create_task(
+            self._heartbeat(
+                attempt_id=claim.attempt.id,
+                token=token,
+                stop_event=lease_stop,
+                lease_lost=lease_lost,
+            )
+        )
+        error: Exception | None = None
+        service = self._service_factory()
+        try:
+            await service.execute_claimed_analysis(claim)
+        except Exception as exc:  # durable attempt owns the safe diagnostic
+            error = exc
+            logger.exception(
+                "content research analysis failed",
+                extra={"workflow_run_id": claim.context.workflow_run_id},
+            )
+        finally:
+            lease_stop.set()
+            await heartbeat
+        current = None
+        if lease_lost.is_set():
+            current, effective = await asyncio.gather(
+                asyncio.to_thread(
+                    self._repository.get_analysis_attempt, claim.attempt.id
+                ),
+                asyncio.to_thread(
+                    self._repository.get_effective_attempt_for_run,
+                    claim.context.workflow_run_id,
+                ),
+            )
+            terminal_failure_is_authoritative = (
+                error is not None
+                and current is not None
+                and current.state in {"running", "failed", "succeeded"}
+                and effective is not None
+                and effective.id == claim.attempt.id
+                and (
+                    current.state in {"failed", "succeeded"}
+                    or current.lease_token == token
+                )
+            )
+            if not terminal_failure_is_authoritative:
+                logger.error(
+                    "content research analysis lease lost; suppressing stale terminal write",
+                    extra={"workflow_run_id": claim.context.workflow_run_id},
+                )
+                return True
+            logger.info(
+                "content research analysis terminal failure remains authoritative",
+                extra={"workflow_run_id": claim.context.workflow_run_id},
+            )
+        if error is not None:
+            if current is None:
+                current = await asyncio.to_thread(
+                    self._repository.get_analysis_attempt, claim.attempt.id
+                )
+            if current is not None and current.state == "succeeded":
+                # Analysis is immutable once succeeded.  A later composer,
+                # audit, or materializer error belongs to report recovery and
+                # must not rewrite the successful attempt as failed.
+                await service.record_report_finalization_failure(
+                    claim.context.workflow_run_id,
+                    error,
+                )
+            else:
+                await service.record_analysis_failure(
+                    claim.context.workflow_run_id,
+                    error,
+                    attempt_id=claim.attempt.id,
+                    lease_token=token,
+                )
+        return True
+
+    async def _heartbeat(
+        self,
+        *,
+        attempt_id: str,
+        token: str,
+        stop_event: asyncio.Event,
+        lease_lost: asyncio.Event,
+    ) -> None:
+        interval = max(1.0, self._lease_seconds / 3)
+        while True:
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=interval)
+                return
+            except asyncio.TimeoutError:
+                pass
+            try:
+                await asyncio.to_thread(
+                    self._repository.renew_analysis_attempt,
+                    attempt_id,
+                    lease_token=token,
+                    lease_expires_at=self._clock()
+                    + timedelta(seconds=self._lease_seconds),
+                    now=self._clock(),
+                )
+            except AnalysisLeaseFencedError:
+                lease_lost.set()
+                return
+
+    async def run_loop(self, *, stop_event: asyncio.Event) -> None:
+        while not stop_event.is_set():
+            try:
+                processed = await self.run_once()
+            except Exception:
+                logger.exception("content research analysis poll failed")
+                processed = False
+            if not processed:
+                self._wake_event.clear()
                 if await self.run_once():
                     continue
                 try:

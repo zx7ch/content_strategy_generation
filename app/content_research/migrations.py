@@ -1498,6 +1498,284 @@ def _apply_0033(conn: sqlite3.Connection) -> None:
         _add_columns(conn, _V33_WORKFLOW_RUN_COLUMNS)
 
 
+_V34_MARKETING_ANALYSIS_IDENTITY_SQL = """
+CREATE TABLE content_research_evidence_snapshots (
+    id TEXT PRIMARY KEY,
+    schema_version TEXT NOT NULL,
+    workflow_run_id TEXT NOT NULL,
+    scope_contract_id TEXT NOT NULL,
+    retrieval_execution_unit_id TEXT NOT NULL,
+    retrieval_attempt_no INTEGER NOT NULL CHECK(retrieval_attempt_no >= 1),
+    snapshot_fingerprint TEXT NOT NULL,
+    query_groups_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(retrieval_execution_unit_id, retrieval_attempt_no)
+);
+CREATE INDEX idx_cr_evidence_snapshot_run_created
+    ON content_research_evidence_snapshots(workflow_run_id, created_at, id);
+CREATE TABLE content_research_evidence_snapshot_notes (
+    snapshot_id TEXT NOT NULL,
+    note_id TEXT NOT NULL,
+    account_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+    title_hash TEXT NOT NULL,
+    body_hash TEXT NOT NULL,
+    source_url TEXT NOT NULL,
+    captured_at TEXT NOT NULL,
+    query_provenance_json TEXT NOT NULL,
+    PRIMARY KEY(snapshot_id, note_id),
+    FOREIGN KEY(snapshot_id) REFERENCES content_research_evidence_snapshots(id)
+);
+CREATE INDEX idx_cr_evidence_snapshot_note_account
+    ON content_research_evidence_snapshot_notes(snapshot_id, account_id, note_id);
+CREATE TABLE content_research_analysis_units (
+    id TEXT PRIMARY KEY,
+    schema_version TEXT NOT NULL,
+    workflow_run_id TEXT NOT NULL,
+    evidence_snapshot_id TEXT NOT NULL,
+    contract_fingerprint TEXT NOT NULL,
+    policy_version TEXT NOT NULL,
+    prompt_hash TEXT NOT NULL,
+    response_schema_hash TEXT NOT NULL,
+    embedding_fingerprint_json TEXT NOT NULL,
+    algorithm_version TEXT NOT NULL,
+    verifier_version TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(evidence_snapshot_id, contract_fingerprint),
+    FOREIGN KEY(evidence_snapshot_id) REFERENCES content_research_evidence_snapshots(id)
+);
+CREATE INDEX idx_cr_analysis_unit_run_created
+    ON content_research_analysis_units(workflow_run_id, created_at, id);
+CREATE TABLE content_research_analysis_attempts (
+    id TEXT PRIMARY KEY,
+    analysis_unit_id TEXT NOT NULL,
+    attempt_no INTEGER NOT NULL CHECK(attempt_no >= 1),
+    state TEXT NOT NULL CHECK(state IN ('queued', 'running', 'succeeded', 'failed', 'cancelled')),
+    successor_of_attempt_id TEXT,
+    lease_owner TEXT,
+    lease_token TEXT,
+    lease_expires_at TEXT,
+    created_at TEXT NOT NULL,
+    terminal_at TEXT,
+    UNIQUE(analysis_unit_id, attempt_no),
+    FOREIGN KEY(analysis_unit_id) REFERENCES content_research_analysis_units(id),
+    FOREIGN KEY(successor_of_attempt_id) REFERENCES content_research_analysis_attempts(id)
+);
+CREATE UNIQUE INDEX idx_cr_analysis_attempt_one_active
+    ON content_research_analysis_attempts(analysis_unit_id)
+    WHERE state IN ('queued', 'running');
+CREATE UNIQUE INDEX idx_cr_analysis_attempt_one_successor
+    ON content_research_analysis_attempts(successor_of_attempt_id)
+    WHERE successor_of_attempt_id IS NOT NULL;
+CREATE TABLE content_research_analysis_checkpoints (
+    id TEXT PRIMARY KEY,
+    analysis_unit_id TEXT NOT NULL,
+    track TEXT NOT NULL CHECK(track IN ('shared', 'need', 'value', 'message')),
+    stage TEXT NOT NULL,
+    input_fingerprint TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('pending', 'running', 'completed', 'failed')),
+    output_refs_json TEXT NOT NULL DEFAULT '[]',
+    result_checksum TEXT,
+    completed_by_attempt_id TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(analysis_unit_id, track, stage, input_fingerprint),
+    FOREIGN KEY(analysis_unit_id) REFERENCES content_research_analysis_units(id),
+    FOREIGN KEY(completed_by_attempt_id) REFERENCES content_research_analysis_attempts(id)
+);
+CREATE INDEX idx_cr_analysis_checkpoint_unit_track_stage
+    ON content_research_analysis_checkpoints(analysis_unit_id, track, stage, status);
+"""
+
+
+def _apply_0034(conn: sqlite3.Connection) -> None:
+    for statement in (
+        item.strip()
+        for item in _V34_MARKETING_ANALYSIS_IDENTITY_SQL.split(";")
+        if item.strip()
+    ):
+        conn.execute(statement)
+
+
+_V35_MARKETING_ANALYSIS_JOB_SQL = """
+CREATE TABLE content_research_analysis_jobs (
+    analysis_unit_id TEXT PRIMARY KEY,
+    workflow_run_id TEXT NOT NULL,
+    research_plan_id TEXT NOT NULL,
+    coverage_snapshot_id TEXT NOT NULL,
+    execution_authorization_id TEXT,
+    manifest_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(analysis_unit_id) REFERENCES content_research_analysis_units(id)
+);
+CREATE INDEX idx_cr_analysis_job_run_created
+    ON content_research_analysis_jobs(workflow_run_id, created_at, analysis_unit_id);
+"""
+
+
+def _apply_0035(conn: sqlite3.Connection) -> None:
+    conn.executescript(_V35_MARKETING_ANALYSIS_JOB_SQL)
+
+
+_V36_TRACE_REVISION_SQL = """
+CREATE TABLE content_research_trace_revisions (
+    workflow_run_id TEXT PRIMARY KEY,
+    revision INTEGER NOT NULL CHECK(revision >= 1),
+    updated_at TEXT NOT NULL
+);
+CREATE TRIGGER cr_trace_revision_transition_insert
+AFTER INSERT ON content_research_state_transitions BEGIN
+    INSERT INTO content_research_trace_revisions(workflow_run_id, revision, updated_at)
+    VALUES (NEW.run_id, 1, CURRENT_TIMESTAMP)
+    ON CONFLICT(workflow_run_id) DO UPDATE SET revision=revision+1, updated_at=CURRENT_TIMESTAMP;
+END;
+CREATE TRIGGER cr_trace_revision_trace_insert
+AFTER INSERT ON content_research_traces BEGIN
+    INSERT INTO content_research_trace_revisions(workflow_run_id, revision, updated_at)
+    VALUES (NEW.workflow_run_id, 1, CURRENT_TIMESTAMP)
+    ON CONFLICT(workflow_run_id) DO UPDATE SET revision=revision+1, updated_at=CURRENT_TIMESTAMP;
+END;
+CREATE TRIGGER cr_trace_revision_observation_insert
+AFTER INSERT ON content_research_observation_events BEGIN
+    INSERT INTO content_research_trace_revisions(workflow_run_id, revision, updated_at)
+    VALUES (NEW.workflow_run_id, 1, CURRENT_TIMESTAMP)
+    ON CONFLICT(workflow_run_id) DO UPDATE SET revision=revision+1, updated_at=CURRENT_TIMESTAMP;
+END;
+CREATE TRIGGER cr_trace_revision_execution_unit_insert
+AFTER INSERT ON content_research_scope_execution_units BEGIN
+    INSERT INTO content_research_trace_revisions(workflow_run_id, revision, updated_at)
+    VALUES (NEW.workflow_run_id, 1, CURRENT_TIMESTAMP)
+    ON CONFLICT(workflow_run_id) DO UPDATE SET revision=revision+1, updated_at=CURRENT_TIMESTAMP;
+END;
+CREATE TRIGGER cr_trace_revision_execution_unit_update
+AFTER UPDATE ON content_research_scope_execution_units BEGIN
+    INSERT INTO content_research_trace_revisions(workflow_run_id, revision, updated_at)
+    VALUES (NEW.workflow_run_id, 1, CURRENT_TIMESTAMP)
+    ON CONFLICT(workflow_run_id) DO UPDATE SET revision=revision+1, updated_at=CURRENT_TIMESTAMP;
+END;
+CREATE TRIGGER cr_trace_revision_execution_fact_insert
+AFTER INSERT ON content_research_execution_facts BEGIN
+    INSERT INTO content_research_trace_revisions(workflow_run_id, revision, updated_at)
+    SELECT workflow_run_id, 1, CURRENT_TIMESTAMP
+    FROM content_research_scope_execution_units WHERE id=NEW.execution_unit_id
+    ON CONFLICT(workflow_run_id) DO UPDATE SET revision=revision+1, updated_at=CURRENT_TIMESTAMP;
+END;
+CREATE TRIGGER cr_trace_revision_stage_checkpoint_insert
+AFTER INSERT ON content_research_stage_checkpoints BEGIN
+    INSERT INTO content_research_trace_revisions(workflow_run_id, revision, updated_at)
+    VALUES (NEW.workflow_run_id, 1, CURRENT_TIMESTAMP)
+    ON CONFLICT(workflow_run_id) DO UPDATE SET revision=revision+1, updated_at=CURRENT_TIMESTAMP;
+END;
+CREATE TRIGGER cr_trace_revision_stage_checkpoint_update
+AFTER UPDATE ON content_research_stage_checkpoints BEGIN
+    INSERT INTO content_research_trace_revisions(workflow_run_id, revision, updated_at)
+    VALUES (NEW.workflow_run_id, 1, CURRENT_TIMESTAMP)
+    ON CONFLICT(workflow_run_id) DO UPDATE SET revision=revision+1, updated_at=CURRENT_TIMESTAMP;
+END;
+CREATE TRIGGER cr_trace_revision_analysis_attempt_insert
+AFTER INSERT ON content_research_analysis_attempts BEGIN
+    INSERT INTO content_research_trace_revisions(workflow_run_id, revision, updated_at)
+    SELECT workflow_run_id, 1, CURRENT_TIMESTAMP
+    FROM content_research_analysis_units WHERE id=NEW.analysis_unit_id
+    ON CONFLICT(workflow_run_id) DO UPDATE SET revision=revision+1, updated_at=CURRENT_TIMESTAMP;
+END;
+CREATE TRIGGER cr_trace_revision_analysis_attempt_update
+AFTER UPDATE ON content_research_analysis_attempts BEGIN
+    INSERT INTO content_research_trace_revisions(workflow_run_id, revision, updated_at)
+    SELECT workflow_run_id, 1, CURRENT_TIMESTAMP
+    FROM content_research_analysis_units WHERE id=NEW.analysis_unit_id
+    ON CONFLICT(workflow_run_id) DO UPDATE SET revision=revision+1, updated_at=CURRENT_TIMESTAMP;
+END;
+CREATE TRIGGER cr_trace_revision_analysis_checkpoint_insert
+AFTER INSERT ON content_research_analysis_checkpoints BEGIN
+    INSERT INTO content_research_trace_revisions(workflow_run_id, revision, updated_at)
+    SELECT workflow_run_id, 1, CURRENT_TIMESTAMP
+    FROM content_research_analysis_units WHERE id=NEW.analysis_unit_id
+    ON CONFLICT(workflow_run_id) DO UPDATE SET revision=revision+1, updated_at=CURRENT_TIMESTAMP;
+END;
+CREATE TRIGGER cr_trace_revision_publication_insert
+AFTER INSERT ON content_research_report_publications BEGIN
+    INSERT INTO content_research_trace_revisions(workflow_run_id, revision, updated_at)
+    VALUES (NEW.workflow_run_id, 1, CURRENT_TIMESTAMP)
+    ON CONFLICT(workflow_run_id) DO UPDATE SET revision=revision+1, updated_at=CURRENT_TIMESTAMP;
+END;
+CREATE TRIGGER cr_trace_revision_integrity_event_insert
+AFTER INSERT ON content_research_report_integrity_events BEGIN
+    INSERT INTO content_research_trace_revisions(workflow_run_id, revision, updated_at)
+    VALUES (NEW.workflow_run_id, 1, CURRENT_TIMESTAMP)
+    ON CONFLICT(workflow_run_id) DO UPDATE SET revision=revision+1, updated_at=CURRENT_TIMESTAMP;
+END;
+"""
+
+
+def _apply_0036(conn: sqlite3.Connection) -> None:
+    conn.executescript(_V36_TRACE_REVISION_SQL)
+
+
+_V37_ANALYSIS_AUTHORITY_SQL = """
+ALTER TABLE content_research_analysis_checkpoints
+    ADD COLUMN private_result_json TEXT NOT NULL DEFAULT '{}';
+ALTER TABLE workflow_runs
+    ADD COLUMN effective_analysis_attempt_id TEXT;
+UPDATE workflow_runs
+SET effective_analysis_attempt_id=(
+    SELECT attempt.id
+    FROM content_research_analysis_attempts AS attempt
+    JOIN content_research_analysis_units AS unit
+      ON unit.id=attempt.analysis_unit_id
+    WHERE unit.workflow_run_id=workflow_runs.run_id
+    ORDER BY attempt.attempt_no DESC, attempt.created_at DESC
+    LIMIT 1
+)
+WHERE effective_analysis_attempt_id IS NULL
+  AND EXISTS (
+    SELECT 1
+    FROM content_research_analysis_attempts AS attempt
+    JOIN content_research_analysis_units AS unit
+      ON unit.id=attempt.analysis_unit_id
+    WHERE unit.workflow_run_id=workflow_runs.run_id
+  );
+CREATE INDEX idx_workflow_run_effective_analysis_attempt
+    ON workflow_runs(effective_analysis_attempt_id);
+"""
+
+
+def _apply_0037(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        "ALTER TABLE content_research_analysis_checkpoints "
+        "ADD COLUMN private_result_json TEXT NOT NULL DEFAULT '{}'"
+    )
+    if conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow_runs'"
+    ).fetchone() is None:
+        return
+    workflow_columns = {
+        str(row[1]) for row in conn.execute("PRAGMA table_info(workflow_runs)")
+    }
+    if "effective_analysis_attempt_id" not in workflow_columns:
+        conn.execute(
+            "ALTER TABLE workflow_runs ADD COLUMN effective_analysis_attempt_id TEXT"
+        )
+    conn.execute(
+        "UPDATE workflow_runs SET effective_analysis_attempt_id=("
+        "SELECT attempt.id FROM content_research_analysis_attempts AS attempt "
+        "JOIN content_research_analysis_units AS unit "
+        "ON unit.id=attempt.analysis_unit_id "
+        "WHERE unit.workflow_run_id=workflow_runs.run_id "
+        "ORDER BY attempt.attempt_no DESC, attempt.created_at DESC LIMIT 1) "
+        "WHERE effective_analysis_attempt_id IS NULL AND EXISTS ("
+        "SELECT 1 FROM content_research_analysis_attempts AS attempt "
+        "JOIN content_research_analysis_units AS unit "
+        "ON unit.id=attempt.analysis_unit_id "
+        "WHERE unit.workflow_run_id=workflow_runs.run_id)"
+    )
+    conn.execute(
+        "CREATE INDEX idx_workflow_run_effective_analysis_attempt "
+        "ON workflow_runs(effective_analysis_attempt_id)"
+    )
+
+
 def _apply_0015(conn: sqlite3.Connection) -> None:
     conn.execute(_V15_LLM_CONFIGURATION_SQL)
 
@@ -1570,6 +1848,14 @@ def _expected_checksums(migration_0002_sql: str, legacy_checksum: str) -> dict[s
         "0031": _checksum(_V31_REPORT_INTEGRITY_EVENT_STATEMENTS),
         "0032": _checksum(_V32_SCOPE_DRAFT_VERSION_COLUMNS),
         "0033": hashlib.sha256(_V33_LIFECYCLE_AUTHORITY_SQL.encode("utf-8")).hexdigest(),
+        "0034": hashlib.sha256(
+            _V34_MARKETING_ANALYSIS_IDENTITY_SQL.encode("utf-8")
+        ).hexdigest(),
+        "0035": hashlib.sha256(
+            _V35_MARKETING_ANALYSIS_JOB_SQL.encode("utf-8")
+        ).hexdigest(),
+        "0036": hashlib.sha256(_V36_TRACE_REVISION_SQL.encode("utf-8")).hexdigest(),
+        "0037": hashlib.sha256(_V37_ANALYSIS_AUTHORITY_SQL.encode("utf-8")).hexdigest(),
     }
 
 
@@ -1880,6 +2166,34 @@ def apply_content_research_migrations(
                 name="content_research_lifecycle_authority",
                 checksum=expected_checksums["0033"],
                 apply=lambda: _apply_0033(conn),
+            )
+            _apply_migration(
+                conn,
+                version="0034",
+                name="marketing_analysis_identity_skeleton",
+                checksum=expected_checksums["0034"],
+                apply=lambda: _apply_0034(conn),
+            )
+            _apply_migration(
+                conn,
+                version="0035",
+                name="marketing_analysis_durable_jobs",
+                checksum=expected_checksums["0035"],
+                apply=lambda: _apply_0035(conn),
+            )
+            _apply_migration(
+                conn,
+                version="0036",
+                name="content_research_trace_revision",
+                checksum=expected_checksums["0036"],
+                apply=lambda: _apply_0036(conn),
+            )
+            _apply_migration(
+                conn,
+                version="0037",
+                name="marketing_analysis_explicit_authority",
+                checksum=expected_checksums["0037"],
+                apply=lambda: _apply_0037(conn),
             )
         except Exception:
             conn.rollback()

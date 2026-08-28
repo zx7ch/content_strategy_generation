@@ -7,6 +7,7 @@ or marketing effect.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from app.content_research.admission.candidates import (
@@ -30,6 +31,21 @@ PRODUCT_MARKETING_CLAIM_INTENTS = {
 
 _PROHIBITED_OUTCOME_TERMS = ("偏好", "转化", "购买", "因果", "效果提升", "表现更好")
 _MAX_DIRECT_OBSERVATION_CHARS = 280
+_SCENE_TERMS = ("春季", "夏季", "秋季", "冬季", "通勤", "运动", "徒步", "睡眠", "居家", "户外")
+_AUDIENCE_TERMS = ("儿童", "宝宝", "学生", "上班族", "孕妇", "老人", "男士", "女士")
+_COUNTER_TERMS = (
+    "不凉",
+    "不透气",
+    "不舒服",
+    "不推荐",
+    "没有凉感",
+    "没感觉",
+    "闷热",
+    "有点闷",
+    "太闷",
+    "刺痒",
+)
+_ATOMIC_BOUNDARY = re.compile(r"[。！？!?；;\r\n]+")
 
 
 def build_product_marketing_candidate(
@@ -48,15 +64,48 @@ def build_product_marketing_candidate(
     if fact.field_path not in quote_fields_for_claim("product_marketing", claim_type):
         raise ValueError("product-marketing claim type cannot use this evidence field")
     quote, text_start = _direct_observation(fact.text)
+    return _build_product_marketing_candidate_for_span(
+        workflow_run_id=workflow_run_id,
+        direction_id=direction_id,
+        claim_type=claim_type,
+        fact=fact,
+        quote=quote,
+        text_start=text_start,
+        scope=scope,
+    )
+
+
+def _build_product_marketing_candidate_for_span(
+    *,
+    workflow_run_id: str,
+    direction_id: str,
+    claim_type: str,
+    fact: ExtractedFact,
+    quote: str,
+    text_start: int,
+    scope: dict[str, Any] | None = None,
+) -> ClaimCandidateRecord:
+    if direction_id != "product_marketing":
+        raise ValueError("product-marketing factory requires product_marketing direction")
+    if claim_type not in PRODUCT_MARKETING_CLAIM_INTENTS:
+        raise ValueError("product-marketing claim type is not allowed")
+    if fact.field_path not in quote_fields_for_claim("product_marketing", claim_type):
+        raise ValueError("product-marketing claim type cannot use this evidence field")
     if any(term in quote for term in _PROHIBITED_OUTCOME_TERMS):
         raise ValueError("product-marketing observation cannot claim preference, conversion, or effect")
+    qualifiers = _qualifiers(quote)
     return build_claim_candidate(
         workflow_run_id=workflow_run_id,
         direction_id=direction_id,
         intent_id=PRODUCT_MARKETING_CLAIM_INTENTS[claim_type],
         claim_type=claim_type,
         statement=quote,
-        scope={"sample": "selected_packets", **dict(scope or {})},
+        scope={
+            "sample": "selected_packets",
+            "qualifiers": qualifiers,
+            "polarity": _polarity(quote),
+            **dict(scope or {}),
+        },
         fact=fact,
         quote=quote,
         text_start=text_start,
@@ -71,12 +120,79 @@ def _direct_observation(text: str) -> tuple[str, int]:
     reports what one sampled note explicitly says; it must not promote the
     entire body to a single claim.
     """
-    for start, line in _nonempty_lines(text):
-        excerpt = line[:_MAX_DIRECT_OBSERVATION_CHARS].strip()
-        if excerpt:
-            offset = start + line.index(excerpt)
-            return excerpt, offset
+    for excerpt, offset in _atomic_observations(text):
+        return excerpt, offset
     raise ValueError("product-marketing observation requires non-empty text")
+
+
+def _atomic_observations(text: str) -> list[tuple[str, int]]:
+    """Return bounded Chinese sentence/short-clause spans from the exact source."""
+    spans: list[tuple[str, int]] = []
+    cursor = 0
+    for boundary in _ATOMIC_BOUNDARY.finditer(text):
+        spans.extend(_bounded_atomic_segment(text, cursor, boundary.start()))
+        cursor = boundary.end()
+    spans.extend(_bounded_atomic_segment(text, cursor, len(text)))
+    return spans
+
+
+def extract_atomic_marketing_spans(text: str) -> tuple[tuple[str, int, int], ...]:
+    """Public deterministic extraction contract used by the quality gate."""
+    return tuple(
+        (quote, start, start + len(quote))
+        for quote, start in _atomic_observations(text)
+    )
+
+
+def infer_atomic_marketing_metadata(
+    quote: str, *, field_path: str
+) -> dict[str, object]:
+    qualifiers = _qualifiers(quote)
+    if field_path == "title":
+        tracks = ["message"]
+    elif field_path == "content_text":
+        tracks = ["value"]
+        if qualifiers["scenes"] or qualifiers["audiences"]:
+            tracks.append("need")
+    else:
+        tracks = []
+    return {
+        "tracks": sorted(tracks),
+        "qualifiers": qualifiers,
+        "polarity": _polarity(quote),
+    }
+
+
+def _bounded_atomic_segment(text: str, start: int, end: int) -> list[tuple[str, int]]:
+    raw = text[start:end]
+    stripped = raw.strip()
+    if not stripped:
+        return []
+    offset = start + raw.index(stripped)
+    results: list[tuple[str, int]] = []
+    remaining = stripped
+    remaining_offset = offset
+    while remaining:
+        excerpt = remaining[:_MAX_DIRECT_OBSERVATION_CHARS].strip()
+        if not excerpt:
+            break
+        excerpt_offset = remaining_offset + remaining.index(excerpt)
+        results.append((excerpt, excerpt_offset))
+        consumed = remaining.index(excerpt) + len(excerpt)
+        remaining_offset += consumed
+        remaining = remaining[consumed:].strip()
+    return results
+
+
+def _qualifiers(text: str) -> dict[str, list[str]]:
+    return {
+        "scenes": [term for term in _SCENE_TERMS if term in text],
+        "audiences": [term for term in _AUDIENCE_TERMS if term in text],
+    }
+
+
+def _polarity(text: str) -> str:
+    return "counter" if any(term in text for term in _COUNTER_TERMS) else "support"
 
 
 def _nonempty_lines(text: str):
@@ -101,22 +217,31 @@ def build_product_marketing_candidates(
     """
     candidates: list[ClaimCandidateRecord] = []
     for fact in extract_facts(packet):
-        claim_type = "product_value_expression" if fact.field_path == "content_text" else (
-            "message_angle" if fact.field_path == "title" else None
-        )
-        if claim_type is None:
-            continue
-        try:
-            candidates.append(
-                build_product_marketing_candidate(
-                    workflow_run_id=packet.workflow_run_id,
-                    direction_id=packet.research_direction_id,
-                    claim_type=claim_type,
-                    fact=fact,
-                )
-            )
-        except ValueError:
-            continue
+        for quote, text_start in _atomic_observations(fact.text):
+            claim_types: list[str] = []
+            if fact.field_path == "content_text":
+                claim_types.append("product_value_expression")
+                qualifiers = _qualifiers(quote)
+                if qualifiers["scenes"]:
+                    claim_types.append("use_context")
+                if qualifiers["audiences"]:
+                    claim_types.append("target_audience_framing")
+            elif fact.field_path == "title":
+                claim_types.append("message_angle")
+            for claim_type in claim_types:
+                try:
+                    candidates.append(
+                        _build_product_marketing_candidate_for_span(
+                            workflow_run_id=packet.workflow_run_id,
+                            direction_id=packet.research_direction_id,
+                            claim_type=claim_type,
+                            fact=fact,
+                            quote=quote,
+                            text_start=text_start,
+                        )
+                    )
+                except ValueError:
+                    continue
     return candidates
 
 

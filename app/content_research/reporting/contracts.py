@@ -83,17 +83,21 @@ class ReportSection:
     prose: str | None = None
     structured_card_ids: tuple[str, ...] = ()
     claim_candidate_ids: tuple[str, ...] = ()
+    counter_claim_candidate_ids: tuple[str, ...] = ()
     aggregate_claim_ids: tuple[str, ...] = ()
     cross_direction_record_ids: tuple[str, ...] = ()
     weak_signal_ids: tuple[str, ...] = ()
     limitation_ids: tuple[str, ...] = ()
     citation_group_ids: tuple[str, ...] = ()
+    counter_citation_group_ids: tuple[str, ...] = ()
     citation_anchors: tuple[CitationAnchor, ...] = ()
     marketing_conclusion_ids: tuple[str, ...] = ()
     conclusion_state: str | None = None
     reason_codes: tuple[str, ...] = ()
     supporting_note_count: int = 0
     independent_author_count: int = 0
+    counter_note_count: int = 0
+    counter_author_count: int = 0
     additional_qualified_count: int = 0
     verification_direction: str | None = None
     action_label: str | None = None
@@ -110,11 +114,13 @@ class ReportSection:
         for field_name, values in (
             ("structured_card_ids", self.structured_card_ids),
             ("claim_candidate_ids", self.claim_candidate_ids),
+            ("counter_claim_candidate_ids", self.counter_claim_candidate_ids),
             ("aggregate_claim_ids", self.aggregate_claim_ids),
             ("cross_direction_record_ids", self.cross_direction_record_ids),
             ("weak_signal_ids", self.weak_signal_ids),
             ("limitation_ids", self.limitation_ids),
             ("citation_group_ids", self.citation_group_ids),
+            ("counter_citation_group_ids", self.counter_citation_group_ids),
             ("marketing_conclusion_ids", self.marketing_conclusion_ids),
             ("reason_codes", self.reason_codes),
             ("supporting_conclusion_ids", self.supporting_conclusion_ids),
@@ -124,6 +130,8 @@ class ReportSection:
             self.supporting_note_count,
             self.independent_author_count,
             self.additional_qualified_count,
+            self.counter_note_count,
+            self.counter_author_count,
         ) < 0:
             raise ValueError("marketing conclusion counts cannot be negative")
         if not self.reference_ids:
@@ -163,13 +171,20 @@ class ReportSection:
             expected_track = self.section_kind.removeprefix("marketing_")
             if not self.marketing_conclusion_ids or not self.conclusion_state:
                 raise ValueError("marketing conclusion section requires a governed decision")
-            if self.conclusion_state in {"selected", "directional"}:
+            if self.conclusion_state in {"selected", "directional", "contested"}:
                 if not self.claim_candidate_ids or not self.citation_group_ids:
                     raise ValueError("supported marketing conclusion requires governed support")
                 if self.conclusion_state == "selected" and (self.verification_direction or self.reason_codes):
                     raise ValueError("selected marketing conclusion cannot carry failure guidance")
-                if self.conclusion_state == "directional" and not self.verification_direction:
-                    raise ValueError("directional marketing conclusion requires verification guidance")
+                if self.conclusion_state in {"directional", "contested"} and not self.verification_direction:
+                    raise ValueError("limited marketing conclusion requires verification guidance")
+                if self.conclusion_state == "contested" and (
+                    not self.counter_claim_candidate_ids
+                    or not self.counter_citation_group_ids
+                    or self.counter_note_count < 1
+                    or self.counter_author_count < 1
+                ):
+                    raise ValueError("contested marketing conclusion requires counter evidence")
             elif self.conclusion_state in {
                 "insufficient_evidence",
                 "no_single_primary_conclusion",
@@ -196,11 +211,13 @@ class ReportSection:
         return (
             self.structured_card_ids
             + self.claim_candidate_ids
+            + self.counter_claim_candidate_ids
             + self.aggregate_claim_ids
             + self.cross_direction_record_ids
             + self.weak_signal_ids
             + self.limitation_ids
             + self.citation_group_ids
+            + self.counter_citation_group_ids
             + self.marketing_conclusion_ids
             + self.supporting_conclusion_ids
         )
@@ -412,6 +429,9 @@ class ReportPublication:
     timeline_message_type: str = "artifact_result"
     final_message_count: int = 1
     omitted_section_ids: tuple[str, ...] = ()
+    track_publication_dispositions: tuple[
+        tuple[str, str, str | None], ...
+    ] = ()
     previous_version_id: str | None = None
     scope_contract_id: str | None = None
     execution_unit_id: str | None = None
@@ -448,6 +468,24 @@ class ReportPublication:
             ("omitted section ids", self.omitted_section_ids),
         ):
             _unique_nonempty(values, field_name)
+        disposition_tracks: set[str] = set()
+        for track, state, reason_code in self.track_publication_dispositions:
+            if track not in {"need", "value", "message"}:
+                raise ValueError("invalid publication disposition track")
+            if track in disposition_tracks:
+                raise ValueError("duplicate publication disposition track")
+            disposition_tracks.add(track)
+            if state not in {
+                "published",
+                "withheld_by_faithfulness",
+                "omitted_by_publication_policy",
+            }:
+                raise ValueError("invalid publication disposition state")
+            if state == "withheld_by_faithfulness":
+                if reason_code != "faithfulness_not_verified":
+                    raise ValueError("withheld publication disposition requires reason")
+            elif reason_code is not None:
+                raise ValueError("published or policy-omitted disposition has no reason")
         if self.publication_state == "complete_verified_report":
             required_kinds = {"main_findings", "limitations_scope"} if self.compose_mode == "template_only" else _CORE_SECTION_KINDS
             if not required_kinds <= set(self.verified_section_kinds):
@@ -459,8 +497,11 @@ class ReportPublication:
         elif self.publication_state in {"partial_verified_report", "directional_report"}:
             if not self.structured_card_section_ids:
                 raise ValueError("partial or directional report requires structured cards")
-            if not self.omitted_section_ids:
-                raise ValueError("partial or directional report requires omitted prose sections")
+            # A report may be partial because its analysis is deliberately
+            # bounded (for example Task 3.1 marketing-track conclusions over a
+            # frozen sample), even when no individual prose section needs to be
+            # withdrawn.  ``omitted_section_ids`` records actual redactions; it
+            # is not a synthetic marker for every kind of publication limit.
         elif self.has_free_prose:
             raise ValueError("evidence-only report cannot contain free prose")
         ReportExecutionLineage.optional(
@@ -497,6 +538,7 @@ class ReportPublication:
             "timeline_message_type": self.timeline_message_type,
             "final_message_count": self.final_message_count,
             "omitted_section_ids": self.omitted_section_ids,
+            "track_publication_dispositions": self.track_publication_dispositions,
             "scope_contract_id": self.scope_contract_id,
             "execution_unit_id": self.execution_unit_id,
             "coverage_snapshot_id": self.coverage_snapshot_id,
@@ -521,6 +563,14 @@ class ReportPublication:
                 "timeline_message_type": self.timeline_message_type,
                 "final_message_count": self.final_message_count,
                 "omitted_section_ids": list(self.omitted_section_ids),
+                "track_publication_dispositions": [
+                    {
+                        "track": track,
+                        "state": state,
+                        "reason_code": reason_code,
+                    }
+                    for track, state, reason_code in self.track_publication_dispositions
+                ],
             },
             workflow_run_id=self.workflow_run_id,
             research_plan_id=self.research_plan_id,

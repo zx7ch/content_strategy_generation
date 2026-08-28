@@ -1,0 +1,61 @@
+{
+  "schema_version": "marketing_conclusion_quality_fixture_v1",
+  "instances_per_template": 20,
+  "templates": [
+    {
+      "id": "commute_cooling_a",
+      "field_path": "content_text",
+      "text": "夏季通勤穿这件T恤很凉爽透气。",
+      "quote": "夏季通勤穿这件T恤很凉爽透气",
+      "tracks": ["need", "value"],
+      "polarity": "support",
+      "scenes": ["夏季", "通勤"],
+      "audiences": [],
+      "cluster": "commute_cooling"
+    },
+    {
+      "id": "commute_cooling_b",
+      "field_path": "content_text",
+      "text": "通勤时这件T恤凉爽而且很透气。",
+      "quote": "通勤时这件T恤凉爽而且很透气",
+      "tracks": ["need", "value"],
+      "polarity": "support",
+      "scenes": ["通勤"],
+      "audiences": [],
+      "cluster": "commute_cooling"
+    },
+    {
+      "id": "child_sport_counter",
+      "field_path": "content_text",
+      "text": "儿童运动后穿这件T恤有点闷。",
+      "quote": "儿童运动后穿这件T恤有点闷",
+      "tracks": ["need", "value"],
+      "polarity": "counter",
+      "scenes": ["运动"],
+      "audiences": ["儿童"],
+      "cluster": "child_sport_cooling"
+    },
+    {
+      "id": "child_sport_support",
+      "field_path": "content_text",
+      "text": "儿童运动时穿这件T恤凉爽不闷。",
+      "quote": "儿童运动时穿这件T恤凉爽不闷",
+      "tracks": ["need", "value"],
+      "polarity": "support",
+      "scenes": ["运动"],
+      "audiences": ["儿童"],
+      "cluster": "child_sport_cooling"
+    },
+    {
+      "id": "message_title",
+      "field_path": "title",
+      "text": "夏季通勤T恤的凉爽体验",
+      "quote": "夏季通勤T恤的凉爽体验",
+      "tracks": ["message"],
+      "polarity": "support",
+      "scenes": ["夏季", "通勤"],
+      "audiences": [],
+      "cluster": "message_title"
+    }
+  ]
+}

@@ -92,6 +92,11 @@ from app.content_research.lifecycle.transitions import (
             "retry_report",
             ContentResearchState.REPORT_COMPOSING,
         ),
+        (
+            ContentResearchState.RECOVERY_REQUIRED,
+            "retry_analysis",
+            ContentResearchState.REPORT_COMPOSING,
+        ),
     ],
 )
 def test_transition_table_advances_only_to_the_contract_state(

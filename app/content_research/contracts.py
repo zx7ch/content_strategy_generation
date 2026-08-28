@@ -363,8 +363,8 @@ def _locked_query_plan(
             raise ValueError("locked query groups must be non-empty and unique")
         primary_count = sum(item["activation"] == "primary" for item in groups)
         fallback_count = sum(item["activation"] == "coverage_fallback" for item in groups)
-        if primary_count not in {1, 2} or fallback_count > 1:
-            raise ValueError("locked query plan exceeds the Lite 2 plus 1 cap")
+        if not 1 <= primary_count <= 3 or fallback_count > 1 or len(groups) > 3:
+            raise ValueError("locked query plan exceeds the Lite three-query cap")
         if any(item["candidate_cap"] != 20 for item in groups):
             raise ValueError("Lite query groups require candidate_cap=20")
         directions[direction_id] = {

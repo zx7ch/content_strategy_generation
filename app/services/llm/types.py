@@ -68,6 +68,7 @@ class LLMResponse:
     usage: TokenUsage
     latency_ms: int
     raw_response_id: str | None = None
+    finish_reason: str | None = None
     configuration_source: str = "system_default"
 
 

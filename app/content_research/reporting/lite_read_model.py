@@ -628,6 +628,7 @@ def _marketing_conclusion_projection(
     for track in ("need", "value", "message"):
         records = [item for item in raw if item.get("track") == track]
         selected = [item for item in records if item.get("state") == "selected"]
+        contested = [item for item in records if item.get("state") == "contested"]
         directional = [item for item in records if item.get("state") == "directional"]
         qualified = [item for item in records if item.get("state") == "qualified"]
         terminal = [
@@ -640,12 +641,14 @@ def _marketing_conclusion_projection(
                 "analysis_unavailable",
             }
         ]
-        if len(selected) > 1 or len(directional) > 1 or (selected and (directional or terminal)) or (directional and terminal) or len(terminal) > 1:
+        supported = selected + contested + directional
+        if len(supported) > 1 or (supported and terminal) or len(terminal) > 1:
             raise PublishedReportNotFoundError(
                 f"published report {track} marketing decision is ambiguous"
             )
-        if selected:
-            declared_additional_count = selected[0].get(
+        if selected or contested:
+            primary = (selected or contested)[0]
+            declared_additional_count = primary.get(
                 "additional_qualified_count"
             )
             if declared_additional_count is None:
@@ -662,19 +665,28 @@ def _marketing_conclusion_projection(
                 additional_qualified_count = declared_additional_count
             projected = _selected_marketing_conclusion(
                 report,
-                selected[0],
+                primary,
                 cards_by_id=cards_by_id,
                 citations_by_claim=citations_by_claim,
                 additional_qualified_count=additional_qualified_count,
+                contested=bool(contested),
             )
-            if not _marketing_section_verified(
-                report, track=track, decision=selected[0], projected=projected
-            ):
+            section = _matching_marketing_section(
+                report, track=track, decision=primary, projected=projected
+            )
+            disposition = _marketing_publication_disposition(
+                report, track=track, section_id=str(section["section_id"])
+            )
+            _validate_marketing_section_prose(
+                section, decision=primary, disposition=disposition
+            )
+            if disposition["state"] != "published":
                 result[track] = {
-                    "state": "analysis_unavailable",
-                    "reason_codes": ["marketing_conclusion_not_verified"],
+                    "state": disposition["state"],
+                    "analysis_state": str(primary["state"]),
+                    "reason_codes": [str(disposition["reason_code"])],
                     "verification_direction": _marketing_verification_direction(
-                        "analysis_unavailable"
+                        disposition["state"]
                     ),
                 }
                 continue
@@ -687,8 +699,25 @@ def _marketing_conclusion_projection(
                 citations_by_claim=citations_by_claim, additional_qualified_count=0,
                 directional=True,
             )
-            if not _marketing_section_verified(report, track=track, decision=directional[0], projected=projected):
-                raise PublishedReportNotFoundError("published report directional marketing conclusion is not verified")
+            section = _matching_marketing_section(
+                report, track=track, decision=directional[0], projected=projected
+            )
+            disposition = _marketing_publication_disposition(
+                report, track=track, section_id=str(section["section_id"])
+            )
+            _validate_marketing_section_prose(
+                section, decision=directional[0], disposition=disposition
+            )
+            if disposition["state"] != "published":
+                result[track] = {
+                    "state": disposition["state"],
+                    "analysis_state": "directional",
+                    "reason_codes": [str(disposition["reason_code"])],
+                    "verification_direction": _marketing_verification_direction(
+                        disposition["state"]
+                    ),
+                }
+                continue
             result[track] = projected
             continue
         decision = terminal[0] if terminal else {
@@ -722,39 +751,120 @@ def _marketing_conclusion_projection(
     }
 
 
-def _marketing_section_verified(
+def _matching_marketing_section(
     report: dict[str, Any],
     *,
     track: str,
     decision: dict[str, Any],
     projected: dict[str, Any],
-) -> bool:
+) -> dict[str, Any]:
     sections = report.get("sections")
     if not isinstance(sections, list):
-        return False
+        raise PublishedReportNotFoundError("published report sections are missing")
     matches = [
         item
         for item in sections
         if isinstance(item, dict) and item.get("section_kind") == f"marketing_{track}"
     ]
     if len(matches) != 1:
-        return False
+        raise PublishedReportNotFoundError(
+            f"published report {track} marketing section is missing"
+        )
     section = matches[0]
-    publication = report.get("publication")
-    omitted = set(
-        publication.get("omitted_section_ids") or []
-        if isinstance(publication, dict)
-        else []
-    )
-    return (
-        section.get("section_id") not in omitted
-        and section.get("conclusion_state") == decision.get("state")
-        and section.get("prose") == decision.get("statement")
+    matches_analysis = (
+        section.get("conclusion_state") == decision.get("state")
         and section.get("claim_candidate_ids") == decision.get("supporting_claim_ids")
-        and section.get("citation_group_ids") == projected.get("citation_group_ids")
+        and section.get("counter_claim_candidate_ids")
+        == (decision.get("counter_claim_ids") or [])
+        and section.get("citation_group_ids")
+        == list(
+            dict.fromkeys(
+                [
+                    *projected.get("citation_group_ids", []),
+                    *projected.get("counter_citation_group_ids", []),
+                ]
+            )
+        )
+        and section.get("counter_citation_group_ids")
+        == (projected.get("counter_citation_group_ids") or [])
         and section.get("marketing_conclusion_ids")
         == [projected.get("conclusion_id")]
     )
+    if not matches_analysis:
+        raise PublishedReportNotFoundError(
+            f"published report {track} marketing section does not match analysis"
+        )
+    return section
+
+
+def _validate_marketing_section_prose(
+    section: dict[str, Any],
+    *,
+    decision: dict[str, Any],
+    disposition: dict[str, str],
+) -> None:
+    prose = section.get("prose")
+    statement = decision.get("statement")
+    if disposition["state"] == "published":
+        valid = prose == statement
+    else:
+        valid = prose is None or prose == statement
+    if not valid:
+        raise PublishedReportNotFoundError(
+            "published report marketing prose does not match analysis disposition"
+        )
+
+
+def _marketing_publication_disposition(
+    report: dict[str, Any], *, track: str, section_id: str
+) -> dict[str, str]:
+    publication = report.get("publication")
+    if not isinstance(publication, dict):
+        raise PublishedReportNotFoundError("published report publication is missing")
+    raw = publication.get("track_publication_dispositions")
+    if raw:
+        if not isinstance(raw, list) or any(not isinstance(item, dict) for item in raw):
+            raise PublishedReportNotFoundError(
+                "published report track dispositions are malformed"
+            )
+        matches = [item for item in raw if item.get("track") == track]
+        if len(matches) != 1:
+            raise PublishedReportNotFoundError(
+                f"published report {track} disposition is ambiguous"
+            )
+        state = matches[0].get("state")
+        reason_code = matches[0].get("reason_code")
+        if state == "published" and reason_code is None:
+            return {"state": "published", "reason_code": ""}
+        if (
+            state == "withheld_by_faithfulness"
+            and reason_code == "faithfulness_not_verified"
+        ):
+            return {"state": state, "reason_code": reason_code}
+        if state == "omitted_by_publication_policy" and reason_code is None:
+            return {
+                "state": state,
+                "reason_code": "publication_policy_omitted",
+            }
+        raise PublishedReportNotFoundError(
+            f"published report {track} disposition is malformed"
+        )
+
+    # Historical v1 publications remain read-only.  Their frozen omission and
+    # audit outcome are sufficient to derive the missing disposition without
+    # backfilling or re-running analysis.
+    omitted = set(publication.get("omitted_section_ids") or [])
+    if section_id not in omitted:
+        return {"state": "published", "reason_code": ""}
+    if publication.get("audit_recovery_state") == "audit_rewrite_exhausted":
+        return {
+            "state": "withheld_by_faithfulness",
+            "reason_code": "faithfulness_not_verified",
+        }
+    return {
+        "state": "omitted_by_publication_policy",
+        "reason_code": "publication_policy_omitted",
+    }
 
 
 def _selected_marketing_conclusion(
@@ -765,6 +875,7 @@ def _selected_marketing_conclusion(
     citations_by_claim: dict[str, list[dict[str, Any]]],
     additional_qualified_count: int,
     directional: bool = False,
+    contested: bool = False,
 ) -> dict[str, Any]:
     statement = decision.get("statement")
     claim_ids = decision.get("supporting_claim_ids")
@@ -784,7 +895,16 @@ def _selected_marketing_conclusion(
         or note_count < (1 if directional else 3)
         or author_count < (1 if directional else 2)
         or author_count > note_count
-        or (not directional and decision.get("reason_codes") not in ([], ()))
+        or (
+            not directional
+            and not contested
+            and decision.get("reason_codes") not in ([], ())
+        )
+        or (
+            contested
+            and set(decision.get("reason_codes") or [])
+            != {"counter_evidence_threshold_met"}
+        )
     ):
         raise PublishedReportNotFoundError(
             "published report selected marketing conclusion is malformed"
@@ -816,6 +936,30 @@ def _selected_marketing_conclusion(
         raise PublishedReportNotFoundError(
             "published report selected marketing note count is invalid"
         )
+    counter_claim_ids = decision.get("counter_claim_ids") or []
+    if not isinstance(counter_claim_ids, list) or any(
+        not isinstance(item, str) or not item for item in counter_claim_ids
+    ):
+        raise PublishedReportNotFoundError(
+            "published report marketing counter claims are malformed"
+        )
+    counter_citations: list[dict[str, Any]] = []
+    for claim_id in counter_claim_ids:
+        card = cards_by_id.get(claim_id)
+        claim_citations = citations_by_claim.get(claim_id) or []
+        if (
+            card is None
+            or card.get("admission_state") != "admitted"
+            or card.get("direction_id") != "product_marketing"
+            or not claim_citations
+        ):
+            raise PublishedReportNotFoundError(
+                "published report marketing counter evidence is invalid"
+            )
+        counter_citations.extend(claim_citations)
+    counter_citation_ids = list(
+        dict.fromkeys(str(item["citation_group_id"]) for item in counter_citations)
+    )
     conclusion_id = decision.get("candidate_id")
     if not isinstance(conclusion_id, str) or not conclusion_id:
         publication = report.get("publication")
@@ -834,13 +978,34 @@ def _selected_marketing_conclusion(
             },
         )
     return {
-        "state": "directional" if directional else "selected",
+        "state": "directional" if directional else "contested" if contested else "selected",
         "conclusion_id": conclusion_id,
         "statement": statement,
         "citation_group_ids": citation_ids,
         "supporting_note_count": note_count,
         "independent_author_count": author_count,
         "additional_qualified_count": additional_qualified_count,
+        **(
+            {
+                "counter_citation_group_ids": counter_citation_ids,
+                "counter_note_count": int(decision.get("counter_note_count") or 0),
+                "counter_author_count": int(
+                    decision.get("counter_author_count") or 0
+                ),
+            }
+            if counter_claim_ids
+            else {}
+        ),
+        **(
+            {
+                "verification_direction": _marketing_verification_direction(
+                    "contested"
+                ),
+                "reason_codes": list(decision.get("reason_codes") or []),
+            }
+            if contested
+            else {}
+        ),
         **({
             "note_gap": max(0, 3 - note_count),
             "author_gap": max(0, 2 - author_count),
@@ -856,6 +1021,9 @@ def _marketing_verification_direction(state: str) -> str:
         "insufficient_evidence": "补充至少 3 篇合格笔记，并覆盖至少 2 位独立作者后重新验证。",
         "no_single_primary_conclusion": "增加能够区分候选结论的合格笔记后重新评估主结论。",
         "analysis_unavailable": "恢复结论分析能力并继续本轮分析，不新增未经治理的判断。",
+        "contested": "支持与反向证据都达到门槛；必须同时查看两侧原文，不作为一致性定论。",
+        "withheld_by_faithfulness": "分析已完成，但本次报告表述未通过证据核验；查看 Trace 中保留的分析状态。",
+        "omitted_by_publication_policy": "分析已完成，但本次报告范围未采用该轨结论。",
     }
     if state not in directions:
         raise PublishedReportNotFoundError(
@@ -1215,10 +1383,12 @@ def _publication_reason(report: dict[str, Any]) -> str | None:
     publication = report.get("publication")
     if not isinstance(publication, dict):
         return None
+    recovery_state = publication.get("audit_recovery_state")
+    if recovery_state and recovery_state != "all_required_sections_passed":
+        return str(recovery_state)
     reason_codes = publication.get("reason_codes")
     if isinstance(reason_codes, list):
         reason = next((str(item) for item in reason_codes if item), None)
         if reason:
             return reason
-    recovery_state = publication.get("audit_recovery_state")
-    return str(recovery_state) if recovery_state else None
+    return None

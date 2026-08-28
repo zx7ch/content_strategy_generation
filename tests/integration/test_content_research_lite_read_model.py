@@ -392,6 +392,7 @@ async def _project_formal_cards(
     citation_group_ids=None,
     marketing_conclusions=None,
     before_read=None,
+    withheld_marketing_track=None,
 ):
     db_path = str(tmp_path / "lite-projection-guard.db")
     store = SQLiteContentResearchStore(db_path)
@@ -459,6 +460,34 @@ async def _project_formal_cards(
     }
     if publication_state == "partial_verified_report":
         publication_changes["omitted_section_ids"] = ("sec_core",)
+    if withheld_marketing_track is not None:
+        withheld_section = next(
+            section
+            for section in draft.sections
+            if section.section_kind == f"marketing_{withheld_marketing_track}"
+        )
+        publication_changes.update(
+            {
+                "omitted_section_ids": (withheld_section.section_id,),
+                "track_publication_dispositions": tuple(
+                    (
+                        track,
+                        (
+                            "withheld_by_faithfulness"
+                            if track == withheld_marketing_track
+                            else "published"
+                        ),
+                        (
+                            "faithfulness_not_verified"
+                            if track == withheld_marketing_track
+                            else None
+                        ),
+                    )
+                    for track in ("need", "value", "message")
+                ),
+                "audit_recovery_state": "audit_rewrite_exhausted",
+            }
+        )
     publication = replace(
         _publication(draft, decision, compose_mode=compose_mode),
         **publication_changes,
@@ -762,6 +791,9 @@ async def test_lite_report_projects_only_primary_marketing_conclusion(tmp_path):
             "supporting_claim_ids": ["cc_need_1"],
             "supporting_note_count": 1,
             "independent_author_count": 1,
+            "counter_claim_ids": ["cc_need_2"],
+            "counter_note_count": 1,
+            "counter_author_count": 1,
             "reason_codes": ["conclusion_note_count_unmet", "conclusion_author_count_unmet"],
         },
         {
@@ -804,7 +836,160 @@ async def test_lite_report_projects_only_primary_marketing_conclusion(tmp_path):
     assert value["note_gap"] == 2
     assert value["author_gap"] == 1
     assert value["citation_group_ids"] == ["citation_need_1"]
+    assert value["counter_citation_group_ids"] == ["citation_need_2"]
+    assert value["counter_note_count"] == 1
+    assert value["counter_author_count"] == 1
     assert "statement" not in report["sections"]["marketing_conclusions"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_lite_report_distinguishes_faithfulness_withholding_from_analysis_failure(
+    tmp_path,
+):
+    claim_cards = [
+        _card(f"cc_need_{index}", f"cad_need_{index}", claim_type="use_context")
+        for index in range(1, 4)
+    ]
+    citation_groups = [
+        _citation(
+            f"citation_need_{index}",
+            f"cc_need_{index}",
+            f"cad_need_{index}",
+            display_index=index,
+        )
+        for index in range(1, 4)
+    ]
+    conclusions = [
+        {
+            "track": "need",
+            "state": "selected",
+            "candidate_id": "mc_need_primary",
+            "statement": "高温通勤场景中的凉感需求…",
+            "supporting_claim_ids": [f"cc_need_{index}" for index in range(1, 4)],
+            "supporting_note_count": 3,
+            "independent_author_count": 2,
+            "reason_codes": [],
+        },
+        {
+            "track": "value",
+            "state": "directional",
+            "candidate_id": "mc_value_directional",
+            "statement": "轻薄垂感与凉感材质方向",
+            "supporting_claim_ids": ["cc_need_1"],
+            "supporting_note_count": 1,
+            "independent_author_count": 1,
+            "reason_codes": [
+                "conclusion_note_count_unmet",
+                "conclusion_author_count_unmet",
+            ],
+        },
+        {
+            "track": "message",
+            "state": "no_single_primary_conclusion",
+            "candidate_id": None,
+            "statement": None,
+            "supporting_claim_ids": [],
+            "supporting_note_count": 0,
+            "independent_author_count": 0,
+            "reason_codes": [],
+        },
+    ]
+
+    report = await _project_formal_cards(
+        tmp_path,
+        claim_cards=claim_cards,
+        citation_groups=citation_groups,
+        marketing_conclusions=conclusions,
+        publication_state="directional_report",
+        withheld_marketing_track="need",
+    )
+
+    need = report["sections"]["marketing_conclusions"]["need"]
+    assert need == {
+        "state": "withheld_by_faithfulness",
+        "analysis_state": "selected",
+        "reason_codes": ["faithfulness_not_verified"],
+        "verification_direction": "分析已完成，但本次报告表述未通过证据核验；查看 Trace 中保留的分析状态。",
+    }
+    assert "statement" not in need
+    assert report["publication"]["publication_reason"] == "audit_rewrite_exhausted"
+    assert report["sections"]["marketing_conclusions"]["value"]["state"] == "directional"
+
+
+@pytest.mark.asyncio
+async def test_lite_report_projects_contested_track_with_support_and_counter_citations(
+    tmp_path,
+):
+    claim_cards = [
+        _card(f"cc_value_{index}", f"cad_value_{index}")
+        for index in range(1, 6)
+    ]
+    citation_groups = [
+        _citation(
+            f"citation_value_{index}",
+            f"cc_value_{index}",
+            f"cad_value_{index}",
+            display_index=index,
+        )
+        for index in range(1, 6)
+    ]
+    conclusions = [
+        {
+            "track": "value",
+            "state": "contested",
+            "candidate_id": "mc_value_contested",
+            "statement": "通勤样本对凉爽体验存在分歧",
+            "supporting_claim_ids": [f"cc_value_{index}" for index in range(1, 4)],
+            "counter_claim_ids": ["cc_value_4", "cc_value_5"],
+            "supporting_note_count": 3,
+            "independent_author_count": 3,
+            "counter_note_count": 2,
+            "counter_author_count": 2,
+            "reason_codes": ["counter_evidence_threshold_met"],
+        },
+        {
+            "track": "need",
+            "state": "insufficient_evidence",
+            "candidate_id": None,
+            "statement": None,
+            "supporting_claim_ids": [],
+            "supporting_note_count": 0,
+            "independent_author_count": 0,
+            "reason_codes": ["conclusion_no_qualified_candidate"],
+        },
+        {
+            "track": "message",
+            "state": "insufficient_evidence",
+            "candidate_id": None,
+            "statement": None,
+            "supporting_claim_ids": [],
+            "supporting_note_count": 0,
+            "independent_author_count": 0,
+            "reason_codes": ["conclusion_no_qualified_candidate"],
+        },
+    ]
+
+    report = await _project_formal_cards(
+        tmp_path,
+        claim_cards=claim_cards,
+        citation_groups=citation_groups,
+        marketing_conclusions=conclusions,
+        publication_state="partial_verified_report",
+    )
+
+    value = report["sections"]["marketing_conclusions"]["value"]
+    assert value["state"] == "contested"
+    assert value["citation_group_ids"] == [
+        "citation_value_1",
+        "citation_value_2",
+        "citation_value_3",
+    ]
+    assert value["counter_citation_group_ids"] == [
+        "citation_value_4",
+        "citation_value_5",
+    ]
+    assert value["counter_note_count"] == 2
+    assert value["counter_author_count"] == 2
 
 
 @pytest.mark.asyncio

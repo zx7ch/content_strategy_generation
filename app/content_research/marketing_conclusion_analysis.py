@@ -33,6 +33,21 @@ class MarketingConclusionAnalysisError(ValueError):
 
 _MESSAGE_ANGLE_PERFORMANCE_TERMS = ("偏好", "转化", "购买", "因果", "效果提升", "表现更好")
 _DEFAULT_MODEL_TIMEOUT_SECONDS = 90.0
+_MAX_CANDIDATES_PER_TRACK = 5
+_TRACK_CLAIM_TYPES = {
+    "need": frozenset({"use_context", "target_audience_framing"}),
+    "value": frozenset({"product_value_expression"}),
+    "message": frozenset({"message_angle"}),
+}
+MARKETING_CONCLUSION_SYSTEM_PROMPT = (
+    "You are a bounded product-marketing analyst. Return JSON only with exactly "
+    "candidates, an array of objects containing exactly track, statement, and "
+    "supporting_claim_ids. Return at most 5 candidates for each requested track; "
+    "merge compatible claims instead of emitting one candidate per claim. Use only "
+    "the supplied support-polarity claims whose eligible_tracks include the output "
+    "track; counter claims are limitations, never supporting evidence. Never infer "
+    "new evidence."
+)
 
 
 class MarketingConclusionAnalysisService:
@@ -60,12 +75,16 @@ class MarketingConclusionAnalysisService:
         admitted_claims: Iterable[
             tuple[ClaimAdmissionDecisionRecord, ClaimCandidateRecord]
         ],
+        track: str | None = None,
     ) -> tuple[MarketingConclusionCandidateRecord, ...]:
         conclusion_policy = _policy_value(policy)
+        if track is not None and track not in MARKETING_CONCLUSION_TRACKS:
+            raise ValueError("marketing conclusion track is invalid")
 
-        safe_claims: list[dict[str, str]] = []
+        safe_claims: list[dict[str, object]] = []
         known_claim_ids: set[str] = set()
         claim_types_by_id: dict[str, str] = {}
+        claim_polarities_by_id: dict[str, str] = {}
         for decision, claim in admitted_claims:
             self._validate_admitted_claim(
                 decision=decision,
@@ -78,6 +97,22 @@ class MarketingConclusionAnalysisService:
                 raise ValueError("duplicate admitted claim")
             known_claim_ids.add(claim_id)
             claim_types_by_id[claim_id] = claim.claim_type
+            scope = claim.payload.get("scope")
+            scope = scope if isinstance(scope, dict) else {}
+            qualifiers = scope.get("qualifiers")
+            qualifiers = qualifiers if isinstance(qualifiers, dict) else {}
+            polarity = scope.get("polarity")
+            safe_polarity = (
+                polarity if polarity in {"support", "counter"} else "support"
+            )
+            claim_polarities_by_id[claim_id] = safe_polarity
+            eligible_tracks = [
+                item
+                for item in MARKETING_CONCLUSION_TRACKS
+                if claim.claim_type in _TRACK_CLAIM_TYPES[item]
+            ]
+            if track is not None and track not in eligible_tracks:
+                continue
             safe_claims.append(
                 {
                     "claim_id": claim_id,
@@ -85,6 +120,14 @@ class MarketingConclusionAnalysisService:
                     "intent_id": claim.intent_id,
                     "quote": str(quote_ref["quote"]),
                     "field_path": str(quote_ref["field_path"]),
+                    "eligible_tracks": eligible_tracks,
+                    "polarity": safe_polarity,
+                    "qualifiers": {
+                        "scenes": _safe_qualifier_values(qualifiers.get("scenes")),
+                        "audiences": _safe_qualifier_values(
+                            qualifiers.get("audiences")
+                        ),
+                    },
                 }
             )
         safe_claims.sort(key=lambda item: item["claim_id"])
@@ -93,12 +136,7 @@ class MarketingConclusionAnalysisService:
             messages=[
                 Message(
                     role="system",
-                    content=(
-                        "You are a bounded product-marketing analyst. Return JSON only with exactly "
-                        "candidates, an array of objects containing exactly track, statement, and "
-                        "supporting_claim_ids. A track may have multiple proposals; use only the "
-                        "supplied claims and never infer new evidence."
-                    ),
+                    content=MARKETING_CONCLUSION_SYSTEM_PROMPT,
                 ),
                 Message(
                     role="user",
@@ -107,7 +145,7 @@ class MarketingConclusionAnalysisService:
                             "primary_marketing_goal": conclusion_policy[
                                 "primary_marketing_goal"
                             ],
-                            "tracks": list(conclusion_policy["tracks"]),
+                            "tracks": [track] if track is not None else list(conclusion_policy["tracks"]),
                             "claims": safe_claims,
                         },
                         ensure_ascii=False,
@@ -118,7 +156,7 @@ class MarketingConclusionAnalysisService:
             task_type="content_research.marketing_conclusion_analysis",
             model_policy="quality",
             temperature=0,
-            max_tokens=900,
+            max_tokens=3200,
             response_format={"type": "json_object"},
             context=(
                 content_research_llm_context(
@@ -148,6 +186,11 @@ class MarketingConclusionAnalysisService:
                 True,
                 None,
             ) from exc
+        if response.finish_reason == "length":
+            raise MarketingConclusionAnalysisError(
+                "marketing conclusion response was truncated by the model output limit",
+                detail_code="response_truncated",
+            )
         try:
             payload = json.loads(response.content)
         except (TypeError, json.JSONDecodeError) as exc:
@@ -155,13 +198,21 @@ class MarketingConclusionAnalysisService:
                 "marketing conclusion response must be valid JSON",
                 detail_code="invalid_json",
             ) from exc
-        return self._parse_candidates(
+        candidates = self._parse_candidates(
             payload,
             workflow_run_id=workflow_run_id,
             research_plan_id=research_plan_id,
             known_claim_ids=known_claim_ids,
             claim_types_by_id=claim_types_by_id,
+            claim_polarities_by_id=claim_polarities_by_id,
+            requested_track=track,
         )
+        if track is not None and any(candidate.track != track for candidate in candidates):
+            raise MarketingConclusionAnalysisError(
+                "marketing conclusion response crossed the requested track boundary",
+                detail_code="unexpected_track",
+            )
+        return candidates
 
     @staticmethod
     def _validate_admitted_claim(
@@ -208,6 +259,8 @@ class MarketingConclusionAnalysisService:
         research_plan_id: str,
         known_claim_ids: set[str],
         claim_types_by_id: Mapping[str, str],
+        claim_polarities_by_id: Mapping[str, str],
+        requested_track: str | None = None,
     ) -> tuple[MarketingConclusionCandidateRecord, ...]:
         if not isinstance(payload, dict) or set(payload) != {"candidates"}:
             raise MarketingConclusionAnalysisError(
@@ -221,6 +274,7 @@ class MarketingConclusionAnalysisService:
                 detail_code="invalid_candidates_shape",
             )
         records: list[MarketingConclusionCandidateRecord] = []
+        candidate_counts: dict[str, int] = {}
         for raw in raw_candidates:
             if not isinstance(raw, dict) or set(raw) != {
                 "track",
@@ -238,6 +292,17 @@ class MarketingConclusionAnalysisService:
                 raise MarketingConclusionAnalysisError(
                     "marketing conclusion candidate has unknown track",
                     detail_code="unknown_track",
+                )
+            candidate_counts[track] = candidate_counts.get(track, 0) + 1
+            if candidate_counts[track] > _MAX_CANDIDATES_PER_TRACK:
+                raise MarketingConclusionAnalysisError(
+                    "marketing conclusion response has too many candidates for one track",
+                    detail_code="too_many_candidates",
+                )
+            if requested_track is not None and track != requested_track:
+                raise MarketingConclusionAnalysisError(
+                    "marketing conclusion response crossed the requested track boundary",
+                    detail_code="unexpected_track",
                 )
             if not isinstance(statement, str) or not statement.strip():
                 raise MarketingConclusionAnalysisError(
@@ -262,6 +327,22 @@ class MarketingConclusionAnalysisService:
                 raise MarketingConclusionAnalysisError(
                     "marketing conclusion candidate references an unknown claim",
                     detail_code="unknown_supporting_claim_id",
+                )
+            if any(
+                claim_types_by_id[claim_id] not in _TRACK_CLAIM_TYPES[track]
+                for claim_id in supporting_claim_ids
+            ):
+                raise MarketingConclusionAnalysisError(
+                    "marketing conclusion candidate uses evidence from another track",
+                    detail_code="supporting_claim_track_mismatch",
+                )
+            if any(
+                claim_polarities_by_id[claim_id] != "support"
+                for claim_id in supporting_claim_ids
+            ):
+                raise MarketingConclusionAnalysisError(
+                    "marketing conclusion candidate used counter evidence as support",
+                    detail_code="supporting_claim_polarity_invalid",
                 )
             if (
                 track == "message"
@@ -297,3 +378,15 @@ class MarketingConclusionAnalysisService:
                 )
             )
         return tuple(records)
+
+
+def _safe_qualifier_values(value: object) -> list[str]:
+    if not isinstance(value, list | tuple):
+        return []
+    return sorted(
+        {
+            item.strip()
+            for item in value
+            if isinstance(item, str) and item.strip() and len(item) <= 32
+        }
+    )

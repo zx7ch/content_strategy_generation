@@ -489,6 +489,33 @@ async def test_report_publication_retry_rejects_a_different_publication_than_fai
 
 
 @pytest.mark.asyncio
+async def test_report_finalization_retry_allows_failure_before_publication_id_exists(
+    manager,
+):
+    run = await manager.start_run(thread_id="thread-compose-retry", user_id="user-1")
+    await manager.initialize_steps(
+        run.run_id,
+        [{"step_name": "formal_research", "phase": "retrieval", "max_attempts": 1}],
+    )
+    await manager.start_step(run.run_id, "formal_research")
+    await manager.complete_step(run.run_id, "formal_research")
+    await manager.begin_report_finalization(run.run_id)
+    await manager.fail_run(
+        run.run_id,
+        {
+            "code": "report_publication_failed",
+            "message": "report composition failed before publication persistence",
+        },
+    )
+
+    resumed = await manager.retry_failed_report_finalization(
+        run.run_id, publication_id=None
+    )
+
+    assert resumed.status == WorkflowRunStatus.FINALIZING_REPORT
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("timing", "table", "predicate"),
     (
@@ -619,6 +646,32 @@ async def test_recoverable_specialist_failure_waits_for_user_and_resumes(manager
     resumed = await manager.resume_run(run.run_id)
     assert resumed.status == WorkflowRunStatus.RUNNING
     assert "run_waiting_user" in await _event_types(manager.db_path, run.run_id)
+
+
+@pytest.mark.asyncio
+async def test_repeated_recoverable_failure_is_idempotent(manager):
+    run = await manager.start_run(thread_id="thread-recovery-repeat", user_id="user-1")
+    step = (await manager.initialize_steps(
+        run.run_id,
+        [{"step_name": "formal_research", "phase": "retrieval", "max_attempts": 3}],
+    ))[0]
+    await manager.start_step(run.run_id, step.step_name)
+
+    first = await manager.wait_for_user_recovery(
+        run.run_id,
+        step_name="formal_research",
+        reason={"code": "transient_error", "message": "provider call failed"},
+    )
+    replay = await manager.wait_for_user_recovery(
+        run.run_id,
+        step_name="formal_research",
+        reason={"code": "transient_error", "message": "provider call failed"},
+    )
+
+    assert first.status == WorkflowRunStatus.WAITING_USER
+    assert replay.status == WorkflowRunStatus.WAITING_USER
+    assert (await manager._fetch_step_row(run.run_id, step.step_name))["attempt_count"] == 1
+    assert (await _event_types(manager.db_path, run.run_id)).count("run_waiting_user") == 1
 
 
 @pytest.mark.asyncio

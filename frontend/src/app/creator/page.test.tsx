@@ -90,6 +90,52 @@ test("Xiaohongshu login card exposes both setup paths and only redacted status m
   globalThis.fetch = previousFetch;
 });
 
+test("Xiaohongshu login card refreshes when workflow authentication state changes", async () => {
+  const dom = new JSDOM("<!doctype html><html><body></body></html>", { url: "http://localhost" });
+  Object.assign(globalThis, {
+    window: dom.window,
+    document: dom.window.document,
+    HTMLElement: dom.window.HTMLElement,
+    Event: dom.window.Event,
+    IS_REACT_ACT_ENVIRONMENT: true,
+  });
+  Object.defineProperty(globalThis, "navigator", { configurable: true, value: dom.window.navigator });
+  const previousFetch = globalThis.fetch;
+  let requestCount = 0;
+  globalThis.fetch = async () => {
+    requestCount += 1;
+    return new Response(JSON.stringify(requestCount === 1 ? {
+      authenticated: true,
+      source: "manual_cookie",
+    } : {
+      authenticated: false,
+      source: "manual_cookie",
+      failure_code: "auth_required",
+    }), { status: 200, headers: { "Content-Type": "application/json" } });
+  };
+  const React = await import("react");
+  Object.assign(globalThis, { React });
+  const { act } = React;
+  const { createRoot } = await import("react-dom/client");
+  const { XiaohongshuLoginCard } = await import("@/components/content-research/XiaohongshuLoginCard.tsx");
+  const container = document.createElement("div");
+  document.body.append(container);
+  const root = createRoot(container);
+
+  await act(async () => { root.render(React.createElement(XiaohongshuLoginCard, { refreshKey: "collecting:1" })); });
+  await act(async () => { await Promise.resolve(); });
+  assert.match(container.textContent ?? "", /已登录/);
+
+  await act(async () => { root.render(React.createElement(XiaohongshuLoginCard, { refreshKey: "recovery_required:2" })); });
+  await act(async () => { await Promise.resolve(); });
+  assert.match(container.textContent ?? "", /登录状态已失效/);
+  assert.doesNotMatch(container.textContent ?? "", /已登录/);
+
+  await act(async () => { root.unmount(); });
+  container.remove();
+  globalThis.fetch = previousFetch;
+});
+
 test("Xiaohongshu login keeps a rejected Cookie editable and blocks a duplicate save", async () => {
   const dom = new JSDOM("<!doctype html><html><body></body></html>", { url: "http://localhost" });
   Object.assign(globalThis, {
@@ -245,6 +291,20 @@ test("Creator request epochs reject late responses from a previously selected ru
   assert.equal(requests.accepts(earlierRecovery), false);
   assert.equal(requests.accepts(newerRecovery), true);
   assert.equal(requests.accepts(sameRunReport), true);
+});
+
+test("Trace revision guard rejects older snapshots and becomes uncertain after three failures", async () => {
+  const { ContentResearchTraceRevisionGuard } = await import("./page-state.ts");
+  const guard = new ContentResearchTraceRevisionGuard();
+
+  assert.equal(guard.accept(12), true);
+  assert.equal(guard.accept(11), false);
+  assert.equal(guard.recordFailure(), false);
+  assert.equal(guard.recordFailure(), false);
+  assert.equal(guard.recordFailure(), true);
+  assert.equal(guard.isUncertain(), true);
+  assert.equal(guard.accept(13), true);
+  assert.equal(guard.isUncertain(), false);
 });
 
 test("scope draft saves are serialized and coalesce to the latest edit", async () => {

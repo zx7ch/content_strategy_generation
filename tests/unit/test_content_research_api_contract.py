@@ -13,6 +13,9 @@ def test_p0_workflow_action_contract_lists_supported_actions():
     assert P0_WORKFLOW_ACTIONS == (
         "cancel",
         "retry_presearch",
+        "retry_analysis",
+        "retry_report",
+        "repair_publication",
         "revise_subject",
         "confirm_brief",
         "replace_scope_draft",

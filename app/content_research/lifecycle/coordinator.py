@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import sqlite3
-import uuid
-import asyncio
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -49,6 +49,19 @@ def _now() -> str:
 
 def _canonical_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _publication_id_from_artifact_payload(value: Any) -> str | None:
+    if not value:
+        return None
+    try:
+        payload = json.loads(str(value))
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    publication_id = payload.get("report_publication_id")
+    return publication_id if isinstance(publication_id, str) and publication_id else None
 
 
 def _fingerprint(command: LifecycleCommand) -> str:
@@ -112,6 +125,237 @@ class ContentResearchPersistenceCoordinator:
         await self._ensure_schema()
         async with self._writer_lock:
             return await self._with_busy_retry(lambda: self._apply_once(command))
+
+    async def retry_analysis(
+        self,
+        command: LifecycleCommand,
+        *,
+        expected_attempt_id: str,
+        expected_contract_fingerprint: str,
+    ) -> tuple[RunProjection, str]:
+        """Atomically advance recovery and create the exact analysis successor."""
+        if command.kind != "retry_analysis":
+            raise LifecycleCommandConflict("analysis retry requires retry_analysis command")
+        await self._ensure_schema()
+        async with self._writer_lock:
+            return await self._with_busy_retry(
+                lambda: self._retry_analysis_once(
+                    command,
+                    expected_attempt_id=expected_attempt_id,
+                    expected_contract_fingerprint=expected_contract_fingerprint,
+                )
+            )
+
+    async def fail_analysis_attempt(
+        self,
+        command: LifecycleCommand,
+        *,
+        attempt_id: str,
+        lease_token: str | None,
+        allow_expired_lease: bool = False,
+    ) -> RunProjection:
+        """Atomically close the authoritative attempt and move its Run to recovery."""
+        if command.kind != "fail":
+            raise LifecycleCommandConflict("analysis failure requires fail command")
+        await self._ensure_schema()
+        async with self._writer_lock:
+            return await self._with_busy_retry(
+                lambda: self._fail_analysis_attempt_once(
+                    command,
+                    attempt_id=attempt_id,
+                    lease_token=lease_token,
+                    allow_expired_lease=allow_expired_lease,
+                )
+            )
+
+    async def _fail_analysis_attempt_once(
+        self,
+        command: LifecycleCommand,
+        *,
+        attempt_id: str,
+        lease_token: str | None,
+        allow_expired_lease: bool,
+    ) -> RunProjection:
+        conn = await self._connect()
+        try:
+            await conn.execute("BEGIN IMMEDIATE")
+            existing = await self._fetch_command(conn, command.command_id)
+            request_fingerprint = _fingerprint(command)
+            if existing is not None:
+                if (
+                    existing["run_id"] != command.run_id
+                    or existing["command_kind"] != command.kind
+                    or existing["request_fingerprint"] != request_fingerprint
+                ):
+                    raise LifecycleCommandConflict(
+                        "command identity was reused with new input"
+                    )
+                projection = await self._load_in_transaction(conn, command.run_id)
+                await conn.rollback()
+                return projection
+            async with conn.execute(
+                "SELECT attempt.*, unit.workflow_run_id, "
+                "run.effective_analysis_attempt_id "
+                "FROM content_research_analysis_attempts AS attempt "
+                "JOIN content_research_analysis_units AS unit "
+                "ON unit.id=attempt.analysis_unit_id "
+                "JOIN workflow_runs AS run ON run.run_id=unit.workflow_run_id "
+                "WHERE attempt.id=? AND run.run_id=?",
+                (attempt_id, command.run_id),
+            ) as cursor:
+                attempt = await cursor.fetchone()
+            if attempt is None or attempt["effective_analysis_attempt_id"] != attempt_id:
+                raise LifecycleCommandConflict("analysis failure attempt is stale")
+            if str(attempt["state"]) != "running":
+                raise LifecycleCommandConflict("analysis failure requires a running attempt")
+            expires_at = (
+                datetime.fromisoformat(str(attempt["lease_expires_at"]))
+                if attempt["lease_expires_at"]
+                else None
+            )
+            if allow_expired_lease:
+                if expires_at is None or expires_at > datetime.now(timezone.utc):
+                    raise LifecycleCommandConflict("analysis lease has not expired")
+            elif not lease_token or attempt["lease_token"] != lease_token:
+                raise LifecycleCommandConflict("analysis failure lease was fenced")
+
+            result_revision = await self._advance(conn, command)
+            now = _now()
+            await conn.execute(
+                "UPDATE content_research_analysis_attempts "
+                "SET state='failed', terminal_at=?, lease_expires_at=NULL "
+                "WHERE id=? AND state='running'",
+                (now, attempt_id),
+            )
+            await conn.execute(
+                "INSERT INTO content_research_lifecycle_commands "
+                "(command_id, run_id, command_kind, request_fingerprint, "
+                "result_revision, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    command.command_id,
+                    command.run_id,
+                    command.kind,
+                    request_fingerprint,
+                    result_revision,
+                    now,
+                ),
+            )
+            projection = await self._load_in_transaction(conn, command.run_id)
+            await conn.commit()
+            return projection
+        except Exception:
+            await conn.rollback()
+            raise
+        finally:
+            await conn.close()
+
+    async def _retry_analysis_once(
+        self,
+        command: LifecycleCommand,
+        *,
+        expected_attempt_id: str,
+        expected_contract_fingerprint: str,
+    ) -> tuple[RunProjection, str]:
+        conn = await self._connect()
+        try:
+            await conn.execute("BEGIN IMMEDIATE")
+            existing = await self._fetch_command(conn, command.command_id)
+            request_fingerprint = _fingerprint(command)
+            if existing is not None:
+                if (
+                    existing["run_id"] != command.run_id
+                    or existing["command_kind"] != command.kind
+                    or existing["request_fingerprint"] != request_fingerprint
+                ):
+                    raise LifecycleCommandConflict(
+                        "command identity was reused with new input"
+                    )
+                async with conn.execute(
+                    "SELECT id FROM content_research_analysis_attempts "
+                    "WHERE successor_of_attempt_id=?",
+                    (expected_attempt_id,),
+                ) as cursor:
+                    successor = await cursor.fetchone()
+                if successor is None:
+                    raise LifecycleCommandConflict(
+                        "replayed analysis retry is missing its successor"
+                    )
+                projection = await self._load_in_transaction(conn, command.run_id)
+                await conn.rollback()
+                return projection, str(successor["id"])
+
+            async with conn.execute(
+                "SELECT attempt.*, unit.workflow_run_id, unit.contract_fingerprint "
+                "FROM workflow_runs AS run "
+                "JOIN content_research_analysis_attempts AS attempt "
+                "ON attempt.id=run.effective_analysis_attempt_id "
+                "JOIN content_research_analysis_units AS unit "
+                "ON unit.id=attempt.analysis_unit_id "
+                "JOIN content_research_analysis_jobs AS job "
+                "ON job.analysis_unit_id=unit.id "
+                "WHERE run.run_id=? AND unit.workflow_run_id=run.run_id",
+                (command.run_id,),
+            ) as cursor:
+                attempt = await cursor.fetchone()
+            if attempt is None:
+                raise LifecycleCommandConflict(
+                    "legacy run has no retryable analysis attempt"
+                )
+            if str(attempt["id"]) != expected_attempt_id:
+                raise LifecycleCommandConflict("analysis retry attempt is stale")
+            if str(attempt["state"]) not in {"failed", "cancelled"}:
+                raise LifecycleCommandConflict(
+                    "analysis retry requires a failed predecessor"
+                )
+            if str(attempt["contract_fingerprint"]) != expected_contract_fingerprint:
+                raise LifecycleCommandConflict(
+                    "analysis retry contract fingerprint changed"
+                )
+
+            result_revision = await self._advance(conn, command)
+            successor_no = int(attempt["attempt_no"]) + 1
+            successor_id = "ana_" + hashlib.sha256(
+                "\x1f".join(
+                    (str(attempt["analysis_unit_id"]), str(successor_no))
+                ).encode("utf-8")
+            ).hexdigest()[:24]
+            await conn.execute(
+                "INSERT INTO content_research_analysis_attempts "
+                "(id, analysis_unit_id, attempt_no, state, successor_of_attempt_id, "
+                "created_at) VALUES (?, ?, ?, 'queued', ?, ?)",
+                (
+                    successor_id,
+                    str(attempt["analysis_unit_id"]),
+                    successor_no,
+                    expected_attempt_id,
+                    _now(),
+                ),
+            )
+            await conn.execute(
+                "UPDATE workflow_runs SET effective_analysis_attempt_id=? WHERE run_id=?",
+                (successor_id, command.run_id),
+            )
+            await conn.execute(
+                "INSERT INTO content_research_lifecycle_commands "
+                "(command_id, run_id, command_kind, request_fingerprint, "
+                "result_revision, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    command.command_id,
+                    command.run_id,
+                    command.kind,
+                    request_fingerprint,
+                    result_revision,
+                    _now(),
+                ),
+            )
+            projection = await self._load_in_transaction(conn, command.run_id)
+            await conn.commit()
+            return projection, successor_id
+        except Exception:
+            await conn.rollback()
+            raise
+        finally:
+            await conn.close()
 
     async def _apply_once(self, command: LifecycleCommand) -> RunProjection:
         conn = await self._connect()
@@ -263,6 +507,15 @@ class ContentResearchPersistenceCoordinator:
                            ORDER BY a.attempt_no DESC LIMIT 1""",
                         (run_id,),
                     ).fetchone()
+                    publication = conn.execute(
+                        """SELECT payload_json FROM workflow_artifacts
+                           WHERE run_id=? AND artifact_type='final_result'
+                             AND artifact_version=? LIMIT 1""",
+                        (run_id, int(row["artifact_version"] or 0)),
+                    ).fetchone()
+                    publication_id = _publication_id_from_artifact_payload(
+                        publication["payload_json"] if publication else None
+                    )
                 return projection_from_row(
                     row,
                     brief_id=str(brief["id"]) if brief else None,
@@ -273,6 +526,7 @@ class ContentResearchPersistenceCoordinator:
                         if attempt
                         else None
                     ),
+                    publication_id=publication_id,
                 )
             except sqlite3.OperationalError as exc:
                 if not self._is_sqlite_busy(exc):
@@ -523,6 +777,16 @@ class ContentResearchPersistenceCoordinator:
             raise LifecycleCommandConflict("expected state does not match current state")
         if command.expected_revision != current_revision:
             raise LifecycleCommandConflict("expected revision does not match current revision")
+        if command.kind == "cancel":
+            async with conn.execute(
+                "SELECT 1 FROM content_research_report_publications "
+                "WHERE workflow_run_id=? LIMIT 1",
+                (command.run_id,),
+            ) as cursor:
+                if await cursor.fetchone() is not None:
+                    raise LifecycleCommandConflict(
+                        "report publication already committed; cancellation lost the race"
+                    )
         try:
             decision = transition(
                 current_state=current_state,
@@ -550,6 +814,8 @@ class ContentResearchPersistenceCoordinator:
 
         error_payload = dict(command.payload.get("error") or {})
         reason_code = str(error_payload.get("code") or "") or None
+        if command.kind == "cancel":
+            reason_code = "user_cancelled"
         now = _now()
         if decision.to_state in {
             ContentResearchState.BRIEF_CONFIRMATION_REQUIRED,
@@ -699,6 +965,15 @@ class ContentResearchPersistenceCoordinator:
                    WHERE run_id=? AND step_name='presearch'""",
                 (now, now, command.run_id),
             )
+        elif command.kind in {"retry_analysis", "retry_report"}:
+            await conn.execute(
+                """UPDATE workflow_steps
+                   SET status='running', attempt_count=attempt_count+1,
+                       started_at=COALESCE(started_at, ?), completed_at=NULL,
+                       error_code=NULL, error_message=NULL, updated_at=?
+                   WHERE run_id=? AND step_name='report'""",
+                (now, now, command.run_id),
+            )
         elif command.kind == "fail":
             await conn.execute(
                 """UPDATE workflow_steps
@@ -715,6 +990,37 @@ class ContentResearchPersistenceCoordinator:
                 ),
             )
         elif command.kind == "cancel":
+            await conn.execute(
+                """UPDATE content_research_dispatch_jobs
+                   SET status='failed', lease_expires_at=NULL, lease_owner=NULL,
+                       lease_token=NULL, last_error='user_cancelled', updated_at=?
+                   WHERE workflow_run_id=? AND status IN ('queued', 'running')""",
+                (now, command.run_id),
+            )
+            await conn.execute(
+                """UPDATE content_research_scope_execution_attempts
+                   SET state='cancelled', lease_expires_at=NULL
+                   WHERE execution_unit_id IN (
+                       SELECT id FROM content_research_scope_execution_units
+                       WHERE workflow_run_id=?
+                   ) AND state IN ('pending', 'running')""",
+                (command.run_id,),
+            )
+            await conn.execute(
+                """UPDATE content_research_scope_execution_units
+                   SET state='cancelled' WHERE workflow_run_id=?
+                   AND state NOT IN ('completed', 'failed', 'outcome_unknown', 'cancelled')""",
+                (command.run_id,),
+            )
+            await conn.execute(
+                """UPDATE content_research_analysis_attempts
+                   SET state='cancelled', terminal_at=?, lease_expires_at=NULL
+                   WHERE analysis_unit_id IN (
+                       SELECT id FROM content_research_analysis_units
+                       WHERE workflow_run_id=?
+                   ) AND state IN ('queued', 'running')""",
+                (now, command.run_id),
+            )
             await conn.execute(
                 """UPDATE workflow_steps
                    SET status='cancelled', completed_at=COALESCE(completed_at, ?),
@@ -881,25 +1187,30 @@ class ContentResearchPersistenceCoordinator:
         definitions = {
             item.id: item for item in ResearchDirectionRegistry().list_directions()
         }
-        core_query = contract.query_groups[0].final_query
         as_of = datetime.now(timezone.utc)
         window = {
             "start_at": (as_of - timedelta(days=365)).isoformat(),
             "end_at": as_of.isoformat(),
         }
         query_groups_by_direction = {
-            direction_id: (
+            direction_id: tuple(
                 {
-                    "id": f"qplan_{hashlib.sha256(f'{run_id}:{direction_id}'.encode()).hexdigest()[:16]}",
+                    "id": group.id,
                     "direction_id": direction_id,
-                    "normalized_query": core_query,
-                    "priority": 0,
+                    "normalized_query": group.final_query,
+                    "priority": priority,
                     "sort": "likes",
                     "time_window": window,
                     "candidate_cap": 20,
-                    "roles": ["core_object"],
+                    "roles": [group.execution_role],
                     "activation": "primary",
-                },
+                    "normalized_identity": hashlib.sha256(
+                        _canonical_json(
+                            {"scope_contract_id": contract.id, "group_id": group.id}
+                        ).encode("utf-8")
+                    ).hexdigest(),
+                }
+                for priority, group in enumerate(contract.query_groups)
             )
             for direction_id in selected_direction_ids
         }
@@ -921,6 +1232,11 @@ class ContentResearchPersistenceCoordinator:
             query_groups_by_direction=query_groups_by_direction,
             subject_structure=dict(brief_payload.get("subject_structure") or {}),
             subject_structure_hash=str(brief_payload.get("subject_structure_hash") or ""),
+            primary_marketing_goal=(
+                "content_seeding"
+                if "product_marketing" in selected_direction_ids
+                else None
+            ),
         )
         await conn.execute(
             "INSERT INTO content_research_run_policy_snapshots VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -1329,6 +1645,13 @@ class ContentResearchPersistenceCoordinator:
             (run_id,),
         ) as cursor:
             attempt = await cursor.fetchone()
+        async with conn.execute(
+            """SELECT payload_json FROM workflow_artifacts
+               WHERE run_id=? AND artifact_type='final_result'
+                 AND artifact_version=? LIMIT 1""",
+            (run_id, int(row["artifact_version"] or 0)),
+        ) as cursor:
+            publication = await cursor.fetchone()
         return projection_from_row(
             row,
             brief_id=str(brief["id"]) if brief else None,
@@ -1338,6 +1661,9 @@ class ContentResearchPersistenceCoordinator:
                 f"{attempt['execution_unit_id']}:{attempt['attempt_no']}"
                 if attempt
                 else None
+            ),
+            publication_id=_publication_id_from_artifact_payload(
+                publication["payload_json"] if publication else None
             ),
         )
 

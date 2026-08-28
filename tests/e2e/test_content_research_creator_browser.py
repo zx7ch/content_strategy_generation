@@ -7,6 +7,7 @@ import json
 import os
 import re
 import sqlite3
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.request import Request, urlopen
@@ -71,6 +72,15 @@ def real_creator_stack(tmp_path, request):
             parameters.get("source_scenario") or "auth_required"
         ),
         "CREATOR_E2E_SOURCE_CALL_LOG": str(source_call_log),
+        "CREATOR_E2E_INVALID_ANALYSIS_TRACKS": str(
+            parameters.get("invalid_analysis_tracks") or ""
+        ),
+        "CREATOR_E2E_EMPTY_ANALYSIS_TRACKS": str(
+            parameters.get("empty_analysis_tracks") or ""
+        ),
+        "CREATOR_E2E_WITHHOLD_MARKETING_TRACK": str(
+            parameters.get("withhold_marketing_track") or ""
+        ),
     }
     frontend_env = {
         **os.environ,
@@ -96,7 +106,7 @@ def real_creator_stack(tmp_path, request):
         cwd=repo_root,
         env=backend_env,
         ready_url=f"{backend_url}/health",
-        ready_timeout=30,
+        ready_timeout=60,
         name="backend",
     ):
         with run_process(
@@ -113,7 +123,7 @@ def real_creator_stack(tmp_path, request):
             cwd=frontend_root,
             env=frontend_env,
             ready_url=f"{frontend_url}/creator",
-            ready_timeout=60,
+            ready_timeout=90,
             name="frontend",
         ):
             yield {
@@ -298,10 +308,10 @@ def test_creator_corrects_search_structure_and_reads_only_the_backend_query_prev
 
 @pytest.mark.parametrize(
     "real_creator_stack",
-    [{"source_scenario": "complete"}],
+    [{"source_scenario": "complete", "withhold_marketing_track": "need"}],
     indirect=True,
 )
-def test_creator_confirm_scope_executes_one_complete_verified_run(browser_page):
+def test_creator_generates_traceable_marketing_conclusions_without_recollecting(browser_page):
     page, stack = browser_page
     page.goto(stack["frontend_url"] + "/creator", wait_until="domcontentloaded")
     page.get_by_role("button", name=re.compile("内容调研")).click(timeout=15000)
@@ -332,6 +342,12 @@ def test_creator_confirm_scope_executes_one_complete_verified_run(browser_page):
     for index, query in enumerate(expected_queries):
         expect(scope.get_by_test_id("scope-final-query").nth(index)).to_have_text(query)
 
+    # A single confirmation click must both persist the currently focused edit
+    # and freeze that newest Scope. Requiring a separate blur makes the first
+    # click disappear when the blur-triggered save temporarily disables the
+    # confirmation button.
+    scope.get_by_label("场景或人群补充词（可选）").fill("夏季通勤")
+    expected_queries = ["T恤", "T恤 凉感", "T恤 夏季通勤"]
     confirm = scope.get_by_role("button", name="确认并开始调研")
     expect(confirm).to_be_enabled()
     with page.expect_response(
@@ -339,11 +355,45 @@ def test_creator_confirm_scope_executes_one_complete_verified_run(browser_page):
         and '"action":"confirm_scope"' in (response.request.post_data or ""),
         timeout=30000,
     ) as confirmation:
-        confirm.evaluate("(button) => { button.click(); button.click(); }")
+        confirm.click()
     assert confirmation.value.status == 200, confirmation.value.text()
 
     expect(page.get_by_text("调研报告已完成", exact=True)).to_be_visible(timeout=120000)
-    expect(page.get_by_role("article", name="Content Research published report")).to_be_visible(timeout=30000)
+    report = page.get_by_role("article", name="Content Research published report")
+    expect(report).to_be_visible(timeout=30000)
+    expect(report.get_by_text("audit_rewrite_exhausted", exact=True)).to_have_count(0)
+    expect(
+        report.get_by_text(
+            "部分叙述未通过证据核验，已自动隐藏；当前仅展示可验证内容。",
+            exact=True,
+        )
+    ).to_be_visible()
+    expect(
+        report.get_by_text("分析已选定 · 本次未发布", exact=True)
+    ).to_be_visible()
+    expect(report.get_by_text("分析不可用", exact=True)).to_have_count(0)
+
+    evidence_buttons = report.get_by_role("button", name="证据详情", exact=True)
+    expect(evidence_buttons).not_to_have_count(0)
+    first_evidence_button = evidence_buttons.nth(0)
+    first_evidence_group = first_evidence_button.locator("..")
+    first_evidence_button.click()
+    first_inline_evidence = first_evidence_group.get_by_role(
+        "region", name=re.compile(r"引用 \[\d+\] 证据详情")
+    )
+    expect(first_inline_evidence).to_be_visible()
+    expect(first_inline_evidence).to_contain_text("content_text")
+
+    second_evidence_button = evidence_buttons.nth(1)
+    second_evidence_group = second_evidence_button.locator("..")
+    second_evidence_button.click()
+    expect(first_evidence_group.get_by_role("region")).to_have_count(0)
+    expect(
+        second_evidence_group.get_by_role(
+            "region", name=re.compile(r"引用 \[\d+\] 证据详情")
+        )
+    ).to_be_visible()
+    expect(report.get_by_role("region", name=re.compile(r"引用 \[\d+\] 证据详情"))).to_have_count(1)
 
     source_calls = [
         json.loads(line)
@@ -354,6 +404,26 @@ def test_creator_confirm_scope_executes_one_complete_verified_run(browser_page):
     assert all(call["workflow_run_id"] == run_id for call in source_calls)
 
     with sqlite3.connect(stack["db_path"]) as connection:
+        scope_query_groups = json.loads(
+            connection.execute(
+                "SELECT query_groups_json FROM content_research_scope_contracts "
+                "WHERE workflow_run_id=?",
+                (run_id,),
+            ).fetchone()[0]
+        )
+        locked_plan = json.loads(
+            connection.execute(
+                "SELECT effective_policy_json FROM content_research_run_policy_snapshots "
+                "WHERE workflow_run_id=?",
+                (run_id,),
+            ).fetchone()[0]
+        )["locked_query_plan"]["directions"]["product_marketing"]
+        assert [group["id"] for group in locked_plan["query_groups"]] == [
+            group["id"] for group in scope_query_groups
+        ]
+        assert [group["normalized_query"] for group in locked_plan["query_groups"]] == [
+            group["final_query"] for group in scope_query_groups
+        ]
         assert connection.execute(
             "SELECT COUNT(*) FROM content_research_scope_contracts WHERE workflow_run_id=?",
             (run_id,),
@@ -366,15 +436,301 @@ def test_creator_confirm_scope_executes_one_complete_verified_run(browser_page):
             "SELECT COUNT(*) FROM content_research_directional_evidence_packets WHERE workflow_run_id=?",
             (run_id,),
         ).fetchone()[0] >= 3
-        assert connection.execute(
-            "SELECT COUNT(*) FROM content_research_report_publications WHERE workflow_run_id=?",
+        publication_count, publication_state = connection.execute(
+            "SELECT COUNT(*), MAX(publication_state) "
+            "FROM content_research_report_publications WHERE workflow_run_id=?",
             (run_id,),
-        ).fetchone()[0] == 1
+        ).fetchone()
+        assert (publication_count, publication_state) == (1, "partial_verified_report")
+        publication_payload = json.loads(
+            connection.execute(
+                "SELECT payload_json FROM content_research_report_publications "
+                "WHERE workflow_run_id=?",
+                (run_id,),
+            ).fetchone()[0]
+        )
+        assert publication_payload["track_publication_dispositions"] == [
+            {
+                "track": "need",
+                "state": "withheld_by_faithfulness",
+                "reason_code": "faithfulness_not_verified",
+            },
+            {"track": "value", "state": "published", "reason_code": None},
+            {"track": "message", "state": "published", "reason_code": None},
+        ]
+        snapshot_id, retrieval_unit_id = connection.execute(
+            "SELECT id, retrieval_execution_unit_id "
+            "FROM content_research_evidence_snapshots WHERE workflow_run_id=?",
+            (run_id,),
+        ).fetchone()
+        analysis_unit_id = connection.execute(
+            "SELECT id FROM content_research_analysis_units "
+            "WHERE workflow_run_id=? AND evidence_snapshot_id=?",
+            (run_id, snapshot_id),
+        ).fetchone()[0]
+        analysis_attempt_id, analysis_attempt_state = connection.execute(
+            "SELECT id, state FROM content_research_analysis_attempts "
+            "WHERE analysis_unit_id=? ORDER BY attempt_no DESC LIMIT 1",
+            (analysis_unit_id,),
+        ).fetchone()
+        assert analysis_attempt_state == "succeeded"
+        assert {
+            tuple(row)
+            for row in connection.execute(
+                "SELECT track, status FROM content_research_analysis_checkpoints "
+                "WHERE analysis_unit_id=? AND stage='verifier'",
+                (analysis_unit_id,),
+            ).fetchall()
+        } == {
+            ("need", "completed"),
+            ("value", "completed"),
+            ("message", "completed"),
+        }
+        marketing_checkpoint = json.loads(
+            connection.execute(
+                "SELECT payload_json FROM content_research_stage_checkpoints "
+                "WHERE workflow_run_id=? AND stage_name='marketing_conclusion'",
+                (run_id,),
+            ).fetchone()[0]
+        )
+        assert marketing_checkpoint["evidence_snapshot_id"] == snapshot_id
+        assert marketing_checkpoint["analysis_attempt_id"] == analysis_attempt_id
+        assert marketing_checkpoint["retrieval_execution_unit_id"] == retrieval_unit_id
         state, status = connection.execute(
             "SELECT content_research_state, status FROM workflow_runs WHERE run_id=?",
             (run_id,),
         ).fetchone()
     assert (state, status) == ("report_ready", "succeeded")
+    trace_request = Request(
+        f"{stack['backend_url']}/content-research/workflows/{run_id}/trace",
+        headers=USER_HEADERS,
+    )
+    with urlopen(trace_request, timeout=10) as response:
+        trace = json.loads(response.read())
+    marketing_trace = next(
+        item
+        for item in trace["logical_checkpoints"]
+        if item["stage"] == "marketing_conclusion"
+    )
+    assert trace["state"] == "report_ready"
+    assert marketing_trace["analysis_attempt_id"] == analysis_attempt_id
+    assert marketing_trace["evidence_snapshot_id"] == snapshot_id
+    assert marketing_trace["embedding"]["document_count"] >= 3
+    assert "vectors" not in json.dumps(marketing_trace)
+    assert {
+        track: details["execution"]
+        for track, details in marketing_trace["tracks"].items()
+    } == {"need": "completed", "value": "completed", "message": "completed"}
+    assert marketing_trace["tracks"]["need"]["state"] == "selected"
+    assert marketing_trace["tracks"]["need"]["publication_disposition"] == {
+        "state": "withheld_by_faithfulness",
+        "reason_code": "faithfulness_not_verified",
+    }
+    assert "retry_analysis" not in trace.get("allowed_actions", [])
+
+
+@pytest.mark.parametrize(
+    "real_creator_stack",
+    [{"source_scenario": "contested", "empty_analysis_tracks": "need,message"}],
+    indirect=True,
+)
+def test_creator_reports_supported_contested_and_insufficient_tracks_with_exact_quotes(
+    browser_page,
+):
+    page, stack = browser_page
+    page.goto(stack["frontend_url"] + "/creator", wait_until="domcontentloaded")
+    page.get_by_role("button", name=re.compile("内容调研")).click(timeout=15000)
+    research_input = page.get_by_role(
+        "textbox", name="输入品类、品牌或 SKU，发送后开始内容调研"
+    )
+    research_input.fill("夏季凉感T恤")
+    with page.expect_response(
+        lambda response: response.url.endswith("/content-research/presearch")
+        and response.status == 201,
+        timeout=30000,
+    ) as presearch_response:
+        research_input.press("Enter")
+    run_id = presearch_response.value.json()["workflow_run_id"]
+
+    page.get_by_role("button", name="准确，继续").click()
+    page.get_by_role("button", name="产品营销").click()
+    with page.expect_response(
+        lambda response: response.url.endswith("/actions")
+        and '"action":"confirm_brief"' in (response.request.post_data or ""),
+        timeout=30000,
+    ):
+        page.get_by_role("button", name="确认并继续").click()
+    scope = page.get_by_role("region", name="检索范围确认")
+    expect(scope.get_by_test_id("scope-final-query")).to_have_count(3, timeout=30000)
+    with page.expect_response(
+        lambda response: response.url.endswith("/actions")
+        and '"action":"confirm_scope"' in (response.request.post_data or ""),
+        timeout=30000,
+    ):
+        scope.get_by_role("button", name="确认并开始调研").click()
+
+    expect(page.get_by_text("调研报告已完成", exact=True)).to_be_visible(timeout=120000)
+    report = page.get_by_role("article", name="Content Research published report")
+    value = report.get_by_role("region", name="可被相信的产品卖点")
+    expect(value).to_contain_text("支持 3 篇 / 3 位作者；反向 2 篇 / 2 位作者")
+    expect(report.get_by_text("暂无可验证结论", exact=True)).to_have_count(2)
+
+    evidence_buttons = value.get_by_role("button", name="证据详情", exact=True)
+    expect(evidence_buttons).to_have_count(5)
+    evidence_buttons.nth(0).click()
+    expect(value.get_by_role("region", name=re.compile(r"引用 \[\d+\] 证据详情"))).to_contain_text(
+        "穿着凉爽"
+    )
+    evidence_buttons.nth(4).click()
+    inline_counter = value.get_by_role(
+        "region", name=re.compile(r"引用 \[\d+\] 证据详情")
+    )
+    expect(inline_counter).to_have_count(1)
+    expect(inline_counter).to_contain_text("一点也不凉爽")
+
+    trace_request = Request(
+        f"{stack['backend_url']}/content-research/workflows/{run_id}/trace",
+        headers=USER_HEADERS,
+    )
+    with urlopen(trace_request, timeout=10) as response:
+        trace = json.loads(response.read())
+    marketing_trace = next(
+        item
+        for item in trace["logical_checkpoints"]
+        if item["stage"] == "marketing_conclusion"
+    )
+    assert marketing_trace["tracks"]["value"] == {
+        **marketing_trace["tracks"]["value"],
+        "state": "contested",
+        "supporting_note_count": 3,
+        "independent_author_count": 3,
+        "counter_note_count": 2,
+        "counter_author_count": 2,
+    }
+    assert {
+        track: marketing_trace["tracks"][track]["state"]
+        for track in ("need", "message")
+    } == {"need": "insufficient_evidence", "message": "insufficient_evidence"}
+
+
+@pytest.mark.parametrize(
+    "real_creator_stack",
+    [{"source_scenario": "complete", "invalid_analysis_tracks": "value,message"}],
+    indirect=True,
+)
+def test_creator_exposes_real_analysis_worker_failure_before_report_composition(browser_page):
+    page, stack = browser_page
+    page.goto(stack["frontend_url"] + "/creator", wait_until="domcontentloaded")
+    page.get_by_role("button", name=re.compile("内容调研")).click(timeout=15000)
+    research_input = page.get_by_role(
+        "textbox", name="输入品类、品牌或 SKU，发送后开始内容调研"
+    )
+    research_input.fill("夏季凉感T恤")
+    with page.expect_response(
+        lambda response: response.url.endswith("/content-research/presearch")
+        and response.status == 201,
+        timeout=30000,
+    ) as presearch_response:
+        research_input.press("Enter")
+    run_id = presearch_response.value.json()["workflow_run_id"]
+
+    page.get_by_role("button", name="准确，继续").click()
+    page.get_by_role("button", name="产品营销").click()
+    page.get_by_role("button", name="确认并继续").click()
+    scope = page.get_by_role("region", name="检索范围确认")
+    expect(scope.get_by_test_id("scope-final-query")).to_have_count(3, timeout=30000)
+    scope.get_by_role("button", name="确认并开始调研").click()
+
+    expect(page.get_by_text("本轮调研需要恢复", exact=True)).to_be_visible(timeout=120000)
+    page.get_by_role("button", name="查看 Trace").click()
+    trace_dialog = page.get_by_role("dialog", name="Agent 决策日志 · Trace")
+    expect(trace_dialog.get_by_text("营销结论判定", exact=True)).to_be_visible(timeout=30000)
+    expect(trace_dialog.get_by_text(re.compile("需求：已选定"))).to_be_visible()
+    expect(trace_dialog.get_by_text(re.compile("价值：分析不可用"))).to_be_visible()
+    expect(trace_dialog.get_by_text(re.compile("表达：分析不可用"))).to_be_visible()
+    expect(trace_dialog.get_by_text(re.compile("价值：模型返回的 JSON 无法解析"))).to_be_visible()
+    expect(trace_dialog.get_by_text("营销结论分析", exact=True)).to_be_visible()
+    expect(trace_dialog.get_by_text("组装并发布调研报告", exact=True)).to_be_visible()
+
+    trace_request = Request(
+        f"{stack['backend_url']}/content-research/workflows/{run_id}/trace",
+        headers=USER_HEADERS,
+    )
+    with urlopen(trace_request, timeout=10) as response:
+        trace = json.loads(response.read())
+    marketing_trace = next(
+        item
+        for item in trace["logical_checkpoints"]
+        if item["stage"] == "marketing_conclusion"
+    )
+    assert trace["state"] == "recovery_required"
+    assert trace["effective_attempt"] == {
+        "kind": "analysis",
+        "attempt_no": 1,
+        "state": "failed",
+    }
+    assert marketing_trace["status"] == "failed"
+    assert marketing_trace["tracks"]["need"]["execution"] == "completed"
+    assert marketing_trace["tracks"]["value"] == {
+        "state": "analysis_unavailable",
+        "execution": "failed",
+        "decision": "analysis_failed",
+        "publication_role": "omitted",
+        "reason_codes": ["marketing_analysis_unavailable"],
+        "failure_code": "llm_protocol_incompatible",
+        "failure_detail": "invalid_json",
+        "recovery_action": "repair_model_configuration_and_resume",
+    }
+    assert marketing_trace["tracks"]["message"] == marketing_trace["tracks"]["value"]
+    runtime_statuses = {
+        step["step_name"]: step["status"] for step in trace["runtime_steps"]
+    }
+    assert runtime_statuses["formal_research"] == "succeeded"
+    assert runtime_statuses["marketing_analysis"] == "failed"
+    assert runtime_statuses["report"] == "pending"
+    assert trace["external_api_summary"]["failed_count"] == 0
+    assert trace["external_api_summary"]["call_count"] > 0
+    source_call_count = trace["external_api_summary"]["call_count"]
+    with sqlite3.connect(stack["db_path"]) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM content_research_report_publications WHERE workflow_run_id=?",
+            (run_id,),
+        ).fetchone() == (0,)
+
+    trace_dialog.get_by_role("button", name="关闭 Trace 对话框").click()
+    page.reload(wait_until="domcontentloaded")
+    expect(page.get_by_text("本轮调研需要恢复", exact=True)).to_be_visible(
+        timeout=30000
+    )
+    expect(page.get_by_role("button", name="继续失败的分析")).to_be_visible()
+    page.get_by_role("button", name="继续失败的分析").click()
+    deadline = time.monotonic() + 30
+    retry_trace = None
+    while time.monotonic() < deadline:
+        with urlopen(trace_request, timeout=10) as response:
+            candidate = json.loads(response.read())
+        if candidate.get("effective_attempt") == {
+            "kind": "analysis",
+            "attempt_no": 2,
+            "state": "failed",
+        }:
+            retry_trace = candidate
+            break
+        time.sleep(0.2)
+
+    assert retry_trace is not None
+    assert retry_trace["state"] == "recovery_required"
+    assert retry_trace["run_status"] == "waiting_user"
+    assert retry_trace["current_stage"] == "marketing_analysis"
+    assert retry_trace["external_api_summary"]["call_count"] == source_call_count
+    retry_marketing = next(
+        item
+        for item in retry_trace["logical_checkpoints"]
+        if item["stage"] == "marketing_conclusion"
+    )
+    assert retry_marketing["tracks"]["need"]["execution"] == "completed"
+    assert retry_marketing["tracks"]["value"]["failure_detail"] == "invalid_json"
+    assert retry_marketing["tracks"]["message"]["failure_detail"] == "invalid_json"
 
 
 

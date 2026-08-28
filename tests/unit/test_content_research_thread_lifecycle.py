@@ -6,6 +6,11 @@ import pytest
 
 from app.content_research.api_schemas import ContentResearchSourceCollectionRequest
 from app.content_research.models import ResearchBriefRecord, TraceRecord, utcnow
+from app.content_research.scope_contract import (
+    ScopeConstraint,
+    ScopeQueryGroupInput,
+    build_scope_contract,
+)
 from app.content_research.service import (
     ContentResearchService,
     ContentResearchValidationError,
@@ -86,6 +91,15 @@ async def test_formal_research_rejects_an_orphaned_creator_thread_before_executi
         status="ready",
         payload={"schema_version": "content_research_brief_v1", "seed_text": "北面"},
     ))
+    store.save_scope_contract(
+        build_scope_contract(
+            workflow_run_id="run_orphaned",
+            research_plan_id="plan_orphaned",
+            version=1,
+            constraints=(ScopeConstraint("core_object", "核心对象", "北面", "required"),),
+            query_groups=(ScopeQueryGroupInput("北面", "北面"),),
+        )
+    )
     service = ContentResearchService(
         store=store,
         presearch=None,

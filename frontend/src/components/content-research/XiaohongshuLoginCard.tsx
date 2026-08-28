@@ -11,7 +11,7 @@ import {
 } from "@/lib/content-research-api";
 import { contentResearchErrorFeedback } from "@/lib/content-research-error-feedback";
 
-export function XiaohongshuLoginCard() {
+export function XiaohongshuLoginCard({ refreshKey }: { refreshKey?: string }) {
   const [status, setStatus] = useState<XHSLoginStatus | null>(null);
   const [cookie, setCookie] = useState("");
   const [qrImage, setQrImage] = useState<string | null>(null);
@@ -20,7 +20,14 @@ export function XiaohongshuLoginCard() {
   const [savingCookie, setSavingCookie] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => { void getXHSLoginStatus().then(setStatus).catch(() => setError("登录状态暂不可用")); }, []);
+  useEffect(() => {
+    void getXHSLoginStatus()
+      .then((nextStatus) => {
+        setStatus(nextStatus);
+        setError(null);
+      })
+      .catch(() => setError("登录状态暂不可用"));
+  }, [refreshKey]);
   useEffect(() => {
     if (!qrPending) return;
     const poll = () => void getCurrentXHSQRLogin().then((result) => {

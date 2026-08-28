@@ -71,7 +71,7 @@ class ReportPublicationMaterializer:
             run = await workflow_store.get_run(publication.workflow_run_id)
             if run is None:
                 raise ValueError("missing Creator workflow run for report publication")
-            if run.status.value != "finalizing_report":
+            if run.status.value not in {"finalizing_report", "succeeded"}:
                 raise ValueError("cannot materialize a report outside finalizing_report")
             existing = await workflow_store.list_artifacts(publication.workflow_run_id)
 
@@ -85,6 +85,17 @@ class ReportPublicationMaterializer:
             None,
         )
         if artifact is None:
+            parent_artifact = next(
+                (
+                    item
+                    for item in existing
+                    if publication.previous_version_id is not None
+                    and item.artifact_type == WorkflowArtifactType.FINAL_RESULT
+                    and (item.payload_json or {}).get("report_publication_id")
+                    == publication.previous_version_id
+                ),
+                None,
+            )
             if self._execution_context is not None:
                 manager = LeaseFencedWorkflowRunManager(
                     self._db_path,
@@ -118,6 +129,9 @@ class ReportPublicationMaterializer:
                     artifact_type=WorkflowArtifactType.FINAL_RESULT,
                     payload=self._artifact_payload(publication, draft, decision, snapshot),
                     payload_mode=WorkflowArtifactPayloadMode.SNAPSHOT,
+                    parent_artifact_id=(
+                        parent_artifact.artifact_id if parent_artifact is not None else None
+                    ),
                     summary_text="内容调研报告已发布",
                     transaction_guard=require_current_integrity,
                 )
@@ -284,6 +298,9 @@ class ReportPublicationMaterializer:
             "verified_section_ids": publication.payload["verified_section_ids"],
             "omitted_section_ids": publication.payload.get("omitted_section_ids", []),
             "audit_recovery_state": publication.payload["audit_recovery_state"],
+            "track_publication_dispositions": publication.payload.get(
+                "track_publication_dispositions", []
+            ),
         }
 
 

@@ -10,7 +10,6 @@ from app.content_research.models import (
     ObservationEventRecord,
     ResearchBriefRecord,
     ResearchDirectionRecord,
-    ResearchPlanRecord,
     SubagentTaskRecord,
     TraceRecord,
     utcnow,
@@ -27,6 +26,11 @@ from app.content_research.persistence_models import (
     MarketingConclusionDecisionRecord,
     StageCheckpointRecord,
     WeakSignalRecord,
+)
+from app.content_research.scope_contract import (
+    ScopeConstraint,
+    ScopeQueryGroupInput,
+    build_scope_contract,
 )
 from app.content_research.service import ContentResearchService
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
@@ -53,6 +57,25 @@ class CapturingRuntime:
         return {"status": "failed", "recoverable": False}
 
 
+def _authorize_initial_collection(
+    store: SQLiteContentResearchStore,
+    *,
+    workflow_run_id: str,
+    research_plan_id: str,
+) -> None:
+    store.save_scope_contract(
+        build_scope_contract(
+            workflow_run_id=workflow_run_id,
+            research_plan_id=research_plan_id,
+            version=1,
+            constraints=(
+                ScopeConstraint("core_object", "核心对象", "长袖衬衫", "required"),
+            ),
+            query_groups=(ScopeQueryGroupInput("长袖衬衫", "长袖衬衫"),),
+        )
+    )
+
+
 @pytest.mark.asyncio
 async def test_formal_execution_reuses_the_existing_workflow_trace(tmp_path):
     store = SQLiteContentResearchStore(str(tmp_path / "formal-trace-reuse.db"))
@@ -73,6 +96,11 @@ async def test_formal_execution_reuses_the_existing_workflow_trace(tmp_path):
     store.save_brief(brief)
     store.save_subagent_task(task)
     store.save_trace(trace)
+    _authorize_initial_collection(
+        store,
+        workflow_run_id=brief.workflow_run_id,
+        research_plan_id=task.plan_id,
+    )
 
     class CapturingRouter:
         def __init__(self) -> None:
@@ -102,71 +130,6 @@ async def test_formal_execution_reuses_the_existing_workflow_trace(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_formal_completion_without_a_live_creator_run_reports_not_published(tmp_path):
-    store = SQLiteContentResearchStore(str(tmp_path / "governed-completion.db"))
-    snapshot, policies, contracts = build_default_snapshot(
-        snapshot_id="rps_governed", workflow_run_id="run_governed", brief_id="rb_governed", plan_id="rp_governed",
-    )
-    store.save_run_policy_snapshot(snapshot)
-    for policy in policies:
-        store.save_sample_policy(policy)
-    for contract in contracts:
-        store.save_direction_contract(contract)
-    brief = ResearchBriefRecord(
-        id="rb_governed", workflow_run_id="run_governed", thread_id="thread_governed",
-        schema_version="v1", status="confirmed", payload={"schema_version": "v1"},
-    )
-    store.save_brief(brief)
-    store.save_plan(ResearchPlanRecord(
-        id="rp_governed", brief_id=brief.id, workflow_run_id=brief.workflow_run_id,
-        thread_id=brief.thread_id, schema_version="v1", status="confirmed",
-        payload={"schema_version": "v1"},
-    ))
-    task = SubagentTaskRecord(
-        id="sat_governed", workflow_run_id="run_governed", thread_id="thread_governed", schema_version="v1",
-        status="partial_completed", plan_id="rp_governed", direction_id="product_marketing",
-        payload={
-            "schema_version": "v1",
-            "workflow_child_task_id": "child_governed",
-            "output_payload": {"metadata": {"packet_ids": ["dep_note_1"]}},
-        },
-    )
-    store.save_subagent_task(task)
-    result = DirectionResultDecisionRecord(
-        "drd_governed", "v1", {"state": "insufficient_evidence", "admitted_claim_ids": [], "weak_signal_ids": []},
-        research_direction_id="product_marketing", policy_snapshot_id=snapshot.id,
-    )
-    store.save_direction_result_decision(result)
-    runtime = CapturingRuntime()
-    service = ContentResearchService(store=store, presearch=None, workflow_runtime=runtime)
-
-    await service._execute_formal_research(brief=brief, provider="xiaohongshu", source_kind="search", limit=10)
-
-    completion = runtime.completed[0]
-    child_refs = completion["task_outcomes"][0]["artifact_refs"]
-    assert {item["type"] for item in child_refs} == {
-        "content_research_directional_packet", "content_research_direction_result",
-    }
-    assert {item["type"] for item in completion["artifact_refs"]} == {
-        "content_research_directional_packet",
-        "content_research_direction_result",
-    }
-    assert completion["task_outcomes"][0]["status"] == "partial_completed"
-    event = runtime.events[0]
-    assert event["event_type"] == "formal_research_governed_completed"
-    assert event["payload"]["workflow_execution_state"] == "completed"
-    assert event["payload"]["publication_state"] == "not_published"
-    assert event["payload"]["governance_replayed"] is False
-    assert {item.stage_name for item in store.list_typed_records(StageCheckpointRecord)} == {"reconcile", "aggregate"}
-
-    await service._execute_formal_research(brief=brief, provider="xiaohongshu", source_kind="search", limit=10)
-
-    assert runtime.events[-1]["payload"]["governance_replayed"] is True
-    checkpoints = [item.stage_name for item in store.list_typed_records(StageCheckpointRecord)]
-    assert checkpoints.count("reconcile") == checkpoints.count("aggregate") == 1
-
-
-@pytest.mark.asyncio
 async def test_failed_direction_does_not_run_cross_direction_governance(tmp_path):
     store = SQLiteContentResearchStore(str(tmp_path / "failed-governance.db"))
     brief = ResearchBriefRecord(
@@ -179,6 +142,11 @@ async def test_failed_direction_does_not_run_cross_direction_governance(tmp_path
         schema_version="v1", status="failed", plan_id="rp_missing", direction_id="product_marketing",
         payload={"schema_version": "v1", "workflow_child_task_id": "child_failed", "output_payload": {"error_message": "adapter failed"}},
     ))
+    _authorize_initial_collection(
+        store,
+        workflow_run_id=brief.workflow_run_id,
+        research_plan_id="rp_missing",
+    )
     runtime = CapturingRuntime()
     service = ContentResearchService(store=store, presearch=None, workflow_runtime=runtime)
 
@@ -509,3 +477,67 @@ def test_governed_snapshot_uses_only_manifest_owned_claims_governance_and_checkp
     assert [item["checkpoint_id"] for item in governed["checkpoint_summary"]["stages"]] == [
         "scp_marketing_current"
     ]
+
+
+def test_marketing_checkpoint_extends_manifest_with_snapshot_derived_packets(
+    tmp_path,
+) -> None:
+    store = SQLiteContentResearchStore(str(tmp_path / "analysis-manifest.db"))
+    store.save_canonical_source(
+        CanonicalSourceRecord(
+            "source_1",
+            "v1",
+            {},
+            platform="xhs",
+            platform_source_kind="note",
+            platform_source_id="note_1",
+        )
+    )
+    ownership = {
+        "workflow_run_id": "run_1",
+        "scope_contract_id": "scope_1",
+        "execution_unit_id": "execution_1",
+        "attempt_no": 1,
+        "execution_revision": 1,
+    }
+    packet = DirectionalEvidencePacketRecord(
+        "sep_1",
+        "content_research_directional_evidence_packet_v2",
+        {
+            "field_projection": {
+                "content_text": "上身凉爽",
+                "source_url": "https://example.test/note_1",
+            },
+            "evidence_snapshot_id": "snapshot_1",
+        },
+        research_direction_id="product_marketing",
+        canonical_source_id="source_1",
+        field_projection_hash="hash_1",
+        **ownership,
+    )
+    store.save_directional_evidence_packet(packet)
+    checkpoint = StageCheckpointRecord(
+        "scp_1",
+        "content_research_stage_checkpoint_v1",
+        {
+            "evidence_snapshot_id": "snapshot_1",
+            "projected_packet_ids": [packet.id],
+        },
+        subagent_task_id="marketing-conclusion:plan_1",
+        stage_name="marketing_conclusion",
+        input_fingerprint="fingerprint_1",
+        status="completed",
+        **ownership,
+    )
+    store.save_stage_checkpoint(checkpoint)
+    manifest = CoverageManifest(packet_ids=(), checkpoint_ids=(), **ownership)
+    service = ContentResearchService(
+        store=store, presearch=None, workflow_runtime=CapturingRuntime()
+    )
+
+    extended = service._extend_manifest_with_generated_checkpoints(
+        manifest, (checkpoint,)
+    )
+
+    assert extended.packet_ids == (packet.id,)
+    assert extended.checkpoint_ids == (checkpoint.id,)

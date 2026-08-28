@@ -112,13 +112,13 @@ def test_publication_state_matrix_requires_core_sections_and_excludes_evidence_o
 
     with pytest.raises(ValueError, match="core audited"):
         _publication(draft, decision, verified_section_kinds=("core_conclusions", "main_findings"))
-    with pytest.raises(ValueError, match="partial report requires omitted"):
-        _publication(
-            draft,
-            decision,
-            publication_state="partial_verified_report",
-            verified_section_kinds=("core_conclusions",),
-        )
+    bounded_partial = _publication(
+        draft,
+        decision,
+        publication_state="partial_verified_report",
+        verified_section_kinds=("core_conclusions",),
+    )
+    assert bounded_partial.omitted_section_ids == ()
     with pytest.raises(ValueError, match="cannot contain free prose"):
         _publication(
             draft,

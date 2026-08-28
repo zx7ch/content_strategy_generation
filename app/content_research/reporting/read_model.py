@@ -216,6 +216,9 @@ class PublishedReportReader:
                 "audit_state": decision.payload.get("audit_state"),
                 "reason_codes": list(decision.payload.get("reason_codes") or []),
                 "omitted_section_ids": list(publication.payload.get("omitted_section_ids") or []),
+                "track_publication_dispositions": list(
+                    publication.payload.get("track_publication_dispositions") or []
+                ),
                 "audit_recovery_state": publication.payload.get("audit_recovery_state"),
                 "compose_mode": publication.payload.get("compose_mode") or "prose",
                 "scope_contract_id": publication.scope_contract_id,
@@ -316,6 +319,10 @@ class PublishedReportReader:
                 ),
                 reverse=True,
             )
+            if self._integrity_projection(matches[0])["integrity_state"] != "healthy":
+                raise PublishedReportNotFoundError(
+                    "current published report failed integrity validation"
+                )
         return matches[0]
 
     def _integrity_projection(

@@ -13,6 +13,12 @@ SQLite 写竞争、Trace 失真和旧规格残留问题达成的最终产品与�
 2. Content Research 主流程 SQLite 写协调整改；
 3. Trace 真实执行投影整改。
 
+Task 3 中营销结论生成、独立 analysis attempt、Embedding Runtime、worker 失联恢复、
+营销分析 Trace 和回归门禁由增量规格
+[`2026-08-25-task-3-1-marketing-conclusion-trace-design.md`](./2026-08-25-task-3-1-marketing-conclusion-trace-design.md)
+定义。该规格是本文 `report_composing`、Trace 和发布门禁的具体化，不增加第二套业务
+状态机或新的用户流程阶段。
+
 三个任务可以分阶段开发和提交，但在三者全部通过发布门禁之前，不得宣称
 Content Research 主流程已经稳定交付。Task 1 与 Task 2 尤其不能作为两个可独立
 发布的安全检查点：Task 1 定义唯一状态语义，Task 2 使这些转换在 SQLite 上可靠。
@@ -316,6 +322,11 @@ Trace 顶层状态只读取 `workflow_run.content_research_state` 与 `state_rev
 | `TRACE-CR-04` | 小红书调用 | provider request/outcome facts | query group、operation、状态、数量、重试、安全错误 |
 | `TRACE-CR-05` | 笔记 | canonical source/evidence 的安全引用 | source id、标题、作者名、URL、检索来源、处理状态 |
 | `TRACE-CR-06` | Coverage/报告 | Coverage snapshot/publication facts | 样本数、作者数、缺口、决策、报告状态 |
+| `TRACE-CR-07` | 营销分析 | 当前有效 analysis attempt、原子证据/观点组/三轨 decision/verifier facts | 五个中文分析阶段、真实计数、支持/反向证据和安全失败 |
+
+Task 3.1 将 Trace 读取收敛为同一只读事务的 snapshot，并增加单调
+`trace_revision`。当前状态仍只由 `state_revision` 表示；`trace_revision` 只用于防止
+同一状态内的旧执行事实响应覆盖新响应，不是第二套状态机。
 
 ### Trace 错误契约
 
@@ -387,6 +398,25 @@ Trace 不复制原始笔记正文，只引用持久化来源：
 | `FAIL-CR-17` | `waiting_user` 不得显示为等待恢复或执行中，也不得从 `started_at` 持续累计执行时长。 |
 | `FAIL-CR-18` | Creator Trace 不得暴露 `scope_confirm`、`formal_research`、`coverage`、`report` 或“安全执行阶段”等内部名称；必须投影为统一的中文用户阶段。 |
 | `FAIL-CR-19` | Scope 保存已在后端提交但响应丢失时，前端不得继续使用旧 Draft/revision 使最新编辑因 409 丢失；恢复读取失败或有界重试失败必须保留本地输入并显示错误。 |
+| `FAIL-CR-20` | 营销分析必须使用与 retrieval 分离的 analysis attempt；重试绑定同一冻结 Evidence Snapshot，Spider operation delta 为零。 |
+| `FAIL-CR-21` | analysis worker 失联、lease 过期、LLM/Embedding/SQLite/协议失败必须收敛为 `recovery_required`，不得永久显示执行中或发布空成功报告。 |
+| `FAIL-CR-22` | Trace 连续读取失败时 Creator 显示“暂时无法确认最新状态”，不得继续把缓存中的 `running` 当作事实。 |
+
+## Task 3.1 增量范围
+
+营销结论分析发生在现有 `report_composing` 状态内部，用户只看到“整理笔记证据、
+归并相近观点、提炼营销结论、核验结论依据、生成调研报告”。EmbeddingService 在
+Runtime 启动时加载、预热并注册为单例；业务 Run 只调用已就绪服务。
+
+检索完成后冻结 Evidence Snapshot。Retrieval attempt 拥有 Spider 副作用，analysis
+attempt 只读取冻结证据并调用 LLM/Embedding。一个 analysis unit 同时最多有一个有效
+attempt；重试创建 successor，旧 attempt 被 fenced。营销分析、三轨决定或核验结果
+缺失时 publication gate 必须拒绝 `report_ready`。
+
+完整 authority、状态、转换、失败、回归和验收合同见
+[`Task 3.1 营销结论生成与真实 Trace 设计`](./2026-08-25-task-3-1-marketing-conclusion-trace-design.md)，
+实施顺序见
+[`Task 3.1 纵向切片计划`](../plans/2026-08-25-task-3-1-marketing-conclusion-trace.md)。
 
 ## 旧规格删除契约
 

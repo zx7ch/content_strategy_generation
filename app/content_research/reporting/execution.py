@@ -130,7 +130,9 @@ class ReportExecutionService:
                     omitted = tuple(
                         section.section_id
                         for section in draft.sections
-                        if section.prose and section.conclusion_state != "directional"
+                        if section.prose
+                        and section.conclusion_state
+                        not in {"directional", "selected", "contested"}
                     )
                     draft = self._withdraw_prose(draft, omitted)
                     self._store.save_report_draft(draft.to_record())
@@ -141,7 +143,19 @@ class ReportExecutionService:
                     )
                     withdrawn_section_ids = omitted
                 else:
-                    state = "partial_verified_report" if withdrawn_section_ids else "complete_verified_report"
+                    if _has_selected(draft):
+                        # Task 3.1 tracks are independent analysis viewpoints,
+                        # not a completeness quota.  Even three selected tracks
+                        # remain a partial verified report over a bounded sample.
+                        state = "partial_verified_report"
+                    elif _completed_marketing_analysis_has_no_publishable_conclusion(snapshot):
+                        state = "evidence_only_report"
+                    else:
+                        state = (
+                            "partial_verified_report"
+                            if withdrawn_section_ids
+                            else "complete_verified_report"
+                        )
                 publication_decision = decision
                 if draft.id != decision.report_draft_id:
                     publication_decision = replace(
@@ -180,8 +194,25 @@ class ReportExecutionService:
         omitted = tuple(dict.fromkeys((*withdrawn_section_ids, *last_evaluation.affected_section_ids))) or tuple(
             section.section_id for section in draft.sections if section.prose
         )
-        prose_sections = [section for section in draft.sections if section.prose and section.section_id not in omitted]
-        state = "partial_verified_report" if prose_sections else "evidence_only_report"
+        visible_marketing_states = _visible_marketing_states(draft, omitted)
+        has_marketing_sections = any(
+            section.section_kind.startswith("marketing_") for section in draft.sections
+        )
+        if not has_marketing_sections:
+            state = (
+                "partial_verified_report"
+                if any(
+                    section.prose and section.section_id not in set(omitted)
+                    for section in draft.sections
+                )
+                else "evidence_only_report"
+            )
+        elif {"selected", "contested"} & visible_marketing_states:
+            state = "partial_verified_report"
+        elif "directional" in visible_marketing_states:
+            state = "directional_report"
+        else:
+            state = "evidence_only_report"
         published_draft = self._withdraw_prose(draft, omitted)
         self._store.save_report_draft(published_draft.to_record())
         publication_decision = replace(
@@ -196,6 +227,8 @@ class ReportExecutionService:
             state,
             omitted,
             state != "evidence_only_report",
+            str(policy.get("report_compose_mode") or "prose"),
+            withheld_section_ids=omitted,
         )
         self._store.save_report_publication(publication.to_record())
         return publication
@@ -211,7 +244,17 @@ class ReportExecutionService:
         )
         return replace(draft, sections=sections, previous_version_id=draft.id)
 
-    def _publication(self, draft: Any, decision_id: str, state: str, omitted: tuple[str, ...], has_prose: bool, compose_mode: str = "prose") -> ReportPublication:
+    def _publication(
+        self,
+        draft: Any,
+        decision_id: str,
+        state: str,
+        omitted: tuple[str, ...],
+        has_prose: bool,
+        compose_mode: str = "prose",
+        *,
+        withheld_section_ids: tuple[str, ...] = (),
+    ) -> ReportPublication:
         kinds = tuple(section.section_kind for section in draft.sections if section.section_id not in omitted)
         ids = tuple(section.section_id for section in draft.sections if section.section_id not in omitted)
         return ReportPublication(
@@ -220,8 +263,17 @@ class ReportExecutionService:
             policy_version=draft.policy_version, algorithm_version=draft.algorithm_version, report_draft_id=draft.id,
             faithfulness_decision_id=decision_id, publication_state=state, verified_section_ids=ids,
             verified_section_kinds=kinds, structured_card_section_ids=tuple(section.section_id for section in draft.sections),
-            audit_recovery_state="all_required_sections_passed" if state == "complete_verified_report" else "audit_rewrite_exhausted",
+            audit_recovery_state=(
+                "audit_rewrite_exhausted"
+                if withheld_section_ids
+                else "all_required_sections_passed"
+            ),
             has_free_prose=has_prose, omitted_section_ids=omitted,
+            track_publication_dispositions=_track_publication_dispositions(
+                draft,
+                omitted_section_ids=omitted,
+                withheld_section_ids=withheld_section_ids,
+            ),
             compose_mode=compose_mode,
             scope_contract_id=draft.scope_contract_id,
             execution_unit_id=draft.execution_unit_id,
@@ -243,6 +295,17 @@ class ReportExecutionService:
             structured_card_section_ids=tuple(payload["structured_card_section_ids"]),
             audit_recovery_state=str(payload["audit_recovery_state"]), has_free_prose=bool(payload["has_free_prose"]),
             omitted_section_ids=tuple(payload.get("omitted_section_ids") or ()), compose_mode=str(payload.get("compose_mode") or "prose"), previous_version_id=record.previous_version_id,
+            track_publication_dispositions=tuple(
+                (
+                    str(item["track"]),
+                    str(item["state"]),
+                    str(item["reason_code"])
+                    if item.get("reason_code") is not None
+                    else None,
+                )
+                for item in payload.get("track_publication_dispositions") or ()
+                if isinstance(item, dict)
+            ),
             scope_contract_id=record.scope_contract_id,
             execution_unit_id=record.execution_unit_id,
             coverage_snapshot_id=record.coverage_snapshot_id,
@@ -277,12 +340,70 @@ def _marketing_conclusion_states(draft: ReportDraft) -> set[str | None]:
     }
 
 
+def _visible_marketing_states(
+    draft: ReportDraft, omitted_section_ids: tuple[str, ...]
+) -> set[str | None]:
+    omitted = set(omitted_section_ids)
+    return {
+        section.conclusion_state
+        for section in draft.sections
+        if section.section_kind.startswith("marketing_")
+        and section.section_id not in omitted
+        and section.prose
+    }
+
+
+def _track_publication_dispositions(
+    draft: ReportDraft,
+    *,
+    omitted_section_ids: tuple[str, ...],
+    withheld_section_ids: tuple[str, ...],
+) -> tuple[tuple[str, str, str | None], ...]:
+    omitted = set(omitted_section_ids)
+    withheld = set(withheld_section_ids)
+    sections_by_track = {
+        section.section_kind.removeprefix("marketing_"): section
+        for section in draft.sections
+        if section.section_kind.startswith("marketing_")
+    }
+    result: list[tuple[str, str, str | None]] = []
+    for track in ("need", "value", "message"):
+        section = sections_by_track.get(track)
+        if section is None:
+            continue
+        if section.section_id in withheld:
+            result.append(
+                (track, "withheld_by_faithfulness", "faithfulness_not_verified")
+            )
+        elif section.section_id in omitted:
+            result.append((track, "omitted_by_publication_policy", None))
+        else:
+            result.append((track, "published", None))
+    return tuple(result)
+
+
 def _has_directional(draft: ReportDraft) -> bool:
     return "directional" in _marketing_conclusion_states(draft)
 
 
 def _has_selected(draft: ReportDraft) -> bool:
-    return "selected" in _marketing_conclusion_states(draft)
+    return bool({"selected", "contested"} & _marketing_conclusion_states(draft))
+
+
+def _completed_marketing_analysis_has_no_publishable_conclusion(
+    snapshot: ResearchResultSnapshotRecord,
+) -> bool:
+    governed = snapshot.metadata.get("governed_snapshot")
+    if not isinstance(governed, dict):
+        return False
+    conclusions = governed.get("marketing_conclusions")
+    if not isinstance(conclusions, list) or len(conclusions) != 3:
+        return False
+    return all(
+        isinstance(item, dict)
+        and item.get("state") == "insufficient_evidence"
+        for item in conclusions
+    )
 
 
 def _has_admitted_cited_evidence(snapshot: ResearchResultSnapshotRecord) -> bool:

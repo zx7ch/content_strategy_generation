@@ -286,6 +286,7 @@ MARKETING_CONCLUSION_DECISION_STATES = frozenset(
         "selected",
         "qualified",
         "directional",
+        "contested",
         "insufficient_evidence",
         "no_single_primary_conclusion",
         "analysis_unavailable",
@@ -315,6 +316,8 @@ MARKETING_CONCLUSION_TRACE_REASON_CODES = frozenset(
         "conclusion_track_not_supported",
         "first_intent_support_unmet",
         "marketing_analysis_unavailable",
+        "groundedness_verifier_rejected",
+        "counter_evidence_threshold_met",
     }
 )
 MARKETING_CONCLUSION_TRACE_RECOVERY_ACTIONS = frozenset(
@@ -334,6 +337,7 @@ MARKETING_CONCLUSION_TRACE_FAILURE_CODES = frozenset(
 MARKETING_CONCLUSION_TRACE_PROTOCOL_DETAILS = frozenset(
     {
         "invalid_json",
+        "response_truncated",
         "invalid_top_level_shape",
         "invalid_candidates_shape",
         "invalid_candidate_shape",
@@ -343,6 +347,8 @@ MARKETING_CONCLUSION_TRACE_PROTOCOL_DETAILS = frozenset(
         "duplicate_supporting_claim_ids",
         "unknown_supporting_claim_id",
         "message_angle_performance_statement",
+        "supporting_claim_track_mismatch",
+        "supporting_claim_polarity_invalid",
     }
 )
 
@@ -610,6 +616,7 @@ class ReportIntegrityEventRecord:
         if self.reason_code not in {
             "frozen_execution_attempt_failed",
             "frozen_execution_attempt_outcome_unknown",
+            "materialized_artifact_invalid",
         }:
             raise ValueError("invalid report integrity reason")
         if self.recovery_guidance != "publish_successor_report":

@@ -54,10 +54,21 @@ class FakeClock:
         return self.values.pop(0)
 
 
-def make_response(*, usage: Any = None, content: str | None = " hello ", response_id: str = "resp_1") -> Any:
+def make_response(
+    *,
+    usage: Any = None,
+    content: str | None = " hello ",
+    response_id: str = "resp_1",
+    finish_reason: str = "stop",
+) -> Any:
     return SimpleNamespace(
         id=response_id,
-        choices=[SimpleNamespace(message=SimpleNamespace(content=content))],
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(content=content),
+                finish_reason=finish_reason,
+            )
+        ],
         usage=usage,
     )
 
@@ -84,6 +95,7 @@ async def test_openai_compatible_adapter_returns_normalized_response() -> None:
     assert response.usage == TokenUsage(prompt_tokens=12, completion_tokens=7, total_tokens=19)
     assert response.latency_ms == 125
     assert response.raw_response_id == "resp_1"
+    assert response.finish_reason == "stop"
     assert client_factory.calls == [{"api_key": "key-1", "base_url": DEFAULT_BASE_URLS["openai"]}]
 
 

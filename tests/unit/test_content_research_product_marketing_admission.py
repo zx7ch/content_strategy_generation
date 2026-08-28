@@ -6,12 +6,13 @@ import pytest
 
 from app.content_research.admission.candidates import ExtractedFact
 from app.content_research.admission.evaluator import ClaimAdmissionEvaluator
-from app.content_research.admission.relevance import query_relevance_reason
 from app.content_research.admission.product_marketing import (
     PRODUCT_MARKETING_CLAIM_INTENTS,
     build_product_marketing_candidate,
+    build_product_marketing_candidates,
     product_marketing_boundary_reason,
 )
+from app.content_research.admission.relevance import query_relevance_reason
 from app.content_research.contracts import build_default_snapshot
 from app.content_research.persistence_models import (
     ClaimCandidateRecord,
@@ -307,6 +308,51 @@ def test_product_marketing_factory_uses_a_bounded_first_verbatim_observation_wit
     assert quote["quote"] == candidate.statement
     assert quote["text_start"] == 0
     assert quote["text_end"] == len(candidate.statement)
+
+
+def test_product_marketing_bulk_extraction_emits_exact_atomic_spans_and_qualifiers():
+    text = "前言。夏季通勤穿这件T恤很凉爽；儿童运动后却觉得有点闷。"
+    fact = _fact("content_text", text)
+    snapshot, _policies, _contracts, groups = _frozen_first_intent_snapshot()
+    packet = _packet_for_fact(
+        fact=fact,
+        snapshot=snapshot,
+        groups=groups,
+        availability={"content_text": "present"},
+    )
+
+    candidates = build_product_marketing_candidates(packet)
+    atomic = [
+        item
+        for item in candidates
+        if item.statement in {
+            "夏季通勤穿这件T恤很凉爽",
+            "儿童运动后却觉得有点闷",
+        }
+    ]
+
+    assert len(atomic) >= 2
+    for candidate in atomic:
+        ref = candidate.payload["quote_refs"][0]
+        assert text[ref["text_start"] : ref["text_end"]] == ref["quote"]
+        assert ref["quote"] == candidate.statement
+        assert len(ref["quote"]) < len(text)
+    commute = next(item for item in atomic if "通勤" in item.statement)
+    child = next(item for item in atomic if "儿童" in item.statement)
+    assert commute.payload["scope"]["qualifiers"] == {
+        "scenes": ["夏季", "通勤"],
+        "audiences": [],
+    }
+    assert commute.payload["scope"]["polarity"] == "support"
+    assert child.payload["scope"]["qualifiers"] == {
+        "scenes": ["运动"],
+        "audiences": ["儿童"],
+    }
+    assert child.payload["scope"]["polarity"] == "counter"
+    assert {item.claim_type for item in atomic} >= {
+        "product_value_expression",
+        "use_context",
+    }
 
 
 def test_product_marketing_boundary_rejects_an_unbounded_or_non_verbatim_claim():

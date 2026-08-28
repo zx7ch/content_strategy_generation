@@ -130,6 +130,111 @@ def test_migration_0033_adds_the_single_lifecycle_authority(tmp_path):
     assert migration == ("content_research_lifecycle_authority",)
 
 
+def test_migration_0037_adds_explicit_analysis_authority_and_private_stage_results(tmp_path):
+    db_path = str(tmp_path / "analysis-authority.db")
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE workflow_runs (run_id TEXT PRIMARY KEY)")
+
+    bootstrap_content_research_schema(db_path)
+
+    with sqlite3.connect(db_path) as conn:
+        run_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(workflow_runs)")
+        }
+        checkpoint_columns = {
+            row[1]
+            for row in conn.execute(
+                "PRAGMA table_info(content_research_analysis_checkpoints)"
+            )
+        }
+        migration = conn.execute(
+            "SELECT name FROM content_research_schema_migrations WHERE version='0037'"
+        ).fetchone()
+
+    assert "effective_analysis_attempt_id" in run_columns
+    assert "private_result_json" in checkpoint_columns
+    assert migration == ("marketing_analysis_explicit_authority",)
+
+
+def test_migration_0034_adds_unreachable_analysis_identity_without_rewriting_runs(tmp_path):
+    db_path = str(tmp_path / "analysis-identity.db")
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE workflow_runs (run_id TEXT PRIMARY KEY, payload_json TEXT)")
+        conn.execute(
+            "INSERT INTO workflow_runs (run_id, payload_json) VALUES (?, ?)",
+            ("run-existing", '{"subject":"凉感衬衫"}'),
+        )
+
+    bootstrap_content_research_schema(db_path)
+
+    with sqlite3.connect(db_path) as conn:
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        migration = conn.execute(
+            "SELECT name FROM content_research_schema_migrations WHERE version='0034'"
+        ).fetchone()
+        existing_run = conn.execute(
+            "SELECT run_id, payload_json FROM workflow_runs WHERE run_id='run-existing'"
+        ).fetchone()
+
+    assert {
+        "content_research_evidence_snapshots",
+        "content_research_evidence_snapshot_notes",
+        "content_research_analysis_units",
+        "content_research_analysis_attempts",
+        "content_research_analysis_checkpoints",
+    } <= tables
+    assert migration == ("marketing_analysis_identity_skeleton",)
+    assert existing_run == ("run-existing", '{"subject":"凉感衬衫"}')
+
+
+def test_migration_0034_rolls_back_analysis_identity_schema_on_failure(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    db_path = str(tmp_path / "analysis-identity-rollback.db")
+    bootstrap_content_research_schema(db_path)
+    with sqlite3.connect(db_path) as conn:
+        for table in (
+            "content_research_analysis_checkpoints",
+            "content_research_analysis_attempts",
+            "content_research_analysis_units",
+            "content_research_evidence_snapshot_notes",
+            "content_research_evidence_snapshots",
+        ):
+            conn.execute(f"DROP TABLE {table}")
+        conn.execute("DELETE FROM content_research_schema_migrations WHERE version='0034'")
+
+    original = migrations._apply_0034
+
+    def fail_after_schema(conn: sqlite3.Connection) -> None:
+        original(conn)
+        raise RuntimeError("injected 0034 migration failure")
+
+    monkeypatch.setattr(migrations, "_apply_0034", fail_after_schema)
+    with pytest.raises(RuntimeError, match="injected 0034"):
+        apply_content_research_migrations(db_path, bootstrap_content_research_schema)
+
+    with sqlite3.connect(db_path) as conn:
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        migration = conn.execute(
+            "SELECT 1 FROM content_research_schema_migrations WHERE version='0034'"
+        ).fetchone()
+
+    assert "content_research_evidence_snapshots" not in tables
+    assert "content_research_analysis_units" not in tables
+    assert migration is None
+
+
 def test_migration_0031_rolls_back_partial_integrity_schema_on_failure(
     tmp_path,
 ):

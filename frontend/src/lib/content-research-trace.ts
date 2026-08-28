@@ -116,9 +116,10 @@ export function traceStepTitle(stepName: string) {
   if (stepName === "brief_confirm") return "确认调研需求";
   if (stepName === "scope_confirm") return "确认检索范围";
   if (stepName === "plan_build") return "准备调研计划";
-  if (stepName === "formal_research") return "采集与分析公开内容";
+  if (stepName === "formal_research") return "采集公开内容";
   if (stepName === "coverage") return "检查证据完整性";
-  if (stepName === "report") return "生成调研报告";
+  if (stepName === "marketing_analysis") return "营销结论分析";
+  if (stepName === "report") return "组装并发布调研报告";
   return "处理调研任务";
 }
 
@@ -126,8 +127,9 @@ export function traceStepGroup(stepName: string) {
   if (["presearch", "brief_confirm", "scope_confirm", "plan_build"].includes(stepName)) {
     return "研究范围与计划";
   }
-  if (stepName === "formal_research") return "来源采集与分析";
+  if (stepName === "formal_research") return "来源采集";
   if (stepName === "coverage") return "证据质量检查";
+  if (stepName === "marketing_analysis") return "结论分析";
   if (stepName === "report") return "报告生成";
   return "调研任务";
 }

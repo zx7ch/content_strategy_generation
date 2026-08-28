@@ -38,6 +38,8 @@ import {
   reviseContentResearchSubject,
   replaceContentResearchScopeDraft,
   retryContentResearchPresearch,
+  retryContentResearchAnalysis,
+  retryContentResearchReport,
   runContentResearchWorkflowAction,
   type ContentResearchDirectionEvidence,
   type ContentResearchLiteReportResponse,
@@ -60,6 +62,7 @@ import { resolveContentResearchModelRecovery } from "@/lib/content-research-reco
 import { contentResearchErrorFeedback } from "@/lib/content-research-error-feedback";
 import {
   ContentResearchRequestEpoch,
+  ContentResearchTraceRevisionGuard,
   LatestScopeDraftSaveQueue,
   scopeDraftSnapshotMatches,
   frozenReportScopeQueries,
@@ -105,6 +108,8 @@ interface ContentResearchRunState {
   report: ContentResearchLiteReportResponse | null;
   reportStatus: "idle" | "loading" | "ready" | "unavailable" | "failed";
   reportError: string | null;
+  traceReadUncertain?: boolean;
+  traceLastSyncedAt?: string;
 }
 interface ContentResearchFormalResearchReadModel {
   status: string;
@@ -908,7 +913,11 @@ function ContentResearchScopeDraftCard({
     product_experience_aspect: string | null;
     context_audience_aspect: string | null;
   }) => void;
-  onConfirm: () => void;
+  onConfirm: (input: {
+    core_object: string;
+    product_experience_aspect: string | null;
+    context_audience_aspect: string | null;
+  }) => void;
 }) {
   const draft = projection.draft;
   const [coreObject, setCoreObject] = useState(draft.core_object);
@@ -933,18 +942,23 @@ function ContentResearchScopeDraftCard({
     setContextAspect(draft.context_audience_aspect ?? "");
   }, [draft]);
 
-  function persist() {
+  function currentEdit() {
     const {
       core_object: nextCore,
       product_experience_aspect: nextProduct,
       context_audience_aspect: nextContext,
     } = editRef.current;
-    if (!nextCore.trim()) return;
-    onReplace({
+    return {
       core_object: nextCore.trim(),
       product_experience_aspect: nextProduct.trim() || null,
       context_audience_aspect: nextContext.trim() || null,
-    });
+    };
+  }
+
+  function persist() {
+    const input = currentEdit();
+    if (!input.core_object) return;
+    onReplace(input);
   }
 
   return (
@@ -1024,7 +1038,12 @@ function ContentResearchScopeDraftCard({
           <button
             type="button"
             disabled={busy || !coreObject.trim()}
-            onClick={onConfirm}
+            onMouseDown={(event) => {
+              // Confirmation owns persistence of the exact edit snapshot. Do
+              // not let an input blur disable this button mid-click.
+              event.preventDefault();
+            }}
+            onClick={() => onConfirm(currentEdit())}
             className="shrink-0 rounded-xl bg-ink px-5 py-2.5 text-sm font-semibold text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-35"
           >
             {busy ? "正在确认…" : "确认并开始调研"}
@@ -1050,6 +1069,19 @@ function reportStateLabel(state: LitePublicationState) {
   if (state === "complete_verified_report") return "已完整核验";
   if (state === "partial_verified_report") return "部分内容已核验";
   return "仅展示已验证证据";
+}
+
+function publicationReasonLabel(reason: string) {
+  if (reason === "audit_rewrite_exhausted") {
+    return "部分叙述未通过证据核验，已自动隐藏；当前仅展示可验证内容。";
+  }
+  if (reason === "insufficient_admitted_evidence") {
+    return "现有证据不足以形成可验证结论，当前仅展示已保存依据。";
+  }
+  if (reason === "query_subject_not_supported") {
+    return "当前检索范围无法支持该研究主题，报告仅展示可确认内容。";
+  }
+  return "部分内容未达到发布条件，当前仅展示可验证内容。";
 }
 
 function recordList(value: unknown): Record<string, unknown>[] {
@@ -1094,17 +1126,32 @@ function marketingConclusionReasonLabel(reason: string) {
   if (reason === "conclusion_author_count_unmet") return "独立作者数量不足。";
   if (reason === "conclusion_support_tied") return "多个结论支持度相同，暂不指定唯一主结论。";
   if (reason === "first_intent_support_unmet") return "首要营销目标的直接支持不足。";
+  if (reason === "faithfulness_not_verified") return "分析已完成，但本次报告表述未通过证据核验。";
+  if (reason === "publication_policy_omitted") return "分析已完成，但本次报告范围未采用该轨结论。";
+  if (reason === "counter_evidence_threshold_met") return "支持与反向证据都达到门槛，样本存在明确分歧。";
+  if (reason === "groundedness_verifier_rejected") return "候选结论未通过独立证据核验。";
   if (["marketing_analysis_unavailable", "marketing_conclusion_unavailable", "marketing_conclusion_not_verified"].includes(reason)) return "结论分析当前不可用。";
   return "证据链未通过营销结论核验。";
 }
 
 function marketingConclusionStateLabel(state: string) {
   if (state === "selected") return "已选定";
+  if (state === "contested") return "存在分歧";
+  if (state === "directional") return "方向性结论";
   if (state === "qualified") return "已达到门槛";
   if (state === "insufficient_evidence") return "证据不足";
   if (state === "no_single_primary_conclusion") return "暂无唯一主结论";
   if (state === "analysis_unavailable") return "分析不可用";
+  if (state === "withheld_by_faithfulness") return "分析已选定 · 本次未发布";
+  if (state === "omitted_by_publication_policy") return "分析已完成 · 本次未采用";
   return "等待判定";
+}
+
+function marketingPublicationDispositionLabel(state: string) {
+  if (state === "withheld_by_faithfulness") return "本次报告未发布（表述审计未通过）";
+  if (state === "omitted_by_publication_policy") return "本次报告未采用（发布范围限制）";
+  if (state === "published") return "本次报告已发布";
+  return "";
 }
 
 function marketingConclusionTrackLabel(track: string) {
@@ -1114,12 +1161,30 @@ function marketingConclusionTrackLabel(track: string) {
   return "结论";
 }
 
+function marketingConclusionFailureDetailLabel(detail: string) {
+  if (detail === "invalid_json") return "模型返回的 JSON 无法解析";
+  if (detail === "response_truncated") return "模型输出达到长度上限，JSON 未完整返回";
+  if (detail === "invalid_top_level_shape") return "模型返回的顶层结构不符合协议";
+  if (detail === "invalid_candidates_shape") return "候选结论列表结构不符合协议";
+  if (detail === "invalid_candidate_shape") return "候选结论字段不符合协议";
+  if (detail === "unknown_track") return "模型返回了未请求的分析轨道";
+  if (detail === "empty_statement") return "模型返回了空结论";
+  if (detail === "invalid_supporting_claim_ids") return "模型返回的证据引用格式无效";
+  if (detail === "duplicate_supporting_claim_ids") return "模型重复引用了同一证据";
+  if (detail === "unknown_supporting_claim_id") return "模型引用了未准入的证据";
+  if (detail === "message_angle_performance_statement") return "内容表达轨生成了不允许的效果断言";
+  return "模型输出没有通过结论协议校验";
+}
+
 function ContentResearchReportMessage({
   report,
 }: {
   report: ContentResearchLiteReportResponse;
 }) {
-  const [selectedCitation, setSelectedCitation] = useState<Record<string, unknown> | null>(null);
+  const [selectedCitation, setSelectedCitation] = useState<{
+    disclosureKey: string;
+    citation: Record<string, unknown>;
+  } | null>(null);
   const [candidateAudit, setCandidateAudit] = useState<ContentResearchDirectionEvidence | null>(null);
   const [candidateAuditError, setCandidateAuditError] = useState<string | null>(null);
   const publicationState = litePublicationState(report);
@@ -1209,14 +1274,22 @@ function ContentResearchReportMessage({
     URL.revokeObjectURL(url);
   }
 
-  const citationButton = (citation: Record<string, unknown>, index: number) => {
+  const citationButton = (
+    citation: Record<string, unknown>,
+    index: number,
+    placementKey: string,
+  ) => {
     const displayIndex = String(citation.display_index ?? index + 1);
+    const citationGroupId = stringField(citation, "citation_group_id", String(index));
+    const disclosureKey = `${placementKey}:${citationGroupId}`;
+    const expanded = selectedCitation?.disclosureKey === disclosureKey;
+    const refs = expanded ? recordList(citation.evidence_refs) : [];
     const navigationState = stringField(citation, "navigation_state", "missing_source_url");
     const sourceUrl = stringField(citation, "source_url");
     return (
       <div
-        key={stringField(citation, "citation_group_id", String(index))}
-        className="flex flex-wrap gap-2"
+        key={disclosureKey}
+        className={`${expanded ? "w-full" : ""} flex flex-wrap gap-2`}
       >
         {sourceUrl && navigationState === "available" && (
           <a
@@ -1231,10 +1304,63 @@ function ContentResearchReportMessage({
         <button
           type="button"
           className="rounded-lg border border-line bg-white px-2.5 py-1 text-xs hover:bg-slate-50"
-          onClick={() => setSelectedCitation(citation)}
+          aria-expanded={expanded}
+          onClick={() => setSelectedCitation((current) =>
+            current?.disclosureKey === disclosureKey
+              ? null
+              : { disclosureKey, citation }
+          )}
         >
           证据详情
         </button>
+        {expanded && (
+          <section
+            role="region"
+            aria-label={`引用 [${displayIndex}] 证据详情`}
+            className="w-full rounded-xl border border-line bg-slate-50 px-3 py-3"
+          >
+            <div className="flex justify-between gap-3">
+              <p className="font-semibold">引用 [{displayIndex}]</p>
+              <button
+                type="button"
+                onClick={() => setSelectedCitation(null)}
+                aria-label={`关闭引用 [${displayIndex}] 依据`}
+              >
+                关闭
+              </button>
+            </div>
+            {refs.length > 0 ? (
+              <div className="mt-3 space-y-2 border-t border-line pt-3">
+                <p className="text-xs font-semibold text-quiet">同组证据</p>
+                {refs.map((ref, refIndex) => {
+                  const refNavigationState = stringField(ref, "navigation_state", "missing_source_url");
+                  const refSourceUrl = stringField(ref, "source_url");
+                  return (
+                    <div key={`${stringField(ref, "source_text_hash")}-${refIndex}`} className="rounded-lg bg-white px-3 py-2 text-xs text-quiet">
+                      <p>{stringField(ref, "quote", "已冻结证据")}</p>
+                      <div className="mt-1 flex flex-wrap gap-x-2">
+                        <span>{stringField(ref, "field_path", "字段未公开")}</span>
+                        <span>{stringField(ref, "source_collected_at", "采集时间未公开")}</span>
+                      </div>
+                      {refSourceUrl && refNavigationState === "available" && (
+                        <a className="mt-1 inline-flex underline" href={refSourceUrl} target="_blank" rel="noopener noreferrer">打开原笔记</a>
+                      )}
+                      {refNavigationState === "missing_source_url" && (
+                        <p className="mt-1">未保存来源链接；可查看原文片段与采集时间</p>
+                      )}
+                      {refNavigationState === "navigation_unavailable" && (
+                        <p className="mt-1">来源链接当前不可打开；可查看原文片段与采集时间</p>
+                      )}
+                      {stringField(ref, "navigation_reason") && <p className="mt-1">{stringField(ref, "navigation_reason")}</p>}
+                    </div>
+                  );
+                })}
+              </div>
+            ) : (
+              <p className="mt-3 text-xs text-quiet">该冻结引用未提供可展示的证据明细。</p>
+            )}
+          </section>
+        )}
       </div>
     );
   };
@@ -1256,13 +1382,11 @@ function ContentResearchReportMessage({
       <div className="mt-3 flex flex-wrap gap-2">
         {arrayField(item, "citation_group_ids").map((id, citationIndex) => {
           const citation = citationsById.get(id);
-          return citation ? citationButton(citation, citationIndex) : null;
+          return citation ? citationButton(citation, citationIndex, `${observation ? "observation" : "finding"}-${index}`) : null;
         })}
       </div>
     </details>
   );
-
-  const refs = selectedCitation ? recordList(selectedCitation.evidence_refs) : [];
 
   return (
     <div className="flex justify-start" data-report-publication-id={stringField(report.publication, "report_publication_id")}>
@@ -1290,7 +1414,7 @@ function ContentResearchReportMessage({
 
           {(partial || evidenceOnly) && stringField(report.publication, "publication_reason") && (
             <p className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900">
-              {stringField(report.publication, "publication_reason")}
+              {publicationReasonLabel(stringField(report.publication, "publication_reason"))}
             </p>
           )}
           {evidenceOnly && (
@@ -1304,7 +1428,9 @@ function ContentResearchReportMessage({
           {hasMarketingTracks && marketingTracks.map(({ id, label, value }) => {
             const track = value as Record<string, unknown>;
             const selected = stringField(track, "state") === "selected";
+            const contested = stringField(track, "state") === "contested";
             const directional = stringField(track, "state") === "directional";
+            const withheld = ["withheld_by_faithfulness", "omitted_by_publication_policy"].includes(stringField(track, "state"));
             return (
               <section key={id} aria-label={label} className="border-t border-line pt-4">
                 <h4 className="font-semibold">{label}</h4>
@@ -1320,7 +1446,25 @@ function ContentResearchReportMessage({
                     <div className="mt-3 flex flex-wrap gap-2">
                       {arrayField(track, "citation_group_ids").map((citationId, citationIndex) => {
                         const citation = citationsById.get(citationId);
-                        return citation ? citationButton(citation, citationIndex) : null;
+                        return citation ? citationButton(citation, citationIndex, `marketing-${id}-selected`) : null;
+                      })}
+                    </div>
+                  </div>
+                ) : contested ? (
+                  <div className="mt-3 rounded-xl border border-orange-300 bg-orange-50 px-3 py-3">
+                    <p className="font-medium leading-6">{stringField(track, "statement")}</p>
+                    <p className="mt-2 text-xs text-orange-900">
+                      支持 {numberField(track, "supporting_note_count")} 篇 / {numberField(track, "independent_author_count")} 位作者；反向 {numberField(track, "counter_note_count")} 篇 / {numberField(track, "counter_author_count")} 位作者
+                    </p>
+                    <p className="mt-2 text-xs text-orange-900">{stringField(track, "verification_direction")}</p>
+                    <div className="mt-3 flex flex-wrap gap-2">
+                      {arrayField(track, "citation_group_ids").map((citationId, citationIndex) => {
+                        const citation = citationsById.get(citationId);
+                        return citation ? citationButton(citation, citationIndex, `marketing-${id}-contested-support`) : null;
+                      })}
+                      {arrayField(track, "counter_citation_group_ids").map((citationId, citationIndex) => {
+                        const citation = citationsById.get(citationId);
+                        return citation ? citationButton(citation, citationIndex, `marketing-${id}-contested-counter`) : null;
                       })}
                     </div>
                   </div>
@@ -1334,9 +1478,17 @@ function ContentResearchReportMessage({
                     <div className="mt-3 flex flex-wrap gap-2">
                       {arrayField(track, "citation_group_ids").map((citationId, citationIndex) => {
                         const citation = citationsById.get(citationId);
-                        return citation ? citationButton(citation, citationIndex) : null;
+                        return citation ? citationButton(citation, citationIndex, `marketing-${id}-directional`) : null;
                       })}
                     </div>
+                  </div>
+                ) : withheld ? (
+                  <div className="mt-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-3 text-xs text-quiet">
+                    <p className="font-medium text-ink">{marketingConclusionStateLabel(stringField(track, "state"))}</p>
+                    {arrayField(track, "reason_codes").map((reason) => (
+                      <p key={reason} className="mt-1 text-amber-900">{marketingConclusionReasonLabel(reason)}</p>
+                    ))}
+                    <p className="mt-2">{stringField(track, "verification_direction")}</p>
                   </div>
                 ) : (
                   <div className="mt-3 rounded-xl bg-slate-50 px-3 py-3 text-xs text-quiet">
@@ -1391,7 +1543,7 @@ function ContentResearchReportMessage({
                   <div className="mt-2 flex flex-wrap gap-2">
                     {arrayField(item, "citation_group_ids").map((id, citationIndex) => {
                       const citation = citationsById.get(id);
-                      return citation ? citationButton(citation, citationIndex) : null;
+                      return citation ? citationButton(citation, citationIndex, `lead-${index}`) : null;
                     })}
                   </div>
                 </details>
@@ -1434,50 +1586,12 @@ function ContentResearchReportMessage({
           <section aria-label="证据与来源" className="border-t border-line pt-4">
             <h4 className="font-semibold">{evidenceOnly ? "已保存依据" : "证据与来源"}</h4>
             <div className="mt-2 flex flex-wrap gap-2">
-              {citations.map(citationButton)}
+              {citations.map((citation, index) => citationButton(citation, index, "sources"))}
               {citations.length === 0 && <span className="text-xs text-quiet">没有可展示的冻结引用。</span>}
             </div>
           </section>
         </div>
 
-        {selectedCitation && (
-          <aside className="border-t border-line bg-slate-50 px-5 py-4" aria-label="Content Research citation evidence">
-            <div className="flex justify-between gap-3">
-              <p className="font-semibold">引用 [{String(selectedCitation.display_index ?? "—")}]</p>
-              <button type="button" onClick={() => setSelectedCitation(null)} aria-label="关闭引用依据">关闭</button>
-            </div>
-            {refs.length > 0 ? (
-              <div className="mt-3 space-y-2 border-t border-line pt-3">
-                <p className="text-xs font-semibold text-quiet">同组证据</p>
-                {refs.map((ref, index) => {
-                  const navigationState = stringField(ref, "navigation_state", "missing_source_url");
-                  const sourceUrl = stringField(ref, "source_url");
-                  return (
-                    <div key={`${stringField(ref, "source_text_hash")}-${index}`} className="rounded-lg bg-white px-3 py-2 text-xs text-quiet">
-                      <p>{stringField(ref, "quote", "已冻结证据")}</p>
-                      <div className="mt-1 flex flex-wrap gap-x-2">
-                        <span>{stringField(ref, "field_path", "字段未公开")}</span>
-                        <span>{stringField(ref, "source_collected_at", "采集时间未公开")}</span>
-                      </div>
-                      {sourceUrl && navigationState === "available" && (
-                        <a className="mt-1 inline-flex underline" href={sourceUrl} target="_blank" rel="noopener noreferrer">打开原笔记</a>
-                      )}
-                      {navigationState === "missing_source_url" && (
-                        <p className="mt-1">未保存来源链接；可查看原文片段与采集时间</p>
-                      )}
-                      {navigationState === "navigation_unavailable" && (
-                        <p className="mt-1">来源链接当前不可打开；可查看原文片段与采集时间</p>
-                      )}
-                      {stringField(ref, "navigation_reason") && <p className="mt-1">{stringField(ref, "navigation_reason")}</p>}
-                    </div>
-                  );
-                })}
-              </div>
-            ) : (
-              <p className="mt-3 text-xs text-quiet">该冻结引用未提供可展示的证据明细。</p>
-            )}
-          </aside>
-        )}
         {candidateAudit && (
           <aside className="border-t border-line bg-slate-50 px-5 py-4" aria-label="候选笔记与筛选">
             <div className="flex items-center justify-between gap-3">
@@ -1591,6 +1705,14 @@ function contentResearchRecoveryState(run: ContentResearchRunState): ContentRese
 }
 
 function contentResearchContextStatus(run: ContentResearchRunState): string {
+  if (run.traceReadUncertain) {
+    const lastSync = run.traceLastSyncedAt
+      ? new Date(run.traceLastSyncedAt).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })
+      : null;
+    return lastSync
+      ? `暂时无法确认运行状态（最后同步 ${lastSync}）`
+      : "暂时无法确认运行状态";
+  }
   const lifecycleState = run.summary.run.state;
   if (lifecycleState === "presearch_running") return "轻量预检索进行中";
   if (lifecycleState === "brief_confirmation_required") return "等待确认调研需求";
@@ -1783,7 +1905,11 @@ function ContentResearchTraceInspector({
                         const support = typeof outcome.supporting_note_count === "number" && typeof outcome.independent_author_count === "number"
                           ? ` · ${outcome.supporting_note_count} 篇 / ${outcome.independent_author_count} 位作者`
                           : "";
-                        return [`${marketingConclusionTrackLabel(track)}：${marketingConclusionStateLabel(stringField(outcome, "state"))}${support}`];
+                        const disposition = outcome.publication_disposition && typeof outcome.publication_disposition === "object" && !Array.isArray(outcome.publication_disposition)
+                          ? outcome.publication_disposition as Record<string, unknown>
+                          : {};
+                        const publication = marketingPublicationDispositionLabel(stringField(disposition, "state"));
+                        return [`${marketingConclusionTrackLabel(track)}：${marketingConclusionStateLabel(stringField(outcome, "state"))}${support}${publication ? ` · ${publication}` : ""}`];
                       })
                     : [];
                   const detail = stage === "query_plan"
@@ -1804,6 +1930,17 @@ function ContentResearchTraceInspector({
                       ? arrayField(value as Record<string, unknown>, "reason_codes")
                       : [])
                     : [];
+                  const trackFailures = stage === "marketing_conclusion"
+                    ? Object.entries(checkpoint.tracks && typeof checkpoint.tracks === "object" && !Array.isArray(checkpoint.tracks)
+                      ? checkpoint.tracks as Record<string, unknown>
+                      : {}).flatMap(([track, value]) => {
+                        if (!value || typeof value !== "object" || Array.isArray(value)) return [];
+                        const detail = stringField(value as Record<string, unknown>, "failure_detail");
+                        return detail
+                          ? [`${marketingConclusionTrackLabel(track)}：${marketingConclusionFailureDetailLabel(detail)}`]
+                          : [];
+                      })
+                    : [];
                   const reasonCodes = [...arrayField(checkpoint, "reason_codes"), ...trackReasons];
                   const reasons = reasonCodes.map(stage === "marketing_conclusion" ? marketingConclusionReasonLabel : coverageReasonLabel);
                   return (
@@ -1811,6 +1948,7 @@ function ContentResearchTraceInspector({
                       <div className="flex items-center justify-between gap-3"><p className="font-medium text-ink">{title}</p><span className="text-quiet">{stringField(checkpoint, "status")}</span></div>
                       <p className="mt-1 leading-5 text-quiet">{detail}</p>
                       {reasons.length > 0 && <p className="mt-1 leading-5 text-amber-700">{reasons.join("·")}</p>}
+                      {trackFailures.length > 0 && <p className="mt-1 leading-5 text-red-700">{trackFailures.join("；")}</p>}
                     </article>
                   );
                 })}
@@ -1903,6 +2041,10 @@ function ContentResearchContextSidebar({
   recoveryPending = false,
   recoveryRequiredSince = null,
   onContinuePresearch = async () => {},
+  onRetryAnalysis = async () => {},
+  analysisRetryPending = false,
+  onRetryReport = async () => {},
+  reportRetryPending = false,
 }: {
   run: ContentResearchRunState;
   onExpandedChange: (expanded: boolean) => void;
@@ -1910,6 +2052,10 @@ function ContentResearchContextSidebar({
   recoveryPending?: boolean;
   recoveryRequiredSince?: string | null;
   onContinuePresearch?: () => void | Promise<void>;
+  onRetryAnalysis?: () => void | Promise<void>;
+  analysisRetryPending?: boolean;
+  onRetryReport?: () => void | Promise<void>;
+  reportRetryPending?: boolean;
 }) {
   const report = run.report;
   const published = report ? litePublicationState(report) !== null : false;
@@ -1940,6 +2086,26 @@ function ContentResearchContextSidebar({
             正式报告暂不可读取：{run.reportError}
           </p>
         )}
+        {run.summary.run.allowed_actions.includes("retry_analysis") && (
+          <button
+            type="button"
+            onClick={() => void onRetryAnalysis()}
+            disabled={analysisRetryPending}
+            className="mt-3 w-full rounded-lg bg-ink px-3 py-2 text-xs font-semibold text-white disabled:opacity-50"
+          >
+            {analysisRetryPending ? "正在恢复分析…" : "继续失败的分析"}
+          </button>
+        )}
+        {run.summary.run.allowed_actions.includes("retry_report") && (
+          <button
+            type="button"
+            onClick={() => void onRetryReport()}
+            disabled={reportRetryPending}
+            className="mt-3 w-full rounded-lg bg-ink px-3 py-2 text-xs font-semibold text-white disabled:opacity-50"
+          >
+            {reportRetryPending ? "正在恢复报告…" : "继续生成报告"}
+          </button>
+        )}
         <button type="button" onClick={() => onExpandedChange(true)} className="mt-3 w-full border-t border-line pt-3 text-left text-xs font-semibold text-blue-600 hover:text-blue-700" aria-label="查看完整 workflow trace">查看完整 workflow trace →</button>
       </section>
 
@@ -1963,7 +2129,7 @@ function ContentResearchContextSidebar({
         </ul> : <p className="text-xs leading-5 text-quiet">暂无已发布报告；此处不会显示未冻结的来源、结论或指标。</p>}
       </section>
       <ModelServiceCard recoveryPending={recoveryPending} recoveryRequiredSince={recoveryRequiredSince} onContinue={onContinuePresearch} onConfigurationChanged={() => undefined} />
-      <XiaohongshuLoginCard />
+      <XiaohongshuLoginCard refreshKey={`${run.summary.run.state_revision}:${run.summary.run.state}:${run.summary.run.reason_code ?? ""}`} />
     </aside>
   );
 }
@@ -1981,6 +2147,8 @@ function ContentResearchContextSidebar({
   const [scopeProjectionsByRun, setScopeProjectionsByRun] = useState<Record<string, ContentResearchScopeProjection>>({});
   const [scopeActionBusy, setScopeActionBusy] = useState(false);
   const [scopeDraftSaveBusy, setScopeDraftSaveBusy] = useState(false);
+  const [analysisRetryPending, setAnalysisRetryPending] = useState(false);
+  const [reportRetryPending, setReportRetryPending] = useState(false);
   const [traceExpanded, setTraceExpanded] = useState(false);
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
   const [editingText, setEditingText] = useState("");
@@ -2002,10 +2170,13 @@ function ContentResearchContextSidebar({
   const snapshotRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const snapshotRefreshInFlightRef = useRef(false);
   const contentResearchRequestEpochRef = useRef(new ContentResearchRequestEpoch());
+  const contentResearchTraceRevisionGuardRef = useRef(new ContentResearchTraceRevisionGuard());
+  const contentResearchTraceRevisionRunRef = useRef<string | null>(null);
   const scopeDraftSaveQueueRef = useRef<{
     runId: string;
     queue: LatestScopeDraftSaveQueue<ScopeDraftEdit, ScopeDraftSaveAuthority>;
   } | null>(null);
+  const scopeConfirmationInFlightRef = useRef(false);
   const contentResearchSubmitEpochRef = useRef(0);
   const pendingPresearchCommandsRef = useRef(new Map<string, { seed: string; commandId: string }>());
   // Tracks the most recently *requested* thread load to discard stale responses
@@ -2255,15 +2426,41 @@ function ContentResearchContextSidebar({
   }
 
   async function refreshContentResearchTrace(workflowRunId: string) {
+    if (contentResearchTraceRevisionRunRef.current !== workflowRunId) {
+      contentResearchTraceRevisionRunRef.current = workflowRunId;
+      contentResearchTraceRevisionGuardRef.current.reset();
+    }
     const ticket = contentResearchRequestEpochRef.current.ticket(workflowRunId, "trace");
-    const trace = await getContentResearchTrace(workflowRunId);
-    if (!contentResearchRequestEpochRef.current.accepts(ticket)) return null;
-    setContentResearchRun((current) =>
-      current && current.workflowRunId === workflowRunId
-        ? { ...current, trace }
-        : current
-    );
-    return trace;
+    try {
+      const trace = await getContentResearchTrace(workflowRunId);
+      if (!contentResearchRequestEpochRef.current.accepts(ticket)) return null;
+      if (!contentResearchTraceRevisionGuardRef.current.accept(trace.trace_revision)) {
+        return null;
+      }
+      setContentResearchRun((current) =>
+        current && current.workflowRunId === workflowRunId
+          ? {
+              ...current,
+              trace,
+              traceReadUncertain: false,
+              traceLastSyncedAt: new Date().toISOString(),
+            }
+          : current
+      );
+      return trace;
+    } catch (error) {
+      if (
+        contentResearchRequestEpochRef.current.accepts(ticket)
+        && contentResearchTraceRevisionGuardRef.current.recordFailure()
+      ) {
+        setContentResearchRun((current) =>
+          current && current.workflowRunId === workflowRunId
+            ? { ...current, traceReadUncertain: true }
+            : current
+        );
+      }
+      throw error;
+    }
   }
 
   async function refreshContentResearchScope(workflowRunId: string) {
@@ -2316,10 +2513,10 @@ function ContentResearchContextSidebar({
     core_object: string;
     product_experience_aspect: string | null;
     context_audience_aspect: string | null;
-  }) {
+  }): Promise<ScopeDraftSaveAuthority | null> {
     const run = contentResearchRun?.summary.run;
     const projection = run ? scopeProjectionsByRun[run.run_id] : null;
-    if (!run || !projection || scopeActionBusy) return;
+    if (!run || !projection) return null;
 
     let holder = scopeDraftSaveQueueRef.current;
     if (!holder || holder.runId !== run.run_id) {
@@ -2372,39 +2569,45 @@ function ContentResearchContextSidebar({
       holder = { runId, queue };
       scopeDraftSaveQueueRef.current = holder;
     }
-    if (!holder) return;
+    if (!holder) return null;
     setScopeDraftSaveBusy(true);
     holder.queue.enqueue(input);
     await holder.queue.idle();
     if (scopeDraftSaveQueueRef.current === holder) setScopeDraftSaveBusy(false);
+    const authority = holder.queue.currentAuthority();
+    return scopeDraftSnapshotMatches(authority.scope.draft, input) ? authority : null;
   }
 
-  async function confirmCurrentContentResearchScope() {
-    if (scopeActionBusy || scopeDraftSaveBusy) return;
-    const run = contentResearchRun?.summary.run;
-    const scope = run ? scopeProjectionsByRun[run.run_id] : null;
-    if (!run || !scope || run.state !== "scope_confirmation_required") return;
+  async function confirmCurrentContentResearchScope(input: ScopeDraftEdit) {
+    if (scopeConfirmationInFlightRef.current || scopeActionBusy) return;
+    scopeConfirmationInFlightRef.current = true;
     setScopeActionBusy(true);
     try {
-      const response = await confirmContentResearchScope(run, scope.draft.id);
+      const authority = await replaceCurrentScopeDraft(input);
+      if (!authority || authority.run.state !== "scope_confirmation_required") return;
+      const response = await confirmContentResearchScope(
+        authority.run,
+        authority.scope.draft.id,
+      );
       setScopeProjectionsByRun((current) => ({
         ...current,
-        [run.run_id]: response.result.scope,
+        [authority.run.run_id]: response.result.scope,
       }));
-      setContentResearchRun((current) => current && current.workflowRunId === run.run_id
+      setContentResearchRun((current) => current && current.workflowRunId === authority.run.run_id
         ? {
             ...current,
             summary: { ...current.summary, run: response.result.run },
           }
         : current);
       appendMessage({ role: "assistant", text: "检索范围已确认，正在检索并生成调研报告。" });
-      void pollContentResearchMainline(run.run_id);
+      void pollContentResearchMainline(authority.run.run_id);
     } catch (error) {
       appendMessage({
         role: "system",
         text: contentResearchErrorFeedback(error, "开始调研失败"),
       });
     } finally {
+      scopeConfirmationInFlightRef.current = false;
       setScopeActionBusy(false);
     }
   }
@@ -2604,6 +2807,64 @@ function ContentResearchContextSidebar({
     setPreparedScope(null);
     contentResearchRequestEpochRef.current.activate(presearch.workflow_run_id);
     setTraceExpanded(false);
+  }
+
+  async function retryFailedMarketingAnalysis() {
+    const run = contentResearchRun?.summary.run;
+    if (!run || !run.allowed_actions.includes("retry_analysis") || analysisRetryPending) {
+      return;
+    }
+    const ticket = contentResearchRequestEpochRef.current.ticket(run.run_id, "retry-analysis");
+    setAnalysisRetryPending(true);
+    try {
+      await retryContentResearchAnalysis(run);
+      const workflow = await getContentResearchWorkflow(run.run_id);
+      if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
+      setContentResearchRun((current) => current?.workflowRunId === run.run_id
+        ? { ...current, summary: workflow }
+        : current);
+      await refreshContentResearchTrace(run.run_id);
+      appendMessage({ role: "assistant", text: "已继续失败的分析；已完成轨道会直接复用。" });
+    } catch (error) {
+      if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
+      appendMessage({
+        role: "system",
+        text: contentResearchErrorFeedback(error, "继续分析失败"),
+      });
+    } finally {
+      if (contentResearchRequestEpochRef.current.accepts(ticket)) {
+        setAnalysisRetryPending(false);
+      }
+    }
+  }
+
+  async function retryFailedReportFinalization() {
+    const run = contentResearchRun?.summary.run;
+    if (!run || !run.allowed_actions.includes("retry_report") || reportRetryPending) {
+      return;
+    }
+    const ticket = contentResearchRequestEpochRef.current.ticket(run.run_id, "retry-report");
+    setReportRetryPending(true);
+    try {
+      await retryContentResearchReport(run);
+      const workflow = await getContentResearchWorkflow(run.run_id);
+      if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
+      setContentResearchRun((current) => current?.workflowRunId === run.run_id
+        ? { ...current, summary: workflow }
+        : current);
+      await refreshContentResearchTrace(run.run_id);
+      appendMessage({ role: "assistant", text: "已继续生成报告；已完成的检索和分析会直接复用。" });
+    } catch (error) {
+      if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
+      appendMessage({
+        role: "system",
+        text: contentResearchErrorFeedback(error, "继续生成报告失败"),
+      });
+    } finally {
+      if (contentResearchRequestEpochRef.current.accepts(ticket)) {
+        setReportRetryPending(false);
+      }
+    }
   }
 
   async function selectThread(threadId: string) {
@@ -3242,7 +3503,7 @@ function ContentResearchContextSidebar({
                 projection={scopeProjection}
                 busy={scopeActionBusy || scopeDraftSaveBusy}
                 onReplace={(input) => void replaceCurrentScopeDraft(input)}
-                onConfirm={() => void confirmCurrentContentResearchScope()}
+                onConfirm={(input) => void confirmCurrentContentResearchScope(input)}
               />
             )}
 
@@ -3501,6 +3762,10 @@ function ContentResearchContextSidebar({
         recoveryPending={projectedModelRecoveryPending}
         recoveryRequiredSince={modelRecovery.requiredSince}
         onContinuePresearch={continueModelRecovery}
+        onRetryAnalysis={retryFailedMarketingAnalysis}
+        analysisRetryPending={analysisRetryPending}
+        onRetryReport={retryFailedReportFinalization}
+        reportRetryPending={reportRetryPending}
       />}
       {!contentResearchRun && contentResearchMode && <aside className="hidden w-[300px] shrink-0 overflow-y-auto border-l border-line bg-slate-50 p-4 lg:block" aria-label="内容调研上下文">
         <h2 className="mb-3 text-sm font-semibold text-ink">本次研究摘要</h2>
