@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
 
+from app.content_research.lifecycle.coordinator import (
+    ContentResearchPersistenceCoordinator,
+)
 from app.content_research.models import ResearchBriefRecord
 from app.content_research.observation.trace_service import (
     _duration_ms,
@@ -13,6 +17,7 @@ from app.content_research.observation.trace_service import (
     _logical_checkpoint_projection,
     _project_timing,
     _runtime_step_projection,
+    _safe_marketing_conclusion_checkpoint,
 )
 from app.content_research.persistence_models import StageCheckpointRecord
 from app.content_research.presearch.service import PresearchService
@@ -62,6 +67,68 @@ class FakeLLM:
             usage=TokenUsage(total_tokens=10),
             latency_ms=1,
         )
+
+
+def test_failed_embedding_checkpoint_projects_only_safe_diagnostics() -> None:
+    record = StageCheckpointRecord(
+        id="trace-attempt-1",
+        schema_version="content_research_stage_checkpoint_v1",
+        payload={},
+        workflow_run_id="run-1",
+        subagent_task_id="marketing-conclusion:plan-1",
+        stage_name="marketing_conclusion",
+        input_fingerprint="contract-1",
+        status="failed",
+        retry_count=0,
+        started_at=None,
+        finished_at=None,
+    )
+    projected = _safe_marketing_conclusion_checkpoint(
+        record,
+        {
+            "analysis_attempt_id": "attempt-1",
+            "analysis_attempt_no": 1,
+            "evidence_snapshot_id": "snapshot-1",
+            "retrieval_execution_unit_id": "retrieval-1",
+            "embedding": {
+                "status": "failed",
+                "error_code": "RESEARCH_EMBEDDING_NOT_NORMALIZED",
+                "fingerprint": {
+                    "provider": "sentence_transformers",
+                    "model": "test-model",
+                    "revision": "test-revision",
+                    "dimensions": 3,
+                    "normalization": "l2",
+                    "input_format_version": "v1",
+                },
+                "document_count": 1,
+                "batch_count": 1,
+                "success_count": 0,
+                "failure_count": 1,
+                "duration_ms": 12,
+                "secret": "must-not-leak",
+            },
+            "tracks": {},
+        },
+    )
+
+    assert projected["embedding"]["status"] == "failed"
+    assert projected["embedding"]["error_code"] == "RESEARCH_EMBEDDING_NOT_NORMALIZED"
+    assert projected["embedding"]["failure_count"] == 1
+    assert "secret" not in str(projected)
+
+    unknown = _safe_marketing_conclusion_checkpoint(
+        record,
+        {
+            "embedding": {
+                "status": "failed",
+                "error_code": "RESEARCH_EMBEDDING_SECRET_token_value",
+            },
+            "tracks": {},
+        },
+    )
+    assert "error_code" not in unknown["embedding"]
+    assert "token_value" not in str(unknown)
 
 
 def test_llm_recovery_exposes_only_the_durable_failure_boundary():
@@ -391,8 +458,6 @@ def service(db_path, store):
     )
 
 
-
-
 async def _unconfirmed_workflow(service):
     async with ThreadStore(service._store._db_path) as thread_store:
         thread = await thread_store.create_thread(
@@ -461,8 +526,65 @@ async def _record_usage(db_path: str, workflow_run_id: str) -> None:
         )
 
 
+@pytest.mark.asyncio
+async def test_trace_reads_all_components_from_one_coordinator_transaction(service, monkeypatch):
+    presearch = await _unconfirmed_workflow(service)
+    # A fresh coordinator proves the first Trace read cannot hide schema setup.
+    service._lifecycle = ContentResearchPersistenceCoordinator(service._store._db_path)
+    original_connect = sqlite3.connect
+    connections: list[sqlite3.Connection] = []
+
+    def tracked_connect(*args, **kwargs):
+        connection = original_connect(*args, **kwargs)
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setattr(sqlite3, "connect", tracked_connect)
+
+    trace = await service.get_workflow_trace(presearch.workflow_run_id)
+
+    assert trace.workflow_run_id == presearch.workflow_run_id
+    assert len(connections) == 1
 
 
+@pytest.mark.asyncio
+async def test_trace_read_remains_available_during_a_concurrent_writer(service):
+    presearch = await _unconfirmed_workflow(service)
+    service._lifecycle = ContentResearchPersistenceCoordinator(service._store._db_path)
+    writer = sqlite3.connect(service._store._db_path, timeout=0.25)
+    try:
+        writer.execute("BEGIN IMMEDIATE")
+        writer.execute(
+            "UPDATE workflow_runs SET status='failed' WHERE run_id=?",
+            (presearch.workflow_run_id,),
+        )
+
+        trace = await service.get_workflow_trace(presearch.workflow_run_id)
+
+        assert trace.workflow_run_id == presearch.workflow_run_id
+        assert trace.run_status != "failed"
+        assert writer.in_transaction is True
+    finally:
+        writer.rollback()
+        writer.close()
+
+
+@pytest.mark.asyncio
+async def test_trace_reader_failure_rolls_back_and_closes_snapshot_connection(service):
+    presearch = await _unconfirmed_workflow(service)
+    coordinator = ContentResearchPersistenceCoordinator(service._store._db_path)
+    observed_connections: list[sqlite3.Connection] = []
+
+    async def fail_reader(connection, _run, _transitions):
+        observed_connections.append(connection)
+        raise RuntimeError("trace projection failed")
+
+    with pytest.raises(RuntimeError, match="trace projection failed"):
+        await coordinator.load_trace_snapshot(presearch.workflow_run_id, fail_reader)
+
+    assert len(observed_connections) == 1
+    with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+        observed_connections[0].execute("SELECT 1")
 
 
 def test_trace_timing_marks_legacy_step_estimated_without_precision_invention():
@@ -582,12 +704,6 @@ def test_trace_timing_does_not_project_stale_inactive_boundaries(status, stale_k
 
     assert timing["timing_source"] == "recorded"
     assert stale_key not in timing
-
-
-
-
-
-
 
 
 @pytest.mark.asyncio

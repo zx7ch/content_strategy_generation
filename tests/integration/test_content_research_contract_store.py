@@ -85,7 +85,7 @@ def test_final_entity_schema_has_only_role_specific_columns(tmp_path):
     SQLiteContentResearchStore(db_path)
     with sqlite3.connect(db_path) as conn:
         versions = [row[0] for row in conn.execute("SELECT version FROM content_research_schema_migrations ORDER BY version")]
-        assert versions == [f"{version:04d}" for version in range(1, 38)]
+        assert versions == [f"{version:04d}" for version in range(1, 39)]
         for table in (
             "content_research_canonical_sources",
             "content_research_claim_candidates",

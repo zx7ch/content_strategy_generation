@@ -5,8 +5,17 @@ from __future__ import annotations
 import uuid
 from typing import Any, Protocol
 
-from app.content_research.api_schemas import HumanDecisionRequest, HumanDecisionResponse, HumanDecisionsResponse
-from app.content_research.models import HumanDecisionRecord, ObservationEventRecord, ResearchBriefRecord, utcnow
+from app.content_research.api_schemas import (
+    HumanDecisionRequest,
+    HumanDecisionResponse,
+    HumanDecisionsResponse,
+)
+from app.content_research.models import (
+    HumanDecisionRecord,
+    ObservationEventRecord,
+    ResearchBriefRecord,
+    utcnow,
+)
 from app.content_research.stores.base import ContentResearchStore
 
 DECISION_STATUSES = {"selected", "watchlist", "rejected"}

@@ -976,9 +976,7 @@ def _legacy_decision_from_row(row: sqlite3.Row | tuple[object, ...]):
         target_constraint_id,
     ) = row
     operation = operation or (
-        "limited_report"
-        if resolution == "generate_limited_report"
-        else "supplementary_collection"
+        "limited_report" if resolution == "generate_limited_report" else "supplementary_collection"
     )
     queries = tuple(json.loads(supplementary_queries_json or "[]"))
     return build_legacy_execution_decision_identity(
@@ -1186,9 +1184,7 @@ def _apply_0028(conn: sqlite3.Connection) -> None:
             rebuilt = build_execution_decision_identity(
                 coverage_snapshot_id=str(persisted_identity["coverage_snapshot_id"]),
                 source_scope_contract_id=str(persisted_identity["source_scope_contract_id"]),
-                resulting_scope_contract_id=str(
-                    persisted_identity["resulting_scope_contract_id"]
-                ),
+                resulting_scope_contract_id=str(persisted_identity["resulting_scope_contract_id"]),
                 resolution=str(persisted_identity["resolution"]),
                 target_constraint_id=(
                     str(persisted_identity["target_constraint_id"])
@@ -1196,8 +1192,7 @@ def _apply_0028(conn: sqlite3.Connection) -> None:
                     else None
                 ),
                 supplementary_queries=tuple(
-                    str(value)
-                    for value in persisted_identity.get("supplementary_queries", ())
+                    str(value) for value in persisted_identity.get("supplementary_queries", ())
                 ),
             )
             new_id = rebuilt.execution_unit_id
@@ -1591,9 +1586,7 @@ CREATE INDEX idx_cr_analysis_checkpoint_unit_track_stage
 
 def _apply_0034(conn: sqlite3.Connection) -> None:
     for statement in (
-        item.strip()
-        for item in _V34_MARKETING_ANALYSIS_IDENTITY_SQL.split(";")
-        if item.strip()
+        item.strip() for item in _V34_MARKETING_ANALYSIS_IDENTITY_SQL.split(";") if item.strip()
     ):
         conn.execute(statement)
 
@@ -1746,17 +1739,16 @@ def _apply_0037(conn: sqlite3.Connection) -> None:
         "ALTER TABLE content_research_analysis_checkpoints "
         "ADD COLUMN private_result_json TEXT NOT NULL DEFAULT '{}'"
     )
-    if conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow_runs'"
-    ).fetchone() is None:
-        return
-    workflow_columns = {
-        str(row[1]) for row in conn.execute("PRAGMA table_info(workflow_runs)")
-    }
-    if "effective_analysis_attempt_id" not in workflow_columns:
+    if (
         conn.execute(
-            "ALTER TABLE workflow_runs ADD COLUMN effective_analysis_attempt_id TEXT"
-        )
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow_runs'"
+        ).fetchone()
+        is None
+    ):
+        return
+    workflow_columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(workflow_runs)")}
+    if "effective_analysis_attempt_id" not in workflow_columns:
+        conn.execute("ALTER TABLE workflow_runs ADD COLUMN effective_analysis_attempt_id TEXT")
     conn.execute(
         "UPDATE workflow_runs SET effective_analysis_attempt_id=("
         "SELECT attempt.id FROM content_research_analysis_attempts AS attempt "
@@ -1774,6 +1766,62 @@ def _apply_0037(conn: sqlite3.Connection) -> None:
         "CREATE INDEX idx_workflow_run_effective_analysis_attempt "
         "ON workflow_runs(effective_analysis_attempt_id)"
     )
+
+
+_V38_ATTEMPT_SCOPED_ANALYSIS_FAILURES_SQL = """
+DROP TRIGGER IF EXISTS cr_trace_revision_analysis_checkpoint_insert;
+ALTER TABLE content_research_analysis_checkpoints
+    RENAME TO content_research_analysis_checkpoints_v37;
+DROP INDEX idx_cr_analysis_checkpoint_unit_track_stage;
+CREATE TABLE content_research_analysis_checkpoints (
+    id TEXT PRIMARY KEY,
+    analysis_unit_id TEXT NOT NULL,
+    track TEXT NOT NULL CHECK(track IN ('shared', 'need', 'value', 'message')),
+    stage TEXT NOT NULL,
+    input_fingerprint TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('pending', 'running', 'completed', 'failed')),
+    output_refs_json TEXT NOT NULL DEFAULT '[]',
+    result_checksum TEXT,
+    private_result_json TEXT NOT NULL DEFAULT '{}',
+    completed_by_attempt_id TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(analysis_unit_id) REFERENCES content_research_analysis_units(id),
+    FOREIGN KEY(completed_by_attempt_id) REFERENCES content_research_analysis_attempts(id)
+);
+INSERT INTO content_research_analysis_checkpoints (
+    id, analysis_unit_id, track, stage, input_fingerprint, status,
+    output_refs_json, result_checksum, private_result_json,
+    completed_by_attempt_id, created_at, updated_at
+)
+SELECT
+    id, analysis_unit_id, track, stage, input_fingerprint, status,
+    output_refs_json, result_checksum, private_result_json,
+    completed_by_attempt_id, created_at, updated_at
+FROM content_research_analysis_checkpoints_v37;
+DROP TABLE content_research_analysis_checkpoints_v37;
+CREATE UNIQUE INDEX idx_cr_analysis_checkpoint_completed_identity
+    ON content_research_analysis_checkpoints(
+        analysis_unit_id, track, stage, input_fingerprint
+    ) WHERE status='completed';
+CREATE UNIQUE INDEX idx_cr_analysis_checkpoint_failed_attempt_identity
+    ON content_research_analysis_checkpoints(
+        analysis_unit_id, completed_by_attempt_id, track, stage, input_fingerprint
+    ) WHERE status='failed';
+CREATE INDEX idx_cr_analysis_checkpoint_unit_track_stage
+    ON content_research_analysis_checkpoints(analysis_unit_id, track, stage, status);
+CREATE TRIGGER cr_trace_revision_analysis_checkpoint_insert
+AFTER INSERT ON content_research_analysis_checkpoints BEGIN
+    INSERT INTO content_research_trace_revisions(workflow_run_id, revision, updated_at)
+    SELECT workflow_run_id, 1, CURRENT_TIMESTAMP
+    FROM content_research_analysis_units WHERE id=NEW.analysis_unit_id
+    ON CONFLICT(workflow_run_id) DO UPDATE SET revision=revision+1, updated_at=CURRENT_TIMESTAMP;
+END;
+"""
+
+
+def _apply_0038(conn: sqlite3.Connection) -> None:
+    conn.executescript(_V38_ATTEMPT_SCOPED_ANALYSIS_FAILURES_SQL)
 
 
 def _apply_0015(conn: sqlite3.Connection) -> None:
@@ -1839,23 +1887,18 @@ def _expected_checksums(migration_0002_sql: str, legacy_checksum: str) -> dict[s
         "0026": _checksum("execution_unit_alias_canonical_repair_v1"),
         "0027": _checksum("execution_decision_identity_contract_v1"),
         "0028": _checksum("minimal_execution_decision_identity_v1"),
-        "0029": _checksum(
-            (_V29_EXECUTION_LINEAGE_COLUMNS, _V29_EXECUTION_LINEAGE_INDEXES)
-        ),
-        "0030": _checksum(
-            (_V30_REPORT_LINEAGE_COLUMNS, _V30_REPORT_LINEAGE_INDEXES)
-        ),
+        "0029": _checksum((_V29_EXECUTION_LINEAGE_COLUMNS, _V29_EXECUTION_LINEAGE_INDEXES)),
+        "0030": _checksum((_V30_REPORT_LINEAGE_COLUMNS, _V30_REPORT_LINEAGE_INDEXES)),
         "0031": _checksum(_V31_REPORT_INTEGRITY_EVENT_STATEMENTS),
         "0032": _checksum(_V32_SCOPE_DRAFT_VERSION_COLUMNS),
         "0033": hashlib.sha256(_V33_LIFECYCLE_AUTHORITY_SQL.encode("utf-8")).hexdigest(),
-        "0034": hashlib.sha256(
-            _V34_MARKETING_ANALYSIS_IDENTITY_SQL.encode("utf-8")
-        ).hexdigest(),
-        "0035": hashlib.sha256(
-            _V35_MARKETING_ANALYSIS_JOB_SQL.encode("utf-8")
-        ).hexdigest(),
+        "0034": hashlib.sha256(_V34_MARKETING_ANALYSIS_IDENTITY_SQL.encode("utf-8")).hexdigest(),
+        "0035": hashlib.sha256(_V35_MARKETING_ANALYSIS_JOB_SQL.encode("utf-8")).hexdigest(),
         "0036": hashlib.sha256(_V36_TRACE_REVISION_SQL.encode("utf-8")).hexdigest(),
         "0037": hashlib.sha256(_V37_ANALYSIS_AUTHORITY_SQL.encode("utf-8")).hexdigest(),
+        "0038": hashlib.sha256(
+            _V38_ATTEMPT_SCOPED_ANALYSIS_FAILURES_SQL.encode("utf-8")
+        ).hexdigest(),
     }
 
 
@@ -2194,6 +2237,13 @@ def apply_content_research_migrations(
                 name="marketing_analysis_explicit_authority",
                 checksum=expected_checksums["0037"],
                 apply=lambda: _apply_0037(conn),
+            )
+            _apply_migration(
+                conn,
+                version="0038",
+                name="attempt_scoped_analysis_failures",
+                checksum=expected_checksums["0038"],
+                apply=lambda: _apply_0038(conn),
             )
         except Exception:
             conn.rollback()

@@ -183,7 +183,7 @@ SQLite dispatch/lifecycle 聚焦回归为 `28 passed`，Content Research 当前�
 
 最终 prebuild gate 已把 Task 3.1 的核心契约提升为独立阻断项：证据抽取、分析执行、质量包、
 governed completion、dispatch/analysis worker、Lite read model、原子持久化、报告执行与
-Snapshot replay 共 `109 passed`；更广的 Content Research lane 为 `630 passed`；Creator
+Snapshot replay 的 11 个核心测试文件必须存在；实际后端阻断 lane 为 `642 passed`。Creator
 frontend 为 `78 passed`，TypeScript `--noEmit` 通过。
 
 最初受限环境中的 Browser E2E 因端口不可绑定而被 pytest 标成 skip，release 脚本却仍返回
@@ -207,9 +207,15 @@ frontend 为 `78 passed`，TypeScript `--noEmit` 通过。
   embedding 和成功轨道 checkpoint，不重新调用 Spider。
 - directional 结论包含反向证据时，Lite report 过去遗漏 counter lineage 并拒绝读取已发布报告；
   当前投影始终保留 counter claim/citation/count，方向性与 contested 语义仍分别呈现。
+- Research embedding 失败现在按 attempt 持久化固定白名单错误码、失败计数和耗时，并通过同一
+  Trace Snapshot 投放；失败记录不会占用可复用成功 checkpoint 的唯一身份，后续 retry 可保留
+  已完成轨道并写入新的成功结果。
+- Trace 首次读取、并发读取和异常回滚均只使用 coordinator 持有的一条 query-only SQLite 事务；
+  报告 Snapshot 的同步 busy wait 已移出 async event loop，避免竞争写者无法提交而形成 30 秒
+  自锁。对应真实 contested Browser 场景从锁超时恢复到 `13.09s`，完整 7 条 Browser gate 连续通过。
 
-使用当前代码重新构建 Apple Silicon `dist/xhs-runtime.zip`（351 MB，SHA-256
-`5f9fbe3e0f21f55a5ecda261602da912c30adaee307535db4969d21f29e057e3`）。ZIP 完整性检查通过；
+使用当前代码重新构建 Apple Silicon `dist/xhs-runtime.zip`（`290,767,224` bytes，SHA-256
+`a687e4a4fe4fefb1455d3d7b5c627d6dd39df3e1eba2ee5505d6abe739b28232`）。ZIP 完整性检查通过；
 Artifact gate 校验归档结构和无密钥 `config.env`，实际启动冻结 Runtime、读取当前生命周期
 authority/Trace/Lite report、停止、再启动并读取同一 SQLite 状态，结果 `2 passed`。
 
@@ -220,7 +226,22 @@ Spider 检索、运行中多次打开 Trace、报告完成、证据详情内联�
 need/value/message 三轨分析，报告读取成功并包含 `112` 条冻结且可追溯的引用。逐帧中间文件
 仅用于本地编码，不进入发布提交。
 
+该真实 canary 的脱敏模型调用证据如下；request ID 为本地不可变 usage request record ID，
+session/job ID 均为上述 Run ID，不记录 API Key、Cookie、Prompt 或上游原始响应：
+
+| Provider / model | Request records | Tokens (prompt / completion / total) | 总延迟 | Failure code |
+|---|---:|---:|---:|---|
+| `openai_compatible` / `gpt-4o-mini` | 6 | 9,240 / 2,305 / 11,545 | 43,909 ms | 无（6 次均 success） |
+
+Request record IDs：`57f68381-a4c6-4f30-bcf1-ed6699f37409`、
+`3ac86ccb-9e11-4b11-9885-6cc989210c92`、
+`95bf49d2-dbb7-4dbb-987a-6ba8bf6510e4`、
+`2c46d77c-9b05-4fa5-a929-b4dd5068f8ed`、
+`45ccfee0-3049-4fb1-965c-798d7bdb108b`、
+`a21175f2-b604-4957-b111-a215656f4b00`。
+
 技术发布结论：当前代码的 prebuild gate、当前登录态的真实浏览器 canary 和新冻结产物的
-artifact gate 均已通过。正式 Git release 仍必须使用包含本次变更的 commit，并创建与
-`pyproject.toml` 完全一致的 tag；当前内部候选二进制为 ad-hoc 签名，面向普通 macOS 用户
-公开分发前仍需 Developer ID 签名和 notarization。
+artifact gate 均已通过。F003 feature release 分支以通过上述门禁的 commit SHA 为候选点；
+正式版本 tag 仅在该功能合入 `master`、从 `master` 再次完成全套门禁后创建，并与
+`pyproject.toml` 版本完全一致。当前内部候选二进制为 ad-hoc 签名，面向普通 macOS 用户公开
+分发前仍需 Developer ID 签名和 notarization。

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from app.content_research.presearch.service import PresearchChecklist
 
-
 DEFAULT_RESEARCH_DIRECTIONS = [
     "高增长关键词",
     "产品卖点表达",

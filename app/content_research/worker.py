@@ -387,7 +387,9 @@ class ContentResearchAnalysisWorker:
         lease_seconds: int = 120,
         clock: Callable[[], datetime] = utcnow,
     ) -> None:
-        self._repository = SQLiteMarketingAnalysisRepository(store._db_path)
+        self._repository = SQLiteMarketingAnalysisRepository(
+            store._db_path, bootstrap_schema=False
+        )
         self._service_factory = service_factory
         self._wake_event = wake_event or asyncio.Event()
         self._recovery_scan_seconds = recovery_scan_seconds

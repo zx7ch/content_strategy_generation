@@ -33,6 +33,24 @@ class AnalysisLeaseFencedError(RuntimeError):
     """A stale or expired analysis attempt tried to persist output."""
 
 
+class _BorrowedSQLiteConnection:
+    """Non-closing context wrapper for a coordinator-owned read transaction."""
+
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self._connection = connection
+
+    def __enter__(self) -> sqlite3.Connection:
+        return self._connection
+
+    def __exit__(self, _exc_type, _exc_value, _traceback) -> bool:
+        return False
+
+    def __getattr__(self, name: str) -> Any:
+        if name == "close":
+            return lambda: None
+        return getattr(self._connection, name)
+
+
 def _required(*values: str) -> None:
     if not all(value.strip() for value in values):
         raise ValueError("analysis persistence identity is required")
@@ -164,11 +182,21 @@ class AnalysisCheckpoint:
 class SQLiteMarketingAnalysisRepository:
     """Persist immutable Task 3.1 identities and fenced analysis execution."""
 
-    def __init__(self, db_path: str) -> None:
+    def __init__(
+        self,
+        db_path: str,
+        *,
+        read_transaction_connection: sqlite3.Connection | None = None,
+        bootstrap_schema: bool = True,
+    ) -> None:
         self._db_path = db_path
-        bootstrap_content_research_schema(db_path)
+        self._read_transaction_connection = read_transaction_connection
+        if read_transaction_connection is None and bootstrap_schema:
+            bootstrap_content_research_schema(db_path)
 
     def _connect(self) -> sqlite3.Connection:
+        if self._read_transaction_connection is not None:
+            return _BorrowedSQLiteConnection(self._read_transaction_connection)  # type: ignore[return-value]
         conn = sqlite3.connect(self._db_path, timeout=30)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys=ON")
@@ -385,10 +413,13 @@ class SQLiteMarketingAnalysisRepository:
         _required(analysis_unit_id)
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            if conn.execute(
-                "SELECT 1 FROM content_research_analysis_units WHERE id=?",
-                (analysis_unit_id,),
-            ).fetchone() is None:
+            if (
+                conn.execute(
+                    "SELECT 1 FROM content_research_analysis_units WHERE id=?",
+                    (analysis_unit_id,),
+                ).fetchone()
+                is None
+            ):
                 raise ValueError("analysis unit does not exist")
             if successor_of_attempt_id is not None:
                 existing_successor = conn.execute(
@@ -450,9 +481,12 @@ class SQLiteMarketingAnalysisRepository:
                     created_at,
                 ),
             )
-            if conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow_runs'"
-            ).fetchone() is not None:
+            if (
+                conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow_runs'"
+                ).fetchone()
+                is not None
+            ):
                 conn.execute(
                     "UPDATE workflow_runs SET effective_analysis_attempt_id=? WHERE run_id=("
                     "SELECT workflow_run_id FROM content_research_analysis_units WHERE id=?"
@@ -488,9 +522,7 @@ class SQLiteMarketingAnalysisRepository:
             if unit is None:
                 raise ValueError("analysis job unit does not exist")
             if str(unit["workflow_run_id"]) != workflow_run_id:
-                raise AnalysisIdentityConflictError(
-                    "analysis job workflow does not match its unit"
-                )
+                raise AnalysisIdentityConflictError("analysis job workflow does not match its unit")
             existing = conn.execute(
                 "SELECT * FROM content_research_analysis_jobs WHERE analysis_unit_id=?",
                 (analysis_unit_id,),
@@ -500,14 +532,11 @@ class SQLiteMarketingAnalysisRepository:
                     str(existing["workflow_run_id"]) == workflow_run_id
                     and str(existing["research_plan_id"]) == research_plan_id
                     and str(existing["coverage_snapshot_id"]) == coverage_snapshot_id
-                    and existing["execution_authorization_id"]
-                    == execution_authorization_id
+                    and existing["execution_authorization_id"] == execution_authorization_id
                     and str(existing["manifest_json"]) == manifest_json
                 )
                 if not same:
-                    raise AnalysisIdentityConflictError(
-                        "analysis job context is immutable"
-                    )
+                    raise AnalysisIdentityConflictError("analysis job context is immutable")
                 return self._row_to_analysis_job_context(existing)
             conn.execute(
                 "INSERT INTO content_research_analysis_jobs "
@@ -531,9 +560,7 @@ class SQLiteMarketingAnalysisRepository:
             assert row is not None
             return self._row_to_analysis_job_context(row)
 
-    def get_analysis_job_context(
-        self, analysis_unit_id: str
-    ) -> AnalysisJobContext | None:
+    def get_analysis_job_context(self, analysis_unit_id: str) -> AnalysisJobContext | None:
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT * FROM content_research_analysis_jobs WHERE analysis_unit_id=?",
@@ -556,9 +583,12 @@ class SQLiteMarketingAnalysisRepository:
         if lease_expires_at <= current_time:
             raise ValueError("analysis lease must expire in the future")
         with self._connect() as conn:
-            has_workflow_runs = conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow_runs'"
-            ).fetchone() is not None
+            has_workflow_runs = (
+                conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow_runs'"
+                ).fetchone()
+                is not None
+            )
             lifecycle_join = (
                 "LEFT JOIN workflow_runs AS run ON run.run_id=job.workflow_run_id "
                 if has_workflow_runs
@@ -592,11 +622,9 @@ class SQLiteMarketingAnalysisRepository:
                 "JOIN content_research_analysis_jobs AS job "
                 "ON job.analysis_unit_id=attempt.analysis_unit_id "
                 + lifecycle_join
-                +
-                "WHERE attempt.state='queued' "
+                + "WHERE attempt.state='queued' "
                 + lifecycle_filter
-                +
-                "ORDER BY attempt.created_at, attempt.id LIMIT 1"
+                + "ORDER BY attempt.created_at, attempt.id LIMIT 1"
             ).fetchone()
             if row is None:
                 return None
@@ -630,9 +658,12 @@ class SQLiteMarketingAnalysisRepository:
             raise ValueError("analysis lease check time must be timezone-aware")
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            has_workflow_runs = conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow_runs'"
-            ).fetchone() is not None
+            has_workflow_runs = (
+                conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow_runs'"
+                ).fetchone()
+                is not None
+            )
             lifecycle_join = (
                 "LEFT JOIN workflow_runs AS run ON run.run_id=job.workflow_run_id "
                 if has_workflow_runs
@@ -648,11 +679,9 @@ class SQLiteMarketingAnalysisRepository:
                 "JOIN content_research_analysis_jobs AS job "
                 "ON job.analysis_unit_id=attempt.analysis_unit_id "
                 + lifecycle_join
-                +
-                "WHERE attempt.state='running' AND attempt.lease_expires_at IS NOT NULL "
+                + "WHERE attempt.state='running' AND attempt.lease_expires_at IS NOT NULL "
                 + lifecycle_filter
-                +
-                "AND attempt.lease_expires_at<=? ORDER BY attempt.created_at, attempt.id",
+                + "AND attempt.lease_expires_at<=? ORDER BY attempt.created_at, attempt.id",
                 (current_time.isoformat(),),
             ).fetchall()
             expired = tuple(self._row_to_analysis_attempt(row) for row in rows)
@@ -674,9 +703,12 @@ class SQLiteMarketingAnalysisRepository:
         if current_time.tzinfo is None:
             raise ValueError("analysis lease check time must be timezone-aware")
         with self._connect() as conn:
-            has_workflow_runs = conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow_runs'"
-            ).fetchone() is not None
+            has_workflow_runs = (
+                conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow_runs'"
+                ).fetchone()
+                is not None
+            )
             if not has_workflow_runs:
                 return ()
             rows = conn.execute(
@@ -815,10 +847,13 @@ class SQLiteMarketingAnalysisRepository:
                 raise AnalysisIdentityConflictError(
                     "analysis attempt cannot succeed before every planned track completes"
                 )
-            if checkpoint.workflow_run_id != conn.execute(
-                "SELECT workflow_run_id FROM content_research_analysis_units WHERE id=?",
-                (row["analysis_unit_id"],),
-            ).fetchone()[0]:
+            if (
+                checkpoint.workflow_run_id
+                != conn.execute(
+                    "SELECT workflow_run_id FROM content_research_analysis_units WHERE id=?",
+                    (row["analysis_unit_id"],),
+                ).fetchone()[0]
+            ):
                 raise AnalysisIdentityConflictError(
                     "analysis terminal checkpoint belongs to another Run"
                 )
@@ -855,9 +890,12 @@ class SQLiteMarketingAnalysisRepository:
                 "SET state='succeeded', terminal_at=?, lease_expires_at=NULL WHERE id=?",
                 (current_time.isoformat(), attempt_id),
             )
-            if conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow_runs'"
-            ).fetchone() is not None:
+            if (
+                conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow_runs'"
+                ).fetchone()
+                is not None
+            ):
                 conn.execute(
                     "UPDATE workflow_runs SET effective_analysis_attempt_id=? WHERE run_id=?",
                     (attempt_id, checkpoint.workflow_run_id),
@@ -914,7 +952,9 @@ class SQLiteMarketingAnalysisRepository:
                     "SET state='failed', terminal_at=? WHERE id=? AND state='running'",
                     [(current_time.isoformat(), attempt_id) for attempt_id in attempt_ids],
                 )
-            return tuple(self._load_analysis_attempt(conn, attempt_id) for attempt_id in attempt_ids)
+            return tuple(
+                self._load_analysis_attempt(conn, attempt_id) for attempt_id in attempt_ids
+            )
 
     def get_analysis_attempt(self, attempt_id: str) -> AnalysisAttempt | None:
         with self._connect() as conn:
@@ -936,9 +976,12 @@ class SQLiteMarketingAnalysisRepository:
 
     def get_effective_attempt_for_run(self, workflow_run_id: str) -> AnalysisAttempt | None:
         with self._connect() as conn:
-            if conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow_runs'"
-            ).fetchone() is None:
+            if (
+                conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow_runs'"
+                ).fetchone()
+                is None
+            ):
                 return None
             row = conn.execute(
                 "SELECT attempt.* FROM workflow_runs AS run "
@@ -1046,6 +1089,84 @@ class SQLiteMarketingAnalysisRepository:
             )
             return self._load_analysis_checkpoint(conn, checkpoint_id)
 
+    def fail_analysis_checkpoint(
+        self,
+        *,
+        analysis_unit_id: str,
+        attempt_id: str,
+        lease_token: str,
+        track: str,
+        stage: str,
+        input_fingerprint: str,
+        error_code: str,
+        private_result: dict[str, Any] | None = None,
+        now: datetime | None = None,
+    ) -> AnalysisCheckpoint:
+        """Persist one attempt-scoped safe failure without poisoning reusable success."""
+        _required(
+            analysis_unit_id,
+            attempt_id,
+            lease_token,
+            track,
+            stage,
+            input_fingerprint,
+            error_code,
+        )
+        if track not in {"shared", "need", "value", "message"}:
+            raise ValueError("invalid analysis checkpoint track")
+        current_time = now or datetime.now(timezone.utc)
+        checkpoint_id = _stable_id(
+            "anf",
+            analysis_unit_id,
+            attempt_id,
+            track,
+            stage,
+            input_fingerprint,
+        )
+        safe_result = {**(private_result or {}), "error_code": error_code}
+        checksum = _sha256_text(_canonical_json(safe_result))
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            attempt = self._require_live_attempt(
+                conn,
+                attempt_id=attempt_id,
+                lease_token=lease_token,
+                now=current_time,
+            )
+            if attempt["analysis_unit_id"] != analysis_unit_id:
+                raise AnalysisLeaseFencedError(
+                    "attempt is not the active lease attempt for this unit"
+                )
+            existing = conn.execute(
+                "SELECT * FROM content_research_analysis_checkpoints WHERE id=?",
+                (checkpoint_id,),
+            ).fetchone()
+            if existing is not None:
+                if existing["status"] != "failed" or existing["result_checksum"] != checksum:
+                    raise AnalysisIdentityConflictError("failed analysis checkpoint is immutable")
+                return self._row_to_analysis_checkpoint(existing)
+            timestamp = current_time.isoformat()
+            conn.execute(
+                "INSERT INTO content_research_analysis_checkpoints "
+                "(id, analysis_unit_id, track, stage, input_fingerprint, status, "
+                "output_refs_json, result_checksum, private_result_json, "
+                "completed_by_attempt_id, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, 'failed', '[]', ?, ?, ?, ?, ?)",
+                (
+                    checkpoint_id,
+                    analysis_unit_id,
+                    track,
+                    stage,
+                    input_fingerprint,
+                    checksum,
+                    _canonical_json(safe_result),
+                    attempt_id,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            return self._load_analysis_checkpoint(conn, checkpoint_id)
+
     def complete_analysis_track(
         self,
         *,
@@ -1061,9 +1182,7 @@ class SQLiteMarketingAnalysisRepository:
     ) -> AnalysisCheckpoint:
         """Atomically commit proposals, backend decision, and verifier checkpoint."""
         current_time = now or datetime.now(timezone.utc)
-        checkpoint_id = _stable_id(
-            "anc", analysis_unit_id, track, "verifier", input_fingerprint
-        )
+        checkpoint_id = _stable_id("anc", analysis_unit_id, track, "verifier", input_fingerprint)
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             attempt = self._require_live_attempt(
@@ -1077,9 +1196,7 @@ class SQLiteMarketingAnalysisRepository:
                     "attempt is not the active lease attempt for this unit"
                 )
             if decision.track != track:
-                raise AnalysisIdentityConflictError(
-                    "analysis decision crossed its track boundary"
-                )
+                raise AnalysisIdentityConflictError("analysis decision crossed its track boundary")
             existing_checkpoint = conn.execute(
                 "SELECT * FROM content_research_analysis_checkpoints WHERE id=?",
                 (checkpoint_id,),
@@ -1088,23 +1205,23 @@ class SQLiteMarketingAnalysisRepository:
                 if (
                     existing_checkpoint["status"] != "completed"
                     or existing_checkpoint["result_checksum"] != result_checksum
-                    or tuple(json.loads(existing_checkpoint["output_refs_json"]))
-                    != (decision.id,)
+                    or tuple(json.loads(existing_checkpoint["output_refs_json"])) != (decision.id,)
                 ):
-                    raise AnalysisIdentityConflictError(
-                        "completed analysis track is immutable"
-                    )
+                    raise AnalysisIdentityConflictError("completed analysis track is immutable")
                 return self._row_to_analysis_checkpoint(existing_checkpoint)
-            run = conn.execute(
-                "SELECT content_research_state FROM workflow_runs WHERE run_id=?",
-                (decision.workflow_run_id,),
-            ).fetchone() if conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow_runs'"
-            ).fetchone() is not None else None
+            run = (
+                conn.execute(
+                    "SELECT content_research_state FROM workflow_runs WHERE run_id=?",
+                    (decision.workflow_run_id,),
+                ).fetchone()
+                if conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow_runs'"
+                ).fetchone()
+                is not None
+                else None
+            )
             if run is not None and run["content_research_state"] == "cancelled_or_failed":
-                raise AnalysisLeaseFencedError(
-                    "analysis output cannot commit after cancellation"
-                )
+                raise AnalysisLeaseFencedError("analysis output cannot commit after cancellation")
 
             def insert_candidate(record: MarketingConclusionCandidateRecord) -> None:
                 conn.execute(
@@ -1112,9 +1229,13 @@ class SQLiteMarketingAnalysisRepository:
                     "(id, schema_version, workflow_run_id, research_plan_id, track, "
                     "payload_json, metadata_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     (
-                        record.id, record.schema_version, record.workflow_run_id,
-                        record.research_plan_id, record.track,
-                        _canonical_json(record.payload), _canonical_json(record.metadata),
+                        record.id,
+                        record.schema_version,
+                        record.workflow_run_id,
+                        record.research_plan_id,
+                        record.track,
+                        _canonical_json(record.payload),
+                        _canonical_json(record.metadata),
                         record.created_at.isoformat(),
                     ),
                 )
@@ -1127,10 +1248,16 @@ class SQLiteMarketingAnalysisRepository:
                 "track, state, payload_json, metadata_json, created_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
-                    decision.id, decision.schema_version, decision.workflow_run_id,
-                    decision.research_plan_id, decision.candidate_id, decision.track,
-                    decision.state, _canonical_json(decision.payload),
-                    _canonical_json(decision.metadata), decision.created_at.isoformat(),
+                    decision.id,
+                    decision.schema_version,
+                    decision.workflow_run_id,
+                    decision.research_plan_id,
+                    decision.candidate_id,
+                    decision.track,
+                    decision.state,
+                    _canonical_json(decision.payload),
+                    _canonical_json(decision.metadata),
+                    decision.created_at.isoformat(),
                 ),
             )
             timestamp = current_time.isoformat()
@@ -1141,9 +1268,15 @@ class SQLiteMarketingAnalysisRepository:
                 "completed_by_attempt_id, created_at, updated_at) "
                 "VALUES (?, ?, ?, 'verifier', ?, 'completed', ?, ?, '{}', ?, ?, ?)",
                 (
-                    checkpoint_id, analysis_unit_id, track, input_fingerprint,
-                    _canonical_json((decision.id,)), result_checksum, attempt_id,
-                    timestamp, timestamp,
+                    checkpoint_id,
+                    analysis_unit_id,
+                    track,
+                    input_fingerprint,
+                    _canonical_json((decision.id,)),
+                    result_checksum,
+                    attempt_id,
+                    timestamp,
+                    timestamp,
                 ),
             )
             return self._load_analysis_checkpoint(conn, checkpoint_id)
@@ -1165,9 +1298,7 @@ class SQLiteMarketingAnalysisRepository:
             ).fetchone()
         return self._row_to_analysis_checkpoint(row) if row is not None else None
 
-    def list_analysis_checkpoints(
-        self, analysis_unit_id: str
-    ) -> tuple[AnalysisCheckpoint, ...]:
+    def list_analysis_checkpoints(self, analysis_unit_id: str) -> tuple[AnalysisCheckpoint, ...]:
         """Return the durable unit checkpoints in their commit order."""
         with self._connect() as conn:
             rows = conn.execute(

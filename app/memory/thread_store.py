@@ -25,11 +25,13 @@ def _new_id() -> str:
 class ThreadStore:
     """Persistent store for Creator conversation threads and messages."""
 
-    def __init__(self, db_path: str | None = None):
+    def __init__(self, db_path: str | None = None, *, read_only: bool = False):
         # Content Research runs, their timeline messages, and Creator threads
         # must share one runtime database.  An explicit path is still useful
         # for isolated tests and migrations.
         self.db_path = db_path or settings.SQLITE_DB_PATH
+        self.read_only = read_only
+        self._thread_table_available = True
         self._conn: Optional[aiosqlite.Connection] = None
         self._logger = get_logger(__name__, component="thread_store")
 
@@ -46,13 +48,26 @@ class ThreadStore:
         # Content Research may hold a short SQLite write transaction while a
         # Creator timeline message is appended; wait for that transaction
         # instead of turning a valid run into a spurious startup failure.
-        self._conn = await aiosqlite.connect(self.db_path, timeout=30)
+        if self.read_only:
+            self._conn = await aiosqlite.connect(
+                f"file:{self.db_path}?mode=ro", uri=True, timeout=30
+            )
+        else:
+            self._conn = await aiosqlite.connect(self.db_path, timeout=30)
         self._conn.row_factory = aiosqlite.Row
         # WAL is configured once during database bootstrap. Re-applying it on
         # ordinary Creator connections can block behind an active checkpoint.
         await self._conn.execute("PRAGMA busy_timeout=30000")
         await self._conn.execute("PRAGMA synchronous=NORMAL")
-        await self._init_tables()
+        if self.read_only:
+            await self._conn.execute("PRAGMA query_only=ON")
+            async with self._conn.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type='table' AND name='creator_threads'"
+            ) as cursor:
+                self._thread_table_available = await cursor.fetchone() is not None
+        else:
+            await self._init_tables()
 
     async def close(self) -> None:
         if self._conn is None:
@@ -195,6 +210,8 @@ class ThreadStore:
         return [dict(r) for r in rows]
 
     async def get_thread(self, thread_id: str) -> Optional[dict]:
+        if not self._thread_table_available:
+            return None
         row = await self._get_thread_row(thread_id)
         return dict(row) if row is not None else None
 

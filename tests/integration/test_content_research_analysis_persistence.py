@@ -32,12 +32,15 @@ def test_empty_analysis_queue_poll_does_not_request_a_sqlite_write_lock(
     blocker = _connect_without_wait(db_path)
     blocker.execute("BEGIN IMMEDIATE")
     try:
-        assert repository.claim_next_analysis_job(
-            lease_owner="analysis-worker",
-            lease_token="lease-token",
-            lease_expires_at=datetime(2026, 8, 26, 10, 0, tzinfo=timezone.utc),
-            now=datetime(2026, 8, 26, 9, 30, tzinfo=timezone.utc),
-        ) is None
+        assert (
+            repository.claim_next_analysis_job(
+                lease_owner="analysis-worker",
+                lease_token="lease-token",
+                lease_expires_at=datetime(2026, 8, 26, 10, 0, tzinfo=timezone.utc),
+                now=datetime(2026, 8, 26, 9, 30, tzinfo=timezone.utc),
+            )
+            is None
+        )
     finally:
         blocker.rollback()
         blocker.close()
@@ -78,8 +81,14 @@ def test_evidence_snapshot_freezes_source_fields_hashes_and_query_provenance(tmp
     assert replayed == first
     assert first.notes[0].title == "凉感衬衫实穿"
     assert first.notes[0].body == "夏季通勤不闷，但跑步后后背会贴身。"
-    assert first.notes[0].title_hash == "79b8cf0350bb98592805a6efce0a9dd0095f5c9b80388e791bfe9ad35c7ef7a2"
-    assert first.notes[0].body_hash == "58c36fece3e90f38643f51534c4349a3a00d014451674b3ef0a6b6d7392bb487"
+    assert (
+        first.notes[0].title_hash
+        == "79b8cf0350bb98592805a6efce0a9dd0095f5c9b80388e791bfe9ad35c7ef7a2"
+    )
+    assert (
+        first.notes[0].body_hash
+        == "58c36fece3e90f38643f51534c4349a3a00d014451674b3ef0a6b6d7392bb487"
+    )
     assert first.notes[0].query_provenance == ("query-core", "query-experience")
 
     changed_note = FrozenEvidenceNoteInput(
@@ -143,15 +152,18 @@ def test_analysis_attempt_enforces_one_active_successor_and_reuses_completed_tra
         algorithm_version="analysis-v1",
         verifier_version="verifier-v1",
     )
-    assert repository.get_or_create_analysis_unit(
-        evidence_snapshot_id=snapshot.id,
-        policy_version="marketing-policy-v1",
-        prompt_hash="prompt-hash-1",
-        response_schema_hash="schema-hash-1",
-        embedding_fingerprint=unit.embedding_fingerprint,
-        algorithm_version="analysis-v1",
-        verifier_version="verifier-v1",
-    ) == unit
+    assert (
+        repository.get_or_create_analysis_unit(
+            evidence_snapshot_id=snapshot.id,
+            policy_version="marketing-policy-v1",
+            prompt_hash="prompt-hash-1",
+            response_schema_hash="schema-hash-1",
+            embedding_fingerprint=unit.embedding_fingerprint,
+            algorithm_version="analysis-v1",
+            verifier_version="verifier-v1",
+        )
+        == unit
+    )
 
     first_attempt = repository.create_analysis_attempt(unit.id)
     with pytest.raises(AnalysisActiveAttemptConflictError, match="active analysis attempt"):
@@ -186,16 +198,22 @@ def test_analysis_attempt_enforces_one_active_successor_and_reuses_completed_tra
     )
     assert successor.attempt_no == 2
     assert successor.successor_of_attempt_id == first_attempt.id
-    assert repository.create_analysis_attempt(
-        unit.id,
-        successor_of_attempt_id=first_attempt.id,
-    ) == successor
-    assert repository.get_completed_analysis_checkpoint(
-        analysis_unit_id=unit.id,
-        track="need",
-        stage="verifier",
-        input_fingerprint="need-input-1",
-    ) == need_checkpoint
+    assert (
+        repository.create_analysis_attempt(
+            unit.id,
+            successor_of_attempt_id=first_attempt.id,
+        )
+        == successor
+    )
+    assert (
+        repository.get_completed_analysis_checkpoint(
+            analysis_unit_id=unit.id,
+            track="need",
+            stage="verifier",
+            input_fingerprint="need-input-1",
+        )
+        == need_checkpoint
+    )
 
     with pytest.raises(AnalysisLeaseFencedError, match="not the active lease attempt"):
         repository.complete_analysis_checkpoint(
@@ -209,6 +227,86 @@ def test_analysis_attempt_enforces_one_active_successor_and_reuses_completed_tra
             result_checksum="value-checksum-1",
             now=datetime(2026, 8, 26, 9, 34, tzinfo=timezone.utc),
         )
+
+
+def test_failed_checkpoint_is_attempt_scoped_and_does_not_poison_retry(tmp_path) -> None:
+    repository = SQLiteMarketingAnalysisRepository(str(tmp_path / "analysis-failure.db"))
+    snapshot = repository.freeze_evidence_snapshot(
+        workflow_run_id="run-failure",
+        scope_contract_id="scope-failure",
+        retrieval_execution_unit_id="retrieval-failure",
+        retrieval_attempt_no=1,
+        query_groups=({"id": "query-core", "query": "凉感T恤"},),
+        notes=(),
+    )
+    unit = repository.get_or_create_analysis_unit(
+        evidence_snapshot_id=snapshot.id,
+        policy_version="policy-v1",
+        prompt_hash="prompt-v1",
+        response_schema_hash="schema-v1",
+        embedding_fingerprint={"model": "test", "dimensions": 3},
+        algorithm_version="algorithm-v1",
+        verifier_version="verifier-v1",
+    )
+    first = repository.create_analysis_attempt(unit.id)
+    first = repository.claim_analysis_attempt(
+        first.id,
+        lease_owner="worker-1",
+        lease_token="lease-1",
+        lease_expires_at=datetime(2026, 8, 26, 10, 0, tzinfo=timezone.utc),
+        now=datetime(2026, 8, 26, 9, 30, tzinfo=timezone.utc),
+    )
+    failed = repository.fail_analysis_checkpoint(
+        analysis_unit_id=unit.id,
+        attempt_id=first.id,
+        lease_token="lease-1",
+        track="shared",
+        stage="embedding",
+        input_fingerprint="embedding-input",
+        error_code="RESEARCH_EMBEDDING_NOT_NORMALIZED",
+        private_result={"trace": {"failure_count": 1}},
+        now=datetime(2026, 8, 26, 9, 31, tzinfo=timezone.utc),
+    )
+    assert failed.status == "failed"
+    assert failed.private_result["error_code"] == ("RESEARCH_EMBEDDING_NOT_NORMALIZED")
+    repository.fail_analysis_attempt(
+        first.id,
+        lease_token="lease-1",
+        now=datetime(2026, 8, 26, 9, 32, tzinfo=timezone.utc),
+    )
+
+    successor = repository.create_analysis_attempt(unit.id, successor_of_attempt_id=first.id)
+    successor = repository.claim_analysis_attempt(
+        successor.id,
+        lease_owner="worker-2",
+        lease_token="lease-2",
+        lease_expires_at=datetime(2026, 8, 26, 10, 0, tzinfo=timezone.utc),
+        now=datetime(2026, 8, 26, 9, 33, tzinfo=timezone.utc),
+    )
+    completed = repository.complete_analysis_checkpoint(
+        analysis_unit_id=unit.id,
+        attempt_id=successor.id,
+        lease_token="lease-2",
+        track="shared",
+        stage="embedding",
+        input_fingerprint="embedding-input",
+        output_refs=("document-fingerprint",),
+        result_checksum="success-checksum",
+        private_result={"vectors": {"atom-1": [1.0, 0.0, 0.0]}},
+        now=datetime(2026, 8, 26, 9, 34, tzinfo=timezone.utc),
+    )
+
+    assert completed.status == "completed"
+    assert completed.id != failed.id
+    assert (
+        repository.get_completed_analysis_checkpoint(
+            analysis_unit_id=unit.id,
+            track="shared",
+            stage="embedding",
+            input_fingerprint="embedding-input",
+        )
+        == completed
+    )
 
 
 def test_analysis_attempt_succeeds_only_after_all_tracks_and_expired_lease_is_fenced(
@@ -294,9 +392,12 @@ def test_analysis_attempt_succeeds_only_after_all_tracks_and_expired_lease_is_fe
         lease_expires_at=datetime(2026, 8, 26, 9, 40, tzinfo=timezone.utc),
         now=datetime(2026, 8, 26, 9, 30, tzinfo=timezone.utc),
     )
-    assert [item.id for item in repository.expire_analysis_attempts(
-        now=datetime(2026, 8, 26, 9, 41, tzinfo=timezone.utc)
-    )] == [expired.id]
+    assert [
+        item.id
+        for item in repository.expire_analysis_attempts(
+            now=datetime(2026, 8, 26, 9, 41, tzinfo=timezone.utc)
+        )
+    ] == [expired.id]
     with pytest.raises(AnalysisLeaseFencedError):
         repository.complete_analysis_checkpoint(
             analysis_unit_id=second_unit.id,
@@ -360,12 +461,15 @@ def test_analysis_job_claim_is_durable_and_expired_attempt_requires_explicit_rec
     assert claimed is not None
     assert claimed.attempt.id == queued.id
     assert claimed.context == context
-    assert repository.claim_next_analysis_job(
-        lease_owner="analysis-worker-2",
-        lease_token="lease-2",
-        lease_expires_at=datetime(2026, 8, 26, 10, 1, tzinfo=timezone.utc),
-        now=datetime(2026, 8, 26, 9, 31, tzinfo=timezone.utc),
-    ) is None
+    assert (
+        repository.claim_next_analysis_job(
+            lease_owner="analysis-worker-2",
+            lease_token="lease-2",
+            lease_expires_at=datetime(2026, 8, 26, 10, 1, tzinfo=timezone.utc),
+            now=datetime(2026, 8, 26, 9, 31, tzinfo=timezone.utc),
+        )
+        is None
+    )
 
     expired = repository.recover_expired_analysis_jobs(
         now=datetime(2026, 8, 26, 10, 1, tzinfo=timezone.utc)
@@ -377,9 +481,12 @@ def test_analysis_job_claim_is_durable_and_expired_attempt_requires_explicit_rec
     assert terminal.state == "failed"
     assert terminal.attempt_no == 1
 
-    assert repository.claim_next_analysis_job(
-        lease_owner="analysis-worker-2",
-        lease_token="lease-2",
-        lease_expires_at=datetime(2026, 8, 26, 10, 3, tzinfo=timezone.utc),
-        now=datetime(2026, 8, 26, 10, 2, tzinfo=timezone.utc),
-    ) is None
+    assert (
+        repository.claim_next_analysis_job(
+            lease_owner="analysis-worker-2",
+            lease_token="lease-2",
+            lease_expires_at=datetime(2026, 8, 26, 10, 3, tzinfo=timezone.utc),
+            now=datetime(2026, 8, 26, 10, 2, tzinfo=timezone.utc),
+        )
+        is None
+    )

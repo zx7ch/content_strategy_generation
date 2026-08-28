@@ -41,6 +41,10 @@ dependencies = [
     "qrcode>=8.0",
     "Pillow>=10.0",
     "python-dotenv>=1.0.0",
+    "openai>=1.0.0",
+    "anthropic>=0.39.0",
+    "numpy>=1.24.0",
+    "structlog>=24.0.0",
 ]
 
 [project.optional-dependencies]
@@ -63,8 +67,10 @@ target-version = ['py310']
 
 [tool.ruff]
 line-length = 100
-select = ["E", "F", "I", "N", "W", "UP"]
-ignore = ["E501"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N"]
+ignore = ["E501", "N818"]
 
 [tool.mypy]
 python_version = "3.10"
@@ -79,6 +85,10 @@ python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 markers = [
+    "unit: isolated module tests",
+    "integration: internal component integration tests",
+    "e2e: deterministic user-visible application flows",
     "acceptance: real dependency acceptance tests",
+    "slow: long-running test",
     "real_dependency: requires real external services",
 ]

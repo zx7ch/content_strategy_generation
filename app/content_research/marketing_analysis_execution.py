@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import time
 import uuid
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, replace
@@ -59,6 +60,7 @@ from app.content_research.research_embedding import (
     ResearchEmbeddingDocument,
     ResearchEmbeddingRuntime,
     ResearchEmbeddingUnavailableError,
+    safe_research_embedding_error_code,
 )
 from app.content_research.runtime import canonical_fingerprint
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
@@ -129,7 +131,7 @@ class MarketingAnalysisExecutionService:
         llm_scope: Mapping[str, object] | None = None,
     ) -> None:
         self._store = store
-        self._repository = SQLiteMarketingAnalysisRepository(store._db_path)
+        self._repository = SQLiteMarketingAnalysisRepository(store._db_path, bootstrap_schema=False)
         self._llm = (
             TrackedDirectionalAnalysisLLM(llm=llm, db_path=store._db_path)
             if llm is not None
@@ -180,10 +182,7 @@ class MarketingAnalysisExecutionService:
         preparation = await self.prepare(
             workflow_run_id=workflow_run_id,
             research_plan_id=research_plan_id,
-            coverage_snapshot_id=(
-                "coverage_"
-                + canonical_fingerprint(asdict(manifest))[:24]
-            ),
+            coverage_snapshot_id=("coverage_" + canonical_fingerprint(asdict(manifest))[:24]),
             execution_authorization_id=None,
             manifest=manifest,
         )
@@ -259,16 +258,12 @@ class MarketingAnalysisExecutionService:
         )
         return MarketingAnalysisPreparation(context, attempt, snapshot, unit)
 
-    async def execute_claimed(
-        self, claim: AnalysisJobClaim
-    ) -> MarketingAnalysisExecutionResult:
+    async def execute_claimed(self, claim: AnalysisJobClaim) -> MarketingAnalysisExecutionResult:
         attempt = claim.attempt
         token = str(attempt.lease_token or "")
         if attempt.state != "running" or not token:
             raise RuntimeError("marketing analysis requires a claimed attempt")
-        unit = await asyncio.to_thread(
-            self._repository.get_analysis_unit, attempt.analysis_unit_id
-        )
+        unit = await asyncio.to_thread(self._repository.get_analysis_unit, attempt.analysis_unit_id)
         if unit is None:
             raise RuntimeError("marketing analysis unit disappeared")
         snapshot = await asyncio.to_thread(
@@ -293,6 +288,7 @@ class MarketingAnalysisExecutionService:
             snapshot=snapshot,
             atoms=atoms,
             analysis_unit_id=unit.id,
+            embedding_fingerprint=unit.embedding_fingerprint,
             attempt=attempt,
             lease_token=token,
         )
@@ -364,7 +360,11 @@ class MarketingAnalysisExecutionService:
                             }
                         ),
                     )
-                except (LLMProviderFailure, MarketingConclusionAnalysisError, ResearchEmbeddingUnavailableError) as exc:
+                except (
+                    LLMProviderFailure,
+                    MarketingConclusionAnalysisError,
+                    ResearchEmbeddingUnavailableError,
+                ) as exc:
                     failure_code, failure_detail = self._safe_failure(exc)
                     failures[track] = failure_code
                     await asyncio.to_thread(
@@ -387,6 +387,7 @@ class MarketingAnalysisExecutionService:
                 snapshot=snapshot,
                 attempt=attempt,
                 contract_fingerprint=unit.contract_fingerprint,
+                embedding_fingerprint=unit.embedding_fingerprint,
                 projected_packet_ids=tuple(sorted(packets)),
             )
             attempt, checkpoint = await asyncio.to_thread(
@@ -405,9 +406,7 @@ class MarketingAnalysisExecutionService:
 
     def _persist_projected_analysis_inputs(
         self,
-        admitted_claims: tuple[
-            tuple[ClaimAdmissionDecisionRecord, ClaimCandidateRecord], ...
-        ],
+        admitted_claims: tuple[tuple[ClaimAdmissionDecisionRecord, ClaimCandidateRecord], ...],
         packets: Mapping[str, DirectionalEvidencePacketRecord],
     ) -> None:
         """Materialize analysis evidence into the governed report authority.
@@ -427,9 +426,7 @@ class MarketingAnalysisExecutionService:
             expected.pop("created_at", None)
             actual.pop("created_at", None)
             if actual != expected:
-                raise AnalysisContractIncompatibleError(
-                    "ANALYSIS_PROJECTED_EVIDENCE_CONFLICT"
-                )
+                raise AnalysisContractIncompatibleError("ANALYSIS_PROJECTED_EVIDENCE_CONFLICT")
 
         for packet in sorted(packets.values(), key=lambda item: item.id):
             save_once(packet, self._store.save_directional_evidence_packet)
@@ -438,36 +435,25 @@ class MarketingAnalysisExecutionService:
             save_once(decision, self._store.save_claim_admission_decision)
 
     async def assert_retry_compatible(self, analysis_unit_id: str) -> AnalysisUnit:
-        unit = await asyncio.to_thread(
-            self._repository.get_analysis_unit, analysis_unit_id
-        )
+        unit = await asyncio.to_thread(self._repository.get_analysis_unit, analysis_unit_id)
         if unit is None:
-            raise AnalysisContractIncompatibleError(
-                "ANALYSIS_CONTRACT_INCOMPATIBLE"
-            )
+            raise AnalysisContractIncompatibleError("ANALYSIS_CONTRACT_INCOMPATIBLE")
         policy = self._store.get_run_policy_snapshot_for_workflow(unit.workflow_run_id)
         if policy is None:
-            raise AnalysisContractIncompatibleError(
-                "ANALYSIS_CONTRACT_INCOMPATIBLE"
-            )
+            raise AnalysisContractIncompatibleError("ANALYSIS_CONTRACT_INCOMPATIBLE")
         self._require_compatible_contract(unit, policy.effective_policy_hash)
         return unit
 
-    def _require_compatible_contract(
-        self, unit: AnalysisUnit, effective_policy_hash: str
-    ) -> None:
+    def _require_compatible_contract(self, unit: AnalysisUnit, effective_policy_hash: str) -> None:
         if (
-            unit.policy_version
-            != f"{ANALYSIS_POLICY_VERSION}:{effective_policy_hash}"
+            unit.policy_version != f"{ANALYSIS_POLICY_VERSION}:{effective_policy_hash}"
             or unit.prompt_hash != ANALYSIS_PROMPT_HASH
             or unit.response_schema_hash != ANALYSIS_RESPONSE_SCHEMA_HASH
-            or unit.embedding_fingerprint != self._embedding_fingerprint()
+            or unit.embedding_fingerprint != self._embedding_identity()
             or unit.algorithm_version != ANALYSIS_ALGORITHM_VERSION
             or unit.verifier_version != ANALYSIS_VERIFIER_VERSION
         ):
-            raise AnalysisContractIncompatibleError(
-                "ANALYSIS_CONTRACT_INCOMPATIBLE"
-            )
+            raise AnalysisContractIncompatibleError("ANALYSIS_CONTRACT_INCOMPATIBLE")
 
     @staticmethod
     def _manifest_from_context(context: AnalysisJobContext) -> CoverageManifest:
@@ -571,6 +557,12 @@ class MarketingAnalysisExecutionService:
             )
         return health.fingerprint.as_dict()
 
+    def _embedding_identity(self) -> dict[str, object]:
+        """Read model identity without treating transient readiness as compatibility."""
+        if self._embedding_runtime is None:
+            raise ResearchEmbeddingUnavailableError("RESEARCH_EMBEDDING_UNAVAILABLE")
+        return self._embedding_runtime.health.fingerprint.as_dict()
+
     async def _complete_shared_extraction_checkpoint(
         self,
         *,
@@ -639,15 +631,17 @@ class MarketingAnalysisExecutionService:
         snapshot: EvidenceSnapshot,
         atoms: tuple[AtomicMarketingEvidence, ...],
         analysis_unit_id: str,
+        embedding_fingerprint: Mapping[str, object],
         attempt: AnalysisAttempt,
         lease_token: str,
     ) -> dict[str, tuple[float, ...]]:
+        frozen_embedding_fingerprint = dict(embedding_fingerprint)
         input_fingerprint = canonical_fingerprint(
             {
                 "snapshot": snapshot.snapshot_fingerprint,
                 "stage": "embedding",
                 "atoms": [atom.atom_id for atom in atoms],
-                "embedding": self._embedding_fingerprint(),
+                "embedding": frozen_embedding_fingerprint,
             }
         )
         existing = await asyncio.to_thread(
@@ -666,27 +660,55 @@ class MarketingAnalysisExecutionService:
                 for atom_id, values in raw_vectors.items()
                 if isinstance(values, list)
             }
-        if atoms:
-            assert self._embedding_runtime is not None
-            batch = await asyncio.to_thread(
-                self._embedding_runtime.embed_documents,
-                tuple(
-                    ResearchEmbeddingDocument(atom.atom_id, atom.aspect, atom.quote)
-                    for atom in atoms
-                ),
+        started_at = time.perf_counter()
+        try:
+            if atoms:
+                assert self._embedding_runtime is not None
+                batch = await asyncio.to_thread(
+                    self._embedding_runtime.embed_documents,
+                    tuple(
+                        ResearchEmbeddingDocument(atom.atom_id, atom.aspect, atom.quote)
+                        for atom in atoms
+                    ),
+                )
+                output_refs = batch.input_fingerprints
+                vectors = {
+                    atom_id: tuple(vector)
+                    for atom_id, vector in zip(batch.document_ids, batch.vectors, strict=True)
+                }
+                checksum = hashlib.sha256(
+                    json.dumps(batch.vectors, separators=(",", ":")).encode()
+                ).hexdigest()
+                dimensions = batch.embedding_fingerprint.dimensions
+            else:
+                output_refs = ()
+                vectors = {}
+                checksum = hashlib.sha256(b"[]").hexdigest()
+                dimensions = int(frozen_embedding_fingerprint.get("dimensions") or 0)
+        except Exception as exc:
+            duration_ms = max(0, round((time.perf_counter() - started_at) * 1000))
+            error_code = safe_research_embedding_error_code(str(exc))
+            await asyncio.to_thread(
+                self._repository.fail_analysis_checkpoint,
+                analysis_unit_id=analysis_unit_id,
+                attempt_id=attempt.id,
+                lease_token=lease_token,
+                track="shared",
+                stage="embedding",
+                input_fingerprint=input_fingerprint,
+                error_code=error_code,
+                private_result={
+                    "trace": {
+                        "batch_count": 1 if atoms else 0,
+                        "success_count": 0,
+                        "failure_count": len(atoms) if atoms else 1,
+                        "duration_ms": duration_ms,
+                        "dimensions": int(frozen_embedding_fingerprint.get("dimensions") or 0),
+                    }
+                },
             )
-            output_refs = batch.input_fingerprints
-            vectors = {
-                atom_id: tuple(vector)
-                for atom_id, vector in zip(batch.document_ids, batch.vectors, strict=True)
-            }
-            checksum = hashlib.sha256(
-                json.dumps(batch.vectors, separators=(",", ":")).encode()
-            ).hexdigest()
-        else:
-            output_refs = ()
-            vectors = {}
-            checksum = hashlib.sha256(b"[]").hexdigest()
+            raise
+        duration_ms = max(0, round((time.perf_counter() - started_at) * 1000))
         await asyncio.to_thread(
             self._repository.complete_analysis_checkpoint,
             analysis_unit_id=analysis_unit_id,
@@ -697,7 +719,16 @@ class MarketingAnalysisExecutionService:
             input_fingerprint=input_fingerprint,
             output_refs=output_refs,
             result_checksum=checksum,
-            private_result={"vectors": {key: list(value) for key, value in vectors.items()}},
+            private_result={
+                "vectors": {key: list(value) for key, value in vectors.items()},
+                "trace": {
+                    "batch_count": 1 if atoms else 0,
+                    "success_count": len(vectors),
+                    "failure_count": 0,
+                    "duration_ms": duration_ms,
+                    "dimensions": dimensions,
+                },
+            },
         )
         return vectors
 
@@ -735,15 +766,11 @@ class MarketingAnalysisExecutionService:
             generated = ()
         clusters = cluster_atomic_marketing_evidence(atoms, vectors)
         verifications = {
-            candidate.id: verify_marketing_candidate(
-                candidate, atoms=atoms, clusters=clusters
-            )
+            candidate.id: verify_marketing_candidate(candidate, atoms=atoms, clusters=clusters)
             for candidate in generated
         }
         governed_candidates = tuple(
-            candidate
-            for candidate in generated
-            if verifications[candidate.id].state != "failed"
+            candidate for candidate in generated if verifications[candidate.id].state != "failed"
         )
         evaluation = evaluate_marketing_conclusions(
             candidates=governed_candidates,
@@ -765,19 +792,13 @@ class MarketingAnalysisExecutionService:
             verification = verifications[evaluation.candidate_id]
             atom_by_id = {atom.atom_id: atom for atom in atoms}
             counter_claim_ids = tuple(
-                sorted(
-                    {
-                        atom_by_id[atom_id].claim_id
-                        for atom_id in verification.counter_atom_ids
-                    }
-                )
+                sorted({atom_by_id[atom_id].claim_id for atom_id in verification.counter_atom_ids})
             )
             evaluation = replace(
                 evaluation,
                 state=(
                     "contested"
-                    if evaluation.state == "selected"
-                    and verification.state == "contested"
+                    if evaluation.state == "selected" and verification.state == "contested"
                     else evaluation.state
                 ),
                 verifier_state=verification.state,
@@ -833,9 +854,12 @@ class MarketingAnalysisExecutionService:
             if decision == "directional"
             else "omitted"
         )
-        decision_id = "mcd_" + canonical_fingerprint(
-            {"contract": contract_fingerprint, "track": track, "decision": decision}
-        )[:24]
+        decision_id = (
+            "mcd_"
+            + canonical_fingerprint(
+                {"contract": contract_fingerprint, "track": track, "decision": decision}
+            )[:24]
+        )
         record = MarketingConclusionDecisionRecord(
             decision_id,
             "marketing_conclusion_decision_v2",
@@ -876,9 +900,12 @@ class MarketingAnalysisExecutionService:
         failure_code: str,
         failure_detail: str | None,
     ) -> None:
-        decision_id = "mcd_" + canonical_fingerprint(
-            {"attempt": attempt_id, "track": track, "decision": "analysis_failed"}
-        )[:24]
+        decision_id = (
+            "mcd_"
+            + canonical_fingerprint(
+                {"attempt": attempt_id, "track": track, "decision": "analysis_failed"}
+            )[:24]
+        )
         self._store.save_marketing_conclusion_decision(
             MarketingConclusionDecisionRecord(
                 decision_id,
@@ -891,11 +918,7 @@ class MarketingAnalysisExecutionService:
                     "publication_role": "omitted",
                     "reason_codes": ["marketing_analysis_unavailable"],
                     "failure_code": failure_code,
-                    **(
-                        {"failure_detail": failure_detail}
-                        if failure_detail is not None
-                        else {}
-                    ),
+                    **({"failure_detail": failure_detail} if failure_detail is not None else {}),
                     "recovery_action": "repair_model_configuration_and_resume",
                 },
                 workflow_run_id=workflow_run_id,
@@ -915,6 +938,7 @@ class MarketingAnalysisExecutionService:
         snapshot: EvidenceSnapshot,
         attempt: AnalysisAttempt,
         contract_fingerprint: str,
+        embedding_fingerprint: Mapping[str, object],
         projected_packet_ids: tuple[str, ...],
     ) -> StageCheckpointRecord:
         decisions = {
@@ -939,9 +963,7 @@ class MarketingAnalysisExecutionService:
                 "independent_author_count": int(
                     decisions[track].payload.get("independent_author_count") or 0
                 ),
-                "counter_note_count": int(
-                    decisions[track].payload.get("counter_note_count") or 0
-                ),
+                "counter_note_count": int(decisions[track].payload.get("counter_note_count") or 0),
                 "counter_author_count": int(
                     decisions[track].payload.get("counter_author_count") or 0
                 ),
@@ -952,15 +974,47 @@ class MarketingAnalysisExecutionService:
         }
         status = (
             "completed"
-            if any(
-                item["decision"] in {"selected", "contested"}
-                for item in tracks.values()
-            )
+            if any(item["decision"] in {"selected", "contested"} for item in tracks.values())
             else "insufficient"
         )
+        embedding_checkpoint = next(
+            (
+                item
+                for item in self._repository.list_analysis_checkpoints(attempt.analysis_unit_id)
+                if item.track == "shared"
+                and item.stage == "embedding"
+                and item.status == "completed"
+            ),
+            None,
+        )
+        embedding_payload = {
+            "fingerprint": dict(embedding_fingerprint),
+            "document_count": len(snapshot.notes),
+        }
+        if embedding_checkpoint is not None:
+            trace_metrics = embedding_checkpoint.private_result.get("trace")
+            embedding_payload.update(
+                {
+                    "input_fingerprint": embedding_checkpoint.input_fingerprint,
+                    "checkpoint_id": embedding_checkpoint.id,
+                    "result_checksum": embedding_checkpoint.result_checksum,
+                    "result_refs": list(embedding_checkpoint.output_refs),
+                    "reused_checkpoint_id": (
+                        embedding_checkpoint.id
+                        if embedding_checkpoint.completed_by_attempt_id != attempt.id
+                        else None
+                    ),
+                    **(trace_metrics if isinstance(trace_metrics, dict) else {}),
+                }
+            )
         checkpoint = StageCheckpointRecord(
-            "scp_" + canonical_fingerprint(
-                {"run": workflow_run_id, "stage": "marketing_conclusion", "input": contract_fingerprint}
+            "scp_"
+            + canonical_fingerprint(
+                {
+                    "run": workflow_run_id,
+                    "stage": "marketing_conclusion",
+                    "input": contract_fingerprint,
+                }
             )[:24],
             "content_research_stage_checkpoint_v1",
             {
@@ -972,10 +1026,7 @@ class MarketingAnalysisExecutionService:
                 "evidence_snapshot_fingerprint": snapshot.snapshot_fingerprint,
                 "retrieval_execution_unit_id": snapshot.retrieval_execution_unit_id,
                 "projected_packet_ids": list(projected_packet_ids),
-                "embedding": {
-                    "fingerprint": self._embedding_fingerprint(),
-                    "document_count": len(snapshot.notes),
-                },
+                "embedding": embedding_payload,
                 "tracks": tracks,
             },
             workflow_run_id=workflow_run_id,
@@ -1000,9 +1051,16 @@ class MarketingAnalysisExecutionService:
         manifest: CoverageManifest,
         contract_fingerprint: str,
     ) -> StageCheckpointRecord:
-        checkpoint_id = "scp_" + canonical_fingerprint(
-            {"run": workflow_run_id, "stage": "marketing_conclusion", "input": contract_fingerprint}
-        )[:24]
+        checkpoint_id = (
+            "scp_"
+            + canonical_fingerprint(
+                {
+                    "run": workflow_run_id,
+                    "stage": "marketing_conclusion",
+                    "input": contract_fingerprint,
+                }
+            )[:24]
+        )
         checkpoint = self._store.get_typed_record(StageCheckpointRecord, checkpoint_id)
         if checkpoint is None or not manifest.matches(checkpoint):
             raise RuntimeError("TRACK_COVERAGE_INCONSISTENT")

@@ -72,6 +72,9 @@ def test_research_embedding_adapter_formats_snapshot_fields_and_exposes_fingerpr
     )
 
     assert health.status == "ready"
+    assert health.warmup_duration_ms is not None
+    assert health.warmup_duration_ms >= 0
+    assert health.as_dict()["warmup_duration_ms"] == health.warmup_duration_ms
     assert load_calls == [("research-model", "revision-7")]
     assert model.encoded_texts == [
         "标题：Research embedding 预热\n正文：验证中文语义向量",
@@ -105,6 +108,10 @@ def test_research_embedding_adapter_formats_snapshot_fields_and_exposes_fingerpr
         (
             np.asarray([[1.0, 0.0, 0.0], [0.0, np.nan, 0.0]], dtype=np.float32),
             "RESEARCH_EMBEDDING_NON_FINITE",
+        ),
+        (
+            np.asarray([[2.0, 0.0, 0.0], [0.0, 0.6, 0.8]], dtype=np.float32),
+            "RESEARCH_EMBEDDING_NOT_NORMALIZED",
         ),
     ],
 )

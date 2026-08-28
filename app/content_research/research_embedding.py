@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import math
 import threading
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -12,6 +13,23 @@ from typing import Any
 INPUT_FORMAT_VERSION = "research_note_title_body_v1"
 _WARMUP_TITLE = "Research embedding 预热"
 _WARMUP_BODY = "验证中文语义向量"
+SAFE_RESEARCH_EMBEDDING_ERROR_CODES = frozenset(
+    {
+        "RESEARCH_EMBEDDING_UNAVAILABLE",
+        "RESEARCH_EMBEDDING_STOPPED",
+        "RESEARCH_EMBEDDING_RESULT_COUNT_MISMATCH",
+        "RESEARCH_EMBEDDING_DIMENSION_MISMATCH",
+        "RESEARCH_EMBEDDING_NON_FINITE",
+        "RESEARCH_EMBEDDING_NOT_NORMALIZED",
+    }
+)
+
+
+def safe_research_embedding_error_code(value: object) -> str:
+    """Map internal failures onto the fixed public Research embedding vocabulary."""
+    if isinstance(value, str) and value in SAFE_RESEARCH_EMBEDDING_ERROR_CODES:
+        return value
+    return "RESEARCH_EMBEDDING_UNAVAILABLE"
 
 
 @dataclass(frozen=True)
@@ -49,6 +67,7 @@ class ResearchEmbeddingFingerprint:
 class ResearchEmbeddingHealth:
     status: str
     fingerprint: ResearchEmbeddingFingerprint
+    warmup_duration_ms: int | None = None
     error_code: str | None = None
     message: str | None = None
 
@@ -57,6 +76,8 @@ class ResearchEmbeddingHealth:
             "status": self.status,
             "fingerprint": self.fingerprint.as_dict(),
         }
+        if self.warmup_duration_ms is not None:
+            result["warmup_duration_ms"] = self.warmup_duration_ms
         if self.error_code is not None:
             result["error_code"] = self.error_code
         if self.message is not None:
@@ -123,6 +144,7 @@ class SentenceTransformerResearchEmbeddingAdapter:
         return self._fingerprint
 
     def warm(self) -> ResearchEmbeddingHealth:
+        started_at = time.perf_counter()
         model = self._model_loader(
             self._fingerprint.model,
             self._fingerprint.revision,
@@ -132,7 +154,11 @@ class SentenceTransformerResearchEmbeddingAdapter:
         )
         self._encode(model, (warmup,))
         self._model = model
-        return ResearchEmbeddingHealth("ready", self._fingerprint)
+        return ResearchEmbeddingHealth(
+            "ready",
+            self._fingerprint,
+            warmup_duration_ms=max(0, round((time.perf_counter() - started_at) * 1000)),
+        )
 
     def embed_documents(
         self,
@@ -174,6 +200,16 @@ class SentenceTransformerResearchEmbeddingAdapter:
             raise RuntimeError("RESEARCH_EMBEDDING_DIMENSION_MISMATCH")
         if any(not math.isfinite(value) for row in rows for value in row):
             raise RuntimeError("RESEARCH_EMBEDDING_NON_FINITE")
+        if any(
+            not math.isclose(
+                math.sqrt(sum(value * value for value in row)),
+                1.0,
+                rel_tol=1e-5,
+                abs_tol=1e-5,
+            )
+            for row in rows
+        ):
+            raise RuntimeError("RESEARCH_EMBEDDING_NOT_NORMALIZED")
         return rows
 
 
@@ -240,11 +276,7 @@ class ResearchEmbeddingRuntime:
                 return self._adapter.embed_documents(documents)
             except RuntimeError as exc:
                 text = str(exc)
-                code = (
-                    text
-                    if text.startswith("RESEARCH_EMBEDDING_")
-                    else "RESEARCH_EMBEDDING_UNAVAILABLE"
-                )
+                code = safe_research_embedding_error_code(text)
                 self._health = ResearchEmbeddingHealth(
                     status="unavailable",
                     fingerprint=self._adapter.fingerprint,

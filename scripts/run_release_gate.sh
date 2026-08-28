@@ -20,7 +20,7 @@ fi
 
 run_prebuild_gate() {
   # Keep the Task 3.1 contract visible even if the broader test globs are reorganized.
-  "$PYTHON" -m pytest -q \
+  local task_3_1_core_files=(
     tests/unit/test_content_research_marketing_evidence_extraction.py \
     tests/unit/test_content_research_marketing_analysis_execution.py \
     tests/unit/test_content_research_marketing_quality.py \
@@ -32,13 +32,22 @@ run_prebuild_gate() {
     tests/integration/test_content_research_report_execution.py \
     tests/integration/test_content_research_packet_replay.py \
     tests/integration/test_content_research_lite_read_model.py
+  )
+  local test_file
+  for test_file in "${task_3_1_core_files[@]}"; do
+    if [[ ! -f "$test_file" ]]; then
+      echo "Missing Task 3.1 release-gate test: $test_file" >&2
+      exit 2
+    fi
+  done
 
   "$PYTHON" -m pytest -q \
     tests/unit/test_content_research*.py \
     tests/integration/test_content_research*.py \
     tests/unit/test_llm_openai_compatible_adapter.py \
     tests/unit/test_runtime_launcher.py \
-    tests/acceptance/test_task_3_1_release_gate.py
+    tests/unit/test_package_metadata.py \
+    tests/unit/test_task_3_1_release_gate.py
 
   CREATOR_BROWSER_E2E_REQUIRED=1 \
     "$PYTHON" scripts/run_creator_browser_e2e.py \

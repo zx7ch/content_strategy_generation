@@ -516,6 +516,15 @@ def test_creator_generates_traceable_marketing_conclusions_without_recollecting(
     assert marketing_trace["analysis_attempt_id"] == analysis_attempt_id
     assert marketing_trace["evidence_snapshot_id"] == snapshot_id
     assert marketing_trace["embedding"]["document_count"] >= 3
+    assert marketing_trace["embedding"]["batch_count"] == 1
+    assert marketing_trace["embedding"]["success_count"] >= 3
+    assert marketing_trace["embedding"]["failure_count"] == 0
+    assert marketing_trace["embedding"]["duration_ms"] >= 0
+    assert marketing_trace["embedding"]["dimensions"] == 3
+    assert marketing_trace["embedding"]["checkpoint_id"].startswith("anc_")
+    assert marketing_trace["embedding"]["input_fingerprint"]
+    assert marketing_trace["embedding"]["result_checksum"]
+    assert marketing_trace["embedding"]["result_refs"]
     assert "vectors" not in json.dumps(marketing_trace)
     assert {
         track: details["execution"]

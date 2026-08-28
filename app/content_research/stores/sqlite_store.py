@@ -324,6 +324,24 @@ class RetryableLocalPersistenceError(RuntimeError):
     """A local persistence failure that callers may safely retry."""
 
 
+class _BorrowedSQLiteConnection:
+    """Keep a coordinator-owned read transaction open across store calls."""
+
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self._connection = connection
+
+    def __enter__(self) -> sqlite3.Connection:
+        return self._connection
+
+    def __exit__(self, _exc_type, _exc_value, _traceback) -> bool:
+        return False
+
+    def __getattr__(self, name: str) -> Any:
+        if name == "close":
+            return lambda: None
+        return getattr(self._connection, name)
+
+
 class SQLiteContentResearchStore:
     """Local SQLite persistence for Content Research business records."""
 
@@ -337,7 +355,20 @@ class SQLiteContentResearchStore:
         self._db_path = db_path
         self._execution_context = execution_context
         self._dispatch_context = dispatch_context
+        self._read_transaction_connection: sqlite3.Connection | None = None
         bootstrap_content_research_schema(db_path)
+
+    @classmethod
+    def for_read_transaction(
+        cls, db_path: str, connection: sqlite3.Connection
+    ) -> SQLiteContentResearchStore:
+        """Build a query-only view over the coordinator's exact transaction."""
+        store = object.__new__(cls)
+        store._db_path = db_path
+        store._execution_context = None
+        store._dispatch_context = None
+        store._read_transaction_connection = connection
+        return store
 
     def for_execution_context(
         self, context: ExecutionContext
@@ -358,6 +389,8 @@ class SQLiteContentResearchStore:
         return scoped
 
     def _raw_connect(self) -> sqlite3.Connection:
+        if self._read_transaction_connection is not None:
+            return _BorrowedSQLiteConnection(self._read_transaction_connection)  # type: ignore[return-value]
         conn = sqlite3.connect(self._db_path, timeout=30)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA busy_timeout=30000")

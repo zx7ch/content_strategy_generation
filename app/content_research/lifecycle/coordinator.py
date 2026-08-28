@@ -8,8 +8,9 @@ import json
 import sqlite3
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, TypeVar
 
 import aiosqlite
 
@@ -41,6 +42,9 @@ class LifecycleCommandConflict(ValueError):
 
 class LifecyclePersistenceBusy(RuntimeError):
     """The bounded local SQLite contention budget was exhausted."""
+
+
+TraceSnapshotT = TypeVar("TraceSnapshotT")
 
 
 def _now() -> str:
@@ -187,9 +191,7 @@ class ContentResearchPersistenceCoordinator:
                     or existing["command_kind"] != command.kind
                     or existing["request_fingerprint"] != request_fingerprint
                 ):
-                    raise LifecycleCommandConflict(
-                        "command identity was reused with new input"
-                    )
+                    raise LifecycleCommandConflict("command identity was reused with new input")
                 projection = await self._load_in_transaction(conn, command.run_id)
                 await conn.rollback()
                 return projection
@@ -267,9 +269,7 @@ class ContentResearchPersistenceCoordinator:
                     or existing["command_kind"] != command.kind
                     or existing["request_fingerprint"] != request_fingerprint
                 ):
-                    raise LifecycleCommandConflict(
-                        "command identity was reused with new input"
-                    )
+                    raise LifecycleCommandConflict("command identity was reused with new input")
                 async with conn.execute(
                     "SELECT id FROM content_research_analysis_attempts "
                     "WHERE successor_of_attempt_id=?",
@@ -298,27 +298,24 @@ class ContentResearchPersistenceCoordinator:
             ) as cursor:
                 attempt = await cursor.fetchone()
             if attempt is None:
-                raise LifecycleCommandConflict(
-                    "legacy run has no retryable analysis attempt"
-                )
+                raise LifecycleCommandConflict("legacy run has no retryable analysis attempt")
             if str(attempt["id"]) != expected_attempt_id:
                 raise LifecycleCommandConflict("analysis retry attempt is stale")
             if str(attempt["state"]) not in {"failed", "cancelled"}:
-                raise LifecycleCommandConflict(
-                    "analysis retry requires a failed predecessor"
-                )
+                raise LifecycleCommandConflict("analysis retry requires a failed predecessor")
             if str(attempt["contract_fingerprint"]) != expected_contract_fingerprint:
-                raise LifecycleCommandConflict(
-                    "analysis retry contract fingerprint changed"
-                )
+                raise LifecycleCommandConflict("analysis retry contract fingerprint changed")
 
             result_revision = await self._advance(conn, command)
             successor_no = int(attempt["attempt_no"]) + 1
-            successor_id = "ana_" + hashlib.sha256(
-                "\x1f".join(
-                    (str(attempt["analysis_unit_id"]), str(successor_no))
-                ).encode("utf-8")
-            ).hexdigest()[:24]
+            successor_id = (
+                "ana_"
+                + hashlib.sha256(
+                    "\x1f".join((str(attempt["analysis_unit_id"]), str(successor_no))).encode(
+                        "utf-8"
+                    )
+                ).hexdigest()[:24]
+            )
             await conn.execute(
                 "INSERT INTO content_research_analysis_attempts "
                 "(id, analysis_unit_id, attempt_no, state, successor_of_attempt_id, "
@@ -434,6 +431,109 @@ class ContentResearchPersistenceCoordinator:
         await self._ensure_schema()
         return await self._with_busy_retry(lambda: self._load_once(run_id))
 
+    async def load_trace_snapshot(
+        self,
+        run_id: str,
+        reader: Callable[
+            [sqlite3.Connection, RunProjection, list[dict[str, Any]]],
+            Awaitable[TraceSnapshotT],
+        ],
+    ) -> TraceSnapshotT:
+        """Build one Trace projection inside one coordinator-owned read transaction."""
+        return await self._with_busy_retry(lambda: self._load_trace_snapshot_once(run_id, reader))
+
+    async def _load_trace_snapshot_once(
+        self,
+        run_id: str,
+        reader: Callable[
+            [sqlite3.Connection, RunProjection, list[dict[str, Any]]],
+            Awaitable[TraceSnapshotT],
+        ],
+    ) -> TraceSnapshotT:
+        connection = sqlite3.connect(f"file:{self._db_path}?mode=ro", uri=True, timeout=0.25)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA busy_timeout=250")
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute("PRAGMA query_only=ON")
+        try:
+            connection.execute("BEGIN")
+            # Pin the WAL boundary before any projection component reads.
+            connection.execute("SELECT 1 FROM sqlite_schema LIMIT 1").fetchone()
+            if (
+                connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow_runs'"
+                ).fetchone()
+                is None
+            ):
+                raise LifecycleCommandConflict("Run does not exist")
+            projection = self._load_sync_in_transaction(connection, run_id)
+            transition_rows = connection.execute(
+                """SELECT from_state, to_state, event, state_revision,
+                          reason_code, attempt_id, created_at
+                   FROM content_research_state_transitions
+                   WHERE run_id=? ORDER BY state_revision ASC""",
+                (run_id,),
+            ).fetchall()
+            result = await reader(
+                connection,
+                projection,
+                [dict(row) for row in transition_rows],
+            )
+            connection.rollback()
+            return result
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _load_sync_in_transaction(connection: sqlite3.Connection, run_id: str) -> RunProjection:
+        row = connection.execute("SELECT * FROM workflow_runs WHERE run_id=?", (run_id,)).fetchone()
+        if row is None:
+            raise LifecycleCommandConflict("Run does not exist")
+        brief = connection.execute(
+            """SELECT id FROM content_research_briefs
+               WHERE workflow_run_id=? ORDER BY updated_at DESC, id DESC LIMIT 1""",
+            (run_id,),
+        ).fetchone()
+        scope = connection.execute(
+            """SELECT id FROM content_research_scope_contracts
+               WHERE workflow_run_id=? ORDER BY version DESC LIMIT 1""",
+            (run_id,),
+        ).fetchone()
+        dispatch = connection.execute(
+            "SELECT 1 FROM content_research_dispatch_jobs WHERE workflow_run_id=?",
+            (run_id,),
+        ).fetchone()
+        attempt = connection.execute(
+            """SELECT a.execution_unit_id, a.attempt_no
+               FROM content_research_scope_execution_attempts AS a
+               JOIN content_research_scope_execution_units AS u
+                 ON u.id=a.execution_unit_id
+               WHERE u.workflow_run_id=?
+               ORDER BY a.attempt_no DESC LIMIT 1""",
+            (run_id,),
+        ).fetchone()
+        publication = connection.execute(
+            """SELECT payload_json FROM workflow_artifacts
+               WHERE run_id=? AND artifact_type='final_result'
+                 AND artifact_version=? LIMIT 1""",
+            (run_id, int(row["artifact_version"] or 0)),
+        ).fetchone()
+        return projection_from_row(
+            row,
+            brief_id=str(brief["id"]) if brief else None,
+            scope_contract_id=str(scope["id"]) if scope else None,
+            has_dispatch=dispatch is not None,
+            execution_attempt_id=(
+                f"{attempt['execution_unit_id']}:{attempt['attempt_no']}" if attempt else None
+            ),
+            publication_id=_publication_id_from_artifact_payload(
+                publication["payload_json"] if publication else None
+            ),
+        )
+
     async def _load_once(self, run_id: str) -> RunProjection:
         conn = await self._connect()
         try:
@@ -445,9 +545,7 @@ class ContentResearchPersistenceCoordinator:
         """Decode a pre-lifecycle Run without granting mutation authority."""
 
         await self._ensure_schema()
-        return await self._with_busy_retry(
-            lambda: self._load_historical_read_only_once(run_id)
-        )
+        return await self._with_busy_retry(lambda: self._load_historical_read_only_once(run_id))
 
     async def _load_historical_read_only_once(self, run_id: str) -> dict[str, Any]:
         conn = await self._connect()
@@ -836,7 +934,8 @@ class ContentResearchPersistenceCoordinator:
             else "scope_confirm"
             if decision.to_state is ContentResearchState.SCOPE_CONFIRMATION_REQUIRED
             else "formal_research"
-            if decision.to_state in {
+            if decision.to_state
+            in {
                 ContentResearchState.RETRIEVAL_QUEUED,
                 ContentResearchState.RETRIEVAL_RUNNING,
                 ContentResearchState.COVERAGE_EVALUATING,
@@ -844,7 +943,8 @@ class ContentResearchPersistenceCoordinator:
             else "coverage"
             if decision.to_state is ContentResearchState.COVERAGE_DECISION_REQUIRED
             else "report"
-            if decision.to_state in {
+            if decision.to_state
+            in {
                 ContentResearchState.REPORT_COMPOSING,
                 ContentResearchState.REPORT_READY,
             }
@@ -852,14 +952,16 @@ class ContentResearchPersistenceCoordinator:
         )
         phase = (
             "retrieval"
-            if decision.to_state in {
+            if decision.to_state
+            in {
                 ContentResearchState.RETRIEVAL_QUEUED,
                 ContentResearchState.RETRIEVAL_RUNNING,
                 ContentResearchState.COVERAGE_EVALUATING,
                 ContentResearchState.COVERAGE_DECISION_REQUIRED,
             }
             else "finalization"
-            if decision.to_state in {
+            if decision.to_state
+            in {
                 ContentResearchState.REPORT_COMPOSING,
                 ContentResearchState.REPORT_READY,
             }
@@ -1099,9 +1201,7 @@ class ContentResearchPersistenceCoordinator:
             raise LifecycleCommandConflict("Scope confirmation requires its current Plan")
         plan_payload = json.loads(str(plan_row["payload_json"]))
         selected_direction_ids = tuple(
-            str(item)
-            for item in plan_payload.get("direction_ids") or ()
-            if str(item)
+            str(item) for item in plan_payload.get("direction_ids") or () if str(item)
         )
         if not selected_direction_ids or not set(selected_direction_ids).issubset(
             DIRECTION_CATALOG_V1
@@ -1184,9 +1284,7 @@ class ContentResearchPersistenceCoordinator:
             (draft_id, run_id, contract.id, now),
         )
 
-        definitions = {
-            item.id: item for item in ResearchDirectionRegistry().list_directions()
-        }
+        definitions = {item.id: item for item in ResearchDirectionRegistry().list_directions()}
         as_of = datetime.now(timezone.utc)
         window = {
             "start_at": (as_of - timedelta(days=365)).isoformat(),
@@ -1233,9 +1331,7 @@ class ContentResearchPersistenceCoordinator:
             subject_structure=dict(brief_payload.get("subject_structure") or {}),
             subject_structure_hash=str(brief_payload.get("subject_structure_hash") or ""),
             primary_marketing_goal=(
-                "content_seeding"
-                if "product_marketing" in selected_direction_ids
-                else None
+                "content_seeding" if "product_marketing" in selected_direction_ids else None
             ),
         )
         await conn.execute(
@@ -1303,8 +1399,12 @@ class ContentResearchPersistenceCoordinator:
         task_ids: list[str] = []
         for index, direction_id in enumerate(selected_direction_ids):
             definition = definitions[direction_id]
-            child_id = f"child_{hashlib.sha256(f'{command_id}:{direction_id}'.encode()).hexdigest()[:24]}"
-            task_id = f"sat_{hashlib.sha256(f'{command_id}:{direction_id}'.encode()).hexdigest()[:24]}"
+            child_id = (
+                f"child_{hashlib.sha256(f'{command_id}:{direction_id}'.encode()).hexdigest()[:24]}"
+            )
+            task_id = (
+                f"sat_{hashlib.sha256(f'{command_id}:{direction_id}'.encode()).hexdigest()[:24]}"
+            )
             task_ids.append(task_id)
             await conn.execute(
                 """INSERT INTO workflow_child_tasks
@@ -1336,7 +1436,9 @@ class ContentResearchPersistenceCoordinator:
                     "schema_version": "content_research_subagent_input_v1",
                     "confirmed_subject": str(draft_row["core_object"]),
                     "subject_structure": subject_structure,
-                    "subject_structure_hash": str(brief_payload.get("subject_structure_hash") or ""),
+                    "subject_structure_hash": str(
+                        brief_payload.get("subject_structure_hash") or ""
+                    ),
                     "competitors": competitors,
                     "custom_research_question": "",
                     "direction": {
@@ -1422,10 +1524,9 @@ class ContentResearchPersistenceCoordinator:
         draft = dict(payload.get("scope_draft") or {})
         if not brief_id or not plan.get("id") or not draft.get("id") or not directions:
             raise ValueError("confirm_brief requires Brief, Plan, directions, and Scope Draft")
-        if (
-            str(draft.get("workflow_run_id") or "") != str(run_row["run_id"])
-            or str(draft.get("research_plan_id") or "") != str(plan["id"])
-        ):
+        if str(draft.get("workflow_run_id") or "") != str(run_row["run_id"]) or str(
+            draft.get("research_plan_id") or ""
+        ) != str(plan["id"]):
             raise LifecycleCommandConflict("Scope Draft lineage does not match this Run and Plan")
         cursor = await conn.execute(
             "SELECT * FROM content_research_briefs WHERE id=? AND workflow_run_id=?",
@@ -1658,9 +1759,7 @@ class ContentResearchPersistenceCoordinator:
             scope_contract_id=str(scope["id"]) if scope else None,
             has_dispatch=dispatch is not None,
             execution_attempt_id=(
-                f"{attempt['execution_unit_id']}:{attempt['attempt_no']}"
-                if attempt
-                else None
+                f"{attempt['execution_unit_id']}:{attempt['attempt_no']}" if attempt else None
             ),
             publication_id=_publication_id_from_artifact_payload(
                 publication["payload_json"] if publication else None

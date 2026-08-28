@@ -1,5 +1,9 @@
 from pathlib import Path
 
+import pytest
+
+pytestmark = pytest.mark.unit
+
 
 def test_tag_release_runs_task_3_1_and_artifact_gates_before_upload() -> None:
     root = Path(__file__).parents[2]

@@ -4,9 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import os
 import sqlite3
-import tempfile
 import unicodedata
 import uuid
 from collections.abc import Awaitable, Callable
@@ -219,7 +217,6 @@ class ReportPublicationMaterializationError(RuntimeError):
 
 
 class WorkflowRuntime(Protocol):
-
     async def record_step_execution_started(self, workflow_run_id: str, step_name: str) -> None: ...
 
     async def record_step_execution_finished(
@@ -295,9 +292,7 @@ class WorkflowRunManagerRuntime:
     def for_execution_context(self, context: ExecutionContext) -> WorkflowRunManagerRuntime:
         return WorkflowRunManagerRuntime(self._db_path, execution_context=context)
 
-    def for_dispatch_context(
-        self, context: DispatchLeaseContext
-    ) -> WorkflowRunManagerRuntime:
+    def for_dispatch_context(self, context: DispatchLeaseContext) -> WorkflowRunManagerRuntime:
         return WorkflowRunManagerRuntime(self._db_path, dispatch_context=context)
 
     def _manager(self, operation: str) -> WorkflowRunManager:
@@ -314,7 +309,6 @@ class WorkflowRunManagerRuntime:
             execution_context=self._execution_context,
             operation=operation,
         )
-
 
     async def record_step_execution_started(self, workflow_run_id: str, step_name: str) -> None:
         async with self._manager("record_step_execution_started") as manager:
@@ -383,13 +377,9 @@ class WorkflowRunManagerRuntime:
                 + ", ".join(sorted(missing_child_ids))
             )
         async with self._manager("complete_formal_research") as manager:
-            if (
-                formal_step is not None
-                and str(formal_step.get("status") or "") == "succeeded"
-            ):
+            if formal_step is not None and str(formal_step.get("status") or "") == "succeeded":
                 if any(
-                    str(child.get("status") or "") != "succeeded"
-                    for child in child_by_id.values()
+                    str(child.get("status") or "") != "succeeded" for child in child_by_id.values()
                 ):
                     raise ValueError(
                         "Completed formal research cannot resume report finalization "
@@ -666,9 +656,7 @@ class ContentResearchService:
         normalized_command_id = command_id.strip()
         if not normalized_command_id:
             raise ContentResearchValidationError("command_id is required")
-        lock = self._presearch_command_locks.setdefault(
-            normalized_command_id, asyncio.Lock()
-        )
+        lock = self._presearch_command_locks.setdefault(normalized_command_id, asyncio.Lock())
         async with lock:
             return await self._submit_presearch_locked(
                 command_id=normalized_command_id,
@@ -822,9 +810,7 @@ class ContentResearchService:
         normalized_command_id = command_id.strip()
         if not normalized_command_id:
             raise ContentResearchValidationError("command_id is required")
-        lock = self._presearch_command_locks.setdefault(
-            normalized_command_id, asyncio.Lock()
-        )
+        lock = self._presearch_command_locks.setdefault(normalized_command_id, asyncio.Lock())
         async with lock:
             return await self._rerun_presearch_locked(
                 workflow_run_id=workflow_run_id,
@@ -909,8 +895,7 @@ class ContentResearchService:
             "brief_status": "draft" if outcome.status == "completed" else "failed",
             "subject": outcome.checklist.subject_confirmation or request.seed_text,
             "competitors": list(outcome.checklist.competitor_tags),
-            "directions": list(outcome.checklist.research_directions)
-            or ["product_marketing"],
+            "directions": list(outcome.checklist.research_directions) or ["product_marketing"],
             "attempt_id": attempt_id,
             "seed_text": request.seed_text,
             "user_note": request.user_note,
@@ -954,11 +939,7 @@ class ContentResearchService:
                     run_id=workflow_run_id,
                     expected_state=ContentResearchState.PRESEARCH_RUNNING,
                     expected_revision=expected_revision,
-                    kind=(
-                        "presearch_completed"
-                        if outcome.status == "completed"
-                        else "fail"
-                    ),
+                    kind=("presearch_completed" if outcome.status == "completed" else "fail"),
                     payload=(
                         brief_payload
                         if outcome.status == "completed"
@@ -1026,7 +1007,6 @@ class ContentResearchService:
         task = asyncio.create_task(reconcile())
         self._lifecycle_reconciliation_tasks.add(task)
         task.add_done_callback(self._lifecycle_reconciliation_tasks.discard)
-
 
     def get_policy_snapshot(self, workflow_run_id: str) -> dict[str, Any]:
         snapshot = self._store.get_run_policy_snapshot_for_workflow(workflow_run_id)
@@ -1117,9 +1097,7 @@ class ContentResearchService:
             run_projection.state is ContentResearchState.REPORT_READY
             and self._publication_repair_available(workflow_run_id)
         ):
-            run_projection = replace(
-                run_projection, allowed_actions=("repair_publication",)
-            )
+            run_projection = replace(run_projection, allowed_actions=("repair_publication",))
         return ContentResearchWorkflowSummaryResponse(
             workflow_run_id=workflow_run_id,
             run=self._run_projection_payload(run_projection),
@@ -1187,9 +1165,7 @@ class ContentResearchService:
         if not publications:
             return False
         events = self._store.list_report_integrity_events(publications[0].id)
-        return bool(
-            events and events[-1].reason_code == "materialized_artifact_invalid"
-        )
+        return bool(events and events[-1].reason_code == "materialized_artifact_invalid")
 
     async def list_workflow_events(
         self, workflow_run_id: str
@@ -1313,9 +1289,7 @@ class ContentResearchService:
             else None
         )
         execution_facts = (
-            self._store.execution_trace(execution_unit.id)
-            if execution_unit is not None
-            else []
+            self._store.execution_trace(execution_unit.id) if execution_unit is not None else []
         )
         return ContentResearchScopeProjectionResponse(
             workflow_run_id=workflow_run_id,
@@ -1347,7 +1321,9 @@ class ContentResearchService:
                 coverage_snapshot=coverage_snapshot,
                 authorizations=authorizations,
                 allowed_resolutions=allowed_resolutions,
-            ) if run_projection.state is ContentResearchState.COVERAGE_DECISION_REQUIRED else None,
+            )
+            if run_projection.state is ContentResearchState.COVERAGE_DECISION_REQUIRED
+            else None,
             execution_unit=_scope_execution_unit_projection(
                 execution_unit=execution_unit,
                 authorization=current_authorization,
@@ -1357,64 +1333,44 @@ class ContentResearchService:
         )
 
     async def get_workflow_trace(self, workflow_run_id: str) -> ContentResearchTraceResponse:
-        snapshot_path = self._create_trace_snapshot()
         try:
-            return await self._get_workflow_trace_from_snapshot(
-                workflow_run_id=workflow_run_id,
-                snapshot_path=snapshot_path,
+            return await self._lifecycle.load_trace_snapshot(
+                workflow_run_id,
+                lambda connection, run, transitions: self._get_workflow_trace_from_transaction(
+                    workflow_run_id=workflow_run_id,
+                    connection=connection,
+                    run=run,
+                    transitions=transitions,
+                ),
             )
-        finally:
-            for path in (snapshot_path, f"{snapshot_path}-wal", f"{snapshot_path}-shm"):
-                try:
-                    os.remove(path)
-                except FileNotFoundError:
-                    pass
-
-    def _create_trace_snapshot(self) -> str:
-        temporary = tempfile.NamedTemporaryFile(
-            prefix="content-research-trace-", suffix=".sqlite3", delete=False
-        )
-        snapshot_path = temporary.name
-        temporary.close()
-        try:
-            with sqlite3.connect(self._store._db_path, timeout=0.25) as source:
-                source.execute("PRAGMA busy_timeout=250")
-                source.execute("BEGIN")
-                # Establish the WAL read boundary before the online backup.
-                source.execute("SELECT 1 FROM sqlite_schema LIMIT 1").fetchone()
-                with sqlite3.connect(snapshot_path) as destination:
-                    source.backup(destination)
-                source.rollback()
-        except Exception:
-            try:
-                os.remove(snapshot_path)
-            except FileNotFoundError:
-                pass
-            raise
-        return snapshot_path
-
-    async def _get_workflow_trace_from_snapshot(
-        self, *, workflow_run_id: str, snapshot_path: str
-    ) -> ContentResearchTraceResponse:
-        snapshot_lifecycle = ContentResearchPersistenceCoordinator(snapshot_path)
-        try:
-            run = await snapshot_lifecycle.load(workflow_run_id)
         except LifecycleCommandConflict as exc:
             if str(exc) != "Run does not exist":
                 raise
             raise ContentResearchNotFoundError(
                 f"Content research workflow not found: {workflow_run_id}"
             ) from exc
-        snapshot_store = SQLiteContentResearchStore(snapshot_path)
+
+    async def _get_workflow_trace_from_transaction(
+        self,
+        *,
+        workflow_run_id: str,
+        connection: sqlite3.Connection,
+        run: RunProjection,
+        transitions: list[dict[str, Any]],
+    ) -> ContentResearchTraceResponse:
+        snapshot_store = SQLiteContentResearchStore.for_read_transaction(
+            self._store._db_path, connection
+        )
         brief = snapshot_store.get_brief_by_workflow(workflow_run_id)
         trace = await ContentResearchTraceService(
-            store=snapshot_store, db_path=snapshot_path
+            store=snapshot_store,
+            db_path=self._store._db_path,
+            read_transaction_connection=connection,
         ).build_trace(
             workflow_run_id=workflow_run_id,
             brief=brief,
             current_publication_id=run.publication_id,
         )
-        transitions = await snapshot_lifecycle.list_transitions(workflow_run_id)
         stage_by_state = {
             ContentResearchState.PRESEARCH_RUNNING: "presearch",
             ContentResearchState.BRIEF_CONFIRMATION_REQUIRED: "brief_confirmation",
@@ -1435,9 +1391,7 @@ class ContentResearchService:
             and trace.effective_attempt is not None
             and trace.effective_attempt.get("state") != "succeeded"
         ):
-            stage_by_state[ContentResearchState.REPORT_COMPOSING] = (
-                "marketing_analysis"
-            )
+            stage_by_state[ContentResearchState.REPORT_COMPOSING] = "marketing_analysis"
         status_by_state = {
             ContentResearchState.BRIEF_CONFIRMATION_REQUIRED: "waiting_user",
             ContentResearchState.SCOPE_CONFIRMATION_REQUIRED: "waiting_user",
@@ -1627,6 +1581,25 @@ class ContentResearchService:
         saved = self._store.save_result_snapshot(snapshot)
         return self._snapshot_response(saved)
 
+    async def _create_result_snapshot_off_event_loop(
+        self,
+        workflow_run_id: str,
+        *,
+        result_type: str,
+        manifest: CoverageManifest | None,
+        coverage_snapshot: CoverageSnapshot | None,
+        execution_context: ExecutionContext | None,
+    ) -> SnapshotResponse:
+        """Keep SQLite busy waits from blocking the async transaction owner."""
+        return await asyncio.to_thread(
+            self.create_result_snapshot,
+            workflow_run_id,
+            result_type=result_type,
+            manifest=manifest,
+            coverage_snapshot=coverage_snapshot,
+            execution_context=execution_context,
+        )
+
     async def get_lite_report(
         self,
         *,
@@ -1724,9 +1697,7 @@ class ContentResearchService:
 
     async def repair_from_persisted_packets(self, workflow_run_id: str) -> dict[str, Any]:
         """Offer packet-only recovery only for the eligible evidence-only report."""
-        ownership_error = legacy_recovery_ownership_unavailable(
-            self._store, workflow_run_id
-        )
+        ownership_error = legacy_recovery_ownership_unavailable(self._store, workflow_run_id)
         if ownership_error is not None:
             raise ContentResearchValidationError(ownership_error)
         report = await self.get_lite_report(workflow_run_id=workflow_run_id)
@@ -1747,19 +1718,12 @@ class ContentResearchService:
         async with recovery_lock:
             replay_input = authority.replay_input
             if replay_input is None:
-                raise ContentResearchValidationError(
-                    "persisted_packet_replay_input_unavailable"
-                )
-            replay = await self.replay_downstream_from_persisted_packets(
-                replay_input
-            )
+                raise ContentResearchValidationError("persisted_packet_replay_input_unavailable")
+            replay = await self.replay_downstream_from_persisted_packets(replay_input)
         return {
             **replay,
             "status": "completed",
-            "packet_count": sum(
-                len(direction.packets)
-                for direction in replay_input.directions
-            ),
+            "packet_count": sum(len(direction.packets) for direction in replay_input.directions),
             "new_collection_count": 0,
         }
 
@@ -1887,9 +1851,11 @@ class ContentResearchService:
             if decision is None:
                 continue
             candidate = conclusion_candidates.get(str(decision.candidate_id or ""))
-            candidate_supporting_ids = list(
-                candidate.payload.get("supporting_claim_ids") or []
-            ) if candidate is not None else []
+            candidate_supporting_ids = (
+                list(candidate.payload.get("supporting_claim_ids") or [])
+                if candidate is not None
+                else []
+            )
             supporting_claim_ids = (
                 candidate_supporting_ids
                 if candidate_supporting_ids
@@ -1934,19 +1900,11 @@ class ContentResearchService:
                     "reason_codes": list(decision.payload.get("reason_codes") or []),
                     "verifier_state": decision.payload.get("verifier_state"),
                     "cluster_ids": list(decision.payload.get("cluster_ids") or []),
-                    "supporting_atom_ids": list(
-                        decision.payload.get("supporting_atom_ids") or []
-                    ),
-                    "counter_atom_ids": list(
-                        decision.payload.get("counter_atom_ids") or []
-                    ),
+                    "supporting_atom_ids": list(decision.payload.get("supporting_atom_ids") or []),
+                    "counter_atom_ids": list(decision.payload.get("counter_atom_ids") or []),
                     "counter_claim_ids": counter_claim_ids,
-                    "counter_note_count": int(
-                        decision.payload.get("counter_note_count") or 0
-                    ),
-                    "counter_author_count": int(
-                        decision.payload.get("counter_author_count") or 0
-                    ),
+                    "counter_note_count": int(decision.payload.get("counter_note_count") or 0),
+                    "counter_author_count": int(decision.payload.get("counter_author_count") or 0),
                 }
             )
         report_section_refs = _report_section_refs(
@@ -1969,12 +1927,14 @@ class ContentResearchService:
                     else None
                 ),
                 "admitted_claim_ids": list(
-                    claim_id for claim_id in (
+                    claim_id
+                    for claim_id in (
                         result_by_direction.get(direction_id).payload.get("admitted_claim_ids")
                         if direction_id in result_by_direction
                         else []
                     )
-                    or [] if claim_id in candidates_by_id
+                    or []
+                    if claim_id in candidates_by_id
                 ),
                 "limitations": list(
                     (
@@ -2029,9 +1989,7 @@ class ContentResearchService:
                 raise ContentResearchValidationError(
                     "Governed report snapshot requires explicit execution Coverage lineage"
                 )
-            unit = self._store.get_scope_execution_unit(
-                execution_context.execution_unit_id
-            )
+            unit = self._store.get_scope_execution_unit(execution_context.execution_unit_id)
             attempt = self._store.get_scope_execution_attempt(
                 execution_context.execution_unit_id, execution_context.attempt_no
             )
@@ -2043,14 +2001,11 @@ class ContentResearchService:
                 ),
                 None,
             )
-            coverage_owned = (
-                unit is not None
-                and (
-                    unit.coverage_snapshot_id == coverage_snapshot.id
-                    or coverage_snapshot.manifest is not None
-                    and coverage_snapshot.manifest.execution_unit_id == unit.id
-                    and coverage_snapshot.manifest.attempt_no == execution_context.attempt_no
-                )
+            coverage_owned = unit is not None and (
+                unit.coverage_snapshot_id == coverage_snapshot.id
+                or coverage_snapshot.manifest is not None
+                and coverage_snapshot.manifest.execution_unit_id == unit.id
+                and coverage_snapshot.manifest.attempt_no == execution_context.attempt_no
             )
             if (
                 unit is None
@@ -2153,7 +2108,7 @@ class ContentResearchService:
         claim_cards: list[dict[str, Any]],
     ) -> dict[str, str]:
         """Bind immutable analysis atoms back to manifest-owned admitted claims."""
-        repository = SQLiteMarketingAnalysisRepository(self._store._db_path)
+        repository = SQLiteMarketingAnalysisRepository(self._store._db_path, bootstrap_schema=False)
         attempt = repository.get_effective_attempt_for_run(workflow_run_id)
         if attempt is None or attempt.state != "succeeded":
             return {}
@@ -2593,9 +2548,7 @@ class ContentResearchService:
             authorization=authorization,
             execution_unit=execution_unit,
             execution_facts=(
-                self._store.execution_trace(execution_unit.id)
-                if execution_unit is not None
-                else []
+                self._store.execution_trace(execution_unit.id) if execution_unit is not None else []
             ),
         )
 
@@ -2642,11 +2595,7 @@ class ContentResearchService:
             if item.workflow_run_id == workflow_run_id
         ]
         replay = next(
-            (
-                item
-                for item in publications
-                if item.metadata.get("repair_command_id") == command_id
-            ),
+            (item for item in publications if item.metadata.get("repair_command_id") == command_id),
             None,
         )
         if replay is not None:
@@ -2658,17 +2607,11 @@ class ContentResearchService:
                 )
             return replay
         candidates = [
-            item
-            for item in publications
-            if publication_id is None or item.id == publication_id
+            item for item in publications if publication_id is None or item.id == publication_id
         ]
         candidates.sort(key=lambda item: (item.created_at, item.id), reverse=True)
         source = next(
-            (
-                item
-                for item in candidates
-                if self._store.list_report_integrity_events(item.id)
-            ),
+            (item for item in candidates if self._store.list_report_integrity_events(item.id)),
             None,
         )
         if source is None:
@@ -2694,12 +2637,15 @@ class ContentResearchService:
                     error_code="PUBLICATION_REPAIR_OUTPUTS_INVALID",
                     suggested_action="start_new_research_run",
                 )
-        successor_id = "rpp_" + canonical_fingerprint(
-            {
-                "repair_command_id": command_id,
-                "previous_version_id": source.id,
-            }
-        )[:24]
+        successor_id = (
+            "rpp_"
+            + canonical_fingerprint(
+                {
+                    "repair_command_id": command_id,
+                    "previous_version_id": source.id,
+                }
+            )[:24]
+        )
         successor = replace(
             source,
             id=successor_id,
@@ -2708,9 +2654,7 @@ class ContentResearchService:
             created_at=utcnow(),
         )
         saved = self._store.save_report_publication(successor)
-        await ReportPublicationMaterializer(
-            self._store, self._store._db_path
-        ).materialize(saved.id)
+        await ReportPublicationMaterializer(self._store, self._store._db_path).materialize(saved.id)
         return saved
 
     async def run_workflow_action(
@@ -2796,14 +2740,14 @@ class ContentResearchService:
                 raise LifecycleCommandConflict(
                     "retry_analysis requires expected_state recovery_required"
                 )
-            repository = SQLiteMarketingAnalysisRepository(self._store._db_path)
+            repository = SQLiteMarketingAnalysisRepository(
+                self._store._db_path, bootstrap_schema=False
+            )
             predecessor = await asyncio.to_thread(
                 repository.get_effective_attempt_for_run, workflow_run_id
             )
             if predecessor is None:
-                raise LifecycleCommandConflict(
-                    "legacy run has no retryable analysis attempt"
-                )
+                raise LifecycleCommandConflict("legacy run has no retryable analysis attempt")
             unit = await MarketingAnalysisExecutionService(
                 store=self._store,
                 llm=self._analysis_llm,
@@ -2850,13 +2794,9 @@ class ContentResearchService:
                     "retry_report requires expected_state recovery_required"
                 )
             current = await self._lifecycle.load(workflow_run_id)
-            if (
-                current.error is None
-                or (
-                    current.error.get("code") != "REPORT_FINALIZATION_FAILED"
-                    and current.error.get("stage")
-                    != ContentResearchState.REPORT_COMPOSING.value
-                )
+            if current.error is None or (
+                current.error.get("code") != "REPORT_FINALIZATION_FAILED"
+                and current.error.get("stage") != ContentResearchState.REPORT_COMPOSING.value
             ):
                 raise LifecycleCommandConflict(
                     "retry_report requires a report finalization failure"
@@ -3014,9 +2954,7 @@ class ContentResearchService:
                         "provider": "xiaohongshu",
                         "source_kind": "search_result",
                         "limit": 20,
-                        "provider_capabilities": _freeze_adapter_capabilities(
-                            self._source_registry
-                        )
+                        "provider_capabilities": _freeze_adapter_capabilities(self._source_registry)
                         or {},
                     },
                 )
@@ -3064,12 +3002,18 @@ class ContentResearchService:
         core_object = str(core_entries[0].get("canonical_name") or "").strip()
         if not core_object:
             raise ContentResearchValidationError("Brief core research object is empty")
-        raw_intents = [str(item).strip() for item in structure_payload.get("research_intents") or []]
+        raw_intents = [
+            str(item).strip() for item in structure_payload.get("research_intents") or []
+        ]
         product_aspect = concrete_product_marketing_aspect(raw_intents[0] if raw_intents else None)
-        context_aspect = " ".join(
-            str(item).strip() for item in structure_payload.get("context_modifiers") or []
-            if str(item).strip()
-        ) or None
+        context_aspect = (
+            " ".join(
+                str(item).strip()
+                for item in structure_payload.get("context_modifiers") or []
+                if str(item).strip()
+            )
+            or None
+        )
         plan_id = _stable_command_id("rp", command_id)
         draft = self._build_scope_v2_draft(
             workflow_run_id=workflow_run_id,
@@ -3118,12 +3062,8 @@ class ContentResearchService:
         command_id: str,
     ) -> dict[str, Any]:
         core_object = " ".join(replacement.core_object.split())
-        product_aspect = " ".join(
-            str(replacement.product_experience_aspect or "").split()
-        ) or None
-        context_aspect = " ".join(
-            str(replacement.context_audience_aspect or "").split()
-        ) or None
+        product_aspect = " ".join(str(replacement.product_experience_aspect or "").split()) or None
+        context_aspect = " ".join(str(replacement.context_audience_aspect or "").split()) or None
         return {
             "replaces_scope_draft_id": latest.id,
             "scope_draft": self._build_scope_v2_draft(
@@ -3159,7 +3099,9 @@ class ContentResearchService:
             preserve_explicit_aspects=origin == "user_edited",
         )
         if not 1 <= len(suggestions) <= 3 or any(not item for item in suggestions):
-            raise ContentResearchValidationError("Scope Draft requires one to three non-empty queries")
+            raise ContentResearchValidationError(
+                "Scope Draft requires one to three non-empty queries"
+            )
         groups = tuple(
             ScopeQueryGroupInput(
                 suggested_query=query,
@@ -3196,9 +3138,7 @@ class ContentResearchService:
         request: ContentResearchSourceCollectionRequest,
     ) -> ContentResearchFormalResearchResponse:
         """Re-materialize a report after a safe, terminal publication failure."""
-        runtime_snapshot = await self._workflow_runtime.get_runtime_snapshot(
-            workflow_run_id
-        )
+        runtime_snapshot = await self._workflow_runtime.get_runtime_snapshot(workflow_run_id)
         runtime_run = runtime_snapshot.get("run") or {}
         runtime_status = str(runtime_run.get("status") or "")
         events = await self._workflow_runtime.list_events(workflow_run_id)
@@ -3419,9 +3359,7 @@ class ContentResearchService:
         action: str,
         published_report: dict[str, Any] | None = None,
     ) -> LegacyRecoveryAuthority:
-        ownership_error = legacy_recovery_ownership_unavailable(
-            self._store, workflow_run_id
-        )
+        ownership_error = legacy_recovery_ownership_unavailable(self._store, workflow_run_id)
         if ownership_error is not None:
             raise ContentResearchValidationError(ownership_error)
         authority = await project_legacy_recovery_authority(
@@ -3433,9 +3371,7 @@ class ContentResearchService:
         try:
             authority.require(action)
         except LegacyRecoveryActionUnavailableError as exc:
-            raise ContentResearchValidationError(
-                str(exc)
-            ) from exc
+            raise ContentResearchValidationError(str(exc)) from exc
         return authority
 
     def _require_frozen_product_marketing_dispatch_contract(
@@ -3722,7 +3658,7 @@ class ContentResearchService:
                 f"Content research workflow not found: {workflow_run_id}"
             )
         self._require_scope_execution_authority(workflow_run_id=workflow_run_id)
-        async with ThreadStore(self._store._db_path) as thread_store:
+        async with ThreadStore(self._store._db_path, read_only=True) as thread_store:
             if await thread_store.get_thread(brief.thread_id) is None:
                 raise ContentResearchValidationError(
                     "Content research cannot start because its Creator thread no longer exists. "
@@ -3770,9 +3706,7 @@ class ContentResearchService:
         if not self._store.dispatch_context_is_live(context):
             raise ExecutionLeaseFencedError("dispatch lease was fenced before formal research")
         bind_runtime = getattr(self._workflow_runtime, "for_dispatch_context", None)
-        scoped_runtime = (
-            bind_runtime(context) if callable(bind_runtime) else self._workflow_runtime
-        )
+        scoped_runtime = bind_runtime(context) if callable(bind_runtime) else self._workflow_runtime
         scoped_service = ContentResearchService(
             # Provider/evidence writes are fenced by the explicit dispatch
             # context passed into the async pipeline below. Binding every
@@ -3812,7 +3746,7 @@ class ContentResearchService:
             event="worker_claimed",
         )
         self._require_scope_execution_authority(workflow_run_id=workflow_run_id)
-        async with ThreadStore(self._store._db_path) as thread_store:
+        async with ThreadStore(self._store._db_path, read_only=True) as thread_store:
             if await thread_store.get_thread(brief.thread_id) is None:
                 raise ContentResearchValidationError(
                     "Content research cannot start because its Creator thread no longer exists. "
@@ -3840,9 +3774,7 @@ class ContentResearchService:
             status="failed" if failed_tasks else "completed",
             task_count=len(tasks),
             completed_task_count=sum(task.status == "completed" for task in tasks),
-            partial_completed_task_count=sum(
-                task.status == "partial_completed" for task in tasks
-            ),
+            partial_completed_task_count=sum(task.status == "partial_completed" for task in tasks),
             failed_tasks=failed_tasks,
             provider=request.provider,
             source_kind=request.source_kind,
@@ -3895,12 +3827,10 @@ class ContentResearchService:
         }:
             return
         if current.state is not ContentResearchState.REPORT_COMPOSING:
-            raise LifecycleCommandConflict(
-                "report finalization failure requires report_composing"
-            )
+            raise LifecycleCommandConflict("report finalization failure requires report_composing")
         effective_attempt = await asyncio.to_thread(
             SQLiteMarketingAnalysisRepository(
-                self._store._db_path
+                self._store._db_path, bootstrap_schema=False
             ).get_effective_attempt_for_run,
             workflow_run_id,
         )
@@ -3908,8 +3838,7 @@ class ContentResearchService:
         await self._lifecycle.apply(
             LifecycleCommand(
                 command_id=(
-                    f"report-finalization-failed:{workflow_run_id}:"
-                    f"{current.state_revision}"
+                    f"report-finalization-failed:{workflow_run_id}:{current.state_revision}"
                 ),
                 run_id=workflow_run_id,
                 expected_state=current.state,
@@ -4018,9 +3947,7 @@ class ContentResearchService:
             return None
 
         execution_revision = (
-            execution_authorization.execution_revision
-            if execution_authorization is not None
-            else 1
+            execution_authorization.execution_revision if execution_authorization is not None else 1
         )
         execution_unit_id = (
             execution_context.execution_unit_id if execution_context is not None else None
@@ -4164,9 +4091,7 @@ class ContentResearchService:
         )
         self._require_live_execution_context(context, "execute_execution_unit")
         bind_runtime = getattr(self._workflow_runtime, "for_execution_context", None)
-        scoped_runtime = (
-            bind_runtime(context) if callable(bind_runtime) else self._workflow_runtime
-        )
+        scoped_runtime = bind_runtime(context) if callable(bind_runtime) else self._workflow_runtime
         scoped_service = ContentResearchService(
             store=self._store.for_execution_context(context),
             presearch=self._presearch,
@@ -4205,9 +4130,7 @@ class ContentResearchService:
                 and isinstance(fact.payload.get("publication_id"), str)
             ]
             publication_id = (
-                str(publication_facts[-1].payload["publication_id"])
-                if publication_facts
-                else ""
+                str(publication_facts[-1].payload["publication_id"]) if publication_facts else ""
             )
             publication = (
                 self._store.get_typed_record(ReportPublicationRecord, publication_id)
@@ -4660,7 +4583,6 @@ class ContentResearchService:
             )
             return
 
-
         await self._advance_lifecycle_if_current(
             brief.workflow_run_id,
             expected_state=ContentResearchState.COVERAGE_EVALUATING,
@@ -4710,7 +4632,7 @@ class ContentResearchService:
                     "Marketing conclusion analysis requires manifest-owned coverage"
                 )
             analysis_repository = SQLiteMarketingAnalysisRepository(
-                self._store._db_path
+                self._store._db_path, bootstrap_schema=False
             )
             effective_attempt = await asyncio.to_thread(
                 analysis_repository.get_effective_attempt_for_run,
@@ -4723,9 +4645,7 @@ class ContentResearchService:
                     embedding_runtime=self._research_embedding_runtime,
                     llm_scope={
                         "llm_scope": {
-                            "workspace_id": str(
-                                brief.payload.get("workspace_id") or ""
-                            ),
+                            "workspace_id": str(brief.payload.get("workspace_id") or ""),
                             "user_id": str(brief.payload.get("user_id") or ""),
                         }
                     },
@@ -4734,9 +4654,7 @@ class ContentResearchService:
                     research_plan_id=plans[-1].id,
                     coverage_snapshot_id=scope_coverage.id,
                     execution_authorization_id=(
-                        execution_authorization.id
-                        if execution_authorization is not None
-                        else None
+                        execution_authorization.id if execution_authorization is not None else None
                     ),
                     manifest=publication_manifest,
                 )
@@ -4878,9 +4796,7 @@ class ContentResearchService:
         """Execute one claimed analysis attempt, then resume report finalization."""
         brief = self._store.get_brief_by_workflow(claim.context.workflow_run_id)
         if brief is None:
-            raise ContentResearchValidationError(
-                "Marketing analysis requires the run brief"
-            )
+            raise ContentResearchValidationError("Marketing analysis requires the run brief")
         await self._workflow_runtime.restart_formal_research_step(
             workflow_run_id=claim.context.workflow_run_id,
             child_task_ids=[],
@@ -4921,24 +4837,22 @@ class ContentResearchService:
             return
         if current.state is not ContentResearchState.RECOVERY_REQUIRED:
             command = LifecycleCommand(
-                    command_id=(
-                        f"analysis-failed:{workflow_run_id}:{current.state_revision}"
-                    ),
-                    run_id=workflow_run_id,
-                    expected_state=current.state,
-                    expected_revision=current.state_revision,
-                    kind="fail",
-                    payload={
-                        "error": {
-                            "code": "MARKETING_ANALYSIS_FAILED",
-                            "stage": "marketing_analysis",
-                            "operation": "marketing_analysis",
-                            "message": str(error) or "Marketing analysis failed",
-                            "retryable": True,
-                            "recovery_action": "retry_analysis",
-                        }
-                    },
-                )
+                command_id=(f"analysis-failed:{workflow_run_id}:{current.state_revision}"),
+                run_id=workflow_run_id,
+                expected_state=current.state,
+                expected_revision=current.state_revision,
+                kind="fail",
+                payload={
+                    "error": {
+                        "code": "MARKETING_ANALYSIS_FAILED",
+                        "stage": "marketing_analysis",
+                        "operation": "marketing_analysis",
+                        "message": str(error) or "Marketing analysis failed",
+                        "retryable": True,
+                        "recovery_action": "retry_analysis",
+                    }
+                },
+            )
             if attempt_id is not None:
                 await self._lifecycle.fail_analysis_attempt(
                     command,
@@ -5017,14 +4931,11 @@ class ContentResearchService:
                 )
             evidence_snapshot_id = checkpoint.payload.get("evidence_snapshot_id")
             for packet_id in raw_packet_ids:
-                packet = self._store.get_typed_record(
-                    DirectionalEvidencePacketRecord, packet_id
-                )
+                packet = self._store.get_typed_record(DirectionalEvidencePacketRecord, packet_id)
                 if (
                     packet is None
                     or not manifest.matches(packet)
-                    or packet.payload.get("evidence_snapshot_id")
-                    != evidence_snapshot_id
+                    or packet.payload.get("evidence_snapshot_id") != evidence_snapshot_id
                 ):
                     raise ContentResearchValidationError(
                         "governance projected packet does not belong to the frozen analysis snapshot"
@@ -5053,11 +4964,11 @@ class ContentResearchService:
             workflow_run_id=workflow_run_id,
             execution_authorization=execution_authorization,
         )
-        async with WorkflowStore(self._store._db_path) as workflow_store:
+        async with WorkflowStore(self._store._db_path, read_only=True) as workflow_store:
             run = await workflow_store.get_run(workflow_run_id)
         if run is None or run.status.value != "finalizing_report":
             return None
-        async with ThreadStore(self._store._db_path) as thread_store:
+        async with ThreadStore(self._store._db_path, read_only=True) as thread_store:
             if await thread_store.get_thread(thread_id) is None:
                 raise ContentResearchValidationError(
                     f"Creator thread is required to publish formal report: {thread_id}"
@@ -5070,9 +4981,7 @@ class ContentResearchService:
             )
         direction_records = self._store.list_directions_for_plan(plans[-1].id)
         coverage = (
-            self._store.get_coverage_snapshot_by_id(
-                execution_authorization.coverage_snapshot_id
-            )
+            self._store.get_coverage_snapshot_by_id(execution_authorization.coverage_snapshot_id)
             if execution_authorization is not None
             and execution_authorization.resolution == "generate_limited_report"
             else self._store.get_coverage_snapshot(
@@ -5088,18 +4997,15 @@ class ContentResearchService:
             )
         )
         coverage_manifest = coverage.manifest if coverage is not None else None
-        if (
-            execution_authorization is not None
-            and (
-                coverage is None
-                or (
-                    execution_authorization.resolution != "generate_limited_report"
-                    and coverage.execution_authorization_id != execution_authorization.id
-                )
-                or (
-                    execution_authorization.resolution == "generate_limited_report"
-                    and coverage.id != execution_authorization.coverage_snapshot_id
-                )
+        if execution_authorization is not None and (
+            coverage is None
+            or (
+                execution_authorization.resolution != "generate_limited_report"
+                and coverage.execution_authorization_id != execution_authorization.id
+            )
+            or (
+                execution_authorization.resolution == "generate_limited_report"
+                and coverage.id != execution_authorization.coverage_snapshot_id
             )
         ):
             raise ContentResearchValidationError(
@@ -5159,16 +5065,14 @@ class ContentResearchService:
                     dispatch_context=dispatch_context,
                 ).materialize(existing_publication.id)
             except Exception as exc:
-                raise ReportPublicationMaterializationError(
-                    existing_publication.id, exc
-                ) from exc
+                raise ReportPublicationMaterializationError(existing_publication.id, exc) from exc
             return {
                 "type": "content_research_report_publication",
                 "id": existing_publication.id,
                 "artifact_id": artifact.artifact_id,
                 "publication_state": existing_publication.publication_state,
             }
-        snapshot_response = self.create_result_snapshot(
+        snapshot_response = await self._create_result_snapshot_off_event_loop(
             workflow_run_id,
             result_type="governed_research_report",
             manifest=manifest,
@@ -5629,17 +5533,11 @@ def _match_analysis_atoms_to_claim_cards(
         "value": {"product_value_expression"},
         "message": {"message_angle"},
     }
-    claims_by_source: dict[
-        tuple[str, object, object], list[tuple[str, dict[str, Any]]]
-    ] = {}
+    claims_by_source: dict[tuple[str, object, object], list[tuple[str, dict[str, Any]]]] = {}
     for card in claim_cards:
         claim_type = str(card.get("claim_type") or "")
         track = next(
-            (
-                name
-                for name, claim_types in track_claim_types.items()
-                if claim_type in claim_types
-            ),
+            (name for name, claim_types in track_claim_types.items() if claim_type in claim_types),
             None,
         )
         if track is None:
@@ -5648,9 +5546,7 @@ def _match_analysis_atoms_to_claim_cards(
             if not isinstance(ref, dict):
                 continue
             key = (track, card.get("canonical_source_id"), ref.get("field_path"))
-            claims_by_source.setdefault(key, []).append(
-                (str(card["claim_candidate_id"]), ref)
-            )
+            claims_by_source.setdefault(key, []).append((str(card["claim_candidate_id"]), ref))
     result: dict[str, str] = {}
     for atom in atoms:
         key = (atom.track, atom.note_id, atom.field_path)
@@ -5681,7 +5577,10 @@ def _analysis_atom_contains_claim_span(
     if atom.quote[relative_start:relative_end] != quote:
         return False
     remainder = atom.quote[:relative_start] + atom.quote[relative_end:]
-    return all(character.isspace() or unicodedata.category(character).startswith("P") for character in remainder)
+    return all(
+        character.isspace() or unicodedata.category(character).startswith("P")
+        for character in remainder
+    )
 
 
 def _map_analysis_atom_claim_ids(
@@ -5770,8 +5669,7 @@ def _checkpoint_summary(
     checkpoints = [
         item
         for item in store.list_typed_records(StageCheckpointRecord)
-        if item.workflow_run_id == workflow_run_id
-        and (manifest is None or manifest.owns(item))
+        if item.workflow_run_id == workflow_run_id and (manifest is None or manifest.owns(item))
     ]
     return {
         "workflow_run_id": workflow_run_id,
@@ -5947,8 +5845,7 @@ def _scope_execution_unit_projection(
         payload = dict((resolution_event or {}).get("payload") or {})
         replay_request: dict[str, Any] = {
             "scope_contract_version": int(
-                payload.get("source_scope_contract_version")
-                or authorization.scope_contract_version
+                payload.get("source_scope_contract_version") or authorization.scope_contract_version
             ),
             "coverage_snapshot_id": execution_unit.coverage_snapshot_id,
             "resolution": execution_unit.resolution,
@@ -5957,9 +5854,7 @@ def _scope_execution_unit_projection(
         if constraint_id:
             replay_request["constraint_id"] = constraint_id
         supplementary_queries = [
-            str(query)
-            for query in payload.get("supplementary_queries") or []
-            if str(query).strip()
+            str(query) for query in payload.get("supplementary_queries") or [] if str(query).strip()
         ]
         if supplementary_queries:
             replay_request["supplementary_queries"] = supplementary_queries
@@ -6197,8 +6092,7 @@ def _admitted_claim_ids_for_run(
     candidates = {
         item.id
         for item in store.list_typed_records(ClaimCandidateRecord)
-        if item.workflow_run_id == workflow_run_id
-        and (manifest is None or manifest.owns(item))
+        if item.workflow_run_id == workflow_run_id and (manifest is None or manifest.owns(item))
     }
     return sorted(
         item.claim_candidate_id

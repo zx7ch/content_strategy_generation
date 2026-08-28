@@ -25,18 +25,33 @@ from app.content_research.persistence_models import (
     ReportPublicationRecord,
     StageCheckpointRecord,
 )
+from app.content_research.research_embedding import (
+    SAFE_RESEARCH_EMBEDDING_ERROR_CODES,
+)
 from app.content_research.scope_contract import thaw_execution_payload
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
 from app.memory.workflow_store import WorkflowStore
-from app.services.llm.usage_tracker import LLMUsageSummary, LLMUsageTracker
+from app.services.llm.usage_tracker import (
+    LLMUsageEvent,
+    LLMUsageStepSummary,
+    LLMUsageSummary,
+    LLMUsageTracker,
+)
 
 
 class ContentResearchTraceService:
     """Build a frontend-friendly trace view from persisted runtime sources."""
 
-    def __init__(self, *, store: SQLiteContentResearchStore, db_path: str) -> None:
+    def __init__(
+        self,
+        *,
+        store: SQLiteContentResearchStore,
+        db_path: str,
+        read_transaction_connection: sqlite3.Connection | None = None,
+    ) -> None:
         self._store = store
         self._db_path = db_path
+        self._read_transaction_connection = read_transaction_connection
 
     async def build_trace(
         self,
@@ -50,17 +65,49 @@ class ContentResearchTraceService:
             event for trace in traces for event in self._store.list_observation_events(trace.id)
         ]
 
-        # Trace is a query-only projection: opening it must not DDL/commit or
-        # join a writer's lock queue while a provider is collecting evidence.
-        async with WorkflowStore(self._db_path, read_only=True) as workflow_store:
-            run = await workflow_store.get_run(workflow_run_id)
-            runtime_steps = await workflow_store.list_steps(workflow_run_id)
-            runtime_child_tasks = await workflow_store.list_child_tasks(workflow_run_id)
-            workflow_events = await workflow_store.list_events(workflow_run_id)
+        if self._read_transaction_connection is not None:
+            connection = self._read_transaction_connection
+            decoder = WorkflowStore(self._db_path, read_only=True)
+            run_row = connection.execute(
+                "SELECT * FROM workflow_runs WHERE run_id=?", (workflow_run_id,)
+            ).fetchone()
+            run = decoder._row_to_run(run_row) if run_row is not None else None
+            runtime_steps = [
+                decoder._row_to_step(row)
+                for row in connection.execute(
+                    "SELECT * FROM workflow_steps WHERE run_id=? "
+                    "ORDER BY created_at ASC, rowid ASC",
+                    (workflow_run_id,),
+                ).fetchall()
+            ]
+            runtime_child_tasks = [
+                decoder._row_to_child_task(row)
+                for row in connection.execute(
+                    "SELECT * FROM workflow_child_tasks WHERE run_id=? "
+                    "ORDER BY created_at ASC, rowid ASC",
+                    (workflow_run_id,),
+                ).fetchall()
+            ]
+            workflow_events = [
+                decoder._row_to_event(row)
+                for row in connection.execute(
+                    "SELECT * FROM workflow_events WHERE run_id=? ORDER BY event_id ASC",
+                    (workflow_run_id,),
+                ).fetchall()
+            ]
+            usage_steps, usage_events = _usage_records_from_connection(connection, workflow_run_id)
+        else:
+            # Compatibility path for direct service tests. Production Trace uses
+            # the coordinator-owned transaction above.
+            async with WorkflowStore(self._db_path, read_only=True) as workflow_store:
+                run = await workflow_store.get_run(workflow_run_id)
+                runtime_steps = await workflow_store.list_steps(workflow_run_id)
+                runtime_child_tasks = await workflow_store.list_child_tasks(workflow_run_id)
+                workflow_events = await workflow_store.list_events(workflow_run_id)
 
-        async with LLMUsageTracker(self._db_path, read_only=True) as usage_tracker:
-            usage_steps = await usage_tracker.summarize_job_steps(workflow_run_id)
-            usage_events = await usage_tracker.list_job_events(workflow_run_id)
+            async with LLMUsageTracker(self._db_path, read_only=True) as usage_tracker:
+                usage_steps = await usage_tracker.summarize_job_steps(workflow_run_id)
+                usage_events = await usage_tracker.list_job_events(workflow_run_id)
 
         current_stage = _derive_current_stage(
             run=_json_dict(run),
@@ -94,10 +141,11 @@ class ContentResearchTraceService:
             _source_operation_event_dict(event) for event in observation_events
         ]
         trace_as_of = datetime.now(timezone.utc)
-        analysis_repository = SQLiteMarketingAnalysisRepository(self._db_path)
-        effective_attempt = analysis_repository.get_effective_attempt_for_run(
-            workflow_run_id
+        analysis_repository = SQLiteMarketingAnalysisRepository(
+            self._db_path,
+            read_transaction_connection=self._read_transaction_connection,
         )
+        effective_attempt = analysis_repository.get_effective_attempt_for_run(workflow_run_id)
         runtime_step_dicts = _runtime_step_projection(
             runtime_steps,
             effective_attempt=effective_attempt,
@@ -166,12 +214,93 @@ class ContentResearchTraceService:
         )
 
     def _trace_revision(self, workflow_run_id: str) -> int:
-        with sqlite3.connect(self._db_path) as conn:
-            row = conn.execute(
+        if self._read_transaction_connection is not None:
+            row = self._read_transaction_connection.execute(
                 "SELECT revision FROM content_research_trace_revisions WHERE workflow_run_id=?",
                 (workflow_run_id,),
             ).fetchone()
+        else:
+            with sqlite3.connect(self._db_path) as conn:
+                row = conn.execute(
+                    "SELECT revision FROM content_research_trace_revisions WHERE workflow_run_id=?",
+                    (workflow_run_id,),
+                ).fetchone()
         return max(1, int(row[0])) if row is not None else 1
+
+
+def _usage_records_from_connection(
+    connection: sqlite3.Connection, workflow_run_id: str
+) -> tuple[list[LLMUsageStepSummary], list[LLMUsageEvent]]:
+    table_available = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='llm_usage_events'"
+    ).fetchone()
+    if table_available is None:
+        return [], []
+    step_rows = connection.execute(
+        """SELECT step_id, step_name, agent_name,
+                  COUNT(*) AS total_calls,
+                  COALESCE(SUM(CASE WHEN status != 'success' THEN 1 ELSE 0 END), 0)
+                    AS failed_calls,
+                  COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
+                  COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
+                  COALESCE(SUM(total_tokens), 0) AS total_tokens,
+                  COALESCE(SUM(total_cost), 0) AS total_cost,
+                  COALESCE(SUM(latency_ms), 0) AS latency_ms,
+                  COALESCE(MAX(currency), 'USD') AS currency,
+                  MIN(created_at) AS first_created_at
+           FROM llm_usage_events WHERE job_id=?
+           GROUP BY COALESCE(step_id, '__unknown__'), step_name, agent_name
+           ORDER BY first_created_at ASC, COALESCE(step_id, '__unknown__') ASC""",
+        (workflow_run_id,),
+    ).fetchall()
+    usage_steps = [
+        LLMUsageStepSummary(
+            step_id=row["step_id"],
+            step_name=row["step_name"],
+            agent_name=row["agent_name"],
+            total_calls=int(row["total_calls"] or 0),
+            failed_calls=int(row["failed_calls"] or 0),
+            prompt_tokens=int(row["prompt_tokens"] or 0),
+            completion_tokens=int(row["completion_tokens"] or 0),
+            total_tokens=int(row["total_tokens"] or 0),
+            total_cost=float(row["total_cost"] or 0),
+            currency=row["currency"] or "USD",
+            latency_ms=int(row["latency_ms"] or 0),
+        )
+        for row in step_rows
+    ]
+    event_rows = connection.execute(
+        """SELECT id, session_id, job_id, step_id, step_name, agent_name,
+                  provider, model, model_policy, prompt_tokens, completion_tokens,
+                  total_tokens, total_cost, currency, latency_ms, status,
+                  error_message, created_at
+           FROM llm_usage_events WHERE job_id=? ORDER BY created_at ASC, id ASC""",
+        (workflow_run_id,),
+    ).fetchall()
+    usage_events = [
+        LLMUsageEvent(
+            id=row["id"],
+            session_id=row["session_id"],
+            job_id=row["job_id"],
+            step_id=row["step_id"],
+            step_name=row["step_name"],
+            agent_name=row["agent_name"],
+            provider=row["provider"],
+            model=row["model"],
+            model_policy=row["model_policy"],
+            prompt_tokens=int(row["prompt_tokens"] or 0),
+            completion_tokens=int(row["completion_tokens"] or 0),
+            total_tokens=int(row["total_tokens"] or 0),
+            total_cost=float(row["total_cost"] or 0),
+            currency=row["currency"] or "USD",
+            latency_ms=(int(row["latency_ms"]) if row["latency_ms"] is not None else None),
+            status=row["status"] or "success",
+            error_message=row["error_message"],
+            created_at=row["created_at"],
+        )
+        for row in event_rows
+    ]
+    return usage_steps, usage_events
 
 
 def _runtime_step_projection(
@@ -202,10 +331,7 @@ def _runtime_step_projection(
                         "execution_finished_at": analysis_created_at.isoformat(),
                         "active_duration_ms": max(
                             0,
-                            int(
-                                (analysis_created_at - started_at).total_seconds()
-                                * 1000
-                            ),
+                            int((analysis_created_at - started_at).total_seconds() * 1000),
                         ),
                     }
                 )
@@ -225,9 +351,7 @@ def _runtime_step_projection(
             elif step.get("status") == "succeeded":
                 step["error_code"] = None
 
-    analysis_status = (
-        "pending" if effective_attempt.state == "queued" else effective_attempt.state
-    )
+    analysis_status = "pending" if effective_attempt.state == "queued" else effective_attempt.state
     analysis_step = {
         "step_id": f"analysis:{effective_attempt.id}",
         "step_name": "marketing_analysis",
@@ -238,9 +362,7 @@ def _runtime_step_projection(
         "started_at": _json_safe(effective_attempt.created_at),
         "completed_at": _json_safe(effective_attempt.terminal_at),
         "error_code": (
-            "MARKETING_ANALYSIS_FAILED"
-            if effective_attempt.state == "failed"
-            else None
+            "MARKETING_ANALYSIS_FAILED" if effective_attempt.state == "failed" else None
         ),
         "timing": _project_timing(
             {
@@ -252,11 +374,7 @@ def _runtime_step_projection(
         ),
     }
     report_index = next(
-        (
-            index
-            for index, step in enumerate(projected)
-            if step.get("step_name") == "report"
-        ),
+        (index for index, step in enumerate(projected) if step.get("step_name") == "report"),
         len(projected),
     )
     projected.insert(report_index, analysis_step)
@@ -786,9 +904,7 @@ def _logical_checkpoint_projection(
         payload = dict(record.payload or {})
         if record.stage_name == "marketing_conclusion":
             marketing = _safe_marketing_conclusion_checkpoint(record, payload)
-            _attach_publication_dispositions(
-                marketing, publication_dispositions or {}
-            )
+            _attach_publication_dispositions(marketing, publication_dispositions or {})
             projected.append(marketing)
             continue
         item: dict[str, Any] = {
@@ -848,9 +964,7 @@ def _logical_checkpoint_projection(
             effective_attempt=effective_attempt,
         )
         if analysis is not None:
-            _attach_publication_dispositions(
-                analysis, publication_dispositions or {}
-            )
+            _attach_publication_dispositions(analysis, publication_dispositions or {})
             projected.insert(0, analysis)
     return projected
 
@@ -906,9 +1020,7 @@ def _in_progress_marketing_conclusion_checkpoint(
             "publication_role": decision.payload.get("publication_role"),
             "reason_codes": list(decision.payload.get("reason_codes") or ()),
             "supporting_note_count": decision.payload.get("supporting_note_count"),
-            "independent_author_count": decision.payload.get(
-                "independent_author_count"
-            ),
+            "independent_author_count": decision.payload.get("independent_author_count"),
             "counter_note_count": decision.payload.get("counter_note_count"),
             "counter_author_count": decision.payload.get("counter_author_count"),
             "verifier_state": decision.payload.get("verifier_state"),
@@ -916,12 +1028,28 @@ def _in_progress_marketing_conclusion_checkpoint(
             "failure_detail": decision.payload.get("failure_detail"),
             "recovery_action": decision.payload.get("recovery_action"),
         }
-    embedding_completed = any(
-        checkpoint.track == "shared"
-        and checkpoint.stage == "embedding"
-        and checkpoint.status == "completed"
-        for checkpoint in checkpoints
+    embedding_checkpoint = next(
+        (
+            checkpoint
+            for checkpoint in checkpoints
+            if checkpoint.track == "shared"
+            and checkpoint.stage == "embedding"
+            and checkpoint.status == "completed"
+        ),
+        None,
     )
+    if embedding_checkpoint is None:
+        embedding_checkpoint = next(
+            (
+                checkpoint
+                for checkpoint in reversed(checkpoints)
+                if checkpoint.track == "shared"
+                and checkpoint.stage == "embedding"
+                and checkpoint.status == "failed"
+                and checkpoint.completed_by_attempt_id == effective_attempt.id
+            ),
+            None,
+        )
     payload: dict[str, Any] = {
         "analysis_attempt_id": effective_attempt.id,
         "analysis_attempt_no": effective_attempt.attempt_no,
@@ -929,11 +1057,32 @@ def _in_progress_marketing_conclusion_checkpoint(
         "retrieval_execution_unit_id": snapshot.retrieval_execution_unit_id,
         "tracks": tracks,
     }
-    if embedding_completed:
+    if embedding_checkpoint is not None:
+        trace_metrics = embedding_checkpoint.private_result.get("trace")
         payload["embedding"] = {
+            "status": embedding_checkpoint.status,
             "fingerprint": unit.embedding_fingerprint,
             "document_count": len(snapshot.notes),
+            "input_fingerprint": embedding_checkpoint.input_fingerprint,
+            "checkpoint_id": embedding_checkpoint.id,
+            **(trace_metrics if isinstance(trace_metrics, dict) else {}),
         }
+        if embedding_checkpoint.status == "completed":
+            payload["embedding"].update(
+                {
+                    "result_checksum": embedding_checkpoint.result_checksum,
+                    "result_refs": list(embedding_checkpoint.output_refs),
+                    "reused_checkpoint_id": (
+                        embedding_checkpoint.id
+                        if embedding_checkpoint.completed_by_attempt_id != effective_attempt.id
+                        else None
+                    ),
+                }
+            )
+        else:
+            payload["embedding"]["error_code"] = embedding_checkpoint.private_result.get(
+                "error_code"
+            )
     record = StageCheckpointRecord(
         id=f"trace-{effective_attempt.id}",
         schema_version="content_research_stage_checkpoint_v1",
@@ -965,11 +1114,15 @@ def _safe_marketing_conclusion_checkpoint(
         "retrieval_execution_unit_id",
     ):
         value = payload.get(key)
-        if isinstance(value, str) and value or (
-            key == "analysis_attempt_no"
-            and isinstance(value, int)
-            and not isinstance(value, bool)
-            and value >= 1
+        if (
+            isinstance(value, str)
+            and value
+            or (
+                key == "analysis_attempt_no"
+                and isinstance(value, int)
+                and not isinstance(value, bool)
+                and value >= 1
+            )
         ):
             item[key] = value
     embedding = payload.get("embedding")
@@ -977,6 +1130,12 @@ def _safe_marketing_conclusion_checkpoint(
         fingerprint = embedding.get("fingerprint")
         document_count = embedding.get("document_count")
         safe_embedding: dict[str, Any] = {}
+        status = embedding.get("status")
+        if status in {"completed", "failed"}:
+            safe_embedding["status"] = status
+        error_code = embedding.get("error_code")
+        if error_code in SAFE_RESEARCH_EMBEDDING_ERROR_CODES:
+            safe_embedding["error_code"] = error_code
         if isinstance(fingerprint, dict):
             safe_embedding["fingerprint"] = {
                 key: fingerprint[key]
@@ -997,6 +1156,30 @@ def _safe_marketing_conclusion_checkpoint(
             and document_count >= 0
         ):
             safe_embedding["document_count"] = document_count
+        for key in (
+            "input_fingerprint",
+            "checkpoint_id",
+            "result_checksum",
+            "reused_checkpoint_id",
+        ):
+            value = embedding.get(key)
+            if isinstance(value, str) and value:
+                safe_embedding[key] = value
+        for key in (
+            "batch_count",
+            "success_count",
+            "failure_count",
+            "duration_ms",
+            "dimensions",
+        ):
+            value = embedding.get(key)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                safe_embedding[key] = value
+        result_refs = embedding.get("result_refs")
+        if isinstance(result_refs, list) and all(
+            isinstance(value, str) and value for value in result_refs
+        ):
+            safe_embedding["result_refs"] = result_refs
         if safe_embedding:
             item["embedding"] = safe_embedding
     tracks = payload.get("tracks")
@@ -1030,12 +1213,9 @@ def _safe_marketing_conclusion_checkpoint(
                     ):
                         safe_disposition["reason_code"] = reason_code
                     safe_track["publication_disposition"] = safe_disposition
-            reason_codes = _safe_marketing_conclusion_reason_codes(
-                source.get("reason_codes")
-            )
+            reason_codes = _safe_marketing_conclusion_reason_codes(source.get("reason_codes"))
             explain_sample_threshold = bool(
-                {"conclusion_note_count_unmet", "conclusion_author_count_unmet"}
-                & set(reason_codes)
+                {"conclusion_note_count_unmet", "conclusion_author_count_unmet"} & set(reason_codes)
             )
             if state in {"selected", "contested"} or explain_sample_threshold:
                 for key in ("supporting_note_count", "independent_author_count"):
@@ -1045,11 +1225,7 @@ def _safe_marketing_conclusion_checkpoint(
             if state == "contested":
                 for key in ("counter_note_count", "counter_author_count"):
                     value = source.get(key)
-                    if (
-                        isinstance(value, int)
-                        and not isinstance(value, bool)
-                        and value >= 0
-                    ):
+                    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
                         safe_track[key] = value
             if reason_codes:
                 safe_track["reason_codes"] = reason_codes
@@ -1166,10 +1342,7 @@ def _publication_track_dispositions(
     if draft is None:
         return {}
     omitted = set(publication.payload.get("omitted_section_ids") or ())
-    audit_exhausted = (
-        publication.payload.get("audit_recovery_state")
-        == "audit_rewrite_exhausted"
-    )
+    audit_exhausted = publication.payload.get("audit_recovery_state") == "audit_rewrite_exhausted"
     for section in draft.payload.get("sections") or ():
         if not isinstance(section, dict):
             continue
