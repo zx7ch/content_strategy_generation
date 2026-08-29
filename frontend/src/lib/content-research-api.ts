@@ -128,6 +128,54 @@ export interface ContentResearchWorkflowSummary {
   runtime_child_tasks: JsonObject[];
 }
 
+export interface ContentResearchHistoricalWorkflowSummary {
+  schema_version: string;
+  workflow_run_id: string;
+  historical_read_only: true;
+  historical_run: {
+    run_id: string;
+    thread_id: string;
+    status: string;
+    read_only: true;
+    mutation_authority?: null;
+    [key: string]: unknown;
+  };
+  brief: NonNullable<ContentResearchWorkflowSummary["brief"]>;
+  plan?: ContentResearchWorkflowSummary["plan"];
+  directions: ContentResearchWorkflowSummary["directions"];
+  subagent_tasks: ContentResearchWorkflowSummary["subagent_tasks"];
+  runtime_run?: JsonObject | null;
+  runtime_steps: JsonObject[];
+  runtime_child_tasks: JsonObject[];
+}
+
+export type ContentResearchWorkflowReadResponse =
+  | ContentResearchWorkflowSummary
+  | ContentResearchHistoricalWorkflowSummary;
+
+export function isHistoricalContentResearchWorkflow(
+  workflow: ContentResearchWorkflowReadResponse,
+): workflow is ContentResearchHistoricalWorkflowSummary {
+  return "historical_read_only" in workflow && workflow.historical_read_only === true;
+}
+
+export function contentResearchWorkflowThreadId(
+  workflow: ContentResearchWorkflowReadResponse,
+): string {
+  return isHistoricalContentResearchWorkflow(workflow)
+    ? workflow.historical_run.thread_id
+    : workflow.run.thread_id;
+}
+
+export function requireMutableContentResearchWorkflow(
+  workflow: ContentResearchWorkflowReadResponse,
+): ContentResearchWorkflowSummary {
+  if (isHistoricalContentResearchWorkflow(workflow)) {
+    throw new ContentResearchApiError("Historical content research workflow is read-only", 409);
+  }
+  return workflow;
+}
+
 export interface ContentResearchTrace {
   schema_version: string;
   workflow_run_id: string;
@@ -687,7 +735,9 @@ export async function getContentResearchPresearch(attemptId: string): Promise<Co
   return contentResearchFetch(`/content-research/presearch/${encodeURIComponent(attemptId)}`);
 }
 
-export async function getContentResearchWorkflow(workflowRunId: string): Promise<ContentResearchWorkflowSummary> {
+export async function getContentResearchWorkflow(
+  workflowRunId: string,
+): Promise<ContentResearchWorkflowReadResponse> {
   return contentResearchFetch(`/content-research/workflows/${encodeURIComponent(workflowRunId)}`);
 }
 

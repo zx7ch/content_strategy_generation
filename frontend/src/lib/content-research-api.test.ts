@@ -5,6 +5,7 @@ import {
   ContentResearchApiError,
   confirmContentResearchBrief,
   contentResearchCommand,
+  contentResearchWorkflowThreadId,
   createContentResearchPresearch,
   endContentResearchWorkflow,
   getContentResearchDecisions,
@@ -62,6 +63,37 @@ test("report publication gaps remain pending instead of becoming permanent failu
     isContentResearchReportPending(new ContentResearchApiError("database unavailable", 500)),
     false
   );
+});
+
+test("historical workflow summaries expose their owning thread without a mutable run", () => {
+  const workflow = {
+    schema_version: "content_research_api_v1",
+    workflow_run_id: "run_historical",
+    historical_read_only: true as const,
+    historical_run: {
+      run_id: "run_historical",
+      thread_id: "thread_historical",
+      status: "succeeded",
+      read_only: true as const,
+      mutation_authority: null,
+    },
+    brief: {
+      id: "brief_historical",
+      workflow_run_id: "run_historical",
+      thread_id: "thread_historical",
+      status: "ready",
+      payload: {},
+    },
+    plan: null,
+    directions: [],
+    subagent_tasks: [],
+    runtime_run: null,
+    runtime_steps: [],
+    runtime_child_tasks: [],
+  };
+
+  assert.equal(contentResearchWorkflowThreadId(workflow), "thread_historical");
+  assert.equal("run" in workflow, false);
 });
 
 test("trace contract exposes stored decision identity and ordered safe execution facts", async () => {

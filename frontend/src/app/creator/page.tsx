@@ -25,6 +25,7 @@ import {
   contentResearchCommand,
   confirmContentResearchBrief,
   confirmContentResearchScope,
+  contentResearchWorkflowThreadId,
   createContentResearchPresearch,
   createContentResearchCommandId,
   endContentResearchWorkflow,
@@ -35,8 +36,10 @@ import {
   getContentResearchLiteReportWithRetry,
   getContentResearchScope,
   getContentResearchWorkflow,
+  isHistoricalContentResearchWorkflow,
   reviseContentResearchSubject,
   replaceContentResearchScopeDraft,
+  requireMutableContentResearchWorkflow,
   retryContentResearchPresearch,
   retryContentResearchAnalysis,
   retryContentResearchReport,
@@ -2241,8 +2244,10 @@ function ContentResearchContextSidebar({
         try {
           const workflow = await getContentResearchWorkflow(workflowRunId);
           if (cancelled) return;
-          restoredThreadId = workflow.run.thread_id;
-          saveContentResearchRunForThread(restoredThreadId, workflowRunId);
+          restoredThreadId = contentResearchWorkflowThreadId(workflow);
+          if (!isHistoricalContentResearchWorkflow(workflow)) {
+            saveContentResearchRunForThread(restoredThreadId, workflowRunId);
+          }
         } catch (error) {
           if (isExpectedLiteReportAbsence(error)) {
             // A broken direct link must not reuse an unrelated thread's run.
@@ -2490,11 +2495,12 @@ function ContentResearchContextSidebar({
         ...current,
         [runId]: response.result.scope,
       }));
-      const [workflow, trace] = await Promise.all([
+      const [workflowResponse, trace] = await Promise.all([
         getContentResearchWorkflow(runId),
         getContentResearchTrace(runId),
       ]);
       if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
+      const workflow = requireMutableContentResearchWorkflow(workflowResponse);
       setContentResearchIntent(null);
       setContentResearchRun(contentResearchRunWithReport(runId, workflow, trace, null, null));
       appendMessage({ role: "assistant", text: "调研需求已确认，请确认本轮最终搜索词。" });
@@ -2616,11 +2622,12 @@ function ContentResearchContextSidebar({
     for (let attempt = 0; attempt < 120; attempt += 1) {
       const ticket = contentResearchRequestEpochRef.current.ticket(workflowRunId, "mainline");
       try {
-        const [workflow, trace] = await Promise.all([
+        const [workflowResponse, trace] = await Promise.all([
           getContentResearchWorkflow(workflowRunId),
           getContentResearchTrace(workflowRunId),
         ]);
         if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
+        const workflow = requireMutableContentResearchWorkflow(workflowResponse);
         setContentResearchRun((current) => current && current.workflowRunId === workflowRunId
           ? { ...current, summary: workflow, trace }
           : current);
@@ -2643,8 +2650,13 @@ function ContentResearchContextSidebar({
       if (!workflowRunId) return false;
       contentResearchRequestEpochRef.current.activate(workflowRunId);
       const ticket = contentResearchRequestEpochRef.current.ticket(workflowRunId, "hydrate");
-      const workflow = await getContentResearchWorkflow(workflowRunId);
+      const workflowResponse = await getContentResearchWorkflow(workflowRunId);
       if (!contentResearchRequestEpochRef.current.accepts(ticket)) return false;
+      if (isHistoricalContentResearchWorkflow(workflowResponse)) {
+        removeContentResearchRunForThread(threadId);
+        return false;
+      }
+      const workflow = workflowResponse;
       const trace = await getContentResearchTrace(workflowRunId);
       if (!contentResearchRequestEpochRef.current.accepts(ticket)) return false;
       if (
@@ -2818,7 +2830,9 @@ function ContentResearchContextSidebar({
     setAnalysisRetryPending(true);
     try {
       await retryContentResearchAnalysis(run);
-      const workflow = await getContentResearchWorkflow(run.run_id);
+      const workflow = requireMutableContentResearchWorkflow(
+        await getContentResearchWorkflow(run.run_id),
+      );
       if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
       setContentResearchRun((current) => current?.workflowRunId === run.run_id
         ? { ...current, summary: workflow }
@@ -2847,7 +2861,9 @@ function ContentResearchContextSidebar({
     setReportRetryPending(true);
     try {
       await retryContentResearchReport(run);
-      const workflow = await getContentResearchWorkflow(run.run_id);
+      const workflow = requireMutableContentResearchWorkflow(
+        await getContentResearchWorkflow(run.run_id),
+      );
       if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
       setContentResearchRun((current) => current?.workflowRunId === run.run_id
         ? { ...current, summary: workflow }
@@ -2923,8 +2939,18 @@ function ContentResearchContextSidebar({
           ? latestFailure
           : undefined;
         try {
-          const workflow = await getContentResearchWorkflow(runIdForThread);
-          if (loadingThreadRef.current !== threadId || workflow.run.thread_id !== threadId) return;
+          const workflowResponse = await getContentResearchWorkflow(runIdForThread);
+          if (
+            loadingThreadRef.current !== threadId
+            || contentResearchWorkflowThreadId(workflowResponse) !== threadId
+          ) return;
+          if (isHistoricalContentResearchWorkflow(workflowResponse)) {
+            removeContentResearchRunForThread(threadId);
+            setContentResearchIntent(null);
+            setContentResearchRun(null);
+            return;
+          }
+          const workflow = workflowResponse;
           if (
             ["brief_confirmation_required", "recovery_required"].includes(workflow.run.state)
             && workflow.brief
