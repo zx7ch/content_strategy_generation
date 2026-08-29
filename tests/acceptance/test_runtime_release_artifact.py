@@ -3,12 +3,14 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import socket
 import subprocess
 import time
 import urllib.request
 import zipfile
-from pathlib import Path
+from datetime import datetime
+from pathlib import Path, PurePosixPath
 from urllib.error import HTTPError
 
 import pytest
@@ -43,15 +45,66 @@ def test_release_archive_contains_runtime_and_launcher():
     assert "xhs-runtime/xhs-runtime" in names
     assert "xhs-runtime/start.command" in names
     assert "xhs-runtime/config.env" in names
+    assert "xhs-runtime/build-info.json" in names
+
+    forbidden_basenames = {".DS_Store", ".env", ".env.example"}
+    forbidden_suffixes = {".db", ".har", ".log", ".sqlite", ".sqlite3"}
+    unsafe_entries = []
+    for name in names:
+        path = PurePosixPath(name)
+        if (
+            path.name in forbidden_basenames
+            or path.suffix.lower() in forbidden_suffixes
+            or ".git" in path.parts
+            or "__pycache__" in path.parts
+        ):
+            unsafe_entries.append(name)
+    assert unsafe_entries == [], (
+        f"release archive contains local/dev data: {sorted(unsafe_entries)}"
+    )
 
     with zipfile.ZipFile(archive) as bundle:
         config = bundle.read("xhs-runtime/config.env").decode("utf-8")
+        build_info = json.loads(bundle.read("xhs-runtime/build-info.json").decode("utf-8"))
 
     assert "LOG_LEVEL=INFO" in config
     assert "SQLITE_DB_PATH=" not in config
     assert "CHROMA_PERSIST_DIR=" not in config
     assert "OPENAI_API_KEY=" not in config
     assert "XHS_SPIDER_COOKIES=" not in config
+
+    assert build_info["schema_version"] == "xhs_runtime_build_info_v1"
+    assert re.fullmatch(r"[0-9a-f]{40}", build_info["git_commit"])
+    assert build_info["git_dirty"] is False
+    assert re.fullmatch(r"\d+\.\d+\.\d+", build_info["version"])
+    assert build_info["platform"]
+    assert build_info["architecture"]
+    assert datetime.fromisoformat(build_info["built_at"].replace("Z", "+00:00")).tzinfo
+
+    current_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert build_info["git_commit"] == current_commit
+
+    source_sentinels = (
+        "app/api/routes/router.py",
+        "app/content_research/service.py",
+        "app/memory/job_store.py",
+    )
+    with zipfile.ZipFile(archive) as bundle:
+        for source_path in source_sentinels:
+            committed = subprocess.run(
+                ["git", "show", f"{build_info['git_commit']}:{source_path}"],
+                check=True,
+                capture_output=True,
+            ).stdout
+            packaged = bundle.read(f"xhs-runtime/_internal/{source_path}")
+            assert packaged == committed, (
+                f"release archive source does not match {build_info['git_commit']}: {source_path}"
+            )
 
 
 def _free_local_port() -> int:
@@ -104,47 +157,74 @@ def _seed_persisted_content_research_fixture(db_path: str) -> str:
         thread_id = str(thread["id"])
         workflow_run_id = "run-release-artifact-restart"
         coordinator = ContentResearchPersistenceCoordinator(db_path)
-        await coordinator.apply(LifecycleCommand(
-            command_id="release-artifact-submit",
-            run_id=workflow_run_id,
-            expected_state=None,
-            expected_revision=0,
-            kind="submit_research_subject",
-            payload={
-                "thread_id": thread_id,
-                "user_id": RELEASE_GATE_HEADERS["X-User-Id"],
-                "seed_text": "防晒长袖",
-            },
-        ))
+        await coordinator.apply(
+            LifecycleCommand(
+                command_id="release-artifact-submit",
+                run_id=workflow_run_id,
+                expected_state=None,
+                expected_revision=0,
+                kind="submit_research_subject",
+                payload={
+                    "thread_id": thread_id,
+                    "user_id": RELEASE_GATE_HEADERS["X-User-Id"],
+                    "seed_text": "防晒长袖",
+                },
+            )
+        )
         return workflow_run_id, thread_id
 
     workflow_run_id, thread_id = asyncio.run(create_run())
     store = SQLiteContentResearchStore(db_path)
-    store.save_brief(ResearchBriefRecord(
-        id="brief-release-gate", workflow_run_id=workflow_run_id,
-        thread_id=thread_id, schema_version="content_research_brief_v1",
-        status="ready", payload={"schema_version": "content_research_brief_v1", "seed_text": "防晒长袖"},
-    ))
-    store.save_trace(TraceRecord(
-        id="trace-release-gate", workflow_run_id=workflow_run_id,
-        thread_id=thread_id, schema_version="content_research_trace_v1",
-        status="completed", started_at=utcnow(),
-        payload={"schema_version": "content_research_trace_v1", "stage": "formal_research"},
-    ))
-    store.save_stage_checkpoint(StageCheckpointRecord(
-        id="details-release-gate", workflow_run_id=workflow_run_id,
-        subagent_task_id="product_marketing:release-gate", stage_name="detail",
-        input_fingerprint="release-gate-details", status="completed",
-        schema_version="content_research_stage_checkpoint_v1",
-        payload={"candidates": [{"note_id": f"note-{index}", "detail_status": "completed"} for index in range(28)]},
-    ))
-    store.save_stage_checkpoint(StageCheckpointRecord(
-        id="report-release-gate", workflow_run_id=workflow_run_id,
-        subagent_task_id="report:release-gate", stage_name="compose",
-        input_fingerprint="release-gate-report", status="failed_recoverable",
-        schema_version="content_research_stage_checkpoint_v1",
-        payload={"reason_code": "transient_error"},
-    ))
+    store.save_brief(
+        ResearchBriefRecord(
+            id="brief-release-gate",
+            workflow_run_id=workflow_run_id,
+            thread_id=thread_id,
+            schema_version="content_research_brief_v1",
+            status="ready",
+            payload={"schema_version": "content_research_brief_v1", "seed_text": "防晒长袖"},
+        )
+    )
+    store.save_trace(
+        TraceRecord(
+            id="trace-release-gate",
+            workflow_run_id=workflow_run_id,
+            thread_id=thread_id,
+            schema_version="content_research_trace_v1",
+            status="completed",
+            started_at=utcnow(),
+            payload={"schema_version": "content_research_trace_v1", "stage": "formal_research"},
+        )
+    )
+    store.save_stage_checkpoint(
+        StageCheckpointRecord(
+            id="details-release-gate",
+            workflow_run_id=workflow_run_id,
+            subagent_task_id="product_marketing:release-gate",
+            stage_name="detail",
+            input_fingerprint="release-gate-details",
+            status="completed",
+            schema_version="content_research_stage_checkpoint_v1",
+            payload={
+                "candidates": [
+                    {"note_id": f"note-{index}", "detail_status": "completed"}
+                    for index in range(28)
+                ]
+            },
+        )
+    )
+    store.save_stage_checkpoint(
+        StageCheckpointRecord(
+            id="report-release-gate",
+            workflow_run_id=workflow_run_id,
+            subagent_task_id="report:release-gate",
+            stage_name="compose",
+            input_fingerprint="release-gate-report",
+            status="failed_recoverable",
+            schema_version="content_research_stage_checkpoint_v1",
+            payload={"reason_code": "transient_error"},
+        )
+    )
     return workflow_run_id
 
 
@@ -172,11 +252,18 @@ def test_frozen_runtime_restart_preserves_content_research_fixture(tmp_path):
     (data_home / "config.env").write_text("OPENAI_API_KEY=legacy-key\nSQLITE_DB_PATH=legacy.db\n")
     db_path = str(data_home / "xhs_agent.db")
     workflow_run_id = _seed_persisted_content_research_fixture(db_path)
-    assert len([
-        checkpoint
-        for checkpoint in SQLiteContentResearchStore(db_path).list_typed_records(StageCheckpointRecord)
-        if checkpoint.workflow_run_id == workflow_run_id
-    ]) == 2
+    assert (
+        len(
+            [
+                checkpoint
+                for checkpoint in SQLiteContentResearchStore(db_path).list_typed_records(
+                    StageCheckpointRecord
+                )
+                if checkpoint.workflow_run_id == workflow_run_id
+            ]
+        )
+        == 2
+    )
 
     port = _free_local_port()
     environment = {**os.environ, "HOME": str(home), "RUNTIME_PORT": str(port)}
@@ -185,22 +272,32 @@ def test_frozen_runtime_restart_preserves_content_research_fixture(tmp_path):
 
     def start() -> subprocess.Popen:
         return subprocess.Popen(
-            [str(executable)], cwd=runtime_dir, env=environment,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            [str(executable)],
+            cwd=runtime_dir,
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
         )
 
     first = start()
     try:
         first_health = _wait_for_health(port, first)
         assert first_health["runtime_diagnostics"]["sqlite_db_path"] == db_path
-        assert _get_json(
-            f"http://127.0.0.1:{port}/content-research/workflows/{workflow_run_id}/trace",
-            headers=RELEASE_GATE_HEADERS,
-        )["workflow_run_id"] == workflow_run_id
-        assert _get_json(
-            f"http://127.0.0.1:{port}/content-research/workflows/{workflow_run_id}/lite-report",
-            headers=RELEASE_GATE_HEADERS,
-        )["workflow_run_id"] == workflow_run_id
+        assert (
+            _get_json(
+                f"http://127.0.0.1:{port}/content-research/workflows/{workflow_run_id}/trace",
+                headers=RELEASE_GATE_HEADERS,
+            )["workflow_run_id"]
+            == workflow_run_id
+        )
+        assert (
+            _get_json(
+                f"http://127.0.0.1:{port}/content-research/workflows/{workflow_run_id}/lite-report",
+                headers=RELEASE_GATE_HEADERS,
+            )["workflow_run_id"]
+            == workflow_run_id
+        )
     finally:
         _stop(first)
 
@@ -208,17 +305,25 @@ def test_frozen_runtime_restart_preserves_content_research_fixture(tmp_path):
     try:
         second_health = _wait_for_health(port, second)
         assert second_health["runtime_diagnostics"]["sqlite_db_path"] == db_path
-        assert _get_json(
-            f"http://127.0.0.1:{port}/content-research/workflows/{workflow_run_id}/trace",
-            headers=RELEASE_GATE_HEADERS,
-        )["workflow_run_id"] == workflow_run_id
-        assert _get_json(
-            f"http://127.0.0.1:{port}/content-research/workflows/{workflow_run_id}/lite-report",
-            headers=RELEASE_GATE_HEADERS,
-        )["workflow_run_id"] == workflow_run_id
+        assert (
+            _get_json(
+                f"http://127.0.0.1:{port}/content-research/workflows/{workflow_run_id}/trace",
+                headers=RELEASE_GATE_HEADERS,
+            )["workflow_run_id"]
+            == workflow_run_id
+        )
+        assert (
+            _get_json(
+                f"http://127.0.0.1:{port}/content-research/workflows/{workflow_run_id}/lite-report",
+                headers=RELEASE_GATE_HEADERS,
+            )["workflow_run_id"]
+            == workflow_run_id
+        )
         checkpoints = [
             checkpoint
-            for checkpoint in SQLiteContentResearchStore(db_path).list_typed_records(StageCheckpointRecord)
+            for checkpoint in SQLiteContentResearchStore(db_path).list_typed_records(
+                StageCheckpointRecord
+            )
             if checkpoint.workflow_run_id == workflow_run_id
         ]
         assert len(checkpoints[0].payload["candidates"]) == 28

@@ -9,6 +9,7 @@ Output: dist/xhs-runtime/  (folder, not single file)
 """
 
 import sys
+from PyInstaller.building.datastruct import Tree
 from PyInstaller.utils.hooks import collect_all, collect_data_files, collect_submodules, copy_metadata
 
 block_cipher = None
@@ -36,8 +37,6 @@ a = Analysis(
         + transformers_datas
         + lg_checkpoint_datas
         + pkg_meta_datas
-        # include app source so imports resolve correctly
-        + [("app", "app"), ("experiments", "experiments")]
     ),
     hiddenimports=(
         chromadb_hiddenimports
@@ -96,6 +95,25 @@ a = Analysis(
     cipher=block_cipher,
     noarchive=False,
 )
+
+# Some Runtime components load non-Python assets from these trees at runtime.
+# Build them explicitly instead of copying the directories wholesale: ignored
+# developer captures and local state can exist under them without appearing in
+# git status, and must never leak into a user-facing archive.
+_runtime_tree_excludes = [
+    ".DS_Store",
+    ".env",
+    ".env.example",
+    ".git",
+    "__pycache__",
+    "*.db",
+    "*.har",
+    "*.log",
+    "*.sqlite",
+    "*.sqlite3",
+]
+a.datas += Tree("app", prefix="app", excludes=_runtime_tree_excludes)
+a.datas += Tree("experiments", prefix="experiments", excludes=_runtime_tree_excludes)
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
