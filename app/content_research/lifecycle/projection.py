@@ -82,6 +82,12 @@ def projection_from_row(
     if (
         state is ContentResearchState.RECOVERY_REQUIRED
         and error is not None
+        and error.get("recovery_action") == "retry_retrieval"
+    ):
+        allowed_actions = ("retry_retrieval", "cancel")
+    elif (
+        state is ContentResearchState.RECOVERY_REQUIRED
+        and error is not None
         and error.get("code") == "MARKETING_ANALYSIS_FAILED"
     ):
         allowed_actions = ("retry_analysis", "cancel")

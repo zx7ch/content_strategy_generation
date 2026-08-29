@@ -41,6 +41,7 @@ import {
   replaceContentResearchScopeDraft,
   requireMutableContentResearchWorkflow,
   retryContentResearchPresearch,
+  retryContentResearchRetrieval,
   retryContentResearchAnalysis,
   retryContentResearchReport,
   runContentResearchWorkflowAction,
@@ -771,7 +772,10 @@ function ContentResearchIntentCard({
     ));
   }
 
-  if (intent.presearch.run.state === "recovery_required") {
+  if (
+    intent.presearch.run.state === "recovery_required"
+    && intent.presearch.run.allowed_actions.includes("retry_presearch")
+  ) {
     return (
       <div className="flex justify-start">
         <div className="w-full max-w-[92%] rounded-2xl border border-amber-200 bg-amber-50 px-5 py-4 text-sm text-amber-900">
@@ -780,6 +784,8 @@ function ContentResearchIntentCard({
       </div>
     );
   }
+
+  if (intent.presearch.run.state === "recovery_required") return null;
 
   if (intent.presearch.run.state !== "brief_confirmation_required") return null;
 
@@ -2044,6 +2050,8 @@ function ContentResearchContextSidebar({
   recoveryPending = false,
   recoveryRequiredSince = null,
   onContinuePresearch = async () => {},
+  onRetryRetrieval = async () => {},
+  retrievalRetryPending = false,
   onRetryAnalysis = async () => {},
   analysisRetryPending = false,
   onRetryReport = async () => {},
@@ -2055,6 +2063,8 @@ function ContentResearchContextSidebar({
   recoveryPending?: boolean;
   recoveryRequiredSince?: string | null;
   onContinuePresearch?: () => void | Promise<void>;
+  onRetryRetrieval?: () => void | Promise<void>;
+  retrievalRetryPending?: boolean;
   onRetryAnalysis?: () => void | Promise<void>;
   analysisRetryPending?: boolean;
   onRetryReport?: () => void | Promise<void>;
@@ -2097,6 +2107,16 @@ function ContentResearchContextSidebar({
             className="mt-3 w-full rounded-lg bg-ink px-3 py-2 text-xs font-semibold text-white disabled:opacity-50"
           >
             {analysisRetryPending ? "正在恢复分析…" : "继续失败的分析"}
+          </button>
+        )}
+        {run.summary.run.allowed_actions.includes("retry_retrieval") && (
+          <button
+            type="button"
+            onClick={() => void onRetryRetrieval()}
+            disabled={retrievalRetryPending}
+            className="mt-3 w-full rounded-lg bg-ink px-3 py-2 text-xs font-semibold text-white disabled:opacity-50"
+          >
+            {retrievalRetryPending ? "正在恢复检索…" : "继续失败的检索"}
           </button>
         )}
         {run.summary.run.allowed_actions.includes("retry_report") && (
@@ -2150,6 +2170,7 @@ function ContentResearchContextSidebar({
   const [scopeProjectionsByRun, setScopeProjectionsByRun] = useState<Record<string, ContentResearchScopeProjection>>({});
   const [scopeActionBusy, setScopeActionBusy] = useState(false);
   const [scopeDraftSaveBusy, setScopeDraftSaveBusy] = useState(false);
+  const [retrievalRetryPending, setRetrievalRetryPending] = useState(false);
   const [analysisRetryPending, setAnalysisRetryPending] = useState(false);
   const [reportRetryPending, setReportRetryPending] = useState(false);
   const [traceExpanded, setTraceExpanded] = useState(false);
@@ -2848,6 +2869,38 @@ function ContentResearchContextSidebar({
     } finally {
       if (contentResearchRequestEpochRef.current.accepts(ticket)) {
         setAnalysisRetryPending(false);
+      }
+    }
+  }
+
+  async function retryFailedRetrieval() {
+    const run = contentResearchRun?.summary.run;
+    if (!run || !run.allowed_actions.includes("retry_retrieval") || retrievalRetryPending) {
+      return;
+    }
+    const ticket = contentResearchRequestEpochRef.current.ticket(run.run_id, "retry-retrieval");
+    setRetrievalRetryPending(true);
+    try {
+      await retryContentResearchRetrieval(run);
+      const workflow = requireMutableContentResearchWorkflow(
+        await getContentResearchWorkflow(run.run_id),
+      );
+      if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
+      setContentResearchIntent(null);
+      setContentResearchRun((current) => current?.workflowRunId === run.run_id
+        ? { ...current, summary: workflow }
+        : current);
+      await refreshContentResearchTrace(run.run_id);
+      appendMessage({ role: "assistant", text: "已继续失败的检索；已完成步骤会直接复用。" });
+    } catch (error) {
+      if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
+      appendMessage({
+        role: "system",
+        text: contentResearchErrorFeedback(error, "继续检索失败"),
+      });
+    } finally {
+      if (contentResearchRequestEpochRef.current.accepts(ticket)) {
+        setRetrievalRetryPending(false);
       }
     }
   }
@@ -3788,6 +3841,8 @@ function ContentResearchContextSidebar({
         recoveryPending={projectedModelRecoveryPending}
         recoveryRequiredSince={modelRecovery.requiredSince}
         onContinuePresearch={continueModelRecovery}
+        onRetryRetrieval={retryFailedRetrieval}
+        retrievalRetryPending={retrievalRetryPending}
         onRetryAnalysis={retryFailedMarketingAnalysis}
         analysisRetryPending={analysisRetryPending}
         onRetryReport={retryFailedReportFinalization}

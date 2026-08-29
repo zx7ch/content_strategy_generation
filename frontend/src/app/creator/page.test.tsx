@@ -27,6 +27,14 @@ test("Creator restores the durable presearch Trace when the request disconnects 
   assert.doesNotMatch(source, /function interruptedPresearchSummary/);
 });
 
+test("Creator exposes retrieval recovery without mislabeling it as a model configuration failure", () => {
+  const source = readFileSync(new URL("./page.tsx", import.meta.url), "utf8");
+
+  assert.match(source, /retryContentResearchRetrieval/);
+  assert.match(source, /继续失败的检索/);
+  assert.match(source, /allowed_actions\.includes\("retry_presearch"\)/);
+});
+
 test("Creator rejects a late presearch response before it can activate an old Run", () => {
   const source = readFileSync(new URL("./page.tsx", import.meta.url), "utf8");
   const guard = source.indexOf("activeThreadIdRef.current !== threadId", source.indexOf("async function sendMessage"));

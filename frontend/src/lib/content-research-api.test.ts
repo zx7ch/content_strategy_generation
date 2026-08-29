@@ -19,6 +19,7 @@ import {
   submitContentResearchContentDecision,
   isContentResearchReportPending,
   retryContentResearchPresearch,
+  retryContentResearchRetrieval,
   replaceContentResearchScopeDraft,
   saveLLMConfiguration,
 } from "./content-research-api.ts";
@@ -249,6 +250,33 @@ test("retry presearch returns the same persisted identifiers", async () => {
   assert.match(requestBody, /"action":"retry_presearch"/);
   assert.equal(result.attempt_id, "att_1");
   assert.equal(result.brief_id, "rb_1");
+});
+
+test("retry retrieval sends the authoritative same-run recovery action", async () => {
+  let requestBody = "";
+  globalThis.fetch = (async (_input, init) => {
+    requestBody = String(init?.body ?? "");
+    return jsonResponse({
+      schema_version: "content_research_workflow_action_response_v1",
+      workflow_run_id: "run_1",
+      action: "retry_retrieval",
+      status: "queued",
+      execution_mode: "local",
+      sync_status: "local_only",
+      result: { run: { ...testRun, state: "retrieval_queued", state_revision: 8 } },
+    });
+  }) as typeof fetch;
+
+  await retryContentResearchRetrieval({
+    ...testRun,
+    state: "recovery_required",
+    state_revision: 7,
+    allowed_actions: ["retry_retrieval", "cancel"],
+  });
+
+  assert.match(requestBody, /"action":"retry_retrieval"/);
+  assert.match(requestBody, /"expected_state":"recovery_required"/);
+  assert.match(requestBody, /"expected_revision":7/);
 });
 
 test("Brief confirmation and Scope replacement use authoritative command envelopes", async () => {

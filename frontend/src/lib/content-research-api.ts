@@ -284,6 +284,7 @@ export interface ContentResearchWorkflowActionRequest {
   action:
     | "cancel"
     | "retry_presearch"
+    | "retry_retrieval"
     | "retry_analysis"
     | "retry_report"
     | "repair_publication"
@@ -711,6 +712,15 @@ export async function deleteLLMConfiguration(): Promise<LLMConfiguration> {
 export async function retryContentResearchPresearch(run: ContentResearchRunProjection): Promise<ContentResearchPresearchResponse> {
   const response = await runContentResearchWorkflowAction<ContentResearchPresearchResponse>(run.run_id, contentResearchCommand(run, "retry_presearch"));
   return response.result;
+}
+
+export async function retryContentResearchRetrieval(
+  run: ContentResearchRunProjection
+): Promise<ContentResearchWorkflowActionResponse<JsonObject>> {
+  return runContentResearchWorkflowAction<JsonObject>(
+    run.run_id,
+    contentResearchCommand(run, "retry_retrieval")
+  );
 }
 
 export async function retryContentResearchAnalysis(

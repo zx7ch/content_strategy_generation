@@ -13,6 +13,7 @@ WORKFLOW_ACTION_RESPONSE_SCHEMA_VERSION = "content_research_workflow_action_resp
 P0_WORKFLOW_ACTIONS = (
     "cancel",
     "retry_presearch",
+    "retry_retrieval",
     "retry_analysis",
     "retry_report",
     "repair_publication",

@@ -2734,6 +2734,67 @@ class ContentResearchService:
                 local_cache_id=response.brief_id,
             )
 
+        if action == "retry_retrieval":
+            declared_state = ContentResearchState(request.expected_state)
+            if declared_state is not ContentResearchState.RECOVERY_REQUIRED:
+                raise LifecycleCommandConflict(
+                    "retry_retrieval requires expected_state recovery_required"
+                )
+            command = LifecycleCommand(
+                command_id=request.command_id,
+                run_id=workflow_run_id,
+                expected_state=declared_state,
+                expected_revision=request.expected_revision,
+                kind="retry_retrieval",
+                payload=request.payload,
+            )
+            current = await self._lifecycle.load(workflow_run_id)
+            if current.state is not ContentResearchState.RECOVERY_REQUIRED:
+                replay = await self._lifecycle.apply(command)
+                return self._action_response(
+                    workflow_run_id=workflow_run_id,
+                    action=action,
+                    status="queued",
+                    result={"run": self._run_projection_payload(replay)},
+                    local_cache_id=replay.brief_id,
+                )
+            if "retry_retrieval" not in current.allowed_actions:
+                raise LifecycleCommandConflict(
+                    "retry_retrieval is not available for this recovery"
+                )
+            runtime_snapshot = await self._workflow_runtime.get_runtime_snapshot(
+                workflow_run_id
+            )
+            provider = str(request.payload.get("provider") or "xiaohongshu")
+            source_kind = str(request.payload.get("source_kind") or "search_result")
+            limit = int(request.payload.get("limit") or 50)
+            recovery_child_ids = self._requeue_recoverable_tasks(
+                workflow_run_id,
+                provider=provider,
+                runtime_child_tasks=list(runtime_snapshot.get("child_tasks") or []),
+            )
+            retried = await self._lifecycle.apply(command)
+            await self._workflow_runtime.restart_formal_research_step(
+                workflow_run_id=workflow_run_id,
+                child_task_ids=recovery_child_ids,
+            )
+            dispatched = await self.dispatch_formal_research(
+                workflow_run_id=workflow_run_id,
+                request=ContentResearchSourceCollectionRequest(
+                    provider=provider,
+                    source_kind=source_kind,
+                    limit=limit,
+                ),
+                retry_completed=True,
+            )
+            return self._action_response(
+                workflow_run_id=workflow_run_id,
+                action=action,
+                status=dispatched.status,
+                result={"run": self._run_projection_payload(retried)},
+                local_cache_id=retried.brief_id,
+            )
+
         if action == "retry_analysis":
             declared_state = ContentResearchState(request.expected_state)
             if declared_state is not ContentResearchState.RECOVERY_REQUIRED:

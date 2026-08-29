@@ -387,6 +387,50 @@ async def test_startup_reconciliation_converges_interrupted_presearch_without_re
 
 
 @pytest.mark.asyncio
+async def test_retrieval_dispatch_failure_projects_retrieval_retry_instead_of_presearch_retry(
+    tmp_path,
+) -> None:
+    db_path = str(tmp_path / "retrieval-recovery-projection.db")
+    thread_id = await _create_thread(db_path)
+    coordinator = ContentResearchPersistenceCoordinator(db_path)
+    await coordinator.apply(
+        LifecycleCommand(
+            command_id="submit-before-retrieval-failure",
+            run_id="run-retrieval-recovery",
+            expected_state=None,
+            expected_revision=0,
+            kind="submit_research_subject",
+            payload={
+                "thread_id": thread_id,
+                "user_id": "user",
+                "seed_text": "夏季凉感T恤",
+            },
+        )
+    )
+
+    failed = await coordinator.apply(
+        LifecycleCommand(
+            command_id="fail-retrieval-dispatch",
+            run_id="run-retrieval-recovery",
+            expected_state=ContentResearchState.PRESEARCH_RUNNING,
+            expected_revision=1,
+            kind="fail",
+            payload={
+                "error": {
+                    "code": "FORMAL_RESEARCH_DISPATCH_FAILED",
+                    "stage": "retrieval_running",
+                    "retryable": True,
+                    "recovery_action": "retry_retrieval",
+                }
+            },
+        )
+    )
+
+    assert failed.state is ContentResearchState.RECOVERY_REQUIRED
+    assert failed.allowed_actions == ("retry_retrieval", "cancel")
+
+
+@pytest.mark.asyncio
 async def test_retry_analysis_atomically_advances_run_and_creates_one_successor(
     tmp_path,
 ) -> None:
