@@ -1363,7 +1363,8 @@ class WorkflowRunManager:
             await self._conn.execute(
                 """
                 UPDATE workflow_steps
-                SET status='succeeded', output_artifact_refs_json=?, active_job_id=NULL, timing_json=?,
+                SET status='succeeded', output_artifact_refs_json=?, active_job_id=NULL,
+                    next_retry_at=NULL, error_code=NULL, error_message=NULL, timing_json=?,
                     completed_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP
                 WHERE step_id=?
                 """,

@@ -793,7 +793,8 @@ async def test_formal_recovery_reopens_step_failed_by_lifecycle_projection(tmp_p
             (await manager._fetch_step_row(run.run_id, "formal_research"))["attempt_count"]
         )
         await manager._conn.execute(
-            "UPDATE workflow_steps SET status='failed', completed_at=CURRENT_TIMESTAMP "
+            "UPDATE workflow_steps SET status='failed', completed_at=CURRENT_TIMESTAMP, "
+            "error_code='FORMAL_RESEARCH_DISPATCH_FAILED', error_message='formal task failed' "
             "WHERE run_id=? AND step_name='formal_research'",
             (run.run_id,),
         )
@@ -815,6 +816,16 @@ async def test_formal_recovery_reopens_step_failed_by_lifecycle_projection(tmp_p
     assert recovered_steps[0].attempt_count == recovery_attempt_count
     assert recovered_children[0].status.value == "retrying"
     assert recovered_children[0].attempt_count == 1
+
+    async with WorkflowRunManager(db_path) as manager:
+        await manager.start_child_task(child.child_task_id)
+        await manager.complete_child_task(child.child_task_id)
+        await manager.complete_step(run.run_id, "formal_research")
+    async with WorkflowStore(db_path) as store:
+        completed_steps = await store.list_steps(run.run_id)
+    assert completed_steps[0].status.value == "succeeded"
+    assert completed_steps[0].error_code is None
+    assert completed_steps[0].error_message is None
 
 
 @pytest.mark.asyncio
