@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 import uuid
 
 import pytest
@@ -71,6 +72,21 @@ async def test_lease_enforces_single_running_job_per_session(isolated_db):
         leased_3 = await store.lease_one()
         assert leased_3 is not None
         assert leased_3.session_id == session_id
+
+
+@pytest.mark.asyncio
+async def test_empty_queue_lease_does_not_compete_for_sqlite_writer(isolated_db):
+    """Idle polling must remain read-only while Content Research is writing."""
+    async with JobStore(isolated_db) as store:
+        assert store._conn is not None
+        await store._conn.execute("PRAGMA busy_timeout=0")
+        blocker = sqlite3.connect(isolated_db, timeout=0)
+        blocker.execute("BEGIN IMMEDIATE")
+        try:
+            assert await store.lease_one() is None
+        finally:
+            blocker.rollback()
+            blocker.close()
 
 
 @pytest.mark.asyncio

@@ -399,6 +399,29 @@ class JobStore:
         assert self._conn is not None
 
         ttl = lease_seconds or settings.JOB_LEASE_SECONDS
+        # This generic worker shares the Runtime SQLite database with Content
+        # Research.  Empty polling must not reserve SQLite's only writer slot:
+        # a synchronous Content Research write on the event loop can otherwise
+        # wait for this aiosqlite connection while its commit is waiting for the
+        # same event loop, producing a self-deadlock and `database is locked`.
+        async with self._conn.execute(
+            """
+            SELECT 1
+            FROM jobs j
+            LEFT JOIN sessions s ON s.session_id = j.session_id
+            WHERE j.status IN ('queued', 'retrying')
+              AND j.not_before <= CURRENT_TIMESTAMP
+              AND (j.run_id IS NOT NULL OR s.lifecycle_state = 'alive')
+              AND NOT EXISTS (
+                  SELECT 1 FROM jobs r
+                  WHERE r.session_id = j.session_id
+                    AND r.status = 'running'
+              )
+            LIMIT 1
+            """
+        ) as preflight:
+            if await preflight.fetchone() is None:
+                return None
         await self._conn.execute("BEGIN IMMEDIATE")
         async with self._conn.execute(
             """
