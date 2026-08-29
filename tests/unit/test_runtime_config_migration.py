@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import multiprocessing
 import os
 import sys
 from datetime import datetime, timezone
@@ -127,6 +128,19 @@ def test_frozen_runtime_always_enables_released_content_research(tmp_path, monke
     _run_frozen_runtime(monkeypatch, install, home)
 
     assert os.environ["F003_LITE_PREVIEW_ENABLED"] == "true"
+
+
+def test_frozen_runtime_diverts_multiprocessing_helpers_before_startup(tmp_path, monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setattr(multiprocessing, "freeze_support", lambda: calls.append("called"))
+    home = tmp_path / "clean-home"
+    install = tmp_path / "runtime"
+    install.mkdir()
+    (install / "config.env").write_text("LOG_LEVEL=INFO\n", encoding="utf-8")
+
+    _run_frozen_runtime(monkeypatch, install, home)
+
+    assert calls == ["called"]
 
 
 def test_frozen_runtime_publishes_safe_resolved_storage_diagnostics(tmp_path, monkeypatch):

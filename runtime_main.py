@@ -9,6 +9,13 @@ import time
 # When running as a PyInstaller bundle, set base dir to the executable's location
 # so relative paths (data/, chroma/) resolve next to the exe, not in temp dir.
 if getattr(sys, "frozen", False):
+    # PyInstaller replaces this hook so resource-tracker and spawned worker
+    # invocations are diverted before they can execute the Runtime entrypoint.
+    # Without it, a helper process recursively starts Uvicorn on port 8000.
+    import multiprocessing as _multiprocessing
+
+    _multiprocessing.freeze_support()
+
     _base = os.path.dirname(sys.executable)
     os.chdir(_base)
 
