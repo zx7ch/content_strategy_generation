@@ -2749,16 +2749,10 @@ class ContentResearchService:
                 payload=request.payload,
             )
             current = await self._lifecycle.load(workflow_run_id)
-            if current.state is not ContentResearchState.RECOVERY_REQUIRED:
-                replay = await self._lifecycle.apply(command)
-                return self._action_response(
-                    workflow_run_id=workflow_run_id,
-                    action=action,
-                    status="queued",
-                    result={"run": self._run_projection_payload(replay)},
-                    local_cache_id=replay.brief_id,
-                )
-            if "retry_retrieval" not in current.allowed_actions:
+            if (
+                current.state is ContentResearchState.RECOVERY_REQUIRED
+                and "retry_retrieval" not in current.allowed_actions
+            ):
                 raise LifecycleCommandConflict(
                     "retry_retrieval is not available for this recovery"
                 )
@@ -2768,11 +2762,30 @@ class ContentResearchService:
             provider = str(request.payload.get("provider") or "xiaohongshu")
             source_kind = str(request.payload.get("source_kind") or "search_result")
             limit = int(request.payload.get("limit") or 50)
-            recovery_child_ids = self._requeue_recoverable_tasks(
-                workflow_run_id,
-                provider=provider,
-                runtime_child_tasks=list(runtime_snapshot.get("child_tasks") or []),
-            )
+            runtime_children = list(runtime_snapshot.get("child_tasks") or [])
+            if current.state is ContentResearchState.RECOVERY_REQUIRED:
+                recovery_child_ids = self._requeue_recoverable_tasks(
+                    workflow_run_id,
+                    provider=provider,
+                    runtime_child_tasks=runtime_children,
+                )
+            else:
+                # An exact command replay may be completing side effects after
+                # a transport/process interruption. The lifecycle command is
+                # authoritative for identity; queued task lineage identifies
+                # the same failed children without replaying provider work.
+                failed_runtime_child_ids = {
+                    str(child.get("child_task_id") or "")
+                    for child in runtime_children
+                    if str(child.get("status") or "") == "failed"
+                }
+                recovery_child_ids = [
+                    child_id
+                    for task in self._store.list_subagent_tasks_for_workflow(workflow_run_id)
+                    if task.status == "queued"
+                    and (child_id := str(task.payload.get("workflow_child_task_id") or ""))
+                    in failed_runtime_child_ids
+                ]
             retried = await self._lifecycle.apply(command)
             await self._workflow_runtime.restart_formal_research_step(
                 workflow_run_id=workflow_run_id,

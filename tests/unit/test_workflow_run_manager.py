@@ -760,6 +760,64 @@ async def test_formal_recovery_action_consumes_one_child_recovery_attempt(tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_formal_recovery_reopens_step_failed_by_lifecycle_projection(tmp_path):
+    db_path = str(tmp_path / "formal_recovery_projected_failure.db")
+    async with WorkflowRunManager(db_path) as manager:
+        run = await manager.start_run(thread_id="thread-recovery-projected", user_id="user-1")
+        step = (
+            await manager.initialize_steps(
+                run.run_id,
+                [{"step_name": "formal_research", "phase": "retrieval", "max_attempts": 3}],
+            )
+        )[0]
+        await manager.start_step(run.run_id, step.step_name)
+        child = (
+            await manager.create_child_tasks(
+                run_id=run.run_id,
+                step_id=step.step_id,
+                tasks=[{"task_type": "content_research.product_marketing", "max_attempts": 3}],
+            )
+        )[0]
+        await manager.start_child_task(child.child_task_id)
+        await manager.fail_child_task(
+            child.child_task_id,
+            {"code": "auth_required", "message": "login required"},
+        )
+        await manager.wait_for_user_recovery(
+            run.run_id,
+            step_name="formal_research",
+            reason="provider recovery required",
+        )
+        assert manager._conn is not None
+        recovery_attempt_count = int(
+            (await manager._fetch_step_row(run.run_id, "formal_research"))["attempt_count"]
+        )
+        await manager._conn.execute(
+            "UPDATE workflow_steps SET status='failed', completed_at=CURRENT_TIMESTAMP "
+            "WHERE run_id=? AND step_name='formal_research'",
+            (run.run_id,),
+        )
+        await manager._conn.execute(
+            "UPDATE workflow_runs SET status='running' WHERE run_id=?",
+            (run.run_id,),
+        )
+        await manager._conn.commit()
+
+    await WorkflowRunManagerRuntime(db_path).restart_formal_research_step(
+        workflow_run_id=run.run_id,
+        child_task_ids=[child.child_task_id],
+    )
+
+    async with WorkflowStore(db_path) as store:
+        recovered_steps = await store.list_steps(run.run_id)
+        recovered_children = await store.list_child_tasks(run.run_id)
+    assert recovered_steps[0].status.value == "running"
+    assert recovered_steps[0].attempt_count == recovery_attempt_count
+    assert recovered_children[0].status.value == "retrying"
+    assert recovered_children[0].attempt_count == 1
+
+
+@pytest.mark.asyncio
 async def test_legacy_running_retrying_formal_step_is_started_idempotently(tmp_path):
     db_path = str(tmp_path / "legacy_scope_continuation.db")
     async with WorkflowRunManager(db_path) as manager:

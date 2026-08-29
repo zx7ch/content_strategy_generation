@@ -1762,6 +1762,32 @@ class WorkflowRunManager:
         """Atomically resume a retryable step and consume its child budgets."""
 
         async def op() -> tuple[WorkflowRun | None, list[WorkflowChildTask]]:
+            assert self._conn is not None
+            step = await self._fetch_step_row(run_id, step_name)
+            if step["status"] == WorkflowStepStatus.FAILED.value:
+                # The authoritative Content Research lifecycle projects a
+                # dispatch failure onto the shared workflow step after the
+                # worker has already placed the run at its user-recovery
+                # boundary. Reopen that exact failed step without consuming
+                # another attempt; the recovery boundary already did so.
+                await self._conn.execute(
+                    """
+                    UPDATE workflow_steps
+                    SET status='retrying', completed_at=NULL, next_retry_at=NULL,
+                        active_job_id=NULL, updated_at=CURRENT_TIMESTAMP
+                    WHERE step_id=?
+                    """,
+                    (step["step_id"],),
+                )
+                run_row = await self._fetch_run_row(run_id)
+                await self._append_event(
+                    run_id=run_id,
+                    thread_id=run_row["thread_id"],
+                    step_id=step["step_id"],
+                    event_type="step_recovery_reopened",
+                    event_level="warning",
+                    payload={"step_name": step_name},
+                )
             run = None
             if resume_parent:
                 run = await self.resume_run(run_id)
