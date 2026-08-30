@@ -11,35 +11,26 @@ from __future__ import annotations
 import asyncio
 from typing import TYPE_CHECKING, Any, Protocol
 
-from app.content_research.analysis_persistence import SQLiteMarketingAnalysisRepository
 from app.content_research.api_schemas import (
-    P0_WORKFLOW_ACTIONS,
-    ContentResearchBriefConfirmationRequest,
     ContentResearchPresearchResponse,
-    ContentResearchSourceCollectionRequest,
-    ContentResearchSubjectRevisionRequest,
     ContentResearchWorkflowActionRequest,
     ContentResearchWorkflowActionResponse,
     HumanDecisionRequest,
     HumanDecisionResponse,
-    ReplaceScopeDraftRequest,
 )
-from app.content_research.contracts import freeze_provider_capabilities
+from app.content_research.commands.dispatcher import (
+    WorkflowActionContext,
+    build_workflow_action_dispatcher,
+)
 from app.content_research.errors import (
     ContentResearchNotFoundError,
     ContentResearchValidationError,
 )
-from app.content_research.lifecycle.coordinator import (
-    LifecycleCommandConflict,
-    LifecyclePersistenceBusy,
-)
+from app.content_research.lifecycle.coordinator import LifecyclePersistenceBusy
 from app.content_research.lifecycle.models import (
     ContentResearchState,
     LifecycleCommand,
     RunProjection,
-)
-from app.content_research.marketing_analysis_execution import (
-    MarketingAnalysisExecutionService,
 )
 from app.content_research.presearch.service import PresearchInput, PresearchOutcome
 
@@ -157,6 +148,7 @@ class ContentResearchCommandService(LegacyContentResearchCommandAdapter):
     def __init__(self, source: ContentResearchService) -> None:
         super().__init__(source)
         self._application = source
+        self._workflow_action_dispatcher = build_workflow_action_dispatcher()
 
     async def submit_presearch(
         self,
@@ -265,413 +257,14 @@ class ContentResearchCommandService(LegacyContentResearchCommandAdapter):
         workflow_run_id: str,
         request: ContentResearchWorkflowActionRequest,
     ) -> ContentResearchWorkflowActionResponse:
-        application = self._application
-        action = request.action.strip()
-        if action not in P0_WORKFLOW_ACTIONS:
-            raise ContentResearchValidationError(
-                f"Unsupported Content Research workflow action: {action}"
-            )
-
-        if action == "repair_publication":
-            repaired = await application._repair_integrity_flagged_publication(
+        return await self._workflow_action_dispatcher.dispatch(
+            WorkflowActionContext(
+                application=self._application,
+                command_service=self,
                 workflow_run_id=workflow_run_id,
-                command_id=request.command_id,
-                expected_state=request.expected_state,
-                expected_revision=request.expected_revision,
-                publication_id=(
-                    str(request.payload.get("publication_id"))
-                    if request.payload.get("publication_id")
-                    else None
-                ),
+                request=request,
             )
-            return application._action_response(
-                workflow_run_id=workflow_run_id,
-                action=action,
-                status="completed",
-                result={"publication_id": repaired.id},
-                local_cache_id=repaired.id,
-            )
-
-        if action == "cancel":
-            cancelled = await application._lifecycle.apply(
-                LifecycleCommand(
-                    command_id=request.command_id,
-                    run_id=workflow_run_id,
-                    expected_state=ContentResearchState(request.expected_state),
-                    expected_revision=request.expected_revision,
-                    kind="cancel",
-                    payload=request.payload,
-                )
-            )
-            return application._action_response(
-                workflow_run_id=workflow_run_id,
-                action=action,
-                status="completed",
-                result={"run": application._run_projection_payload(cancelled)},
-                local_cache_id=cancelled.brief_id,
-            )
-
-        brief = application._store.get_brief_by_workflow(workflow_run_id)
-        if brief is None:
-            raise ContentResearchNotFoundError(
-                f"Content research workflow not found: {workflow_run_id}"
-            )
-
-        if action == "retry_presearch":
-            declared_state = ContentResearchState(request.expected_state)
-            if declared_state is not ContentResearchState.RECOVERY_REQUIRED:
-                raise LifecycleCommandConflict(
-                    "retry_presearch requires expected_state recovery_required"
-                )
-            response = await self.retry_presearch(
-                workflow_run_id,
-                command_id=request.command_id,
-                expected_state=declared_state,
-                expected_revision=request.expected_revision,
-            )
-            return application._action_response(
-                workflow_run_id=workflow_run_id,
-                action=action,
-                status=response.status,
-                result=response.model_dump(mode="json"),
-                local_cache_id=response.brief_id,
-            )
-
-        if action == "retry_retrieval":
-            declared_state = ContentResearchState(request.expected_state)
-            if declared_state is not ContentResearchState.RECOVERY_REQUIRED:
-                raise LifecycleCommandConflict(
-                    "retry_retrieval requires expected_state recovery_required"
-                )
-            command = LifecycleCommand(
-                command_id=request.command_id,
-                run_id=workflow_run_id,
-                expected_state=declared_state,
-                expected_revision=request.expected_revision,
-                kind="retry_retrieval",
-                payload=request.payload,
-            )
-            current = await application._lifecycle.load(workflow_run_id)
-            if (
-                current.state is ContentResearchState.RECOVERY_REQUIRED
-                and "retry_retrieval" not in current.allowed_actions
-            ):
-                raise LifecycleCommandConflict(
-                    "retry_retrieval is not available for this recovery"
-                )
-            runtime_snapshot = await application._workflow_runtime.get_runtime_snapshot(
-                workflow_run_id
-            )
-            provider = str(request.payload.get("provider") or "xiaohongshu")
-            source_kind = str(request.payload.get("source_kind") or "search_result")
-            limit = int(request.payload.get("limit") or 50)
-            runtime_children = list(runtime_snapshot.get("child_tasks") or [])
-            if current.state is ContentResearchState.RECOVERY_REQUIRED:
-                recovery_child_ids = application._requeue_recoverable_tasks(
-                    workflow_run_id,
-                    provider=provider,
-                    runtime_child_tasks=runtime_children,
-                )
-            else:
-                failed_runtime_child_ids = {
-                    str(child.get("child_task_id") or "")
-                    for child in runtime_children
-                    if str(child.get("status") or "") == "failed"
-                }
-                recovery_child_ids = [
-                    child_id
-                    for task in application._store.list_subagent_tasks_for_workflow(
-                        workflow_run_id
-                    )
-                    if task.status == "queued"
-                    and (
-                        child_id := str(
-                            task.payload.get("workflow_child_task_id") or ""
-                        )
-                    )
-                    in failed_runtime_child_ids
-                ]
-            retried = await application._lifecycle.apply(command)
-            await application._workflow_runtime.restart_formal_research_step(
-                workflow_run_id=workflow_run_id,
-                child_task_ids=recovery_child_ids,
-            )
-            dispatched = await application.dispatch_formal_research(
-                workflow_run_id=workflow_run_id,
-                request=ContentResearchSourceCollectionRequest(
-                    provider=provider,
-                    source_kind=source_kind,
-                    limit=limit,
-                ),
-                retry_completed=True,
-            )
-            return application._action_response(
-                workflow_run_id=workflow_run_id,
-                action=action,
-                status=dispatched.status,
-                result={"run": application._run_projection_payload(retried)},
-                local_cache_id=retried.brief_id,
-            )
-
-        if action == "retry_analysis":
-            declared_state = ContentResearchState(request.expected_state)
-            if declared_state is not ContentResearchState.RECOVERY_REQUIRED:
-                raise LifecycleCommandConflict(
-                    "retry_analysis requires expected_state recovery_required"
-                )
-            repository = SQLiteMarketingAnalysisRepository(
-                application._store._db_path,
-                bootstrap_schema=False,
-            )
-            predecessor = await asyncio.to_thread(
-                repository.get_effective_attempt_for_run,
-                workflow_run_id,
-            )
-            if predecessor is None:
-                raise LifecycleCommandConflict(
-                    "legacy run has no retryable analysis attempt"
-                )
-            unit = await MarketingAnalysisExecutionService(
-                store=application._store,
-                llm=application._analysis_llm,
-                embedding_runtime=application._research_embedding_runtime,
-                llm_scope={
-                    "llm_scope": {
-                        "workspace_id": str(brief.payload.get("workspace_id") or ""),
-                        "user_id": str(brief.payload.get("user_id") or ""),
-                    }
-                },
-            ).assert_retry_compatible(predecessor.analysis_unit_id)
-            retried, successor_id = await application._lifecycle.retry_analysis(
-                LifecycleCommand(
-                    command_id=request.command_id,
-                    run_id=workflow_run_id,
-                    expected_state=declared_state,
-                    expected_revision=request.expected_revision,
-                    kind="retry_analysis",
-                    payload={
-                        "predecessor_attempt_id": predecessor.id,
-                        "analysis_contract_fingerprint": unit.contract_fingerprint,
-                    },
-                ),
-                expected_attempt_id=predecessor.id,
-                expected_contract_fingerprint=unit.contract_fingerprint,
-            )
-            if application._analysis_wake_event is not None:
-                application._analysis_wake_event.set()
-            return application._action_response(
-                workflow_run_id=workflow_run_id,
-                action=action,
-                status="queued",
-                result={
-                    "analysis_attempt_id": successor_id,
-                    "run": application._run_projection_payload(retried),
-                },
-                local_cache_id=brief.id,
-            )
-
-        if action == "retry_report":
-            declared_state = ContentResearchState(request.expected_state)
-            if declared_state is not ContentResearchState.RECOVERY_REQUIRED:
-                raise LifecycleCommandConflict(
-                    "retry_report requires expected_state recovery_required"
-                )
-            current = await application._lifecycle.load(workflow_run_id)
-            if current.error is None or (
-                current.error.get("code") != "REPORT_FINALIZATION_FAILED"
-                and current.error.get("stage")
-                != ContentResearchState.REPORT_COMPOSING.value
-            ):
-                raise LifecycleCommandConflict(
-                    "retry_report requires a report finalization failure"
-                )
-            retried = await application._lifecycle.apply(
-                LifecycleCommand(
-                    command_id=request.command_id,
-                    run_id=workflow_run_id,
-                    expected_state=declared_state,
-                    expected_revision=request.expected_revision,
-                    kind="retry_report",
-                    payload={
-                        "preserved_analysis_attempt_id": current.error.get(
-                            "preserved_analysis_attempt_id"
-                        )
-                    },
-                )
-            )
-            await application._dispatch.enqueue(
-                workflow_run_id=workflow_run_id,
-                provider="xiaohongshu",
-                source_kind="search_result",
-                limit=50,
-                retry_completed=True,
-            )
-            if application._dispatch_wake_event is not None:
-                application._dispatch_wake_event.set()
-            return application._action_response(
-                workflow_run_id=workflow_run_id,
-                action=action,
-                status="queued",
-                result={
-                    "run": application._run_projection_payload(retried),
-                    "reused_retrieval": True,
-                    "reused_analysis_attempt_id": current.error.get(
-                        "preserved_analysis_attempt_id"
-                    ),
-                },
-                local_cache_id=brief.id,
-            )
-
-        if action == "revise_subject":
-            declared_state = ContentResearchState(request.expected_state)
-            if declared_state is not ContentResearchState.BRIEF_CONFIRMATION_REQUIRED:
-                raise LifecycleCommandConflict(
-                    "revise_subject requires expected_state brief_confirmation_required"
-                )
-            clarification = ContentResearchSubjectRevisionRequest(**request.payload)
-            response = await self.revise_subject(
-                workflow_run_id=workflow_run_id,
-                command_id=request.command_id,
-                expected_state=declared_state,
-                expected_revision=request.expected_revision,
-                clarification_text=clarification.clarification_text,
-            )
-            return application._action_response(
-                workflow_run_id=workflow_run_id,
-                action=action,
-                status=response.status,
-                result=response.model_dump(mode="json"),
-                local_cache_id=response.brief_id,
-            )
-
-        if action == "confirm_brief":
-            confirmation = ContentResearchBriefConfirmationRequest(**request.payload)
-            declared_state = ContentResearchState(request.expected_state)
-            if declared_state is not ContentResearchState.BRIEF_CONFIRMATION_REQUIRED:
-                raise LifecycleCommandConflict(
-                    "confirm_brief requires expected_state brief_confirmation_required"
-                )
-            projection = await application._lifecycle.apply(
-                LifecycleCommand(
-                    command_id=request.command_id,
-                    run_id=workflow_run_id,
-                    expected_state=declared_state,
-                    expected_revision=request.expected_revision,
-                    kind="confirm_brief",
-                    payload=application._build_confirm_brief_command_payload(
-                        workflow_run_id=workflow_run_id,
-                        brief=brief,
-                        confirmation=confirmation,
-                        command_id=request.command_id,
-                    ),
-                )
-            )
-            scope = await application.query_interface.get_scope_projection(
-                workflow_run_id
-            )
-            return application._action_response(
-                workflow_run_id=workflow_run_id,
-                action=action,
-                status="completed",
-                result={
-                    "run": application._run_projection_payload(projection),
-                    "scope": scope.model_dump(mode="json"),
-                },
-                local_cache_id=brief.id,
-            )
-
-        if action == "replace_scope_draft":
-            replacement = ReplaceScopeDraftRequest(**request.payload)
-            declared_state = ContentResearchState(request.expected_state)
-            if declared_state is not ContentResearchState.SCOPE_CONFIRMATION_REQUIRED:
-                raise LifecycleCommandConflict(
-                    "replace_scope_draft requires expected_state scope_confirmation_required"
-                )
-            latest = application._store.get_scope_draft(replacement.scope_draft_id)
-            if latest is None or latest.workflow_run_id != workflow_run_id:
-                raise LifecycleCommandConflict(
-                    "Scope Draft does not belong to this Run"
-                )
-            projection = await application._lifecycle.apply(
-                LifecycleCommand(
-                    command_id=request.command_id,
-                    run_id=workflow_run_id,
-                    expected_state=declared_state,
-                    expected_revision=request.expected_revision,
-                    kind="replace_scope_draft",
-                    payload=application._build_scope_draft_replacement_payload(
-                        latest=latest,
-                        replacement=replacement,
-                        command_id=request.command_id,
-                    ),
-                )
-            )
-            scope = await application.query_interface.get_scope_projection(
-                workflow_run_id
-            )
-            return application._action_response(
-                workflow_run_id=workflow_run_id,
-                action=action,
-                status="completed",
-                result={
-                    "run": application._run_projection_payload(projection),
-                    "scope": scope.model_dump(mode="json"),
-                },
-                local_cache_id=brief.id,
-            )
-
-        if action == "confirm_scope":
-            declared_state = ContentResearchState(request.expected_state)
-            if declared_state is not ContentResearchState.SCOPE_CONFIRMATION_REQUIRED:
-                raise LifecycleCommandConflict(
-                    "confirm_scope requires expected_state scope_confirmation_required"
-                )
-            latest = application._store.get_latest_scope_draft(workflow_run_id)
-            if latest is None:
-                raise LifecycleCommandConflict(
-                    "Scope Draft does not belong to this Run"
-                )
-            requested_draft_id = str(request.payload.get("scope_draft_id") or "")
-            if requested_draft_id != latest.id:
-                raise LifecycleCommandConflict(
-                    "Scope confirmation requires the latest draft"
-                )
-            projection = await application._lifecycle.apply(
-                LifecycleCommand(
-                    command_id=request.command_id,
-                    run_id=workflow_run_id,
-                    expected_state=declared_state,
-                    expected_revision=request.expected_revision,
-                    kind="confirm_scope",
-                    payload={
-                        "scope_draft_id": latest.id,
-                        "provider": "xiaohongshu",
-                        "source_kind": "search_result",
-                        "limit": 20,
-                        "provider_capabilities": freeze_provider_capabilities(
-                            application._source_registry
-                        )
-                        or {},
-                    },
-                )
-            )
-            scope = await application.query_interface.get_scope_projection(
-                workflow_run_id
-            )
-            if application._dispatch_wake_event is not None:
-                application._dispatch_wake_event.set()
-            return application._action_response(
-                workflow_run_id=workflow_run_id,
-                action=action,
-                status="queued",
-                result={
-                    "run": application._run_projection_payload(projection),
-                    "scope": scope.model_dump(mode="json"),
-                },
-                local_cache_id=brief.id,
-            )
-
-        raise AssertionError("validated P0 action did not return")
+        )
 
     async def _submit_presearch_locked(
         self,

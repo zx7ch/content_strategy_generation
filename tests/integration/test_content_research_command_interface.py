@@ -177,6 +177,19 @@ async def test_command_interface_preserves_revision_idempotency_and_actions(
 
             assert stale.status_code == 409
             assert conflicting_reuse.status_code == 409
+            unsupported = await client.post(
+                f"/content-research/workflows/{run['run_id']}/actions",
+                json={
+                    **confirmation,
+                    "command_id": "command-interface-unsupported",
+                    "action": "future_action",
+                },
+            )
+            assert unsupported.status_code == 422
+            assert unsupported.json()["error_code"] == "INVALID_CONTENT_RESEARCH_ACTION"
+            assert unsupported.json()["error_message"] == (
+                "Unsupported Content Research workflow action: future_action"
+            )
             refreshed = await client.get(
                 f"/content-research/workflows/{run['run_id']}"
             )
