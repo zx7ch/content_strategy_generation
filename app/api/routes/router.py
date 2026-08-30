@@ -43,6 +43,10 @@ from app.content_research.api_schemas import (
     XHSManualCookieRequest,
     XHSQRLoginResponse,
 )
+from app.content_research.command import (
+    ContentResearchCommand,
+    ContentResearchCommandService,
+)
 from app.content_research.errors import (
     ContentResearchNotFoundError,
     ContentResearchStateConflictError,
@@ -876,6 +880,17 @@ def _get_content_research_query(request: Request) -> ContentResearchQuery:
     return query
 
 
+def _get_content_research_command(request: Request) -> ContentResearchCommand:
+    command = getattr(request.app.state, "content_research_command", None)
+    if command is not None and not isinstance(command, ContentResearchCommandService):
+        return command
+    service = _get_content_research_service(request)
+    if command is None or not command.is_for(service):
+        command = service.command_interface
+        request.app.state.content_research_command = command
+    return command
+
+
 def _get_llm_configuration_service(request: Request) -> LiteLLMConfigurationService:
     service = getattr(request.app.state, "llm_configuration_service", None)
     if service is None:
@@ -986,9 +1001,9 @@ async def create_content_research_presearch(
     _require_f003_lite_preview()
     principal = _resolve_workspace_principal_or_error(request)
     assert principal.user_id is not None
-    service = _get_content_research_service(request)
+    command = _get_content_research_command(request)
     try:
-        return await service.submit_presearch(
+        return await command.submit_presearch(
             command_id=payload.command_id,
             seed_text=payload.seed_text,
             user_note=payload.user_note,
@@ -1205,9 +1220,9 @@ async def submit_content_research_brand_decision(
     request: Request,
     x_user_id: str = Header(default=DEFAULT_USER_ID, alias="X-User-Id"),
 ) -> HumanDecisionResponse:
-    service = _get_content_research_service(request)
+    command = _get_content_research_command(request)
     try:
-        return await service.submit_brand_decision(
+        return await command.submit_brand_decision(
             workflow_run_id=workflow_run_id,
             request=payload,
             user_id=x_user_id,
@@ -1226,9 +1241,9 @@ async def submit_content_research_content_decision(
     request: Request,
     x_user_id: str = Header(default=DEFAULT_USER_ID, alias="X-User-Id"),
 ) -> HumanDecisionResponse:
-    service = _get_content_research_service(request)
+    command = _get_content_research_command(request)
     try:
-        return await service.submit_content_decision(
+        return await command.submit_content_decision(
             workflow_run_id=workflow_run_id,
             request=payload,
             user_id=x_user_id,
@@ -1284,9 +1299,12 @@ async def run_content_research_workflow_action(
     payload: ContentResearchWorkflowActionRequest,
     request: Request,
 ) -> ContentResearchWorkflowActionResponse:
-    service = _get_content_research_service(request)
+    command = _get_content_research_command(request)
     try:
-        return await service.run_workflow_action(workflow_run_id=workflow_run_id, request=payload)
+        return await command.run_workflow_action(
+            workflow_run_id=workflow_run_id,
+            request=payload,
+        )
     except Exception as exc:  # noqa: BLE001
         raise _content_research_error(exc) from exc
 

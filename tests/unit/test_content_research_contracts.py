@@ -11,9 +11,9 @@ from app.content_research.contracts import (
     SamplePolicy,
     build_default_snapshot,
     evaluate_capability_preflight,
+    freeze_provider_capabilities,
     policy_hash,
 )
-from app.content_research.service import _freeze_adapter_capabilities
 from app.content_research.sources.base import ProviderCapability
 
 
@@ -244,7 +244,7 @@ def test_adapter_capabilities_are_frozen_once_into_snapshot_shape():
             assert provider == "xiaohongshu"
             return Adapter()
 
-    frozen = _freeze_adapter_capabilities(Registry())
+    frozen = freeze_provider_capabilities(Registry())
 
     assert frozen == {
         "xiaohongshu": {

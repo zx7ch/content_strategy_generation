@@ -9,7 +9,7 @@ import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 
 from app.content_research.admission.quote_fields import CLAIM_QUOTE_FIELDS
 from app.content_research.models import utcnow
@@ -45,6 +45,35 @@ ADMISSION_REASON_CODES = (
 )
 
 AUTHOR_IDENTITY_SCHEMA_VERSION = "provider_author_identity_v1"
+
+
+class ProviderCapabilityRegistry(Protocol):
+    def get(self, provider: str) -> Any: ...
+
+
+def freeze_provider_capabilities(
+    registry: ProviderCapabilityRegistry,
+) -> dict[str, dict[str, Any]] | None:
+    """Freeze provider capabilities into an immutable lifecycle command payload."""
+    adapter = registry.get("xiaohongshu")
+    capability_method = getattr(adapter, "capabilities", None)
+    if not callable(capability_method):
+        return None
+    capabilities = capability_method()
+    return {
+        "xiaohongshu": {
+            "adapter_version": type(adapter).__name__,
+            **{
+                item.operation: {
+                    "status": item.status,
+                    "fields": list(item.fields),
+                    **item.limits,
+                    "failure_retryability": item.failure_retryability,
+                }
+                for item in capabilities
+            },
+        }
+    }
 
 
 @dataclass(frozen=True)

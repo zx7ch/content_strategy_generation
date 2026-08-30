@@ -138,6 +138,7 @@ async def _worker_lifespan(application):
     application.state.llm_configuration_service = llm_configuration_service
     application.state.content_research_service = content_research_service
     application.state.content_research_query = content_research_service.query_interface
+    application.state.content_research_command = content_research_service.command_interface
     application.state.xhs_qr_login_session = xhs_qr_login_session
     application.state.xhs_credential_store = xhs_credential_store
     application.state.content_research_dispatch_worker = content_research_worker
