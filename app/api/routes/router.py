@@ -43,16 +43,22 @@ from app.content_research.api_schemas import (
     XHSManualCookieRequest,
     XHSQRLoginResponse,
 )
-from app.content_research.presearch.service import PresearchService
+from app.content_research.errors import (
+    ContentResearchNotFoundError,
+    ContentResearchStateConflictError,
+    ContentResearchValidationError,
+)
 from app.content_research.lifecycle.coordinator import (
     LifecycleCommandConflict,
     LifecyclePersistenceBusy,
 )
+from app.content_research.presearch.service import PresearchService
+from app.content_research.query import (
+    ContentResearchQuery,
+    ContentResearchQueryService,
+)
 from app.content_research.service import (
-    ContentResearchNotFoundError,
     ContentResearchService,
-    ContentResearchStateConflictError,
-    ContentResearchValidationError,
     WorkflowRunManagerRuntime,
 )
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
@@ -859,6 +865,17 @@ def _get_content_research_service(request: Request) -> ContentResearchService:
     )
 
 
+def _get_content_research_query(request: Request) -> ContentResearchQuery:
+    query = getattr(request.app.state, "content_research_query", None)
+    if query is not None and not isinstance(query, ContentResearchQueryService):
+        return query
+    service = _get_content_research_service(request)
+    if query is None or not query.is_for(service):
+        query = service.query_interface
+        request.app.state.content_research_query = query
+    return query
+
+
 def _get_llm_configuration_service(request: Request) -> LiteLLMConfigurationService:
     service = getattr(request.app.state, "llm_configuration_service", None)
     if service is None:
@@ -1098,9 +1115,9 @@ async def get_content_research_presearch(
     attempt_id: str,
     request: Request,
 ) -> ContentResearchPresearchResponse:
-    service = _get_content_research_service(request)
+    query = _get_content_research_query(request)
     try:
-        return service.get_presearch(attempt_id)
+        return query.get_presearch(attempt_id)
     except Exception as exc:  # noqa: BLE001
         raise _content_research_error(exc) from exc
 
@@ -1116,18 +1133,18 @@ async def get_content_research_workflow(
     workflow_run_id: str,
     request: Request,
 ) -> ContentResearchWorkflowSummaryResponse | ContentResearchHistoricalWorkflowSummaryResponse:
-    service = _get_content_research_service(request)
+    query = _get_content_research_query(request)
     try:
-        return await service.get_workflow_summary(workflow_run_id)
+        return await query.get_workflow_summary(workflow_run_id)
     except Exception as exc:  # noqa: BLE001
         raise _content_research_error(exc) from exc
 
 
 @app.get("/content-research/workflows/{workflow_run_id}/policy-snapshot")
 async def get_content_research_policy_snapshot(workflow_run_id: str, request: Request) -> dict[str, Any]:
-    service = _get_content_research_service(request)
+    query = _get_content_research_query(request)
     try:
-        return service.get_policy_snapshot(workflow_run_id)
+        return query.get_policy_snapshot(workflow_run_id)
     except Exception as exc:  # noqa: BLE001
         raise _content_research_error(exc) from exc
 
@@ -1140,9 +1157,9 @@ async def get_content_research_workflow_events(
     workflow_run_id: str,
     request: Request,
 ) -> ContentResearchWorkflowEventsResponse:
-    service = _get_content_research_service(request)
+    query = _get_content_research_query(request)
     try:
-        return await service.list_workflow_events(workflow_run_id)
+        return await query.list_workflow_events(workflow_run_id)
     except Exception as exc:  # noqa: BLE001
         raise _content_research_error(exc) from exc
 
@@ -1156,9 +1173,9 @@ async def get_content_research_scope_projection(
     request: Request,
     version: int | None = Query(default=None, ge=1),
 ) -> ContentResearchScopeProjectionResponse:
-    service = _get_content_research_service(request)
+    query = _get_content_research_query(request)
     try:
-        return await service.get_scope_projection(workflow_run_id, version=version)
+        return await query.get_scope_projection(workflow_run_id, version=version)
     except Exception as exc:  # noqa: BLE001
         raise _content_research_error(exc) from exc
 
@@ -1171,9 +1188,9 @@ async def get_content_research_workflow_trace(
     workflow_run_id: str,
     request: Request,
 ) -> ContentResearchTraceResponse:
-    service = _get_content_research_service(request)
+    query = _get_content_research_query(request)
     try:
-        return await service.get_workflow_trace(workflow_run_id)
+        return await query.get_workflow_trace(workflow_run_id)
     except Exception as exc:  # noqa: BLE001
         raise _content_research_error(exc) from exc
 
@@ -1228,9 +1245,9 @@ async def list_content_research_human_decisions(
     workflow_run_id: str,
     request: Request,
 ) -> HumanDecisionsResponse:
-    service = _get_content_research_service(request)
+    query = _get_content_research_query(request)
     try:
-        return service.list_human_decisions(workflow_run_id)
+        return query.list_human_decisions(workflow_run_id)
     except Exception as exc:  # noqa: BLE001
         raise _content_research_error(exc) from exc
 
@@ -1247,9 +1264,9 @@ async def get_content_research_lite_report(
     citation_group_ids: list[str] | None = Query(default=None),
 ) -> ContentResearchLiteReportResponse:
     """Read the Lite projection from frozen, materialized publication facts."""
-    service = _get_content_research_service(request)
+    query = _get_content_research_query(request)
     try:
-        return await service.get_lite_report(
+        return await query.get_lite_report(
             workflow_run_id=workflow_run_id,
             research_plan_id=research_plan_id,
             publication_id=publication_id,
@@ -1285,9 +1302,9 @@ async def get_content_research_direction_evidence(
     offset: int = Query(default=0, ge=0),
     limit: int = Query(default=50, ge=1, le=50),
 ) -> ContentResearchDirectionEvidenceResponse:
-    service = _get_content_research_service(request)
+    query = _get_content_research_query(request)
     try:
-        return service.get_direction_evidence(
+        return query.get_direction_evidence(
             workflow_run_id=workflow_run_id, direction_id=direction_id, offset=offset, limit=limit,
         )
     except Exception as exc:  # noqa: BLE001
@@ -1305,9 +1322,9 @@ async def get_content_research_governance(
     offset: int = Query(default=0, ge=0),
     limit: int = Query(default=50, ge=1, le=50),
 ) -> ContentResearchGovernanceResponse:
-    service = _get_content_research_service(request)
+    query = _get_content_research_query(request)
     try:
-        return service.get_governance_read_model(
+        return query.get_governance_read_model(
             workflow_run_id=workflow_run_id,
             research_plan_id=research_plan_id,
             offset=offset,

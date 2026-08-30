@@ -8,7 +8,7 @@ import sqlite3
 import unicodedata
 import uuid
 from collections.abc import Awaitable, Callable
-from dataclasses import asdict, replace
+from dataclasses import replace
 from typing import Any, Protocol
 
 import aiosqlite
@@ -27,16 +27,12 @@ from app.content_research.api_schemas import (
     CONTENT_RESEARCH_API_SCHEMA_VERSION,
     P0_WORKFLOW_ACTIONS,
     ContentResearchBriefConfirmationRequest,
-    ContentResearchBriefResponse,
     ContentResearchDirectionEvidenceResponse,
-    ContentResearchDirectionResponse,
     ContentResearchFormalResearchResponse,
     ContentResearchGovernanceResponse,
     ContentResearchHistoricalWorkflowSummaryResponse,
     ContentResearchLiteReportResponse,
-    ContentResearchPlanResponse,
     ContentResearchPresearchResponse,
-    ContentResearchRunProjectionResponse,
     ContentResearchScopeProjectionResponse,
     ContentResearchSourceCollectionRequest,
     ContentResearchSubagentTaskResponse,
@@ -58,12 +54,17 @@ from app.content_research.contracts import (
     DIRECTION_CATALOG_V1,
 )
 from app.content_research.decisions import ResearchDecisionService
+from app.content_research.errors import (
+    ContentResearchNotFoundError,
+    ContentResearchStateConflictError,
+    ContentResearchValidationError,
+    ReportPublicationMaterializationError,
+)
 from app.content_research.evidence import EvidenceService
 from app.content_research.evidence.governance_reader import (
     GovernanceReadModelReader,
     safe_public_projection,
 )
-from app.content_research.evidence.packet_reader import PacketEvidenceReader
 from app.content_research.execution_lease import (
     DispatchLeaseFencedWorkflowRunManager,
     LeaseFencedWorkflowRunManager,
@@ -115,18 +116,16 @@ from app.content_research.presearch.service import (
     PresearchOutcome,
     PresearchService,
 )
+from app.content_research.projections import run_projection_payload
+from app.content_research.query import ContentResearchQuery, ContentResearchQueryService
 from app.content_research.reporting.execution import ReportExecutionService
 from app.content_research.reporting.faithfulness import (
     LLMReportSemanticAuditor,
     ReportSemanticAuditor,
     UnavailableReportSemanticAuditor,
 )
-from app.content_research.reporting.lite_read_model import LiteReportReader
 from app.content_research.reporting.publication_materializer import ReportPublicationMaterializer
-from app.content_research.reporting.read_model import (
-    ExecutionTraceReader,
-    PublishedReportNotFoundError,
-)
+from app.content_research.reporting.read_model import ExecutionTraceReader
 from app.content_research.research_embedding import (
     ResearchEmbeddingRuntime,
     ResearchEmbeddingUnavailableError,
@@ -141,7 +140,6 @@ from app.content_research.scope_contract import (
     ResearchScopeDraft,
     ScopeAuditEvent,
     ScopeConstraint,
-    ScopeDraftAuditEvent,
     ScopeExecutionAttempt,
     ScopeExecutionAuthorization,
     ScopeExecutionContinuation,
@@ -149,6 +147,21 @@ from app.content_research.scope_contract import (
     ScopeQueryGroupInput,
     build_scope_contract,
     build_scope_draft,
+)
+from app.content_research.scope_projection import (
+    coverage_snapshot_payload as _coverage_snapshot_payload,
+)
+from app.content_research.scope_projection import (
+    scope_audit_payload as _scope_audit_payload,
+)
+from app.content_research.scope_projection import (
+    scope_contract_payload as _scope_contract_payload,
+)
+from app.content_research.scope_projection import (
+    scope_draft_payload as _scope_draft_payload,
+)
+from app.content_research.scope_projection import (
+    scope_execution_unit_projection as _scope_execution_unit_projection,
 )
 from app.content_research.sources import (
     SourceAdapterRegistry,
@@ -181,39 +194,6 @@ from app.memory.thread_store import ThreadStore
 from app.memory.workflow_store import WorkflowStore
 from app.services.llm.failures import LLMProviderFailure
 from app.services.workflow_run_manager import WorkflowRunManager
-
-
-class ContentResearchError(ValueError):
-    """Base error for Content Research service failures."""
-
-
-class ContentResearchNotFoundError(ContentResearchError):
-    """Raised when a requested Content Research object is missing."""
-
-
-class ContentResearchValidationError(ContentResearchError):
-    """Raised when a request payload is invalid."""
-
-
-class ContentResearchStateConflictError(ContentResearchValidationError):
-    """Raised when a valid action is unsafe for the current durable state."""
-
-    def __init__(self, message: str, *, error_code: str, suggested_action: str) -> None:
-        super().__init__(message)
-        self.error_code = error_code
-        self.suggested_action = suggested_action
-
-
-class ContentResearchReportIntegrityError(RuntimeError):
-    """Raised when an existing published report cannot be safely projected."""
-
-
-class ReportPublicationMaterializationError(RuntimeError):
-    """Carry the exact persisted publication across the materialization boundary."""
-
-    def __init__(self, publication_id: str, cause: Exception) -> None:
-        super().__init__(str(cause) or "Report publication failed.")
-        self.publication_id = publication_id
 
 
 class WorkflowRuntime(Protocol):
@@ -637,6 +617,16 @@ class ContentResearchService:
             if analysis_llm is not None
             else UnavailableReportSemanticAuditor()
         )
+        self._query_interface = ContentResearchQueryService(
+            self,
+            store=self._store,
+            lifecycle=self._lifecycle,
+            workflow_runtime=self._workflow_runtime,
+        )
+
+    @property
+    def query_interface(self) -> ContentResearchQuery:
+        return self._query_interface
 
     async def reconcile_startup(self) -> list[RunProjection]:
         """Converge lifecycle work interrupted by the previous process."""
@@ -1009,424 +999,27 @@ class ContentResearchService:
         task.add_done_callback(self._lifecycle_reconciliation_tasks.discard)
 
     def get_policy_snapshot(self, workflow_run_id: str) -> dict[str, Any]:
-        snapshot = self._store.get_run_policy_snapshot_for_workflow(workflow_run_id)
-        if snapshot is None:
-            raise ContentResearchNotFoundError(
-                f"Policy snapshot not found for workflow: {workflow_run_id}"
-            )
-        contracts = self._store.list_direction_contracts(snapshot.id)
-        policies = [self._store.get_sample_policy(item.sample_policy_id) for item in contracts]
-        return {
-            "schema_version": "content_research_policy_snapshot_response_v1",
-            "id": snapshot.id,
-            "workflow_run_id": snapshot.workflow_run_id,
-            "effective_policy": snapshot.effective_policy,
-            "effective_policy_hash": snapshot.effective_policy_hash,
-            "validation_result": snapshot.validation_result,
-            "run_as_of_at": snapshot.run_as_of_at.isoformat(),
-            "sample_policies": [asdict(item) for item in policies if item is not None],
-            "direction_contracts": [asdict(item) for item in contracts],
-        }
+        return self._query_interface.get_policy_snapshot(workflow_run_id)
 
     async def get_workflow_summary(
         self, workflow_run_id: str
     ) -> ContentResearchWorkflowSummaryResponse | ContentResearchHistoricalWorkflowSummaryResponse:
-        brief = self._store.get_brief_by_workflow(workflow_run_id)
-        plans = self._store.list_plans_for_brief(brief.id) if brief is not None else []
-        plan = plans[-1] if plans else None
-        directions = self._store.list_directions_for_plan(plan.id) if plan else []
-        tasks = self._store.list_subagent_tasks_for_workflow(workflow_run_id)
-        runtime_snapshot = await self._workflow_runtime.get_runtime_snapshot(workflow_run_id)
-        try:
-            run_projection = await self._lifecycle.load(workflow_run_id)
-        except ValueError as exc:
-            if "historical workflow run" not in str(exc):
-                raise
-            if brief is None:
-                raise ContentResearchNotFoundError(
-                    f"Content research workflow not found: {workflow_run_id}"
-                ) from exc
-            historical = await self._lifecycle.load_historical_read_only(workflow_run_id)
-            return ContentResearchHistoricalWorkflowSummaryResponse(
-                workflow_run_id=workflow_run_id,
-                historical_run=historical,
-                brief=ContentResearchBriefResponse(
-                    id=brief.id,
-                    workflow_run_id=brief.workflow_run_id,
-                    thread_id=brief.thread_id,
-                    status=brief.status,
-                    payload=brief.payload,
-                ),
-                plan=(
-                    ContentResearchPlanResponse(
-                        id=plan.id,
-                        brief_id=plan.brief_id,
-                        workflow_run_id=plan.workflow_run_id,
-                        status=plan.status,
-                        payload=plan.payload,
-                    )
-                    if plan
-                    else None
-                ),
-                directions=[
-                    ContentResearchDirectionResponse(
-                        id=item.id,
-                        name=str(item.payload.get("name") or item.id),
-                        direction_type=str(item.payload.get("direction_type") or ""),
-                        priority=item.priority,
-                        status=item.status,
-                        payload=item.payload,
-                    )
-                    for item in directions
-                ],
-                subagent_tasks=[
-                    ContentResearchSubagentTaskResponse(
-                        id=item.id,
-                        plan_id=item.plan_id,
-                        direction_id=item.direction_id,
-                        status=item.status,
-                        payload=item.payload,
-                    )
-                    for item in tasks
-                ],
-                runtime_run=runtime_snapshot.get("run"),
-                runtime_steps=list(runtime_snapshot.get("steps") or []),
-                runtime_child_tasks=list(runtime_snapshot.get("child_tasks") or []),
-            )
-        if (
-            run_projection.state is ContentResearchState.REPORT_READY
-            and self._publication_repair_available(workflow_run_id)
-        ):
-            run_projection = replace(run_projection, allowed_actions=("repair_publication",))
-        return ContentResearchWorkflowSummaryResponse(
-            workflow_run_id=workflow_run_id,
-            run=self._run_projection_payload(run_projection),
-            brief=(
-                ContentResearchBriefResponse(
-                    id=brief.id,
-                    workflow_run_id=brief.workflow_run_id,
-                    thread_id=brief.thread_id,
-                    status=brief.status,
-                    payload=brief.payload,
-                )
-                if brief is not None
-                else None
-            ),
-            plan=(
-                ContentResearchPlanResponse(
-                    id=plan.id,
-                    brief_id=plan.brief_id,
-                    workflow_run_id=plan.workflow_run_id,
-                    status=plan.status,
-                    payload=plan.payload,
-                )
-                if plan
-                else None
-            ),
-            directions=[
-                ContentResearchDirectionResponse(
-                    id=item.id,
-                    name=str(
-                        item.payload.get("name") or item.payload.get("direction_id") or item.id
-                    ),
-                    direction_type=str(item.payload.get("direction_type") or ""),
-                    priority=item.priority,
-                    status=item.status,
-                    payload=item.payload,
-                )
-                for item in directions
-            ],
-            subagent_tasks=[
-                ContentResearchSubagentTaskResponse(
-                    id=item.id,
-                    plan_id=item.plan_id,
-                    direction_id=item.direction_id,
-                    status=item.status,
-                    payload=item.payload,
-                )
-                for item in tasks
-            ],
-            runtime_run=runtime_snapshot.get("run"),
-            runtime_steps=list(runtime_snapshot.get("steps") or []),
-            runtime_child_tasks=list(runtime_snapshot.get("child_tasks") or []),
-            local_cache_id=brief.id if brief is not None else None,
-        )
-
-    def _publication_repair_available(self, workflow_run_id: str) -> bool:
-        publications = sorted(
-            (
-                item
-                for item in self._store.list_typed_records(ReportPublicationRecord)
-                if item.workflow_run_id == workflow_run_id
-            ),
-            key=lambda item: (item.created_at, item.id),
-            reverse=True,
-        )
-        if not publications:
-            return False
-        events = self._store.list_report_integrity_events(publications[0].id)
-        return bool(events and events[-1].reason_code == "materialized_artifact_invalid")
+        return await self._query_interface.get_workflow_summary(workflow_run_id)
 
     async def list_workflow_events(
         self, workflow_run_id: str
     ) -> ContentResearchWorkflowEventsResponse:
-        brief = self._store.get_brief_by_workflow(workflow_run_id)
-        if brief is None:
-            raise ContentResearchNotFoundError(
-                f"Content research workflow not found: {workflow_run_id}"
-            )
-        return ContentResearchWorkflowEventsResponse(
-            workflow_run_id=workflow_run_id,
-            events=await self._workflow_runtime.list_events(workflow_run_id),
-        )
+        return await self._query_interface.list_workflow_events(workflow_run_id)
 
     async def get_scope_projection(
         self, workflow_run_id: str, *, version: int | None = None
     ) -> ContentResearchScopeProjectionResponse:
-        run_projection = await self._lifecycle.load(workflow_run_id)
-        brief = self._store.get_brief_by_workflow(workflow_run_id)
-        if brief is None:
-            raise ContentResearchNotFoundError(
-                f"Content research workflow not found: {workflow_run_id}"
-            )
-        draft = self._store.get_latest_scope_draft(workflow_run_id)
-        if draft is None:
-            raise ContentResearchNotFoundError(
-                f"Scope draft not found for workflow: {workflow_run_id}"
-            )
-        contracts = self._store.list_scope_contracts(workflow_run_id)
-        contract = (
-            None
-            if not contracts
-            else contracts[-1]
-            if version is None
-            else self._store.get_scope_contract(workflow_run_id, version=version)
-        )
-        if contract is None and contracts:
-            requested = str(version) if version is not None else "latest"
-            raise ContentResearchNotFoundError(
-                f"Scope contract version {requested} not found for workflow: {workflow_run_id}"
-            )
-
-        audit_events = [
-            _scope_draft_audit_payload(event)
-            for event in self._store.list_scope_draft_audit_events(
-                workflow_run_id, scope_draft_id=draft.id
-            )
-        ]
-        if contract is not None:
-            audit_events.extend(
-                _scope_audit_payload(event)
-                for event in self._store.list_scope_audit_events(
-                    workflow_run_id, version=contract.version
-                )
-            )
-        authorizations = self._store.list_scope_execution_authorizations(workflow_run_id)
-        current_authorization = max(
-            (
-                item
-                for item in authorizations
-                if contract is not None
-                and item.scope_contract_id == contract.id
-                and item.scope_contract_version == contract.version
-            ),
-            key=lambda item: (item.execution_revision, item.created_at, item.id),
-            default=None,
-        )
-        coverage_snapshot = (
-            self._store.get_coverage_snapshot(
-                workflow_run_id,
-                version=contract.version,
-                execution_revision=current_authorization.execution_revision,
-            )
-            if current_authorization is not None and contract is not None
-            else None
-        )
-        if (
-            coverage_snapshot is not None
-            and coverage_snapshot.execution_authorization_id != current_authorization.id
-        ):
-            coverage_snapshot = None
-        if current_authorization is None and contract is not None:
-            coverage_snapshot = self._store.get_coverage_snapshot(
-                workflow_run_id,
-                version=contract.version,
-                execution_revision=1,
-            )
-            if (
-                coverage_snapshot is not None
-                and coverage_snapshot.execution_authorization_id is not None
-            ):
-                coverage_snapshot = None
-        allowed_actions = (
-            [
-                {
-                    "action": "replace_scope_draft",
-                    "available": True,
-                    "scope_draft_id": draft.id,
-                    "query_groups": [
-                        _scope_query_input_payload(item) for item in draft.query_groups
-                    ],
-                }
-            ]
-            if run_projection.state is ContentResearchState.SCOPE_CONFIRMATION_REQUIRED
-            and "replace_scope_draft" in run_projection.allowed_actions
-            else []
-        )
-        allowed_resolutions = (
-            _scope_projection_resolutions(
-                contract=contract,
-                coverage_snapshot=coverage_snapshot,
-                authorizations=authorizations,
-            )
-            if run_projection.state is ContentResearchState.COVERAGE_DECISION_REQUIRED
-            else []
-        )
-        execution_unit = (
-            self._store.get_scope_execution_unit(current_authorization.execution_unit_id)
-            if current_authorization is not None
-            and current_authorization.execution_unit_id is not None
-            else None
-        )
-        execution_facts = (
-            self._store.execution_trace(execution_unit.id) if execution_unit is not None else []
-        )
-        return ContentResearchScopeProjectionResponse(
-            workflow_run_id=workflow_run_id,
-            state=run_projection.state.value,
-            state_revision=run_projection.state_revision,
-            subject_structure_analysis_state=str(
-                brief.payload.get("subject_structure_analysis_state") or "unresolved"
-            ),
-            subject_structure_analysis_reason_codes=tuple(
-                brief.payload.get("subject_structure_analysis_reason_codes") or ()
-            ),
-            run=ContentResearchRunProjectionResponse(
-                **self._run_projection_payload(run_projection)
-            ),
-            draft=_scope_draft_payload(draft),
-            scope_contract=_scope_contract_payload(contract) if contract is not None else None,
-            audit_events=sorted(
-                (safe_public_projection(event) for event in audit_events),
-                key=lambda event: (str(event["created_at"]), str(event["id"])),
-            ),
-            allowed_actions=allowed_actions,
-            coverage_snapshot=(
-                _coverage_snapshot_payload(coverage_snapshot)
-                if coverage_snapshot is not None
-                else None
-            ),
-            allowed_resolutions=allowed_resolutions,
-            decision_recovery=_scope_decision_recovery(
-                coverage_snapshot=coverage_snapshot,
-                authorizations=authorizations,
-                allowed_resolutions=allowed_resolutions,
-            )
-            if run_projection.state is ContentResearchState.COVERAGE_DECISION_REQUIRED
-            else None,
-            execution_unit=_scope_execution_unit_projection(
-                execution_unit=execution_unit,
-                authorization=current_authorization,
-                audit_events=audit_events,
-                execution_facts=execution_facts,
-            ),
+        return await self._query_interface.get_scope_projection(
+            workflow_run_id, version=version
         )
 
     async def get_workflow_trace(self, workflow_run_id: str) -> ContentResearchTraceResponse:
-        try:
-            return await self._lifecycle.load_trace_snapshot(
-                workflow_run_id,
-                lambda connection, run, transitions: self._get_workflow_trace_from_transaction(
-                    workflow_run_id=workflow_run_id,
-                    connection=connection,
-                    run=run,
-                    transitions=transitions,
-                ),
-            )
-        except LifecycleCommandConflict as exc:
-            if str(exc) != "Run does not exist":
-                raise
-            raise ContentResearchNotFoundError(
-                f"Content research workflow not found: {workflow_run_id}"
-            ) from exc
-
-    async def _get_workflow_trace_from_transaction(
-        self,
-        *,
-        workflow_run_id: str,
-        connection: sqlite3.Connection,
-        run: RunProjection,
-        transitions: list[dict[str, Any]],
-    ) -> ContentResearchTraceResponse:
-        snapshot_store = SQLiteContentResearchStore.for_read_transaction(
-            self._store._db_path, connection
-        )
-        brief = snapshot_store.get_brief_by_workflow(workflow_run_id)
-        trace = await ContentResearchTraceService(
-            store=snapshot_store,
-            db_path=self._store._db_path,
-            read_transaction_connection=connection,
-        ).build_trace(
-            workflow_run_id=workflow_run_id,
-            brief=brief,
-            current_publication_id=run.publication_id,
-        )
-        stage_by_state = {
-            ContentResearchState.PRESEARCH_RUNNING: "presearch",
-            ContentResearchState.BRIEF_CONFIRMATION_REQUIRED: "brief_confirmation",
-            ContentResearchState.SCOPE_CONFIRMATION_REQUIRED: "scope_confirmation",
-            ContentResearchState.RETRIEVAL_QUEUED: "retrieval",
-            ContentResearchState.RETRIEVAL_RUNNING: "retrieval",
-            ContentResearchState.COVERAGE_EVALUATING: "coverage",
-            ContentResearchState.COVERAGE_DECISION_REQUIRED: "coverage",
-            ContentResearchState.REPORT_COMPOSING: "report",
-            ContentResearchState.REPORT_READY: "report",
-            ContentResearchState.RECOVERY_REQUIRED: str(
-                (run.error or {}).get("stage") or "recovery"
-            ),
-            ContentResearchState.CANCELLED_OR_FAILED: "terminal",
-        }
-        if (
-            run.state is ContentResearchState.REPORT_COMPOSING
-            and trace.effective_attempt is not None
-            and trace.effective_attempt.get("state") != "succeeded"
-        ):
-            stage_by_state[ContentResearchState.REPORT_COMPOSING] = "marketing_analysis"
-        status_by_state = {
-            ContentResearchState.BRIEF_CONFIRMATION_REQUIRED: "waiting_user",
-            ContentResearchState.SCOPE_CONFIRMATION_REQUIRED: "waiting_user",
-            ContentResearchState.COVERAGE_DECISION_REQUIRED: "waiting_user",
-            ContentResearchState.RECOVERY_REQUIRED: "waiting_user",
-            ContentResearchState.REPORT_READY: "succeeded",
-            ContentResearchState.CANCELLED_OR_FAILED: "failed",
-        }
-        run_status = status_by_state.get(run.state, "running")
-        safe_error = dict(run.error or {})
-        return trace.model_copy(
-            update={
-                "state": run.state.value,
-                "state_revision": run.state_revision,
-                "state_transitions": transitions,
-                "thread_id": run.thread_id,
-                "current_stage": stage_by_state[run.state],
-                "run_status": run_status,
-                "recoverable": (
-                    run.state is ContentResearchState.RECOVERY_REQUIRED
-                    and bool(safe_error.get("retryable"))
-                ),
-                "llm_recovery": (
-                    {
-                        "required": True,
-                        "error_code": safe_error.get("code"),
-                        "recovery_action": safe_error.get("recovery_action"),
-                        "message": safe_error.get("message"),
-                    }
-                    if run.state is ContentResearchState.RECOVERY_REQUIRED
-                    and safe_error.get("stage") == "presearch"
-                    else {}
-                ),
-            }
-        )
+        return await self._query_interface.get_workflow_trace(workflow_run_id)
 
     async def submit_brand_decision(
         self,
@@ -1608,26 +1201,12 @@ class ContentResearchService:
         publication_id: str | None = None,
         citation_group_ids: list[str] | None = None,
     ) -> ContentResearchLiteReportResponse:
-        try:
-            payload = await LiteReportReader(self._store, self._store._db_path).read(
-                workflow_run_id=workflow_run_id,
-                research_plan_id=research_plan_id,
-                publication_id=publication_id,
-                citation_group_ids=citation_group_ids,
-            )
-        except PublishedReportNotFoundError as exc:
-            message = str(exc)
-            if message in {
-                "published report not found",
-                "published report artifact is missing",
-                "published report is not ready",
-                "report scope decision is pending",
-            } or message.startswith(
-                ("requested citation groups are absent", "report scope decision is pending")
-            ):
-                raise ContentResearchNotFoundError(message) from exc
-            raise ContentResearchReportIntegrityError(message) from exc
-        return ContentResearchLiteReportResponse(**payload)
+        return await self._query_interface.get_lite_report(
+            workflow_run_id=workflow_run_id,
+            research_plan_id=research_plan_id,
+            publication_id=publication_id,
+            citation_group_ids=citation_group_ids,
+        )
 
     async def replay_downstream_from_persisted_packets(
         self, replay_input: PersistedPacketReplayInput
@@ -2137,52 +1716,11 @@ class ContentResearchService:
         offset: int = 0,
         limit: int = 50,
     ) -> ContentResearchGovernanceResponse:
-        """Return the sole public read model for cross-direction governance."""
-        brief = self._store.get_brief_by_workflow(workflow_run_id)
-        if brief is None:
-            raise ContentResearchNotFoundError(
-                f"Content research workflow not found: {workflow_run_id}"
-            )
-        plans = self._store.list_plans_for_brief(brief.id)
-        if not plans:
-            raise ContentResearchNotFoundError(
-                f"Content research plan not found for workflow: {workflow_run_id}"
-            )
-        plan_id = research_plan_id or plans[-1].id
-        if not any(item.id == plan_id for item in plans):
-            raise ContentResearchNotFoundError(
-                f"Content research plan not found for workflow: {plan_id}"
-            )
-        policy = self._store.get_run_policy_snapshot_for_workflow(workflow_run_id)
-        if policy is None:
-            raise ContentResearchValidationError(
-                "Governance read model requires a frozen policy snapshot"
-            )
-        try:
-            read = GovernanceReadModelReader(self._store).read(
-                workflow_run_id=workflow_run_id,
-                research_plan_id=plan_id,
-                offset=offset,
-                limit=limit,
-            )
-        except ValueError as exc:
-            raise ContentResearchValidationError(str(exc)) from exc
-        return ContentResearchGovernanceResponse(
-            workflow_run_id=read.workflow_run_id,
-            research_plan_id=read.research_plan_id,
-            governed_snapshot_identity={
-                "schema_version": "content_research_governed_snapshot_v2",
-                "workflow_run_id": workflow_run_id,
-                "research_plan_id": read.research_plan_id,
-                "policy_snapshot_id": policy.id,
-                "effective_policy_hash": policy.effective_policy_hash,
-            },
-            cross_direction_records=read.cross_direction_records,
-            aggregate_claims=read.aggregate_claims,
-            cross_direction_total=read.cross_direction_total,
-            aggregate_total=read.aggregate_total,
-            offset=read.offset,
-            limit=read.limit,
+        return self._query_interface.get_governance_read_model(
+            workflow_run_id=workflow_run_id,
+            research_plan_id=research_plan_id,
+            offset=offset,
+            limit=limit,
         )
 
     def get_direction_evidence(
@@ -2193,167 +1731,9 @@ class ContentResearchService:
         offset: int = 0,
         limit: int = 50,
     ) -> ContentResearchDirectionEvidenceResponse:
-        """Expose the persisted direction read model without provider raw data."""
-        brief = self._store.get_brief_by_workflow(workflow_run_id)
-        if brief is None:
-            raise ContentResearchNotFoundError(
-                f"Content research workflow not found: {workflow_run_id}"
-            )
-        if offset < 0 or not 1 <= limit <= 50:
-            raise ContentResearchValidationError(
-                "offset must be non-negative and limit must be 1..50"
-            )
-        plan = self._store.list_plans_for_brief(brief.id)
-        direction_records = self._store.list_directions_for_plan(plan[-1].id) if plan else []
-        known_directions = {
-            value
-            for item in direction_records
-            for value in (
-                str(item.payload.get("direction_id") or ""),
-                str(item.payload.get("direction_type") or ""),
-            )
-            if value
-        }
-        if direction_id not in known_directions:
-            raise ContentResearchNotFoundError(
-                f"Content research direction not found: {direction_id}"
-            )
-
-        packet_read = PacketEvidenceReader(self._store).read_direction(
+        return self._query_interface.get_direction_evidence(
             workflow_run_id=workflow_run_id,
             direction_id=direction_id,
-            offset=offset,
-            limit=limit,
-        )
-        checkpoints = packet_read.checkpoints
-        collect = next(
-            (item for item in reversed(checkpoints) if item.stage_name == "collect"), None
-        )
-        selection_checkpoint = next(
-            (item for item in reversed(checkpoints) if item.stage_name == "selection"), None
-        )
-        detail_checkpoint = next(
-            (item for item in reversed(checkpoints) if item.stage_name == "detail"), None
-        )
-        packet_checkpoint = next(
-            (item for item in reversed(checkpoints) if item.stage_name == "packet"), None
-        )
-        comment_checkpoint = next(
-            (item for item in reversed(checkpoints) if item.stage_name == "comments"), None
-        )
-        selection_revisions = [
-            item
-            for item in checkpoints
-            if item.stage_name == "selection_revision"
-            and item.payload.get("base_selection_fingerprint")
-            == (selection_checkpoint.input_fingerprint if selection_checkpoint else None)
-        ]
-        # Detail collection can invalidate an initially complete selection:
-        # a selected search card only becomes usable after its required detail
-        # fields are collected.  The final detail checkpoint is therefore the
-        # authoritative selection state for counts, coverage and status.
-        selection = (
-            (detail_checkpoint.payload.get("selection") if detail_checkpoint else None)
-            or (selection_checkpoint.payload.get("selection") if selection_checkpoint else {})
-            or {}
-        )
-        decisions = list(selection.get("decisions") or [])
-        candidates = list((collect.payload.get("candidates") if collect else []) or [])
-        packets = packet_read.packets
-        projections = packet_read.projections
-        selected = [item for item in decisions if item.get("selected")]
-        excluded = [item for item in decisions if not item.get("selected")]
-        packet_views = [
-            _safe_read_model(
-                {
-                    "packet_id": item.id,
-                    "canonical_source_id": item.canonical_source_id,
-                    **item.payload,
-                }
-            )
-            for item in packets
-        ]
-        projection_by_packet = {item.evidence_packet_id: item for item in projections}
-        for packet in packet_views:
-            projection = projection_by_packet.get(packet["packet_id"])
-            if projection:
-                packet["selection"] = _safe_read_model(projection.payload)
-        candidate_ids = {
-            item.id for item in self._store.list_claim_candidates(workflow_run_id, direction_id)
-        }
-        admission_ids = {
-            item.id
-            for item in self._store.list_typed_records(ClaimAdmissionDecisionRecord)
-            if item.claim_candidate_id in candidate_ids
-        }
-        snapshot = self._store.get_run_policy_snapshot_for_workflow(workflow_run_id)
-        direction_result = next(
-            (
-                item.payload
-                for item in reversed(self._store.list_typed_records(DirectionResultDecisionRecord))
-                if item.research_direction_id == direction_id
-                and snapshot is not None
-                and item.policy_snapshot_id == snapshot.id
-            ),
-            {},
-        )
-        weak_signals = [
-            item.payload
-            for item in self._store.list_typed_records(WeakSignalRecord)
-            if item.admission_decision_id in admission_ids
-        ]
-        return ContentResearchDirectionEvidenceResponse(
-            workflow_run_id=workflow_run_id,
-            direction_id=direction_id,
-            status=str(
-                (packet_checkpoint.payload.get("status") if packet_checkpoint else None)
-                or selection.get("status")
-                or "not_started"
-            ),
-            counts={
-                "selected_source_count": int(selection.get("selected_source_count") or 0),
-                "eligible_source_count": int(selection.get("eligible_source_count") or 0),
-                "independent_source_count": self._store.count_run_independent_sources(
-                    workflow_run_id
-                ),
-            },
-            query_plan_hash=selection.get("query_plan_hash"),
-            candidate_manifest_hash=selection.get("candidate_manifest_hash"),
-            query_groups=list((collect.payload.get("query_groups") if collect else []) or []),
-            selection_policy=dict(
-                (
-                    selection_checkpoint.payload.get("selection_policy")
-                    if selection_checkpoint
-                    else collect.payload.get("selection_policy")
-                    if collect
-                    else {}
-                )
-                or {}
-            ),
-            coverage_unmet_query_group_ids=list(
-                selection.get("coverage_unmet_query_group_ids") or []
-            ),
-            selection_revisions=[
-                _safe_read_model(
-                    {key: value for key, value in item.payload.items() if key != "candidates"}
-                )
-                for item in selection_revisions
-            ],
-            comment_collection=_safe_read_model(
-                {
-                    key: value
-                    for key, value in (
-                        comment_checkpoint.payload if comment_checkpoint else {}
-                    ).items()
-                    if key != "packet_ids"
-                }
-            ),
-            candidates=[_safe_read_model(item) for item in candidates[offset : offset + limit]],
-            selections=[_safe_read_model(item) for item in selected[offset : offset + limit]],
-            exclusions=[_safe_read_model(item) for item in excluded[offset : offset + limit]],
-            packets=packet_views,
-            direction_result=direction_result,
-            weak_signals=weak_signals,
             offset=offset,
             limit=limit,
         )
@@ -5470,21 +4850,7 @@ class ContentResearchService:
 
     @staticmethod
     def _run_projection_payload(run_projection: RunProjection) -> dict[str, Any]:
-        return {
-            "run_id": run_projection.run_id,
-            "thread_id": run_projection.thread_id,
-            "state": run_projection.state.value,
-            "state_revision": run_projection.state_revision,
-            "entered_at": run_projection.entered_at,
-            "allowed_actions": list(run_projection.allowed_actions),
-            "reason_code": run_projection.reason_code,
-            "error": dict(run_projection.error) if run_projection.error else None,
-            "brief_id": run_projection.brief_id,
-            "scope_contract_id": run_projection.scope_contract_id,
-            "execution_attempt_id": run_projection.execution_attempt_id,
-            "coverage_snapshot_id": run_projection.coverage_snapshot_id,
-            "publication_id": run_projection.publication_id,
-        }
+        return run_projection_payload(run_projection)
 
 
 def _new_id(prefix: str) -> str:
@@ -5553,24 +4919,6 @@ def _freeze_adapter_capabilities(
             },
         }
     }
-
-
-def _safe_read_model(value: Any) -> Any:
-    """Defence in depth for a public evidence view.
-
-    Packet construction already omits provider raw data; this additionally
-    prevents a future metadata field from leaking a token or raw response.
-    """
-    forbidden = {"raw_payload", "access_token", "token", "cookie", "cookies", "authorization"}
-    if isinstance(value, dict):
-        return {
-            key: _safe_read_model(item)
-            for key, item in value.items()
-            if key.lower() not in forbidden
-        }
-    if isinstance(value, list):
-        return [_safe_read_model(item) for item in value]
-    return value
 
 
 def _citation_groups(claim_cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -5784,278 +5132,6 @@ def _governed_input_fingerprint(governed: dict[str, Any]) -> str:
 
 def _is_season_context(value: str) -> bool:
     return any(marker in value for marker in ("春", "夏", "秋", "冬", "季"))
-
-
-def _scope_constraint_payload(item: ScopeConstraint) -> dict[str, Any]:
-    return {
-        "id": item.id,
-        "label": item.label,
-        "value": item.value,
-        "mode": item.mode,
-        "allowed_aliases": list(item.allowed_aliases),
-    }
-
-
-def _scope_query_input_payload(item: ScopeQueryGroupInput) -> dict[str, Any]:
-    return {
-        "suggested_query": item.suggested_query,
-        "final_query": item.final_query,
-        "targeted_required_terms": list(item.targeted_required_terms),
-        "origin": item.origin,
-    }
-
-
-def _scope_query_group_payload(item: Any) -> dict[str, Any]:
-    return {
-        "id": item.id,
-        "suggested_query": item.suggested_query,
-        "final_query": item.final_query,
-        "origin": item.origin,
-        "execution_role": item.execution_role,
-    }
-
-
-def _scope_draft_payload(draft: ResearchScopeDraft) -> dict[str, Any]:
-    return {
-        "schema_version": draft.schema_version,
-        "id": draft.id,
-        "workflow_run_id": draft.workflow_run_id,
-        "research_plan_id": draft.research_plan_id,
-        "structure_hash": draft.structure_hash,
-        "core_object": draft.core_object,
-        "product_experience_aspect": draft.product_experience_aspect,
-        "context_audience_aspect": draft.context_audience_aspect,
-        "constraints": [_scope_constraint_payload(item) for item in draft.constraints],
-        "query_groups": [_scope_query_input_payload(item) for item in draft.query_groups],
-        "created_at": draft.created_at.isoformat(),
-    }
-
-
-def _scope_draft_audit_payload(event: ScopeDraftAuditEvent) -> dict[str, Any]:
-    return {
-        "id": event.id,
-        "workflow_run_id": event.workflow_run_id,
-        "scope_draft_id": event.scope_draft_id,
-        "event_name": event.event_name,
-        "payload": event.payload,
-        "created_at": event.created_at.isoformat(),
-    }
-
-
-def _scope_contract_payload(contract: Any) -> dict[str, Any]:
-    return {
-        "id": contract.id,
-        "workflow_run_id": contract.workflow_run_id,
-        "research_plan_id": contract.research_plan_id,
-        "version": contract.version,
-        "schema_version": contract.schema_version,
-        "constraints": [_scope_constraint_payload(item) for item in contract.constraints],
-        "query_groups": [_scope_query_group_payload(item) for item in contract.query_groups],
-        "created_at": contract.created_at.isoformat(),
-    }
-
-
-def _scope_audit_payload(event: ScopeAuditEvent) -> dict[str, Any]:
-    return {
-        "id": event.id,
-        "workflow_run_id": event.workflow_run_id,
-        "scope_contract_id": event.scope_contract_id,
-        "scope_contract_version": event.scope_contract_version,
-        "event_name": event.event_name,
-        "payload": event.payload,
-        "created_at": event.created_at.isoformat(),
-    }
-
-
-def _scope_execution_authorization_payload(
-    authorization: ScopeExecutionAuthorization,
-) -> dict[str, Any]:
-    return {
-        "id": authorization.id,
-        "execution_unit_id": authorization.execution_unit_id,
-        "workflow_run_id": authorization.workflow_run_id,
-        "scope_contract_id": authorization.scope_contract_id,
-        "scope_contract_version": authorization.scope_contract_version,
-        "coverage_snapshot_id": authorization.coverage_snapshot_id,
-        "resolution": authorization.resolution,
-        "execution_revision": authorization.execution_revision,
-        "state": authorization.state,
-        "created_at": authorization.created_at.isoformat(),
-    }
-
-
-def _scope_execution_unit_projection(
-    *,
-    execution_unit: ScopeExecutionUnit | None,
-    authorization: ScopeExecutionAuthorization | None,
-    audit_events: list[dict[str, Any]],
-    execution_facts: list[Any],
-) -> dict[str, Any] | None:
-    """Expose recovery authority without leaking an attempt lease to Creator."""
-    if execution_unit is None or authorization is None:
-        return None
-    latest_attempt_no = max(
-        (int(fact.attempt_no) for fact in execution_facts),
-        default=0,
-    )
-    replay_actions: list[dict[str, Any]] = []
-    if (
-        execution_unit.state == "failed"
-        and execution_unit.recovery_state == "replayable"
-        and execution_unit.latest_provider_state == "retryable_failed"
-    ):
-        resolution_event = next(
-            (
-                event
-                for event in reversed(audit_events)
-                if event.get("event_name") == "coverage_resolved"
-                and str((event.get("payload") or {}).get("coverage_snapshot_id") or "")
-                == execution_unit.coverage_snapshot_id
-                and str((event.get("payload") or {}).get("resolution") or "")
-                == execution_unit.resolution
-            ),
-            None,
-        )
-        payload = dict((resolution_event or {}).get("payload") or {})
-        replay_request: dict[str, Any] = {
-            "scope_contract_version": int(
-                payload.get("source_scope_contract_version") or authorization.scope_contract_version
-            ),
-            "coverage_snapshot_id": execution_unit.coverage_snapshot_id,
-            "resolution": execution_unit.resolution,
-        }
-        constraint_id = str(payload.get("constraint_id") or "")
-        if constraint_id:
-            replay_request["constraint_id"] = constraint_id
-        supplementary_queries = [
-            str(query) for query in payload.get("supplementary_queries") or [] if str(query).strip()
-        ]
-        if supplementary_queries:
-            replay_request["supplementary_queries"] = supplementary_queries
-        replay_actions.append(
-            {
-                "action": "replay_coverage_decision",
-                "available": True,
-                "request": replay_request,
-            }
-        )
-    return {
-        "id": execution_unit.id,
-        "state": execution_unit.state,
-        "attempt_no": latest_attempt_no,
-        "recovery_state": execution_unit.recovery_state,
-        "allowed_actions": replay_actions,
-        "trace_summary": {
-            "fact_count": len(execution_facts),
-            "attempt_count": len({int(fact.attempt_no) for fact in execution_facts}),
-            "last_fact_kind": execution_facts[-1].kind if execution_facts else None,
-        },
-    }
-
-
-def _coverage_snapshot_payload(snapshot: Any) -> dict[str, Any]:
-    return {
-        "id": snapshot.id,
-        "workflow_run_id": snapshot.workflow_run_id,
-        "scope_contract_id": snapshot.scope_contract_id,
-        "scope_contract_version": snapshot.scope_contract_version,
-        "execution_revision": snapshot.execution_revision,
-        "source_coverage_snapshot_id": snapshot.source_coverage_snapshot_id,
-        "state": snapshot.state,
-        "constraint_counts": snapshot.constraint_counts,
-        "unmet_constraint_ids": list(snapshot.unmet_constraint_ids),
-        "created_at": snapshot.created_at.isoformat(),
-    }
-
-
-def _scope_projection_resolutions(
-    *,
-    contract: Any | None,
-    coverage_snapshot: Any | None,
-    authorizations: list[ScopeExecutionAuthorization],
-) -> list[dict[str, Any]]:
-    if contract is None or coverage_snapshot is None:
-        return []
-    authorized = any(item.coverage_snapshot_id == coverage_snapshot.id for item in authorizations)
-    valid_constraint_ids = [
-        item.id
-        for item in contract.constraints
-        if item.id in coverage_snapshot.unmet_constraint_ids and item.mode == "required"
-    ]
-    decision_open = coverage_snapshot.state == "awaiting_scope_decision" and not authorized
-    no_required_constraint_reason = "no_unmet_required_constraints"
-    closed_reason = (
-        "coverage_resolution_already_authorized"
-        if authorized
-        else "coverage_resolution_not_required"
-    )
-    return [
-        {
-            "action": "expand_required_constraint",
-            "available": decision_open and bool(valid_constraint_ids),
-            "valid_constraint_ids": valid_constraint_ids if decision_open else [],
-            "supplementary_queries_required": True,
-            "unavailable_reason": (
-                None
-                if decision_open and valid_constraint_ids
-                else no_required_constraint_reason
-                if decision_open
-                else closed_reason
-            ),
-        },
-        {
-            "action": "generate_limited_report",
-            "available": decision_open,
-            "valid_constraint_ids": [],
-            "supplementary_queries_required": False,
-            "unavailable_reason": None if decision_open else closed_reason,
-        },
-        {
-            "action": "relax_constraint",
-            "available": decision_open and bool(valid_constraint_ids),
-            "valid_constraint_ids": valid_constraint_ids if decision_open else [],
-            "supplementary_queries_required": False,
-            "unavailable_reason": (
-                None
-                if decision_open and valid_constraint_ids
-                else no_required_constraint_reason
-                if decision_open
-                else closed_reason
-            ),
-        },
-    ]
-
-
-def _scope_decision_recovery(
-    *,
-    coverage_snapshot: Any | None,
-    authorizations: list[ScopeExecutionAuthorization],
-    allowed_resolutions: list[dict[str, Any]],
-) -> dict[str, Any] | None:
-    if coverage_snapshot is None:
-        return None
-    authorization = next(
-        (
-            item
-            for item in sorted(
-                authorizations,
-                key=lambda value: (value.execution_revision, value.created_at, value.id),
-                reverse=True,
-            )
-            if item.coverage_snapshot_id == coverage_snapshot.id
-        ),
-        None,
-    )
-    return {
-        "coverage_snapshot_id": coverage_snapshot.id,
-        "state": "authorized" if authorization is not None else "decision_required",
-        "authorization_id": authorization.id if authorization is not None else None,
-        "available_actions": [
-            str(item["action"])
-            for item in allowed_resolutions
-            if item.get("available") is True and isinstance(item.get("action"), str)
-        ],
-    }
 
 
 def _coverage_resolution_event(

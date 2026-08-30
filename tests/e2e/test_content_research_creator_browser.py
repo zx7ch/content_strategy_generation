@@ -146,11 +146,20 @@ def browser_page(real_creator_stack):
         browser.close()
 
 
+def _goto_creator_after_brand_hydration(page, frontend_url: str) -> None:
+    """Wait until Creator's selected brand is effective before user actions."""
+    with page.expect_response(
+        lambda response: "/threads?brand_id=" in response.url and response.status == 200,
+        timeout=15000,
+    ):
+        page.goto(frontend_url + "/creator", wait_until="domcontentloaded")
+
+
 def test_creator_submit_subject_reaches_only_the_approved_brief_and_restores_it(
     browser_page,
 ):
     page, stack = browser_page
-    page.goto(stack["frontend_url"] + "/creator", wait_until="domcontentloaded")
+    _goto_creator_after_brand_hydration(page, stack["frontend_url"])
     page.get_by_role("button", name=re.compile("内容调研")).click(timeout=15000)
     research_input = page.get_by_role(
         "textbox", name="输入品类、品牌或 SKU，发送后开始内容调研"
@@ -202,7 +211,7 @@ def test_creator_corrects_search_structure_and_reads_only_the_backend_query_prev
     browser_page,
 ):
     page, stack = browser_page
-    page.goto(stack["frontend_url"] + "/creator", wait_until="domcontentloaded")
+    _goto_creator_after_brand_hydration(page, stack["frontend_url"])
     page.get_by_role("button", name=re.compile("内容调研")).click(timeout=15000)
     research_input = page.get_by_role(
         "textbox", name="输入品类、品牌或 SKU，发送后开始内容调研"
@@ -313,7 +322,7 @@ def test_creator_corrects_search_structure_and_reads_only_the_backend_query_prev
 )
 def test_creator_generates_traceable_marketing_conclusions_without_recollecting(browser_page):
     page, stack = browser_page
-    page.goto(stack["frontend_url"] + "/creator", wait_until="domcontentloaded")
+    _goto_creator_after_brand_hydration(page, stack["frontend_url"])
     page.get_by_role("button", name=re.compile("内容调研")).click(timeout=15000)
     research_input = page.get_by_role(
         "textbox", name="输入品类、品牌或 SKU，发送后开始内容调研"
@@ -547,7 +556,7 @@ def test_creator_reports_supported_contested_and_insufficient_tracks_with_exact_
     browser_page,
 ):
     page, stack = browser_page
-    page.goto(stack["frontend_url"] + "/creator", wait_until="domcontentloaded")
+    _goto_creator_after_brand_hydration(page, stack["frontend_url"])
     page.get_by_role("button", name=re.compile("内容调研")).click(timeout=15000)
     research_input = page.get_by_role(
         "textbox", name="输入品类、品牌或 SKU，发送后开始内容调研"
@@ -629,7 +638,7 @@ def test_creator_reports_supported_contested_and_insufficient_tracks_with_exact_
 )
 def test_creator_exposes_real_analysis_worker_failure_before_report_composition(browser_page):
     page, stack = browser_page
-    page.goto(stack["frontend_url"] + "/creator", wait_until="domcontentloaded")
+    _goto_creator_after_brand_hydration(page, stack["frontend_url"])
     page.get_by_role("button", name=re.compile("内容调研")).click(timeout=15000)
     research_input = page.get_by_role(
         "textbox", name="输入品类、品牌或 SKU，发送后开始内容调研"
@@ -771,7 +780,7 @@ def test_creator_run_b_remains_active_after_reload_and_late_run_a_history(
             title="Run A 历史报告",
         )
     )
-    page.goto(stack["frontend_url"] + "/creator", wait_until="domcontentloaded")
+    _goto_creator_after_brand_hydration(page, stack["frontend_url"])
     page.get_by_text("Run A 历史报告", exact=True).click()
     expect(page.get_by_text("这是 Run A 的历史记录。", exact=True)).to_be_visible(timeout=30000)
 
