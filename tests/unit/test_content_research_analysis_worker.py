@@ -122,7 +122,7 @@ async def test_expired_analysis_converges_run_without_creating_or_claiming_succe
     service = TerminalizedFailureService()
     worker = ContentResearchAnalysisWorker(
         store=SQLiteContentResearchStore(str(tmp_path / "expired-analysis-worker.db")),
-        service_factory=lambda: service,
+        execution_factory=lambda: service,
         clock=lambda: NOW,
     )
     worker._repository = repository
@@ -165,7 +165,7 @@ async def test_terminalized_current_attempt_still_converges_run_after_heartbeat_
     service = TerminalizedFailureService()
     worker = ContentResearchAnalysisWorker(
         store=SQLiteContentResearchStore(str(tmp_path / "analysis-worker.db")),
-        service_factory=lambda: service,
+        execution_factory=lambda: service,
         clock=lambda: NOW,
     )
     worker._repository = TerminalizedAttemptRepository(claim)
@@ -225,7 +225,7 @@ async def test_terminalized_stale_attempt_cannot_fail_a_successor_run(tmp_path) 
     service = TerminalizedFailureService()
     worker = ContentResearchAnalysisWorker(
         store=SQLiteContentResearchStore(str(tmp_path / "stale-analysis-worker.db")),
-        service_factory=lambda: service,
+        execution_factory=lambda: service,
         clock=lambda: NOW,
     )
     worker._repository = TerminalizedAttemptRepository(
@@ -284,7 +284,7 @@ async def test_post_analysis_report_failure_preserves_succeeded_attempt(tmp_path
     service = PostAnalysisReportFailureService()
     worker = ContentResearchAnalysisWorker(
         store=SQLiteContentResearchStore(str(tmp_path / "post-analysis-report.db")),
-        service_factory=lambda: service,
+        execution_factory=lambda: service,
         clock=lambda: NOW,
     )
     worker._repository = repository

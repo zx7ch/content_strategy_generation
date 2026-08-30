@@ -76,12 +76,12 @@ async def _worker_lifespan(application):
     await content_research_service.reconcile_startup()
     content_research_worker = ContentResearchDispatchWorker(
         store=content_research_service._store,
-        service_factory=lambda: content_research_service,
+        execution_factory=lambda: content_research_service.execution_interface,
         wake_event=content_research_dispatch_event,
     )
     content_research_analysis_worker = ContentResearchAnalysisWorker(
         store=content_research_service._store,
-        service_factory=lambda: content_research_service,
+        execution_factory=lambda: content_research_service.execution_interface,
         wake_event=content_research_analysis_event,
     )
     v2_master_data_store, v2_master_data_service = build_master_data_runtime(settings)

@@ -13,6 +13,8 @@ import pytest
 from app.content_research.api_schemas import ContentResearchFormalResearchResponse
 from app.content_research.async_dispatch import AsyncFormalResearchDispatchRepository
 from app.content_research.async_pipeline_store import AsyncDirectionalPersistenceSession
+from app.content_research.errors import ReportPublicationMaterializationError
+from app.content_research.execution import ContentResearchExecution
 from app.content_research.models import SubagentTaskRecord
 from app.content_research.persistence_models import StageCheckpointRecord
 from app.content_research.scope_contract import (
@@ -27,10 +29,6 @@ from app.content_research.scope_contract import (
     ScopeExecutionContinuation,
     ScopeQueryGroupInput,
     build_scope_contract,
-)
-from app.content_research.service import (
-    ContentResearchService,
-    ReportPublicationMaterializationError,
 )
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
 from app.content_research.worker import ContentResearchDispatchWorker
@@ -70,10 +68,10 @@ class FakeFormalResearchService:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str, int]] = []
 
-    async def start_formal_research(self, *, workflow_run_id, request):
-        self.calls.append((workflow_run_id, request.provider, request.limit))
+    async def execute_claimed_dispatch(self, *, context, request):
+        self.calls.append((context.workflow_run_id, request.provider, request.limit))
         return ContentResearchFormalResearchResponse(
-            workflow_run_id=workflow_run_id,
+            workflow_run_id=context.workflow_run_id,
             status="completed",
             task_count=1,
             completed_task_count=1,
@@ -206,7 +204,7 @@ async def test_expired_dispatch_lease_is_recovered_by_a_new_worker(tmp_path):
             ((datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(), "run-recover"),
         )
     service = FakeFormalResearchService()
-    worker = ContentResearchDispatchWorker(store=store, service_factory=lambda: service)
+    worker = ContentResearchDispatchWorker(store=store, execution_factory=lambda: service)
 
     assert await worker.run_once() is True
     assert service.calls == [("run-recover", "xiaohongshu", 12)]
@@ -261,7 +259,7 @@ async def test_worker_claims_persisted_scope_continuation_with_its_queries(tmp_p
     )
     store.save_scope_execution_continuation(continuation)
     service = FakeContinuationService()
-    worker = ContentResearchDispatchWorker(store=store, service_factory=lambda: service)
+    worker = ContentResearchDispatchWorker(store=store, execution_factory=lambda: service)
 
     assert await worker.run_once() is True
     assert service.calls == []
@@ -282,7 +280,7 @@ async def test_worker_passes_the_claimed_execution_attempt_to_the_service(tmp_pa
     service = ExecutionUnitContinuationService()
     worker = ContentResearchDispatchWorker(
         store=store,
-        service_factory=lambda: cast(ContentResearchService, service),
+        execution_factory=lambda: cast(ContentResearchExecution, service),
     )
 
     assert await worker.run_once() is True
@@ -306,7 +304,7 @@ async def test_publication_only_failure_keeps_successful_execution_attempt_truth
     service = PublicationFailureExecutionService()
     worker = ContentResearchDispatchWorker(
         store=store,
-        service_factory=lambda: cast(ContentResearchService, service),
+        execution_factory=lambda: cast(ContentResearchExecution, service),
     )
 
     assert await worker.run_once() is True
@@ -343,7 +341,7 @@ async def test_failed_scope_continuation_is_reclaimed_only_by_exact_action_repla
     )
     store.save_scope_execution_continuation(continuation)
     failing = FailingContinuationService()
-    worker = ContentResearchDispatchWorker(store=store, service_factory=lambda: failing)
+    worker = ContentResearchDispatchWorker(store=store, execution_factory=lambda: failing)
 
     assert await worker.run_once() is True
     failed = store.list_scope_execution_continuations("run-failure")[0]
@@ -359,7 +357,9 @@ async def test_failed_scope_continuation_is_reclaimed_only_by_exact_action_repla
     recovered = store.list_scope_execution_continuations("run-failure")[0]
     assert recovered.state == "pending"
     succeeding = FakeContinuationService()
-    retry_worker = ContentResearchDispatchWorker(store=store, service_factory=lambda: succeeding)
+    retry_worker = ContentResearchDispatchWorker(
+        store=store, execution_factory=lambda: succeeding
+    )
     assert await retry_worker.run_once() is True
     assert store.list_scope_execution_continuations("run-failure")[0].state == "completed"
 
@@ -507,7 +507,7 @@ async def test_event_wakeup_dispatches_without_waiting_for_recovery_scan(tmp_pat
     wake_event = asyncio.Event()
     worker = ContentResearchDispatchWorker(
         store=store,
-        service_factory=lambda: service,
+        execution_factory=lambda: service,
         wake_event=wake_event,
         recovery_scan_seconds=60,
     )
