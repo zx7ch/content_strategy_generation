@@ -295,15 +295,32 @@ class AsyncDirectionalPersistenceSession:
                         ),
                     )
                     if result.rowcount != 1:
-                        raise RuntimeError(
-                            f"immutable persistence conflict for {table}:{record.id}"
+                        cursor = await conn.execute(
+                            f"SELECT schema_version, {', '.join(fields)}, "
+                            f"payload_json, metadata_json FROM {table} WHERE id=?",
+                            (record.id,),
                         )
+                        existing = await cursor.fetchone()
+                        fields_match = existing is not None and all(
+                            existing[field] == value
+                            for field, value in zip(fields, values, strict=True)
+                        )
+                        if existing is None or not (
+                            str(existing["schema_version"]) == record.schema_version
+                            and fields_match
+                            and _loads(existing["payload_json"]) == record.payload
+                            and _loads(existing["metadata_json"]) == record.metadata
+                        ):
+                            raise RuntimeError(
+                                f"immutable persistence conflict for {table}:{record.id}"
+                            )
                 for event in pending_scope_events:
-                    await conn.execute(
+                    result = await conn.execute(
                         """INSERT INTO content_research_scope_audit_events
                            (id, workflow_run_id, scope_contract_id, scope_contract_version,
                             event_name, payload_json, metadata_json, created_at)
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                           ON CONFLICT(id) DO NOTHING""",
                         (
                             event.id,
                             event.workflow_run_id,
@@ -315,6 +332,28 @@ class AsyncDirectionalPersistenceSession:
                             _fmt_dt(event.created_at),
                         ),
                     )
+                    if result.rowcount != 1:
+                        cursor = await conn.execute(
+                            """SELECT workflow_run_id, scope_contract_id,
+                                      scope_contract_version, event_name,
+                                      payload_json, metadata_json
+                               FROM content_research_scope_audit_events
+                               WHERE id=?""",
+                            (event.id,),
+                        )
+                        existing = await cursor.fetchone()
+                        if existing is None or (
+                            str(existing["workflow_run_id"]) != event.workflow_run_id
+                            or str(existing["scope_contract_id"]) != event.scope_contract_id
+                            or int(existing["scope_contract_version"])
+                            != event.scope_contract_version
+                            or str(existing["event_name"]) != event.event_name
+                            or _loads(existing["payload_json"]) != event.payload
+                            or _loads(existing["metadata_json"]) != (event.metadata or {})
+                        ):
+                            raise RuntimeError(
+                                "immutable scope audit event conflict for " + event.id
+                            )
                 await conn.commit()
             except Exception:
                 await conn.rollback()
