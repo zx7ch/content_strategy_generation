@@ -42,6 +42,8 @@ class RetryPresearchHandler:
             command_id=request.command_id,
             expected_state=declared_state,
             expected_revision=request.expected_revision,
+            recovery_plan_id=str(request.payload.get("recovery_plan_id") or ""),
+            plan_fingerprint=str(request.payload.get("plan_fingerprint") or ""),
         )
         return context.application._action_response(
             workflow_run_id=context.workflow_run_id,
@@ -84,17 +86,18 @@ class RetryRetrievalHandler:
         provider = str(request.payload.get("provider") or "xiaohongshu")
         source_kind = str(request.payload.get("source_kind") or "search_result")
         limit = int(request.payload.get("limit") or 50)
-        runtime_children = list(runtime_snapshot.get("child_tasks") or [])
+        workflow_children = list(runtime_snapshot.get("child_tasks") or [])
         if current.state is ContentResearchState.RECOVERY_REQUIRED:
             recovery_child_ids = application._requeue_recoverable_tasks(
                 context.workflow_run_id,
                 provider=provider,
-                runtime_child_tasks=runtime_children,
+                workflow_child_states=workflow_children,
+                apply_changes=False,
             )
         else:
             failed_runtime_child_ids = {
                 str(child.get("child_task_id") or "")
-                for child in runtime_children
+                for child in workflow_children
                 if str(child.get("status") or "") == "failed"
             }
             recovery_child_ids = [
@@ -107,6 +110,12 @@ class RetryRetrievalHandler:
                 in failed_runtime_child_ids
             ]
         retried = await application._lifecycle.apply(command)
+        if current.state is ContentResearchState.RECOVERY_REQUIRED:
+            application._requeue_recoverable_tasks(
+                context.workflow_run_id,
+                provider=provider,
+                workflow_child_states=workflow_children,
+            )
         await application._workflow_runtime.restart_formal_research_step(
             workflow_run_id=context.workflow_run_id,
             child_task_ids=recovery_child_ids,
@@ -144,6 +153,7 @@ class RetryAnalysisHandler:
         repository = SQLiteMarketingAnalysisRepository(
             application._store._db_path,
             bootstrap_schema=False,
+            writer=application._store._writer,
         )
         predecessor = await asyncio.to_thread(
             repository.get_effective_attempt_for_run,
@@ -170,6 +180,8 @@ class RetryAnalysisHandler:
                 expected_revision=request.expected_revision,
                 kind=self.action,
                 payload={
+                    "recovery_plan_id": request.payload.get("recovery_plan_id"),
+                    "plan_fingerprint": request.payload.get("plan_fingerprint"),
                     "predecessor_attempt_id": predecessor.id,
                     "analysis_contract_fingerprint": unit.contract_fingerprint,
                 },
@@ -217,6 +229,8 @@ class RetryReportHandler:
                 expected_revision=request.expected_revision,
                 kind=self.action,
                 payload={
+                    "recovery_plan_id": request.payload.get("recovery_plan_id"),
+                    "plan_fingerprint": request.payload.get("plan_fingerprint"),
                     "preserved_analysis_attempt_id": current.error.get(
                         "preserved_analysis_attempt_id"
                     )

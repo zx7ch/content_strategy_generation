@@ -74,15 +74,21 @@ class LiteLLMConfigurationService:
         )
         if validation.status != "validated":
             return validation
-        saved = self._store.upsert(UserLLMConfiguration(
-            workspace_id=workspace_id, user_id=user_id, base_url=normalized.base_url,
-            model=normalized.model, api_key=normalized.api_key or "", validation_status="validated",
-            validated_at=validation.validated_at or datetime.now(timezone.utc),
-        ))
+        saved = await self._store.upsert_async(
+            UserLLMConfiguration(
+                workspace_id=workspace_id,
+                user_id=user_id,
+                base_url=normalized.base_url,
+                model=normalized.model,
+                api_key=normalized.api_key or "",
+                validation_status="validated",
+                validated_at=validation.validated_at or datetime.now(timezone.utc),
+            )
+        )
         return self._summary(saved)
 
-    def delete(self, workspace_id: str, user_id: str) -> LLMConfigurationSummary:
-        self._store.delete(workspace_id, user_id)
+    async def delete(self, workspace_id: str, user_id: str) -> LLMConfigurationSummary:
+        await self._store.delete_async(workspace_id, user_id)
         return self.get_summary(workspace_id, user_id)
 
     def _normalize_candidate(

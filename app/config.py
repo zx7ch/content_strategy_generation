@@ -47,7 +47,7 @@ class Settings(BaseSettings):
     )
     RUNTIME_VERSION: str = Field(default=_RUNTIME_VERSION, validation_alias=_env_alias("RUNTIME_VERSION"))
     RUNTIME_API_CONTRACT: str = Field(
-        default="local-runtime-v1",
+        default="local-runtime-single-writer",
         validation_alias=_env_alias("RUNTIME_API_CONTRACT"),
     )
     CORS_ALLOWED_ORIGINS: str = Field(
@@ -187,6 +187,11 @@ class Settings(BaseSettings):
     CONTENT_RESEARCH_EMBEDDING_DIMENSIONS: int = Field(
         default=768,
         validation_alias=_env_alias("CONTENT_RESEARCH_EMBEDDING_DIMENSIONS"),
+        ge=1,
+    )
+    CONTENT_RESEARCH_MAX_CONCURRENT_RUNS: int = Field(
+        default=2,
+        validation_alias=_env_alias("CONTENT_RESEARCH_MAX_CONCURRENT_RUNS"),
         ge=1,
     )
 

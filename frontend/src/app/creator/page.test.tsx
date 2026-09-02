@@ -32,7 +32,9 @@ test("Creator exposes retrieval recovery without mislabeling it as a model confi
 
   assert.match(source, /retryContentResearchRetrieval/);
   assert.match(source, /继续失败的检索/);
-  assert.match(source, /allowed_actions\.includes\("retry_presearch"\)/);
+  assert.match(source, /recovery_plan\?\.action === "retry_presearch"/);
+  assert.match(source, /recovery_plan\?\.action === "retry_retrieval"/);
+  assert.doesNotMatch(source, /allowed_actions\.includes\("retry_/);
 });
 
 test("Creator rejects a late presearch response before it can activate an old Run", () => {
@@ -306,12 +308,14 @@ test("Trace revision guard rejects older snapshots and becomes uncertain after t
   const guard = new ContentResearchTraceRevisionGuard();
 
   assert.equal(guard.accept(12), true);
+  assert.equal(guard.minimumRevision(), 12);
   assert.equal(guard.accept(11), false);
   assert.equal(guard.recordFailure(), false);
   assert.equal(guard.recordFailure(), false);
   assert.equal(guard.recordFailure(), true);
   assert.equal(guard.isUncertain(), true);
   assert.equal(guard.accept(13), true);
+  assert.equal(guard.minimumRevision(), 13);
   assert.equal(guard.isUncertain(), false);
 });
 

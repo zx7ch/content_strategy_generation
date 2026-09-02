@@ -9,7 +9,10 @@ from app.api.routes.router import app
 from app.content_research.presearch.service import PresearchService
 from app.content_research.service import ContentResearchService, WorkflowRunManagerRuntime
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
+from app.core.runtime_schema_bootstrap import bootstrap_canonical_runtime_schema
+from app.core.runtime_write_coordinator import RuntimeWriteCoordinator
 from app.memory.thread_store import ThreadStore
+from app.runtime_write_handlers import production_runtime_write_handlers
 from app.services.llm.types import LLMResponse, TokenUsage
 
 
@@ -54,6 +57,9 @@ class FakeLLM:
 async def client(tmp_path):
     original = getattr(app.state, "content_research_service", None)
     db_path = str(tmp_path / "content_research.db")
+    await bootstrap_canonical_runtime_schema(db_path, discovery_secret="workflow-events")
+    writer = RuntimeWriteCoordinator(db_path, handlers=production_runtime_write_handlers())
+    await writer.start()
     app.state.content_research_service = ContentResearchService(
         store=SQLiteContentResearchStore(db_path),
         presearch=PresearchService(FakeLLM(), first_feedback_timeout_seconds=0.05, hard_cutoff_seconds=0.1),
@@ -71,6 +77,7 @@ async def client(tmp_path):
         delattr(app.state, "content_research_service")
     else:
         app.state.content_research_service = original
+    await writer.close()
 
 
 @pytest.mark.asyncio
@@ -116,7 +123,9 @@ async def test_workflow_summary_and_events_expose_runtime_state(client):
     assert summary["run"]["state"] == "scope_confirmation_required"
     assert summary["plan"] is not None
     assert summary["subagent_tasks"] == []
-    assert summary["runtime_child_tasks"] == []
+    assert "runtime_run" not in summary
+    assert "runtime_steps" not in summary
+    assert "runtime_child_tasks" not in summary
 
     events_response = await client.get(f"/content-research/workflows/{presearch['workflow_run_id']}/events")
     assert events_response.status_code == 200

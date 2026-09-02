@@ -30,6 +30,7 @@ from app.content_research.research_embedding import (
 )
 from app.content_research.scope_contract import thaw_execution_payload
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
+from app.core.sqlite_connection_roles import open_readonly_database
 from app.memory.workflow_store import WorkflowStore
 from app.services.llm.usage_tracker import (
     LLMUsageEvent,
@@ -72,18 +73,10 @@ class ContentResearchTraceService:
                 "SELECT * FROM workflow_runs WHERE run_id=?", (workflow_run_id,)
             ).fetchone()
             run = decoder._row_to_run(run_row) if run_row is not None else None
-            runtime_steps = [
+            workflow_steps = [
                 decoder._row_to_step(row)
                 for row in connection.execute(
                     "SELECT * FROM workflow_steps WHERE run_id=? "
-                    "ORDER BY created_at ASC, rowid ASC",
-                    (workflow_run_id,),
-                ).fetchall()
-            ]
-            runtime_child_tasks = [
-                decoder._row_to_child_task(row)
-                for row in connection.execute(
-                    "SELECT * FROM workflow_child_tasks WHERE run_id=? "
                     "ORDER BY created_at ASC, rowid ASC",
                     (workflow_run_id,),
                 ).fetchall()
@@ -101,8 +94,7 @@ class ContentResearchTraceService:
             # the coordinator-owned transaction above.
             async with WorkflowStore(self._db_path, read_only=True) as workflow_store:
                 run = await workflow_store.get_run(workflow_run_id)
-                runtime_steps = await workflow_store.list_steps(workflow_run_id)
-                runtime_child_tasks = await workflow_store.list_child_tasks(workflow_run_id)
+                workflow_steps = await workflow_store.list_steps(workflow_run_id)
                 workflow_events = await workflow_store.list_events(workflow_run_id)
 
             async with LLMUsageTracker(self._db_path, read_only=True) as usage_tracker:
@@ -111,7 +103,7 @@ class ContentResearchTraceService:
 
         current_stage = _derive_current_stage(
             run=_json_dict(run),
-            steps=[_json_dict(step) for step in runtime_steps],
+            steps=[_json_dict(step) for step in workflow_steps],
             traces=traces,
         )
         run_status = (
@@ -140,18 +132,12 @@ class ContentResearchTraceService:
         source_operation_events = [
             _source_operation_event_dict(event) for event in observation_events
         ]
-        trace_as_of = datetime.now(timezone.utc)
         analysis_repository = SQLiteMarketingAnalysisRepository(
             self._db_path,
             read_transaction_connection=self._read_transaction_connection,
+            writer=(self._store._writer if self._read_transaction_connection is None else None),
         )
         effective_attempt = analysis_repository.get_effective_attempt_for_run(workflow_run_id)
-        runtime_step_dicts = _runtime_step_projection(
-            runtime_steps,
-            effective_attempt=effective_attempt,
-            as_of=trace_as_of,
-        )
-
         return ContentResearchTraceResponse(
             workflow_run_id=workflow_run_id,
             trace_revision=self._trace_revision(workflow_run_id),
@@ -180,11 +166,6 @@ class ContentResearchTraceService:
             traces=[_safe_trace_dict(trace) for trace in traces],
             observation_events=observation_event_dicts,
             workflow_events=[_safe_workflow_event_dict(event) for event in workflow_event_dicts],
-            runtime_steps=runtime_step_dicts,
-            runtime_child_tasks=[
-                _safe_runtime_child_task_dict(task, as_of=trace_as_of)
-                for task in runtime_child_tasks
-            ],
             execution_units=_execution_unit_projection(self._store, workflow_run_id),
             usage_summary={},
             external_api_summary=_external_api_summary(
@@ -207,7 +188,7 @@ class ContentResearchTraceService:
             llm_recovery=_llm_recovery_projection(
                 run_status=run_status,
                 current_stage=current_stage,
-                runtime_steps=[_json_dict(step) for step in runtime_steps],
+                workflow_steps=[_json_dict(step) for step in workflow_steps],
                 workflow_events=workflow_event_dicts,
                 brief=brief,
             ),
@@ -220,7 +201,7 @@ class ContentResearchTraceService:
                 (workflow_run_id,),
             ).fetchone()
         else:
-            with sqlite3.connect(self._db_path) as conn:
+            with open_readonly_database(self._db_path) as conn:
                 row = conn.execute(
                     "SELECT revision FROM content_research_trace_revisions WHERE workflow_run_id=?",
                     (workflow_run_id,),
@@ -303,84 +284,6 @@ def _usage_records_from_connection(
     return usage_steps, usage_events
 
 
-def _runtime_step_projection(
-    runtime_steps: list[Any],
-    *,
-    effective_attempt: Any | None,
-    as_of: datetime,
-) -> list[dict[str, Any]]:
-    projected = [_safe_runtime_step_dict(step, as_of=as_of) for step in runtime_steps]
-    if effective_attempt is None:
-        return projected
-
-    analysis_created_at = effective_attempt.created_at
-    for step in projected:
-        if step.get("step_name") == "formal_research":
-            step.update(
-                {
-                    "status": "succeeded",
-                    "completed_at": _json_safe(analysis_created_at),
-                    "error_code": None,
-                }
-            )
-            timing = dict(step.get("timing") or {})
-            started_at = _parse_dt(timing.get("execution_started_at"))
-            if started_at is not None:
-                timing.update(
-                    {
-                        "execution_finished_at": analysis_created_at.isoformat(),
-                        "active_duration_ms": max(
-                            0,
-                            int((analysis_created_at - started_at).total_seconds() * 1000),
-                        ),
-                    }
-                )
-            step["timing"] = timing
-        elif step.get("step_name") == "report":
-            if effective_attempt.state != "succeeded":
-                step.update(
-                    {
-                        "status": "pending",
-                        "attempt_count": 0,
-                        "started_at": None,
-                        "completed_at": None,
-                        "error_code": None,
-                        "timing": {"timing_source": "recorded"},
-                    }
-                )
-            elif step.get("status") == "succeeded":
-                step["error_code"] = None
-
-    analysis_status = "pending" if effective_attempt.state == "queued" else effective_attempt.state
-    analysis_step = {
-        "step_id": f"analysis:{effective_attempt.id}",
-        "step_name": "marketing_analysis",
-        "phase": "analysis",
-        "status": analysis_status,
-        "attempt_count": effective_attempt.attempt_no,
-        "max_attempts": 3,
-        "started_at": _json_safe(effective_attempt.created_at),
-        "completed_at": _json_safe(effective_attempt.terminal_at),
-        "error_code": (
-            "MARKETING_ANALYSIS_FAILED" if effective_attempt.state == "failed" else None
-        ),
-        "timing": _project_timing(
-            {
-                "status": analysis_status,
-                "started_at": effective_attempt.created_at,
-                "completed_at": effective_attempt.terminal_at,
-            },
-            as_of=as_of,
-        ),
-    }
-    report_index = next(
-        (index for index, step in enumerate(projected) if step.get("step_name") == "report"),
-        len(projected),
-    )
-    projected.insert(report_index, analysis_step)
-    return projected
-
-
 def _json_dict(value: Any) -> dict:
     if value is None:
         return {}
@@ -453,58 +356,6 @@ def _safe_workflow_event_dict(event: dict) -> dict:
             "created_at",
         },
     )
-
-
-def _safe_runtime_step_dict(step: Any, *, as_of: datetime) -> dict:
-    value = _json_dict(step)
-    safe = _select_safe_fields(
-        value,
-        {
-            "step_id",
-            "step_name",
-            "phase",
-            "status",
-            "attempt_count",
-            "max_attempts",
-            "started_at",
-            "completed_at",
-            "error_code",
-        },
-    )
-    safe["timing"] = _project_timing(value, as_of=as_of)
-    return safe
-
-
-def _safe_runtime_child_task_dict(task: Any, *, as_of: datetime) -> dict:
-    value = _json_dict(task)
-    safe = _select_safe_fields(
-        value,
-        {
-            "child_task_id",
-            "step_id",
-            "task_type",
-            "status",
-            "attempt_count",
-            "max_attempts",
-            "started_at",
-            "completed_at",
-            "error_code",
-        },
-    )
-    recovery_count = max(int(value.get("attempt_count") or 0), 0)
-    max_attempts = max(int(value.get("max_attempts") or 3), 1)
-    safe["retry_counters"] = {
-        "specialist_user_recovery": {
-            "used": recovery_count,
-            "limit": max(max_attempts - 1, 0),
-        },
-        "workflow_child_attempt": {
-            "used": min(recovery_count + 1, max_attempts),
-            "limit": max_attempts,
-        },
-    }
-    safe["timing"] = _project_timing(value, as_of=as_of)
-    return safe
 
 
 _EXECUTION_IDENTITY_STRING_FIELDS = {
@@ -597,12 +448,12 @@ def _llm_recovery_projection(
     *,
     run_status: str,
     current_stage: str | None,
-    runtime_steps: list[dict],
+    workflow_steps: list[dict],
     workflow_events: list[dict],
     brief: ResearchBriefRecord | None,
 ) -> dict:
     presearch_step = next(
-        (step for step in runtime_steps if step.get("step_name") == "presearch"), {}
+        (step for step in workflow_steps if step.get("step_name") == "presearch"), {}
     )
     required = run_status == "waiting_user" and current_stage == "presearch"
     error_code = presearch_step.get("error_code")
@@ -628,110 +479,6 @@ def _llm_recovery_projection(
         else None,
         "model": payload.get("model") if isinstance(payload.get("model"), str) else None,
     }
-
-
-def _project_timing(value: dict, *, as_of: datetime | str) -> dict:
-    """Return a Lite-safe timing view without leaking the durable JSON record."""
-    recorded = value.get("timing_json")
-    as_of_at = _parse_dt(as_of)
-    recorded_keys = {
-        "queued_at",
-        "queue_spans",
-        "execution_spans",
-        "waiting_spans",
-        "retry_backoff_spans",
-        "pause_spans",
-        "waiting_started_at",
-        "retry_backoff_started_at",
-    }
-    if isinstance(recorded, dict) and any(key in recorded for key in recorded_keys):
-        execution_spans = recorded.get("execution_spans")
-        if not isinstance(execution_spans, list):
-            execution_spans = []
-        active_duration_ms = 0
-        first_execution_at: datetime | None = None
-        last_finished_at: datetime | None = None
-        for span in execution_spans:
-            if not isinstance(span, dict):
-                continue
-            started_at = _parse_dt(span.get("started_at"))
-            if started_at is None:
-                continue
-            first_execution_at = first_execution_at or started_at
-            finished_at = _parse_dt(span.get("finished_at"))
-            if finished_at is None and str(value.get("status") or "") == "running":
-                finished_at = as_of_at
-            if finished_at is None:
-                continue
-            active_duration_ms += max(0, int((finished_at - started_at).total_seconds() * 1000))
-            last_finished_at = finished_at
-
-        status = str(value.get("status") or "")
-        queue_as_of = as_of_at if status == "pending" else None
-        queue_duration_ms = _interval_duration_ms(recorded.get("queue_spans"), as_of=queue_as_of)
-        timing: dict[str, Any] = {"timing_source": "recorded"}
-        if execution_spans:
-            timing["active_duration_ms"] = active_duration_ms
-        if isinstance(recorded.get("queue_spans"), list):
-            timing["queue_duration_ms"] = queue_duration_ms
-        queued_at = _parse_dt(recorded.get("queued_at"))
-        if queued_at is not None:
-            timing["queued_at"] = queued_at.isoformat()
-        if status == "retrying":
-            for source_key, interval_key in (
-                ("waiting_started_at", "waiting_spans"),
-                ("retry_backoff_started_at", "retry_backoff_spans"),
-            ):
-                intervals = recorded.get(interval_key)
-                has_open_interval = isinstance(intervals, list) and any(
-                    isinstance(interval, dict) and interval.get("finished_at") is None
-                    for interval in intervals
-                )
-                # Early recorded rows had only the scalar boundary. Preserve
-                # those while using interval state whenever it is available.
-                if intervals is not None and not has_open_interval:
-                    continue
-                timestamp = _parse_dt(recorded.get(source_key))
-                if timestamp is not None:
-                    timing[source_key] = timestamp.isoformat()
-        if first_execution_at is not None:
-            timing["execution_started_at"] = first_execution_at.isoformat()
-        if last_finished_at is not None:
-            timing["execution_finished_at"] = last_finished_at.isoformat()
-        return timing
-
-    started_at = _parse_dt(value.get("started_at"))
-    finished_at = _parse_dt(value.get("completed_at"))
-    timing = {"timing_source": "estimated"}
-    if started_at is None:
-        return timing
-    effective_end = finished_at or (
-        as_of_at if str(value.get("status") or "") == "running" else None
-    )
-    if effective_end is None:
-        return timing
-    timing.update(
-        {
-            "execution_started_at": started_at.isoformat(),
-            "execution_finished_at": effective_end.isoformat(),
-            "active_duration_ms": max(0, int((effective_end - started_at).total_seconds() * 1000)),
-        }
-    )
-    return timing
-
-
-def _interval_duration_ms(value: Any, *, as_of: datetime | None) -> int:
-    if not isinstance(value, list):
-        return 0
-    total = 0
-    for interval in value:
-        if not isinstance(interval, dict):
-            continue
-        started_at = _parse_dt(interval.get("started_at"))
-        finished_at = _parse_dt(interval.get("finished_at")) or as_of
-        if started_at is not None and finished_at is not None:
-            total += max(0, int((finished_at - started_at).total_seconds() * 1000))
-    return total
 
 
 def _safe_provider_operation_dict(operation: dict) -> dict:

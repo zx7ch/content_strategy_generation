@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Dict, Generic, List, Optional, TypeVar, Literal
+from typing import Any, Dict, Generic, List, Literal, Optional, TypeVar
+
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 # ---------------------------------------------------------------------------
@@ -1087,24 +1088,6 @@ class CreatorMessageResponse(BaseModel):
     active_run_snapshot: Optional[Dict[str, Any]] = None
     updated_title: Optional[str] = None
     assistant_reply: Optional[str] = None
-
-
-class CreatorWorkflowRequest(BaseModel):
-    user_query: str
-    platform: str = "xiaohongshu"
-    mode: str = "editing"
-    user_id: Optional[str] = None
-
-
-class CreatorWorkflowResponse(BaseModel):
-    thread_id: str
-    session_id: str
-    job_id: str
-    stage: str
-    run_id: Optional[str] = None
-    command_result: Optional[Dict[str, Any]] = None
-    active_run_snapshot: Optional[Dict[str, Any]] = None
-    compatibility_mode: Optional[str] = None
 
 
 class JobControlResponse(BaseModel):

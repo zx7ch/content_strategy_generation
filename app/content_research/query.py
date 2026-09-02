@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import asdict, replace
+from pathlib import Path
 from typing import Any, Protocol
 
 from app.content_research.api_schemas import (
@@ -32,6 +33,9 @@ from app.content_research.api_schemas import (
 from app.content_research.errors import (
     ContentResearchNotFoundError,
     ContentResearchReportIntegrityError,
+    ContentResearchRunNotFoundError,
+    ContentResearchSnapshotBehindError,
+    ContentResearchSnapshotUnavailableError,
     ContentResearchValidationError,
 )
 from app.content_research.evidence.governance_reader import (
@@ -41,7 +45,6 @@ from app.content_research.evidence.governance_reader import (
 from app.content_research.evidence.packet_reader import PacketEvidenceReader
 from app.content_research.lifecycle.coordinator import (
     ContentResearchPersistenceCoordinator,
-    LifecycleCommandConflict,
 )
 from app.content_research.lifecycle.models import ContentResearchState, RunProjection
 from app.content_research.observation import ContentResearchTraceService
@@ -51,7 +54,11 @@ from app.content_research.persistence_models import (
     ReportPublicationRecord,
     WeakSignalRecord,
 )
-from app.content_research.projections import run_projection_payload, safe_read_model
+from app.content_research.projections import (
+    recovery_plan_payload,
+    run_projection_payload,
+    safe_read_model,
+)
 from app.content_research.reporting.lite_read_model import LiteReportReader
 from app.content_research.reporting.read_model import PublishedReportNotFoundError
 from app.content_research.scope_projection import (
@@ -66,6 +73,13 @@ from app.content_research.scope_projection import (
     scope_query_input_payload,
 )
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
+from app.core.consistent_snapshot_reader import (
+    ConsistentSnapshotReader,
+    SnapshotBehind,
+    SnapshotFound,
+    SnapshotNotFound,
+    SnapshotUnavailable,
+)
 
 
 class WorkflowReadRuntime(Protocol):
@@ -94,7 +108,7 @@ class ContentResearchQuery(Protocol):
     ) -> ContentResearchScopeProjectionResponse: ...
 
     async def get_workflow_trace(
-        self, workflow_run_id: str
+        self, workflow_run_id: str, *, minimum_revision: int | None = None
     ) -> ContentResearchTraceResponse: ...
 
     def list_human_decisions(self, workflow_run_id: str) -> HumanDecisionsResponse: ...
@@ -158,9 +172,11 @@ class LegacyContentResearchQueryAdapter:
         return await self._source.get_scope_projection(workflow_run_id, version=version)
 
     async def get_workflow_trace(
-        self, workflow_run_id: str
+        self, workflow_run_id: str, *, minimum_revision: int | None = None
     ) -> ContentResearchTraceResponse:
-        return await self._source.get_workflow_trace(workflow_run_id)
+        return await self._source.get_workflow_trace(
+            workflow_run_id, minimum_revision=minimum_revision
+        )
 
     def list_human_decisions(self, workflow_run_id: str) -> HumanDecisionsResponse:
         return self._source.list_human_decisions(workflow_run_id)
@@ -226,6 +242,10 @@ class ContentResearchQueryService(LegacyContentResearchQueryAdapter):
         self._store = store
         self._lifecycle = lifecycle
         self._workflow_runtime = workflow_runtime
+        self._snapshot_reader = ConsistentSnapshotReader(
+            Path(self._store._db_path),
+            domain_trace_loader=self._load_domain_trace_snapshot,
+        )
 
     def get_policy_snapshot(self, workflow_run_id: str) -> dict[str, Any]:
         snapshot = self._store.get_run_policy_snapshot_for_workflow(workflow_run_id)
@@ -255,7 +275,6 @@ class ContentResearchQueryService(LegacyContentResearchQueryAdapter):
         plan = plans[-1] if plans else None
         directions = self._store.list_directions_for_plan(plan.id) if plan else []
         tasks = self._store.list_subagent_tasks_for_workflow(workflow_run_id)
-        runtime_snapshot = await self._workflow_runtime.get_runtime_snapshot(workflow_run_id)
         try:
             run_projection = await self._lifecycle.load(workflow_run_id)
         except ValueError as exc:
@@ -308,9 +327,6 @@ class ContentResearchQueryService(LegacyContentResearchQueryAdapter):
                     )
                     for item in tasks
                 ],
-                runtime_run=runtime_snapshot.get("run"),
-                runtime_steps=list(runtime_snapshot.get("steps") or []),
-                runtime_child_tasks=list(runtime_snapshot.get("child_tasks") or []),
             )
         if (
             run_projection.state is ContentResearchState.REPORT_READY
@@ -365,9 +381,6 @@ class ContentResearchQueryService(LegacyContentResearchQueryAdapter):
                 )
                 for item in tasks
             ],
-            runtime_run=runtime_snapshot.get("run"),
-            runtime_steps=list(runtime_snapshot.get("steps") or []),
-            runtime_child_tasks=list(runtime_snapshot.get("child_tasks") or []),
             local_cache_id=brief.id if brief is not None else None,
         )
 
@@ -400,24 +413,56 @@ class ContentResearchQueryService(LegacyContentResearchQueryAdapter):
         )
 
     async def get_workflow_trace(
-        self, workflow_run_id: str
+        self, workflow_run_id: str, *, minimum_revision: int | None = None
     ) -> ContentResearchTraceResponse:
-        try:
-            return await self._lifecycle.load_trace_snapshot(
-                workflow_run_id,
-                lambda connection, run, transitions: self._get_workflow_trace_from_transaction(
-                    workflow_run_id=workflow_run_id,
-                    connection=connection,
-                    run=run,
-                    transitions=transitions,
-                ),
-            )
-        except LifecycleCommandConflict as exc:
-            if str(exc) != "Run does not exist":
-                raise
-            raise ContentResearchNotFoundError(
+        result = await self._snapshot_reader.read_domain_trace(
+            workflow_run_id,
+            minimum_revision=minimum_revision,
+        )
+        if isinstance(result, SnapshotFound):
+            return result.snapshot
+        if isinstance(result, SnapshotNotFound):
+            raise ContentResearchRunNotFoundError(
                 f"Content research workflow not found: {workflow_run_id}"
-            ) from exc
+            )
+        if isinstance(result, SnapshotBehind):
+            raise ContentResearchSnapshotBehindError(
+                result.observed_revision, result.minimum_revision
+            )
+        assert isinstance(result, SnapshotUnavailable)
+        raise ContentResearchSnapshotUnavailableError(result.code)
+
+    async def _load_domain_trace_snapshot(
+        self,
+        connection: sqlite3.Connection,
+        workflow_run_id: str,
+    ) -> tuple[ContentResearchTraceResponse, int] | None:
+        if connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow_runs'"
+        ).fetchone() is None:
+            return None
+        if connection.execute(
+            "SELECT 1 FROM workflow_runs WHERE run_id=?", (workflow_run_id,)
+        ).fetchone() is None:
+            return None
+        run = self._lifecycle._load_sync_in_transaction(connection, workflow_run_id)
+        transitions = [
+            dict(row)
+            for row in connection.execute(
+                """SELECT from_state, to_state, event, state_revision,
+                          reason_code, attempt_id, created_at
+                   FROM content_research_state_transitions
+                   WHERE run_id=? ORDER BY state_revision ASC""",
+                (workflow_run_id,),
+            ).fetchall()
+        ]
+        trace = await self._get_workflow_trace_from_transaction(
+            workflow_run_id=workflow_run_id,
+            connection=connection,
+            run=run,
+            transitions=transitions,
+        )
+        return trace, trace.trace_revision
 
     async def _get_workflow_trace_from_transaction(
         self,
@@ -470,6 +515,7 @@ class ContentResearchQueryService(LegacyContentResearchQueryAdapter):
             ContentResearchState.CANCELLED_OR_FAILED: "failed",
         }
         safe_error = dict(run.error or {})
+        recovery_plan = recovery_plan_payload(run)
         return trace.model_copy(
             update={
                 "state": run.state.value,
@@ -479,9 +525,9 @@ class ContentResearchQueryService(LegacyContentResearchQueryAdapter):
                 "current_stage": stage_by_state[run.state],
                 "run_status": status_by_state.get(run.state, "running"),
                 "recoverable": (
-                    run.state is ContentResearchState.RECOVERY_REQUIRED
-                    and bool(safe_error.get("retryable"))
+                    recovery_plan is not None
                 ),
+                "recovery_plan": recovery_plan,
                 "llm_recovery": (
                     {
                         "required": True,
@@ -489,8 +535,8 @@ class ContentResearchQueryService(LegacyContentResearchQueryAdapter):
                         "recovery_action": safe_error.get("recovery_action"),
                         "message": safe_error.get("message"),
                     }
-                    if run.state is ContentResearchState.RECOVERY_REQUIRED
-                    and safe_error.get("stage") == "presearch"
+                    if recovery_plan is not None
+                    and recovery_plan["action"] == "retry_presearch"
                     else {}
                 ),
             }

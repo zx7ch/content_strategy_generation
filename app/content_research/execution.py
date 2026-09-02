@@ -247,7 +247,9 @@ class ContentResearchExecutionService:
             raise LifecycleCommandConflict("report finalization failure requires report_composing")
         effective_attempt = await asyncio.to_thread(
             SQLiteMarketingAnalysisRepository(
-                application._store._db_path, bootstrap_schema=False
+                application._store._db_path,
+                bootstrap_schema=False,
+                writer=application._store._writer,
             ).get_effective_attempt_for_run,
             workflow_run_id,
         )
@@ -615,7 +617,7 @@ class ContentResearchExecutionService:
         lease_token: str | None = None,
         allow_expired_lease: bool = False,
     ) -> None:
-        """Project a terminal analysis failure into both lifecycle authorities."""
+        """Project a terminal analysis failure through the canonical lifecycle authority."""
         application = self._application
         current = await application._lifecycle.load(workflow_run_id)
         if current.state in {
@@ -638,6 +640,7 @@ class ContentResearchExecutionService:
                         "message": str(error) or "Marketing analysis failed",
                         "retryable": True,
                         "recovery_action": "retry_analysis",
+                        "attempt_id": attempt_id,
                     }
                 },
             )
@@ -650,10 +653,3 @@ class ContentResearchExecutionService:
                 )
             else:
                 await application._lifecycle.apply(command)
-        await application._workflow_runtime.wait_for_user_recovery(
-            workflow_run_id=workflow_run_id,
-            reason={
-                "code": "marketing_analysis_failed",
-                "message": "retry_analysis",
-            },
-        )

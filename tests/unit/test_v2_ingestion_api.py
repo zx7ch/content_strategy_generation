@@ -2,16 +2,16 @@ from __future__ import annotations
 
 import base64
 
-from fastapi.testclient import TestClient
 import pytest
+from fastapi.testclient import TestClient
 
 from app.api.routes.router import app
 from app.v2.foundation import InMemoryMasterDataStore, MasterDataService
-from app.v2.ingestion import InMemoryIngestionStore, IngestionService
+from app.v2.ingestion import IngestionService, InMemoryIngestionStore
 
 
 @pytest.fixture(autouse=True)
-def reset_v2_ingestion_app_state():
+def reset_v2_ingestion_app_state(isolated_router_lifespan):
     master_store = InMemoryMasterDataStore()
     master_service = MasterDataService(master_store)
     ingestion_store = InMemoryIngestionStore()

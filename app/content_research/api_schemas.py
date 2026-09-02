@@ -64,6 +64,7 @@ class ContentResearchRunProjectionResponse(BaseModel):
     state_revision: int = Field(ge=1)
     entered_at: datetime
     allowed_actions: list[str] = Field(default_factory=list)
+    recovery_plan: dict | None = None
     reason_code: str | None = None
     error: dict | None = None
     brief_id: str | None = None
@@ -143,9 +144,6 @@ class ContentResearchWorkflowSummaryResponse(BaseModel):
     plan: ContentResearchPlanResponse | None = None
     directions: list[ContentResearchDirectionResponse] = Field(default_factory=list)
     subagent_tasks: list[ContentResearchSubagentTaskResponse] = Field(default_factory=list)
-    runtime_run: dict | None = None
-    runtime_steps: list[dict] = Field(default_factory=list)
-    runtime_child_tasks: list[dict] = Field(default_factory=list)
     execution_mode: str = "local"
     remote_run_id: str | None = None
     local_cache_id: str | None = None
@@ -163,9 +161,6 @@ class ContentResearchHistoricalWorkflowSummaryResponse(BaseModel):
     plan: ContentResearchPlanResponse | None = None
     directions: list[ContentResearchDirectionResponse] = Field(default_factory=list)
     subagent_tasks: list[ContentResearchSubagentTaskResponse] = Field(default_factory=list)
-    runtime_run: dict | None = None
-    runtime_steps: list[dict] = Field(default_factory=list)
-    runtime_child_tasks: list[dict] = Field(default_factory=list)
 
 
 class ContentResearchWorkflowEventsResponse(BaseModel):
@@ -246,8 +241,6 @@ class ContentResearchTraceResponse(BaseModel):
     traces: list[dict] = Field(default_factory=list)
     observation_events: list[dict] = Field(default_factory=list)
     workflow_events: list[dict] = Field(default_factory=list)
-    runtime_steps: list[dict] = Field(default_factory=list)
-    runtime_child_tasks: list[dict] = Field(default_factory=list)
     execution_units: list[ContentResearchExecutionUnitTraceResponse] = Field(
         default_factory=list
     )
@@ -258,6 +251,7 @@ class ContentResearchTraceResponse(BaseModel):
     usage_steps: list[dict] = Field(default_factory=list)
     usage_events: list[dict] = Field(default_factory=list)
     llm_recovery: dict = Field(default_factory=dict)
+    recovery_plan: dict | None = None
 
 
 class ContentResearchSourceCollectionRequest(BaseModel):

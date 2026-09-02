@@ -41,6 +41,7 @@ from app.content_research.persistence_models import (
     DirectionalEvidencePacketRecord,
     DirectionSourceProjectionRecord,
     ExecutionOwnership,
+    SourceObservationRecord,
     StageCheckpointRecord,
 )
 from app.content_research.runtime import canonical_fingerprint
@@ -56,6 +57,7 @@ from app.content_research.scope_contract import (
 from app.content_research.sources.base import SourceOperationResult
 from app.content_research.sources.canonical_registry import CanonicalSourceRegistry
 from app.content_research.stores.base import ContentResearchStore
+from app.core.runtime_write_coordinator import RuntimeWriteCoordinator
 
 if TYPE_CHECKING:
     from app.content_research.persisted_packet_replay import (
@@ -958,10 +960,11 @@ class DirectionalExecutionPipeline:
         workflow_run_id: str,
         execution_context: ExecutionContext | None = None,
         dispatch_context: DispatchLeaseContext | None = None,
+        writer: RuntimeWriteCoordinator | None = None,
     ) -> DirectionalExecutionPipeline:
         from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
 
-        scope_store = SQLiteContentResearchStore(db_path)
+        scope_store = SQLiteContentResearchStore(db_path, writer=writer)
         if dispatch_context is not None:
             scope_store = scope_store.for_dispatch_context(dispatch_context)
         return cls(
@@ -970,6 +973,7 @@ class DirectionalExecutionPipeline:
                 workflow_run_id=workflow_run_id,
                 execution_context=execution_context,
                 dispatch_context=dispatch_context,
+                writer=writer,
             ),
             scope_store=scope_store,
             execution_context=execution_context,
@@ -2428,6 +2432,30 @@ class DirectionalExecutionPipeline:
                     "source_kind": candidate.get("source_kind"),
                 },
             )
+            observation_payload = {
+                "schema_version": "content_research_source_observation",
+                "field_projection": packet["field_projection"],
+                "field_availability": packet["field_availability"],
+            }
+            observation_fingerprint = canonical_fingerprint(observation_payload)
+            observation_id = "sob_" + canonical_fingerprint(
+                {
+                    "source": source.id,
+                    "run": self._workflow_run_id,
+                    "observation": observation_fingerprint,
+                }
+            )[:24]
+            if self._store.get_typed_record(SourceObservationRecord, observation_id) is None:
+                self._store.save_source_observation(
+                    SourceObservationRecord(
+                        id=observation_id,
+                        schema_version="content_research_source_observation",
+                        payload=observation_payload,
+                        canonical_source_id=source.id,
+                        workflow_run_id=self._workflow_run_id,
+                        observation_fingerprint=observation_fingerprint,
+                    )
+                )
             packet_id = "dep_" + canonical_fingerprint(
                 {
                     "run": self._workflow_run_id,
@@ -2444,6 +2472,7 @@ class DirectionalExecutionPipeline:
                         workflow_run_id=self._workflow_run_id,
                         research_direction_id=direction_id,
                         canonical_source_id=source.id,
+                        source_observation_id=observation_id,
                         field_projection_hash=packet["field_projection_hash"],
                         **self._execution_ownership(),
                     )

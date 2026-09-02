@@ -367,6 +367,8 @@ class ContentResearchCommandService(LegacyContentResearchCommandAdapter):
         command_id: str,
         expected_state: ContentResearchState,
         expected_revision: int,
+        recovery_plan_id: str,
+        plan_fingerprint: str,
     ) -> ContentResearchPresearchResponse:
         return await self._rerun_presearch(
             workflow_run_id=workflow_run_id,
@@ -375,6 +377,8 @@ class ContentResearchCommandService(LegacyContentResearchCommandAdapter):
             expected_revision=expected_revision,
             command_id=command_id,
             clarification_text=None,
+            recovery_plan_id=recovery_plan_id,
+            plan_fingerprint=plan_fingerprint,
         )
 
     async def revise_subject(
@@ -396,6 +400,8 @@ class ContentResearchCommandService(LegacyContentResearchCommandAdapter):
             expected_revision=expected_revision,
             command_id=command_id,
             clarification_text=clarification,
+            recovery_plan_id=None,
+            plan_fingerprint=None,
         )
 
     async def _rerun_presearch(
@@ -407,6 +413,8 @@ class ContentResearchCommandService(LegacyContentResearchCommandAdapter):
         expected_revision: int,
         command_id: str,
         clarification_text: str | None,
+        recovery_plan_id: str | None,
+        plan_fingerprint: str | None,
     ) -> ContentResearchPresearchResponse:
         normalized_command_id = command_id.strip()
         if not normalized_command_id:
@@ -423,6 +431,8 @@ class ContentResearchCommandService(LegacyContentResearchCommandAdapter):
                 expected_revision=expected_revision,
                 command_id=normalized_command_id,
                 clarification_text=clarification_text,
+                recovery_plan_id=recovery_plan_id,
+                plan_fingerprint=plan_fingerprint,
             )
 
     async def _rerun_presearch_locked(
@@ -434,6 +444,8 @@ class ContentResearchCommandService(LegacyContentResearchCommandAdapter):
         expected_revision: int,
         command_id: str,
         clarification_text: str | None,
+        recovery_plan_id: str | None,
+        plan_fingerprint: str | None,
     ) -> ContentResearchPresearchResponse:
         application = self._application
         brief = application._store.get_brief_by_workflow(workflow_run_id)
@@ -448,7 +460,17 @@ class ContentResearchCommandService(LegacyContentResearchCommandAdapter):
                 expected_state=expected_state,
                 expected_revision=expected_revision,
                 kind=event,
-                payload={"clarification_text": clarification_text},
+                payload={
+                    "clarification_text": clarification_text,
+                    **(
+                        {
+                            "recovery_plan_id": recovery_plan_id,
+                            "plan_fingerprint": plan_fingerprint,
+                        }
+                        if event == "retry_presearch"
+                        else {}
+                    ),
+                },
             )
         )
         if started.state is not ContentResearchState.PRESEARCH_RUNNING:

@@ -6,10 +6,8 @@ from typing import Any
 from app.config import Settings
 from app.v2.db.runner import run_p1_1_migrations, run_p1_2_migrations, run_p1_5_migrations
 from app.v2.decision.bootstrap import build_decision_runtime
-from app.v2.decision.postgres_store import PostgresDecisionStore
 from app.v2.decision.store import InMemoryDecisionStore
 from app.v2.feedback.bootstrap import build_feedback_runtime
-from app.v2.feedback.postgres_store import PostgresFeedbackStore
 from app.v2.feedback.store import InMemoryFeedbackStore
 from app.v2.foundation.bootstrap import build_master_data_runtime
 from app.v2.foundation.models import WorkspaceRecord
@@ -23,7 +21,6 @@ from app.v2.ingestion.service import IngestionService
 from app.v2.ingestion.store import InMemoryIngestionStore
 from app.v2.runtime import V2RuntimeConfigurationError, resolve_v2_backend
 from app.v2.topic_pool.bootstrap import build_topic_pool_runtime
-from app.v2.topic_pool.postgres_store import PostgresTopicPoolStore
 from app.v2.topic_pool.store import InMemoryTopicPoolStore
 
 
@@ -197,12 +194,12 @@ def test_postgres_master_data_store_can_save_workspace_with_connector() -> None:
     assert connection.commits == 1
 
 
-def test_build_master_data_runtime_uses_in_memory_without_postgres_dsn() -> None:
+def test_build_master_data_runtime_uses_single_writer_sqlite_without_postgres_dsn() -> None:
     settings = Settings(_env_file=None)
 
     store, service = build_master_data_runtime(settings)
 
-    assert store.__class__.__name__ == "InMemoryMasterDataStore"
+    assert store.__class__.__name__ == "SQLiteMasterDataStore"
     assert service.__class__.__name__ == "MasterDataService"
 
 

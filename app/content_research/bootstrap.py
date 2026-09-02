@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
-import sqlite3
+from contextlib import closing
+
+from app.core.sqlite_connection_roles import open_bootstrap_database
 
 
 def _bootstrap_legacy_content_research_schema(db_path: str) -> None:
     """Create Content Research tables and indexes if they do not exist."""
-    with sqlite3.connect(db_path) as conn:
+    with closing(open_bootstrap_database(db_path)) as conn:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
         conn.executescript(

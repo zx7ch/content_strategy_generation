@@ -87,8 +87,8 @@ def test_health_returns_minimum_local_runtime_contract() -> None:
     payload = response.json()
     assert payload["service"] == "xhs-agent-runtime"
     assert payload["status"] == "healthy"
-    assert payload["version"] == "0.1.0"
-    assert payload["api_contract"] == "local-runtime-v1"
+    assert payload["version"] == settings.RUNTIME_VERSION
+    assert payload["api_contract"] == "local-runtime-single-writer"
     assert payload["queue"] == "active"
 
 

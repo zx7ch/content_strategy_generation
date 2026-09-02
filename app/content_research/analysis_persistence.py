@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -15,6 +16,12 @@ from app.content_research.persistence_models import (
     MarketingConclusionCandidateRecord,
     MarketingConclusionDecisionRecord,
     StageCheckpointRecord,
+)
+from app.core.runtime_write_coordinator import RuntimeWriteCoordinator, TypedMutation
+from app.core.runtime_write_registry import get_runtime_writer
+from app.core.sqlite_connection_roles import (
+    open_bootstrap_database,
+    open_readonly_database,
 )
 
 EVIDENCE_SNAPSHOT_SCHEMA_VERSION = "content_research_evidence_snapshot_v1"
@@ -39,14 +46,23 @@ class _BorrowedSQLiteConnection:
     def __init__(self, connection: sqlite3.Connection) -> None:
         self._connection = connection
 
-    def __enter__(self) -> sqlite3.Connection:
-        return self._connection
+    def __enter__(self) -> _BorrowedSQLiteConnection:
+        return self
 
     def __exit__(self, _exc_type, _exc_value, _traceback) -> bool:
         return False
 
+    def execute(
+        self,
+        statement: str,
+        parameters: tuple[object, ...] | list[object] = (),
+    ) -> sqlite3.Cursor:
+        if statement.lstrip().upper().startswith("BEGIN"):
+            return self._connection.execute("SELECT 1 WHERE 0")
+        return self._connection.execute(statement, parameters)
+
     def __getattr__(self, name: str) -> Any:
-        if name == "close":
+        if name in {"close", "commit", "rollback"}:
             return lambda: None
         return getattr(self._connection, name)
 
@@ -188,16 +204,85 @@ class SQLiteMarketingAnalysisRepository:
         *,
         read_transaction_connection: sqlite3.Connection | None = None,
         bootstrap_schema: bool = True,
+        writer: RuntimeWriteCoordinator | None = None,
     ) -> None:
         self._db_path = db_path
         self._read_transaction_connection = read_transaction_connection
-        if read_transaction_connection is None and bootstrap_schema:
+        self._writer = writer or get_runtime_writer(self._db_path)
+        self._coordinated_connection: _BorrowedSQLiteConnection | None = None
+        if read_transaction_connection is None and bootstrap_schema and self._writer is None:
             bootstrap_content_research_schema(db_path)
 
+    def __getattribute__(self, name: str):
+        if not name.startswith("_"):
+            state = object.__getattribute__(self, "__dict__")
+            writer = state.get("_writer")
+            if writer is not None and state.get("_coordinated_connection") is None:
+                from app.content_research.analysis_mutations import (
+                    COORDINATED_ANALYSIS_ACTIONS,
+                )
+
+                if name in COORDINATED_ANALYSIS_ACTIONS:
+
+                    def coordinated(*args, **kwargs):
+                        return self._submit_analysis_command(name, args, kwargs)
+
+                    return coordinated
+        return object.__getattribute__(self, name)
+
+    def _submit_analysis_command(
+        self,
+        action: str,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+    ) -> Any:
+        from app.content_research.stores.mutations import (
+            decode_store_value,
+            encode_store_value,
+        )
+
+        assert self._writer is not None
+        result = self._writer.submit_sync(
+            TypedMutation.create(
+                mutation_id=f"content_research_analysis_{uuid.uuid4().hex}",
+                mutation_kind="execute_content_research_analysis_command",
+                domain_payload={
+                    "action": action,
+                    "args": [encode_store_value(value) for value in args],
+                    "kwargs": {
+                        key: encode_store_value(value) for key, value in kwargs.items()
+                    },
+                },
+                run_id=(
+                    str(kwargs["workflow_run_id"])
+                    if kwargs.get("workflow_run_id") is not None
+                    else None
+                ),
+            )
+        )
+        rejection = result.result_fields.get("rejected")
+        message = str(result.result_fields.get("message") or rejection or "analysis rejected")
+        if rejection == "lease_fenced":
+            raise AnalysisLeaseFencedError(message)
+        if rejection == "active_attempt":
+            raise AnalysisActiveAttemptConflictError(message)
+        if rejection == "identity_conflict":
+            raise AnalysisIdentityConflictError(message)
+        if rejection:
+            raise ValueError(message)
+        return decode_store_value(result.result_fields.get("result"))
+
     def _connect(self) -> sqlite3.Connection:
+        if self._coordinated_connection is not None:
+            return self._coordinated_connection  # type: ignore[return-value]
         if self._read_transaction_connection is not None:
             return _BorrowedSQLiteConnection(self._read_transaction_connection)  # type: ignore[return-value]
-        conn = sqlite3.connect(self._db_path, timeout=30)
+        if self._writer is not None:
+            conn = open_readonly_database(self._db_path, timeout=30)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA foreign_keys=ON")
+            return conn
+        conn = open_bootstrap_database(self._db_path, timeout=30)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA busy_timeout=30000")

@@ -8,6 +8,7 @@ from datetime import datetime
 from typing import Any
 
 from app.content_research.lifecycle.models import ContentResearchState, RunProjection
+from app.content_research.lifecycle.recovery import plan_recovery
 
 _ALLOWED_ACTIONS: dict[ContentResearchState, tuple[str, ...]] = {
     ContentResearchState.PRESEARCH_RUNNING: ("cancel",),
@@ -32,7 +33,7 @@ _ALLOWED_ACTIONS: dict[ContentResearchState, tuple[str, ...]] = {
     ),
     ContentResearchState.REPORT_COMPOSING: ("cancel",),
     ContentResearchState.REPORT_READY: (),
-    ContentResearchState.RECOVERY_REQUIRED: ("retry_presearch", "cancel"),
+    ContentResearchState.RECOVERY_REQUIRED: ("cancel",),
     ContentResearchState.CANCELLED_OR_FAILED: (),
 }
 
@@ -56,6 +57,7 @@ def projection_from_row(
     brief_id: str | None,
     scope_contract_id: str | None = None,
     has_dispatch: bool = False,
+    dispatch_attempt_id: str | None = None,
     execution_attempt_id: str | None = None,
     publication_id: str | None = None,
 ) -> RunProjection:
@@ -78,28 +80,26 @@ def projection_from_row(
             f"{state.value} cannot own frozen Scope, dispatch, or execution artifacts"
         )
     error = _json_mapping(row["lifecycle_error_json"])
-    allowed_actions = _ALLOWED_ACTIONS[state]
-    if (
-        state is ContentResearchState.RECOVERY_REQUIRED
-        and error is not None
-        and error.get("recovery_action") == "retry_retrieval"
-    ):
-        allowed_actions = ("retry_retrieval", "cancel")
-    elif (
-        state is ContentResearchState.RECOVERY_REQUIRED
-        and error is not None
-        and error.get("code") == "MARKETING_ANALYSIS_FAILED"
-    ):
-        allowed_actions = ("retry_analysis", "cancel")
-    elif (
-        state is ContentResearchState.RECOVERY_REQUIRED
-        and error is not None
-        and (
-            error.get("code") == "REPORT_FINALIZATION_FAILED"
-            or error.get("stage") == ContentResearchState.REPORT_COMPOSING.value
-        )
-    ):
-        allowed_actions = ("retry_report", "cancel")
+    recovery_plan = plan_recovery(
+        state=state,
+        state_revision=int(raw_revision),
+        error=error,
+        brief_id=current_brief_id,
+        scope_contract_id=scope_contract_id,
+        dispatch_attempt_id=dispatch_attempt_id,
+        execution_attempt_id=execution_attempt_id,
+        analysis_attempt_id=(
+            str(row["effective_analysis_attempt_id"])
+            if row["effective_analysis_attempt_id"]
+            else None
+        ),
+        publication_id=publication_id,
+    )
+    allowed_actions = (
+        (recovery_plan.action, "cancel")
+        if recovery_plan is not None
+        else _ALLOWED_ACTIONS[state]
+    )
     return RunProjection(
         run_id=str(row["run_id"]),
         thread_id=str(row["thread_id"]),
@@ -107,6 +107,7 @@ def projection_from_row(
         state_revision=int(raw_revision),
         entered_at=_parse_datetime(row["state_entered_at"]),
         allowed_actions=allowed_actions,
+        recovery_plan=recovery_plan,
         reason_code=str(row["error_code"]) if row["error_code"] else None,
         error=error,
         brief_id=current_brief_id,

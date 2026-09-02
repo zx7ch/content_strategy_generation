@@ -51,6 +51,21 @@ class ExecutionEvent:
 
 
 @dataclass(frozen=True)
+class RecoveryPlan:
+    recoverable: bool
+    action: str
+    reason_code: str
+    recovery_plan_id: str
+    plan_fingerprint: str
+    failed_stage: str
+    failure_class: str
+    expected_attempt_id: str
+    attempt_no: int | None
+    expected_state_revision: int
+    checkpoint_references: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class RunProjection:
     run_id: str
     thread_id: str
@@ -58,6 +73,7 @@ class RunProjection:
     state_revision: int
     entered_at: datetime
     allowed_actions: tuple[str, ...]
+    recovery_plan: RecoveryPlan | None = None
     reason_code: str | None = None
     error: Mapping[str, Any] | None = None
     brief_id: str | None = None

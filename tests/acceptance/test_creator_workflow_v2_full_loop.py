@@ -125,7 +125,7 @@ async def _workflow_event_payloads(run_id: str, after_event_id: int | None = Non
 
 @pytest.mark.acceptance
 @pytest.mark.asyncio
-async def test_legacy_workflow_endpoint_forwards_to_workflow_v2_without_session_job_truth(client):
+async def test_removed_workflow_endpoint_is_not_reachable(client):
     thread_id = await _create_thread(client)
 
     response = await client.post(
@@ -133,25 +133,14 @@ async def test_legacy_workflow_endpoint_forwards_to_workflow_v2_without_session_
         json={"user_query": "帮我生成一组小红书防晒衣笔记"},
     )
 
-    assert response.status_code == 201
-    body = response.json()
-    run_id = body["run_id"]
-    assert body["compatibility_mode"] == "workflow-v2"
-    assert body["session_id"] == run_id
-    assert body["job_id"] == ""
-    assert body["active_run_snapshot"]["run"]["run_id"] == run_id
-    assert body["active_run_snapshot"]["run"]["current_step"] == "intake.capture_request"
+    assert response.status_code == 404
 
     thread = await client.get(f"/threads/{thread_id}")
     assert thread.status_code == 200
     detail = thread.json()["thread"]
-    assert detail["active_run_id"] == run_id
+    assert detail["active_run_id"] is None
     assert detail["active_workflow_session_id"] is None
     assert detail["active_job_id"] is None
-
-    async with WorkflowStore(settings.SQLITE_DB_PATH) as store:
-        events = await store.list_events(run_id)
-    assert [event.event_type for event in events][:1] == ["run_started"]
 
 
 @pytest.mark.acceptance

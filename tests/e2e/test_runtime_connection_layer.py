@@ -24,7 +24,7 @@ async def test_health_exposes_runtime_contract_and_features(monkeypatch):
     body = response.json()
     assert body["service"]
     assert body["version"]
-    assert body["api_contract"] == "local-runtime-v1"
+    assert body["api_contract"] == "local-runtime-single-writer"
     assert body["features"]["publish_candidate_artifacts"] is True
     assert body["features"]["embedding_prewarm"] is True
     assert body["features"]["content_research"] is settings.F003_LITE_PREVIEW_ENABLED

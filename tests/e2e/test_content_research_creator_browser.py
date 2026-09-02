@@ -10,6 +10,7 @@ import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 import pytest
@@ -59,6 +60,9 @@ def real_creator_stack(tmp_path, request):
         "CHROMA_PERSIST_DIR": str(chroma_dir),
         "JOB_POLL_INTERVAL_MS": "50",
         "SSE_HEARTBEAT_SECONDS": "1",
+        "CONTENT_RESEARCH_MAX_CONCURRENT_RUNS": str(
+            parameters.get("max_concurrent_runs", 1)
+        ),
         "CORS_ALLOWED_ORIGINS": (
             f"http://localhost:3000,http://127.0.0.1:3000,{frontend_url}"
         ),
@@ -72,6 +76,9 @@ def real_creator_stack(tmp_path, request):
             parameters.get("source_scenario") or "auth_required"
         ),
         "CREATOR_E2E_SOURCE_CALL_LOG": str(source_call_log),
+        "CREATOR_E2E_REQUIRE_TWO_ACTIVE_RUNS": (
+            "1" if parameters.get("require_two_active_runs") else "0"
+        ),
         "CREATOR_E2E_INVALID_ANALYSIS_TRACKS": str(
             parameters.get("invalid_analysis_tracks") or ""
         ),
@@ -153,6 +160,182 @@ def _goto_creator_after_brand_hydration(page, frontend_url: str) -> None:
         timeout=15000,
     ):
         page.goto(frontend_url + "/creator", wait_until="domcontentloaded")
+
+
+def _start_product_marketing_run(page: Page, frontend_url: str, subject: str) -> str:
+    _goto_creator_after_brand_hydration(page, frontend_url)
+    with page.expect_response(
+        lambda response: response.url.endswith("/threads")
+        and response.request.method == "POST"
+        and response.status == 201,
+        timeout=30000,
+    ):
+        page.get_by_role("button", name=re.compile("新建对话")).click()
+    page.get_by_role("button", name=re.compile("内容调研")).click(timeout=15000)
+    research_input = page.get_by_role(
+        "textbox", name="输入品类、品牌或 SKU，发送后开始内容调研"
+    )
+    expect(research_input).to_be_enabled(timeout=15000)
+    research_input.fill(subject)
+    with page.expect_response(
+        lambda response: response.url.endswith("/content-research/presearch")
+        and response.status == 201,
+        timeout=30000,
+    ) as presearch_response:
+        research_input.press("Enter")
+    run_id = presearch_response.value.json()["workflow_run_id"]
+
+    page.get_by_role("button", name="准确，继续").click()
+    page.get_by_role("button", name="产品营销").click()
+    with page.expect_response(
+        lambda response: response.url.endswith("/actions")
+        and '"action":"confirm_brief"' in (response.request.post_data or ""),
+        timeout=30000,
+    ):
+        page.get_by_role("button", name="确认并继续").click()
+    scope = page.get_by_role("region", name="检索范围确认")
+    expect(scope.get_by_test_id("scope-final-query")).not_to_have_count(0, timeout=30000)
+    with page.expect_response(
+        lambda response: response.url.endswith("/actions")
+        and '"action":"confirm_scope"' in (response.request.post_data or ""),
+        timeout=30000,
+    ) as confirmation:
+        scope.get_by_role("button", name="确认并开始调研").click()
+    assert confirmation.value.status == 200, confirmation.value.text()
+    return run_id
+
+
+@pytest.mark.parametrize(
+    "real_creator_stack",
+    [
+        {
+            "source_scenario": "concurrent",
+            "max_concurrent_runs": 2,
+            "require_two_active_runs": True,
+        }
+    ],
+    indirect=True,
+)
+def test_two_full_runs_publish_effective_isolated_reports(browser_page):
+    page_a, stack = browser_page
+    browser = page_a.context.browser
+    assert browser is not None
+    context_b = browser.new_context(viewport={"width": 1440, "height": 960})
+    page_b = context_b.new_page()
+    try:
+        run_a = _start_product_marketing_run(
+            page_a, stack["frontend_url"], "夏季凉感T恤"
+        )
+        run_b = _start_product_marketing_run(
+            page_b, stack["frontend_url"], "长袖衬衫 凉感 夏季通勤"
+        )
+        assert run_a != run_b
+
+        for page in (page_a, page_b):
+            expect(page.get_by_text("调研报告已完成", exact=True)).to_be_visible(
+                timeout=120000
+            )
+            expect(
+                page.get_by_role("article", name="Content Research published report")
+            ).to_be_visible(timeout=30000)
+
+        source_calls = [
+            json.loads(line)
+            for line in stack["source_call_log"].read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        assert {call["workflow_run_id"] for call in source_calls} == {run_a, run_b}
+        assert max(len(call["active_run_ids"]) for call in source_calls) == 2
+        queries_by_run = {
+            run_id: {
+                call["query"]
+                for call in source_calls
+                if call["workflow_run_id"] == run_id
+            }
+            for run_id in (run_a, run_b)
+        }
+        assert queries_by_run[run_a] == {"T恤", "T恤 凉感", "T恤 夏季"}
+        assert queries_by_run[run_b] == {
+            "长袖衬衫",
+            "长袖衬衫 凉感",
+            "长袖衬衫 夏季通勤",
+        }
+
+        with sqlite3.connect(stack["db_path"]) as connection:
+            connection.row_factory = sqlite3.Row
+            rows = connection.execute(
+                """SELECT run.run_id, run.thread_id,
+                          run.effective_analysis_attempt_id,
+                          publication.id AS publication_id,
+                          publication.research_plan_id,
+                          publication.governed_snapshot_id,
+                          artifact.artifact_id,
+                          json_extract(
+                              artifact.payload_json, '$.report_publication_id'
+                          ) AS artifact_publication_id,
+                          unit.workflow_run_id AS analysis_run_id
+                   FROM workflow_runs AS run
+                   JOIN content_research_report_publications AS publication
+                     ON publication.workflow_run_id=run.run_id
+                   JOIN workflow_artifacts AS artifact
+                     ON artifact.run_id=run.run_id
+                    AND artifact.artifact_type='final_result'
+                    AND json_extract(
+                        artifact.payload_json, '$.report_publication_id'
+                    )=publication.id
+                   JOIN content_research_analysis_attempts AS attempt
+                     ON attempt.id=run.effective_analysis_attempt_id
+                    AND attempt.state='succeeded'
+                   JOIN content_research_analysis_units AS unit
+                     ON unit.id=attempt.analysis_unit_id
+                    AND unit.workflow_run_id=run.run_id
+                   WHERE run.run_id IN (?, ?)
+                   ORDER BY run.run_id""",
+                (run_a, run_b),
+            ).fetchall()
+            assert len(rows) == 2
+            assert connection.execute(
+                "SELECT COUNT(*) FROM content_research_canonical_sources "
+                "WHERE platform_source_id='note-shared-summer-cooling-1'"
+            ).fetchone()[0] == 1
+
+        by_run = {str(row["run_id"]): dict(row) for row in rows}
+        assert set(by_run) == {run_a, run_b}
+        assert len({row["thread_id"] for row in rows}) == 2
+        assert len({row["effective_analysis_attempt_id"] for row in rows}) == 2
+        assert len({row["publication_id"] for row in rows}) == 2
+        assert len({row["artifact_id"] for row in rows}) == 2
+        for run_id, row in by_run.items():
+            assert row["analysis_run_id"] == run_id
+            assert row["artifact_publication_id"] == row["publication_id"]
+
+        for run_id, row in by_run.items():
+            with urlopen(
+                Request(
+                    f"{stack['backend_url']}/content-research/workflows/{run_id}/trace",
+                    headers=USER_HEADERS,
+                ),
+                timeout=10,
+            ) as response:
+                trace = json.loads(response.read())
+            marketing_trace = next(
+                item
+                for item in trace["logical_checkpoints"]
+                if item["stage"] == "marketing_conclusion"
+            )
+            assert trace["workflow_run_id"] == run_id
+            assert trace["state"] == "report_ready"
+            assert trace["effective_attempt"] == {
+                "kind": "analysis",
+                "attempt_no": 1,
+                "state": "succeeded",
+            }
+            assert (
+                marketing_trace["analysis_attempt_id"]
+                == row["effective_analysis_attempt_id"]
+            )
+    finally:
+        context_b.close()
 
 
 def test_creator_submit_subject_reaches_only_the_approved_brief_and_restores_it(
@@ -249,7 +432,7 @@ def test_creator_corrects_search_structure_and_reads_only_the_backend_query_prev
     page.get_by_role("button", name="查看 Trace").click()
     trace_dialog = page.get_by_role("dialog", name="Agent 决策日志 · Trace")
     expect(trace_dialog.get_by_text("确认检索范围", exact=True)).to_be_visible()
-    expect(trace_dialog.get_by_text("等待用户操作", exact=True)).to_be_visible()
+    expect(trace_dialog.get_by_text("内容调研 · 等待用户确认", exact=True)).to_be_visible()
     expect(trace_dialog.get_by_text("scope_confirm", exact=False)).to_have_count(0)
     expect(trace_dialog.get_by_text("等待恢复", exact=False)).to_have_count(0)
     page.get_by_role("button", name="关闭 Trace 对话框").click()
@@ -667,7 +850,7 @@ def test_creator_exposes_real_analysis_worker_failure_before_report_composition(
     expect(trace_dialog.get_by_text(re.compile("价值：分析不可用"))).to_be_visible()
     expect(trace_dialog.get_by_text(re.compile("表达：分析不可用"))).to_be_visible()
     expect(trace_dialog.get_by_text(re.compile("价值：模型返回的 JSON 无法解析"))).to_be_visible()
-    expect(trace_dialog.get_by_text("营销结论分析", exact=True)).to_be_visible()
+    expect(trace_dialog.get_by_text("组装并发布调研报告", exact=True)).to_be_visible()
     expect(trace_dialog.get_by_text("组装并发布调研报告", exact=True)).to_be_visible()
 
     trace_request = Request(
@@ -700,12 +883,9 @@ def test_creator_exposes_real_analysis_worker_failure_before_report_composition(
         "recovery_action": "repair_model_configuration_and_resume",
     }
     assert marketing_trace["tracks"]["message"] == marketing_trace["tracks"]["value"]
-    runtime_statuses = {
-        step["step_name"]: step["status"] for step in trace["runtime_steps"]
-    }
-    assert runtime_statuses["formal_research"] == "succeeded"
-    assert runtime_statuses["marketing_analysis"] == "failed"
-    assert runtime_statuses["report"] == "pending"
+    assert "runtime_steps" not in trace
+    assert "runtime_child_tasks" not in trace
+    assert trace["state_transitions"][-1]["to_state"] == "recovery_required"
     assert trace["external_api_summary"]["failed_count"] == 0
     assert trace["external_api_summary"]["call_count"] > 0
     source_call_count = trace["external_api_summary"]["call_count"]
@@ -836,6 +1016,81 @@ def test_creator_run_b_remains_active_after_reload_and_late_run_a_history(
 
 
 
+def test_recovery_plan_is_the_only_retry_authority(browser_page):
+    page, stack = browser_page
+    brand_id = default_brand_id(stack["backend_url"])
+    failed = run_async_in_thread(
+        seed_local_identity_conflict(
+            stack["db_path"], brand_id=brand_id, title="本地身份冲突"
+        )
+    )
+
+    with urlopen(
+        Request(
+            f"{stack['backend_url']}/content-research/workflows/{failed['workflow_run_id']}",
+            headers=USER_HEADERS,
+        )
+    ) as response:
+        run = json.load(response)["run"]
+
+    assert run["state"] == "recovery_required"
+    assert run["allowed_actions"] == ["cancel"]
+    assert run.get("recovery_plan") is None
+
+    with urlopen(
+        Request(
+            f"{stack['backend_url']}/content-research/workflows/"
+            f"{failed['workflow_run_id']}/trace",
+            headers=USER_HEADERS,
+        )
+    ) as response:
+        trace = json.load(response)
+    assert trace["recoverable"] is False
+    assert trace.get("recovery_plan") is None
+
+    forged_command = Request(
+        f"{stack['backend_url']}/content-research/workflows/"
+        f"{failed['workflow_run_id']}/actions",
+        data=json.dumps(
+            {
+                "command_id": "forged-local-identity-retry",
+                "expected_state": "recovery_required",
+                "expected_revision": run["state_revision"],
+                "action": "retry_retrieval",
+                "payload": {
+                    "recovery_plan_id": "forged-plan",
+                    "plan_fingerprint": "sha256:forged",
+                },
+            }
+        ).encode(),
+        headers={**USER_HEADERS, "Content-Type": "application/json"},
+        method="POST",
+    )
+    with pytest.raises(HTTPError) as rejected:
+        urlopen(forged_command)
+    assert rejected.value.code == 409
+    safe_error = rejected.value.read().decode()
+    assert "STALE_CONTENT_RESEARCH_COMMAND" in safe_error
+    assert "SELECT" not in safe_error
+    assert "workflow_runs" not in safe_error
+
+    with urlopen(
+        Request(
+            f"{stack['backend_url']}/content-research/workflows/"
+            f"{failed['workflow_run_id']}",
+            headers=USER_HEADERS,
+        )
+    ) as response:
+        unchanged = json.load(response)["run"]
+    assert unchanged["state_revision"] == run["state_revision"]
+    assert unchanged.get("recovery_plan") is None
+
+    open_creator_with_restored_run(
+        page, stack["frontend_url"], failed["workflow_run_id"]
+    )
+    expect(page.get_by_role("button", name="继续失败的检索")).to_have_count(0)
+
+
 def test_creator_model_failure_edit_save_and_continue_same_presearch(browser_page):
     page, stack = browser_page
     retry_requests: list[dict] = []
@@ -855,6 +1110,21 @@ def test_creator_model_failure_edit_save_and_continue_same_presearch(browser_pag
     open_creator_with_restored_run(
         page, stack["frontend_url"], first["workflow_run_id"]
     )
+
+    with urlopen(
+        Request(
+            f"{stack['backend_url']}/content-research/workflows/{first['workflow_run_id']}",
+            headers=USER_HEADERS,
+        )
+    ) as response:
+        recovery_plan = json.load(response)["run"]["recovery_plan"]
+    with urlopen(
+        Request(
+            f"{stack['backend_url']}/content-research/workflows/{first['workflow_run_id']}/trace",
+            headers=USER_HEADERS,
+        )
+    ) as response:
+        assert json.load(response)["recovery_plan"] == recovery_plan
 
     card = page.get_by_role("region", name="模型服务")
     expect(card.get_by_text("模型配置需要更新后才能继续调研。", exact=True)).to_be_visible(timeout=20000)
@@ -913,7 +1183,10 @@ def test_creator_model_failure_edit_save_and_continue_same_presearch(browser_pag
         assert request["expected_state"] == "recovery_required"
         assert request["expected_revision"] >= 1
         assert request["command_id"]
-        assert request["payload"] == {}
+        assert request["payload"] == {
+            "recovery_plan_id": recovery_plan["recovery_plan_id"],
+            "plan_fingerprint": recovery_plan["plan_fingerprint"],
+        }
     assert retried["workflow_run_id"] == first["workflow_run_id"]
     assert retried["attempt_id"].startswith("att_")
     assert retried["attempt_id"] != first["attempt_id"]
@@ -1111,6 +1384,88 @@ async def seed_model_presearch_recovery(
         "attempt_id": attempt_id,
         "brief_id": brief_id,
         "thread_id": thread["id"],
+    }
+
+
+async def seed_local_identity_conflict(
+    db_path: str,
+    *,
+    brand_id: str,
+    title: str,
+) -> dict[str, str]:
+    async with ThreadStore(db_path) as thread_store:
+        thread = await thread_store.create_thread(
+            title=title,
+            workspace_id=WORKSPACE_ID,
+            brand_id=brand_id,
+        )
+    run_id = f"run_local_conflict_{thread['id']}"
+    brief_id = f"brief_{run_id}"
+    attempt_id = f"attempt_{run_id}"
+    coordinator = ContentResearchPersistenceCoordinator(db_path)
+    await coordinator.apply(
+        LifecycleCommand(
+            command_id=f"seed-submit:{run_id}",
+            run_id=run_id,
+            expected_state=None,
+            expected_revision=0,
+            kind="submit_research_subject",
+            payload={
+                "thread_id": thread["id"],
+                "user_id": "operator",
+                "workspace_id": WORKSPACE_ID,
+                "seed_text": title,
+            },
+        )
+    )
+    await coordinator.apply(
+        LifecycleCommand(
+            command_id=f"seed-failure:{run_id}",
+            run_id=run_id,
+            expected_state=ContentResearchState.PRESEARCH_RUNNING,
+            expected_revision=1,
+            kind="fail",
+            payload={
+                "brief_id": brief_id,
+                "schema_version": "content_research_brief_v1",
+                "brief_status": "failed",
+                "subject": title,
+                "directions": ["product_marketing"],
+                "attempt_id": attempt_id,
+                "seed_text": title,
+                "user_note": None,
+                "workspace_id": WORKSPACE_ID,
+                "user_id": "operator",
+                "status": "failed",
+                "subject_confirmation": title,
+                "competitor_tags": [],
+                "research_directions": [],
+                "direction_catalog": list(DIRECTION_CATALOG_V1),
+                "custom_competitor_input": "",
+                "timeout_status": "none",
+                "fallback_used": False,
+                "error_code": "LOCAL_IDENTITY_CONFLICT",
+                "error_message": "本地身份契约冲突",
+                "recoverable": False,
+                "configuration_source": "user",
+                "model": "deterministic-e2e",
+                "error": {
+                    "code": "LOCAL_IDENTITY_CONFLICT",
+                    "stage": "retrieval_running",
+                    "operation": "persist_retrieval_outcome",
+                    "message": "本地身份契约冲突",
+                    "retryable": True,
+                    "recovery_action": "retry_retrieval",
+                    "attempt_id": attempt_id,
+                },
+            },
+        )
+    )
+    return {
+        "workflow_run_id": run_id,
+        "attempt_id": attempt_id,
+        "brief_id": brief_id,
+        "thread_id": str(thread["id"]),
     }
 
 

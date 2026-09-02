@@ -10,6 +10,8 @@ from app.content_research.execution_lease import (
     workflow_dispatch_guard,
     workflow_execution_guard,
 )
+from app.content_research.lifecycle.coordinator import ContentResearchPersistenceCoordinator
+from app.content_research.lifecycle.models import ContentResearchState
 from app.content_research.models import ResearchResultSnapshotRecord
 from app.content_research.persistence_models import (
     ReportDraftRecord,
@@ -23,6 +25,8 @@ from app.content_research.scope_contract import (
     ExecutionLeaseFencedError,
 )
 from app.content_research.stores.base import ContentResearchStore
+from app.core.runtime_write_coordinator import TypedMutation
+from app.core.runtime_write_registry import get_runtime_writer
 from app.memory.thread_store import ThreadStore
 from app.memory.workflow_store import WorkflowStore
 from app.models.workflow import WorkflowArtifact, WorkflowArtifactPayloadMode, WorkflowArtifactType
@@ -96,6 +100,54 @@ class ReportPublicationMaterializer:
                 ),
                 None,
             )
+            writer = get_runtime_writer(self._db_path)
+            if writer is not None:
+                result = await writer.submit(
+                    TypedMutation.create(
+                        mutation_id=f"materialize_report_artifact_{publication.id}",
+                        mutation_kind="materialize_content_research_report_artifact",
+                        run_id=publication.workflow_run_id,
+                        domain_payload={
+                            "publication_id": publication.id,
+                            "run_id": publication.workflow_run_id,
+                            "artifact_payload": self._artifact_payload(
+                                publication, draft, decision, snapshot
+                            ),
+                            "parent_artifact_id": (
+                                parent_artifact.artifact_id
+                                if parent_artifact is not None
+                                else None
+                            ),
+                            "summary_text": "内容调研报告已发布",
+                            "execution_context": (
+                                {
+                                    "execution_unit_id": self._execution_context.execution_unit_id,
+                                    "attempt_no": self._execution_context.attempt_no,
+                                    "lease_token": self._execution_context.lease_token,
+                                    "scope_contract_id": self._execution_context.scope_contract_id,
+                                }
+                                if self._execution_context is not None
+                                else None
+                            ),
+                            "dispatch_context": (
+                                {
+                                    "workflow_run_id": self._dispatch_context.workflow_run_id,
+                                    "lease_owner": self._dispatch_context.lease_owner,
+                                    "lease_token": self._dispatch_context.lease_token,
+                                }
+                                if self._dispatch_context is not None
+                                else None
+                            ),
+                        },
+                    )
+                )
+                if result.result_fields.get("rejected") == "lease_fenced":
+                    raise ExecutionLeaseFencedError(
+                        str(result.result_fields.get("message") or "execution lease fenced")
+                    )
+                artifact = WorkflowArtifact.model_validate(result.result_fields["artifact"])
+                return artifact
+
             if self._execution_context is not None:
                 manager = LeaseFencedWorkflowRunManager(
                     self._db_path,
@@ -137,6 +189,94 @@ class ReportPublicationMaterializer:
                 )
 
         return artifact
+
+    async def commit_publication(self, publication_id: str) -> WorkflowArtifact:
+        """Atomically expose one verified publication across all public projections."""
+
+        publication = self._require_publication(publication_id)
+        if any(
+            item.event_type == "integrity_flagged"
+            for item in self._store.list_report_integrity_events(publication.id)
+        ):
+            raise ValueError("cannot commit an integrity-flagged report publication")
+        draft = self._require_parent(
+            ReportDraftRecord, publication.report_draft_id, "report draft"
+        )
+        decision = self._require_parent(
+            ReportFaithfulnessDecisionRecord,
+            publication.faithfulness_decision_id,
+            "report faithfulness decision",
+        )
+        snapshot = self._require_snapshot(publication)
+        self._validate_lineage(publication, draft, decision, snapshot)
+        projection = await ContentResearchPersistenceCoordinator(
+            self._db_path, writer=self._store._writer
+        ).load(publication.workflow_run_id)
+        if projection.state is not ContentResearchState.REPORT_COMPOSING:
+            raise ValueError("report publication commit requires report_composing")
+
+        async with WorkflowStore(self._db_path) as workflow_store:
+            existing = await workflow_store.list_artifacts(publication.workflow_run_id)
+        parent_artifact = next(
+            (
+                item
+                for item in existing
+                if publication.previous_version_id is not None
+                and item.artifact_type == WorkflowArtifactType.FINAL_RESULT
+                and (item.payload_json or {}).get("report_publication_id")
+                == publication.previous_version_id
+            ),
+            None,
+        )
+        writer = get_runtime_writer(self._db_path) or self._store._writer
+        if writer is None:
+            raise RuntimeError("atomic report publication requires the runtime writer")
+        result = await writer.submit(
+            TypedMutation.create(
+                mutation_id=f"commit_report_publication_{publication.id}",
+                mutation_kind="commit_content_research_report_publication",
+                run_id=publication.workflow_run_id,
+                domain_payload={
+                    "publication_id": publication.id,
+                    "run_id": publication.workflow_run_id,
+                    "expected_state": projection.state.value,
+                    "expected_revision": projection.state_revision,
+                    "artifact_payload": self._artifact_payload(
+                        publication, draft, decision, snapshot
+                    ),
+                    "parent_artifact_id": (
+                        parent_artifact.artifact_id
+                        if parent_artifact is not None
+                        else None
+                    ),
+                    "summary_text": "内容调研报告已发布",
+                    "execution_context": (
+                        {
+                            "execution_unit_id": self._execution_context.execution_unit_id,
+                            "attempt_no": self._execution_context.attempt_no,
+                            "lease_token": self._execution_context.lease_token,
+                            "scope_contract_id": self._execution_context.scope_contract_id,
+                        }
+                        if self._execution_context is not None
+                        else None
+                    ),
+                    "dispatch_context": (
+                        {
+                            "workflow_run_id": self._dispatch_context.workflow_run_id,
+                            "lease_owner": self._dispatch_context.lease_owner,
+                            "lease_token": self._dispatch_context.lease_token,
+                        }
+                        if self._dispatch_context is not None
+                        else None
+                    ),
+                },
+            )
+        )
+        if result.result_fields.get("rejected") == "lease_fenced":
+            raise ExecutionLeaseFencedError(
+                str(result.result_fields.get("message") or "execution lease fenced")
+            )
+        return WorkflowArtifact.model_validate(result.result_fields["artifact"])
 
     async def publish_timeline_message(self, publication_id: str) -> None:
         """Expose the final Creator message only after the run commits success."""

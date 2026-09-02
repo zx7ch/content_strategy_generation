@@ -19,7 +19,7 @@ def test_settings_default_values() -> None:
     assert settings.RAG_EMBEDDING_MODEL == "BAAI/bge-base-zh-v1.5"
     assert settings.RUNTIME_SERVICE_NAME == "xhs-agent-runtime"
     assert settings.RUNTIME_VERSION
-    assert settings.RUNTIME_API_CONTRACT == "local-runtime-v1"
+    assert settings.RUNTIME_API_CONTRACT == "local-runtime-single-writer"
     assert settings.F003_LITE_PREVIEW_ENABLED is False
     assert settings.cors_allowed_origins == [
         "http://localhost:3000",

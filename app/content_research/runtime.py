@@ -5,9 +5,22 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
+
+from app.content_research.stores.sqlite_store import _BorrowedSQLiteConnection
+from app.core.runtime_write_coordinator import (
+    DomainMutationRejectedError,
+    RuntimeWriteCoordinator,
+    TypedMutation,
+)
+from app.core.runtime_write_registry import get_runtime_writer
+from app.core.sqlite_connection_roles import (
+    open_bootstrap_database,
+    open_readonly_database,
+)
 
 STAGE_SEQUENCE = (
     "subject_structure",
@@ -67,8 +80,15 @@ class StageCheckpoint:
 class LLMCostLedger:
     """Append actual provider usage after a call; deliberately never blocks a call."""
 
-    def __init__(self, db_path: str) -> None:
+    def __init__(
+        self,
+        db_path: str,
+        *,
+        writer: RuntimeWriteCoordinator | None = None,
+    ) -> None:
         self._db_path = db_path
+        self._writer = writer or get_runtime_writer(self._db_path)
+        self._coordinated_connection: _BorrowedSQLiteConnection | None = None
 
     def record_actual(
         self,
@@ -123,8 +143,39 @@ class LLMCostLedger:
     ) -> LLMCostLedgerEntry:
         if not research_plan_id or not usage_event_id:
             raise ValueError("research_plan_id and usage_event_id are required")
+        if self._writer is not None:
+            from app.content_research.stores.mutations import (
+                decode_store_value,
+                encode_store_value,
+            )
+
+            try:
+                result = self._writer.submit_sync(
+                    TypedMutation.create(
+                        mutation_id=f"content_research_cost_{uuid.uuid4().hex}",
+                        mutation_kind="execute_content_research_runtime_command",
+                        domain_payload={
+                            "action": "record_cost",
+                            "kwargs": {
+                                key: encode_store_value(value)
+                                for key, value in {
+                                    "research_plan_id": research_plan_id,
+                                    "usage_event_id": usage_event_id,
+                                    "amount": amount,
+                                    "status": status,
+                                    "research_direction_id": research_direction_id,
+                                    "stage_checkpoint_id": stage_checkpoint_id,
+                                    "reason": reason,
+                                }.items()
+                            },
+                        },
+                    )
+                )
+            except DomainMutationRejectedError as exc:
+                raise ValueError(exc.safe_message) from None
+            return decode_store_value(result.result_fields.get("result"))
         key = f"llm_usage:{usage_event_id}"
-        with sqlite3.connect(self._db_path, timeout=30) as conn:
+        with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 "SELECT id, research_plan_id, reservation_status, consumed_amount, payload_json "
@@ -169,10 +220,24 @@ class LLMCostLedger:
             )
         return LLMCostLedgerEntry(entry_id, research_plan_id, usage_event_id, amount, status)
 
+    def _connect(self) -> sqlite3.Connection:
+        if self._coordinated_connection is not None:
+            return self._coordinated_connection  # type: ignore[return-value]
+        if self._writer is not None:
+            return open_readonly_database(self._db_path, timeout=30)
+        return open_bootstrap_database(self._db_path, timeout=30)
+
 
 class CheckpointRuntime:
-    def __init__(self, db_path: str) -> None:
+    def __init__(
+        self,
+        db_path: str,
+        *,
+        writer: RuntimeWriteCoordinator | None = None,
+    ) -> None:
         self._db_path = db_path
+        self._writer = writer or get_runtime_writer(self._db_path)
+        self._coordinated_connection: _BorrowedSQLiteConnection | None = None
 
     def checkpoint(
         self,
@@ -192,6 +257,38 @@ class CheckpointRuntime:
             raise ValueError("invalid checkpoint status")
         if retry_count > 2:
             raise ValueError("a stage permits at most two user-triggered recoveries")
+        if self._writer is not None:
+            from app.content_research.stores.mutations import (
+                decode_store_value,
+                encode_store_value,
+            )
+
+            try:
+                result = self._writer.submit_sync(
+                    TypedMutation.create(
+                        mutation_id=f"content_research_checkpoint_{uuid.uuid4().hex}",
+                        mutation_kind="execute_content_research_runtime_command",
+                        domain_payload={
+                            "action": "checkpoint",
+                            "kwargs": {
+                                key: encode_store_value(value)
+                                for key, value in {
+                                    "subagent_task_id": subagent_task_id,
+                                    "stage_name": stage_name,
+                                    "input_fingerprint": input_fingerprint,
+                                    "status": status,
+                                    "output_refs": output_refs,
+                                    "usage_event_ids": usage_event_ids,
+                                    "failure": failure,
+                                    "retry_count": retry_count,
+                                }.items()
+                            },
+                        },
+                    )
+                )
+            except DomainMutationRejectedError as exc:
+                raise ValueError(exc.safe_message) from None
+            return decode_store_value(result.result_fields.get("result"))
         checkpoint_id = _stable_id("scp", subagent_task_id, stage_name, input_fingerprint)
         payload = {
             "schema_version": "content_research_stage_checkpoint_v1",
@@ -199,7 +296,7 @@ class CheckpointRuntime:
             "usage_event_ids": list(usage_event_ids),
             "failure": failure,
         }
-        with sqlite3.connect(self._db_path, timeout=30) as conn:
+        with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 "SELECT status, retry_count FROM content_research_stage_checkpoints WHERE id = ?",
@@ -240,7 +337,7 @@ class CheckpointRuntime:
         self, *, subagent_task_id: str, stage_name: str, input_fingerprint: str
     ) -> bool:
         checkpoint_id = _stable_id("scp", subagent_task_id, stage_name, input_fingerprint)
-        with sqlite3.connect(self._db_path) as conn:
+        with self._connect() as conn:
             row = conn.execute(
                 "SELECT status FROM content_research_stage_checkpoints WHERE id = ?",
                 (checkpoint_id,),
@@ -248,10 +345,17 @@ class CheckpointRuntime:
         return row is not None and row[0] == "completed"
 
     def resume_stage(self, subagent_task_id: str) -> str | None:
-        with sqlite3.connect(self._db_path) as conn:
+        with self._connect() as conn:
             rows = conn.execute(
                 "SELECT stage_name, status FROM content_research_stage_checkpoints WHERE subagent_task_id = ?",
                 (subagent_task_id,),
             ).fetchall()
         completed = {row[0] for row in rows if row[1] == "completed"}
         return next((stage for stage in STAGE_SEQUENCE if stage not in completed), None)
+
+    def _connect(self) -> sqlite3.Connection:
+        if self._coordinated_connection is not None:
+            return self._coordinated_connection  # type: ignore[return-value]
+        if self._writer is not None:
+            return open_readonly_database(self._db_path, timeout=30)
+        return open_bootstrap_database(self._db_path)

@@ -34,7 +34,7 @@ After the Vercel production domain is available, add it to the local runtime `.e
 ```bash
 RUNTIME_SERVICE_NAME=xhs-agent-runtime
 RUNTIME_VERSION=0.1.0
-RUNTIME_API_CONTRACT=local-runtime-v1
+RUNTIME_API_CONTRACT=local-runtime-single-writer
 CORS_ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:3000,https://content-strategy-generation.vercel.app
 ```
 
@@ -57,7 +57,7 @@ Expected shape:
   "service": "xhs-agent-runtime",
   "status": "healthy",
   "version": "0.1.0",
-  "api_contract": "local-runtime-v1"
+  "api_contract": "local-runtime-single-writer"
 }
 ```
 

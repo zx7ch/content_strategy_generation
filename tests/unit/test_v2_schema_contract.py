@@ -50,7 +50,7 @@ def test_p1_2_migration_manifest_extends_foundation_order() -> None:
 
     assert migrations
     assert migrations[0].migration_id == "v2_p1_1_foundation"
-    assert migrations[-1].migration_id == "v2_p1_2_ingestion"
+    assert migrations[-1].migration_id == "v2_p1_2_ingestion_workspace_alignment"
 
 
 def test_p1_2_schema_contains_required_evidence_tables() -> None:

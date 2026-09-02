@@ -36,6 +36,20 @@ const testRun = {
   allowed_actions: [],
 };
 
+const retrievalRecoveryPlan = {
+  recoverable: true as const,
+  action: "retry_retrieval" as const,
+  reason_code: "provider_timeout",
+  recovery_plan_id: "recovery_plan_1",
+  plan_fingerprint: "sha256:plan-1",
+  failed_stage: "retrieval_running",
+  failure_class: "provider",
+  expected_attempt_id: "attempt_1",
+  attempt_no: 1,
+  expected_state_revision: 7,
+  checkpoint_references: ["scope_1", "attempt_1"],
+};
+
 test("projected action retries retain command identity until state revision changes", () => {
   const first = contentResearchCommand(testRun, "revise_subject", { clarification_text: "关注通勤" });
   const transportRetry = contentResearchCommand(testRun, "revise_subject", { clarification_text: "关注通勤" });
@@ -88,9 +102,6 @@ test("historical workflow summaries expose their owning thread without a mutable
     plan: null,
     directions: [],
     subagent_tasks: [],
-    runtime_run: null,
-    runtime_steps: [],
-    runtime_child_tasks: [],
   };
 
   assert.equal(contentResearchWorkflowThreadId(workflow), "thread_historical");
@@ -108,8 +119,6 @@ test("trace contract exposes stored decision identity and ordered safe execution
     traces: [],
     observation_events: [],
     workflow_events: [],
-    runtime_steps: [],
-    runtime_child_tasks: [],
     execution_units: [{
       id: "seu_1",
       state: "outcome_unknown",
@@ -152,6 +161,24 @@ test("retries a transient Lite report network failure but not an HTTP failure", 
 
   assert.equal(calls, 2);
   assert.equal(report.workflow_run_id, "run_1");
+});
+
+test("requests a causal Trace snapshot from the last accepted revision", async () => {
+  let requestedUrl = "";
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    requestedUrl = String(input);
+    return new Response(JSON.stringify({ trace_revision: 12 }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  }) as typeof fetch;
+
+  await getContentResearchTrace("run causal", 12);
+
+  assert.match(
+    requestedUrl,
+    /\/content-research\/workflows\/run%20causal\/trace\?minimum_revision=12$/,
+  );
 });
 
 test("createContentResearchPresearch posts seed to real P0 endpoint", async () => {
@@ -246,6 +273,12 @@ test("retry presearch returns the same persisted identifiers", async () => {
   const result = await retryContentResearchPresearch({
     ...testRun,
     state: "recovery_required",
+    recovery_plan: {
+      ...retrievalRecoveryPlan,
+      action: "retry_presearch",
+      failed_stage: "presearch",
+      expected_state_revision: 2,
+    },
   });
   assert.match(requestBody, /"action":"retry_presearch"/);
   assert.equal(result.attempt_id, "att_1");
@@ -272,11 +305,17 @@ test("retry retrieval sends the authoritative same-run recovery action", async (
     state: "recovery_required",
     state_revision: 7,
     allowed_actions: ["retry_retrieval", "cancel"],
+    recovery_plan: retrievalRecoveryPlan,
   });
 
-  assert.match(requestBody, /"action":"retry_retrieval"/);
-  assert.match(requestBody, /"expected_state":"recovery_required"/);
-  assert.match(requestBody, /"expected_revision":7/);
+  const request = JSON.parse(requestBody);
+  assert.equal(request.action, "retry_retrieval");
+  assert.equal(request.expected_state, "recovery_required");
+  assert.equal(request.expected_revision, 7);
+  assert.deepEqual(request.payload, {
+    recovery_plan_id: "recovery_plan_1",
+    plan_fingerprint: "sha256:plan-1",
+  });
 });
 
 test("Brief confirmation and Scope replacement use authoritative command envelopes", async () => {
@@ -542,9 +581,6 @@ function workflowPayload() {
     plan: null,
     directions: [],
     subagent_tasks: [],
-    runtime_run: { run_id: "run_1", current_step: "formal_research", status: "running" },
-    runtime_steps: [],
-    runtime_child_tasks: [],
   };
 }
 

@@ -26,6 +26,8 @@ RELEASE_GATE_HEADERS = {
     "X-Workspace-Id": "00000000-0000-0000-0000-000000000001",
     "X-User-Id": "release-gate",
 }
+HEALTH_PROBE_TIMEOUT_SECONDS = 1
+FROZEN_RUNTIME_READ_TIMEOUT_SECONDS = 5
 
 
 def _release_archive() -> Path:
@@ -107,20 +109,74 @@ def test_release_archive_contains_runtime_and_launcher():
             )
 
 
+@pytest.mark.acceptance
+def test_master_frontend_and_runtime_zip_share_single_writer_contract() -> None:
+    archive = _release_archive()
+    if os.getenv("RELEASE_GATE_REQUIRE_ARTIFACT") != "1":
+        pytest.skip("release artifact is built by the release gate")
+    assert archive.exists(), f"release artifact not found: {archive}"
+
+    required_contract = "local-runtime-single-writer"
+    frontend_source = Path("frontend/src/lib/api.ts").read_text(encoding="utf-8")
+    assert f'REQUIRED_API_CONTRACT = "{required_contract}"' in frontend_source
+
+    with zipfile.ZipFile(archive) as bundle:
+        runtime_config = bundle.read("xhs-runtime/config.env").decode("utf-8")
+        packaged_config = bundle.read("xhs-runtime/_internal/app/config.py").decode("utf-8")
+    assert f"RUNTIME_API_CONTRACT={required_contract}" in runtime_config
+    assert f'default="{required_contract}"' in packaged_config
+
+
 def _free_local_port() -> int:
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         return int(listener.getsockname()[1])
 
 
-def _get_json(url: str, *, headers: dict[str, str] | None = None) -> dict:
+def _get_json(
+    url: str,
+    *,
+    headers: dict[str, str] | None = None,
+    timeout_seconds: float = FROZEN_RUNTIME_READ_TIMEOUT_SECONDS,
+) -> dict:
     request = urllib.request.Request(url, headers=headers or {})
     try:
-        with urllib.request.urlopen(request, timeout=1) as response:  # noqa: S310 -- local Runtime only
+        with urllib.request.urlopen(  # noqa: S310 -- local Runtime only
+            request,
+            timeout=timeout_seconds,
+        ) as response:
             return json.loads(response.read().decode("utf-8"))
     except HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
         raise AssertionError(f"{url} returned HTTP {exc.code}: {detail}") from exc
+
+
+def test_release_gate_business_reads_tolerate_bounded_cold_start_jitter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed_timeouts: list[float] = []
+
+    class JSONResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, _exc_type, _exc_value, _traceback) -> bool:
+            return False
+
+        @staticmethod
+        def read() -> bytes:
+            return b'{"status":"ready"}'
+
+    def delayed_local_response(_request, *, timeout: float):
+        observed_timeouts.append(timeout)
+        if timeout < FROZEN_RUNTIME_READ_TIMEOUT_SECONDS:
+            raise TimeoutError("simulated frozen Runtime scheduling jitter")
+        return JSONResponse()
+
+    monkeypatch.setattr(urllib.request, "urlopen", delayed_local_response)
+
+    assert _get_json("http://127.0.0.1:8000/trace") == {"status": "ready"}
+    assert observed_timeouts == [FROZEN_RUNTIME_READ_TIMEOUT_SECONDS]
 
 
 def _wait_for_health(port: int, process: subprocess.Popen) -> dict:
@@ -132,7 +188,10 @@ def _wait_for_health(port: int, process: subprocess.Popen) -> dict:
                 "frozen Runtime exited before health became available:\n" + output[-2000:]
             )
         try:
-            return _get_json(f"http://127.0.0.1:{port}/health")
+            return _get_json(
+                f"http://127.0.0.1:{port}/health",
+                timeout_seconds=HEALTH_PROBE_TIMEOUT_SECONDS,
+            )
         except OSError:
             time.sleep(0.2)
     raise AssertionError("frozen Runtime did not become healthy within 20 seconds")

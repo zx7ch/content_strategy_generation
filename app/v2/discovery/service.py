@@ -3,20 +3,32 @@
 from __future__ import annotations
 
 import sqlite3
+import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-import uuid
 
-from experiments.xhs_extension_mvp.server.models import HotspotSnapshotResponse, TaskSnapshotResponse
-from experiments.xhs_extension_mvp.server.storage import MVPStorage
+from app.core.runtime_write_coordinator import (
+    DomainMutationRejectedError,
+    RuntimeWriteCoordinator,
+    TypedMutation,
+)
+from app.core.runtime_write_registry import get_runtime_writer
+from app.core.sqlite_connection_roles import (
+    open_bootstrap_database,
+    open_readonly_database,
+)
 from app.v2.discovery.query_expander import (
     DiscoveryExpandedQuery,
     DiscoveryQueryExpander,
     DiscoveryQueryExpansionFailure,
 )
-
+from experiments.xhs_extension_mvp.server.models import (
+    HotspotSnapshotResponse,
+    TaskSnapshotResponse,
+)
+from experiments.xhs_extension_mvp.server.storage import MVPStorage
 
 CURRENT_DISCOVERY_QUERY_GENERATION_VERSION = "llm_v1"
 LEGACY_DISCOVERY_QUERY_GENERATION_VERSION = "legacy"
@@ -60,13 +72,38 @@ class DiscoveryService:
         secret: str,
         spider_client: Any | None = None,
         query_expander: DiscoveryQueryExpander | None = None,
+        writer: RuntimeWriteCoordinator | None = None,
     ) -> None:
         self._db_path = Path(database_path)
-        self._storage = MVPStorage(self._db_path, secret=secret)
+        self._writer = writer or get_runtime_writer(self._db_path)
+        self._storage = MVPStorage(
+            self._db_path,
+            secret=secret,
+            read_only=self._writer is not None,
+        )
         self._spider_client = spider_client
         self._query_expander = query_expander
-        self._storage.init_db()
-        self._init_scope_table()
+        if self._writer is None:
+            self._storage.init_db()
+            self._init_scope_table()
+
+    async def _submit(self, action: str, **payload: Any) -> None:
+        if self._writer is None:
+            raise RuntimeError("runtime writer is not configured")
+        try:
+            await self._writer.submit(
+                TypedMutation.create(
+                    mutation_id=f"discovery_{uuid.uuid4().hex}",
+                    mutation_kind="mutate_discovery",
+                    domain_payload={"action": action, **payload},
+                )
+            )
+        except DomainMutationRejectedError as exc:
+            if exc.safe_message.startswith("discovery task not found:"):
+                raise DiscoveryNotFoundError(exc.safe_message) from None
+            if exc.safe_message.startswith("discovery query not found:"):
+                raise DiscoveryNotFoundError(exc.safe_message) from None
+            raise DiscoveryValidationError(exc.safe_message) from None
 
     async def create_task(
         self,
@@ -90,15 +127,33 @@ class DiscoveryService:
         if not expansion_result.queries:
             raise DiscoveryQueryExpansionError("当前未生成可用的拓展搜索词，请稍后重试。")
 
-        task_id, _queries = self._storage.create_task(normalized_topic)
-        self._replace_generated_queries(task_id=task_id, queries=expansion_result.queries)
-        token, expires_at = self._storage.create_capture_token(task_id)
-        self._save_scope(
-            workspace_id=workspace_id,
-            brand_id=brand_id,
-            task_id=task_id,
-            query_generation_source=expansion_result.source,
-        )
+        if self._writer is None:
+            task_id, _queries = self._storage.create_task(normalized_topic)
+            self._replace_generated_queries(task_id=task_id, queries=expansion_result.queries)
+            token, expires_at = self._storage.create_capture_token(task_id)
+            self._save_scope(
+                workspace_id=workspace_id,
+                brand_id=brand_id,
+                task_id=task_id,
+                query_generation_source=expansion_result.source,
+            )
+        else:
+            task_id = str(uuid.uuid4())
+            created_at = datetime.now(timezone.utc).isoformat()
+            token, expires_at = self._storage.create_capture_token(task_id)
+            await self._submit(
+                "create_task",
+                task_id=task_id,
+                topic=normalized_topic,
+                created_at=created_at,
+                workspace_id=workspace_id,
+                brand_id=brand_id,
+                query_generation_source=expansion_result.source,
+                queries=[
+                    {"category": query.category, "query_text": query.query_text}
+                    for query in expansion_result.queries
+                ],
+            )
         return self.get_task_workspace(
             workspace_id=workspace_id,
             brand_id=brand_id,
@@ -148,10 +203,25 @@ class DiscoveryService:
         task_id: str,
     ) -> DiscoveryWorkspaceResult:
         self._assert_scope(workspace_id=workspace_id, brand_id=brand_id, task_id=task_id)
-        await self._storage.refresh_hotspots(task_id, spider_client=self._spider_client)
+        if self._writer is None:
+            await self._storage.refresh_hotspots(task_id, spider_client=self._spider_client)
+        else:
+            snapshot, lists_to_store = await self._storage.prepare_hotspot_refresh(
+                task_id,
+                spider_client=self._spider_client,
+            )
+            generated_at = snapshot.generated_at or datetime.now(timezone.utc)
+            await self._submit(
+                "persist_hotspots",
+                task_id=task_id,
+                status=snapshot.status,
+                generated_at=generated_at.isoformat(),
+                error_message=snapshot.error_message,
+                lists=[item.model_dump(mode="json") for item in lists_to_store],
+            )
         return self.get_task_workspace(workspace_id=workspace_id, brand_id=brand_id, task_id=task_id)
 
-    def add_custom_queries(
+    async def add_custom_queries(
         self,
         *,
         workspace_id: str,
@@ -163,13 +233,16 @@ class DiscoveryService:
         normalized_text = text.strip()
         if not normalized_text:
             raise DiscoveryValidationError("text is required")
-        try:
-            self._storage.add_custom_queries(task_id=task_id, text=normalized_text)
-        except KeyError as exc:
-            raise DiscoveryNotFoundError(f"discovery task not found: {task_id}") from exc
+        if self._writer is None:
+            try:
+                self._storage.add_custom_queries(task_id=task_id, text=normalized_text)
+            except KeyError as exc:
+                raise DiscoveryNotFoundError(f"discovery task not found: {task_id}") from exc
+        else:
+            await self._submit("add_custom_queries", task_id=task_id, text=normalized_text)
         return self.get_task_workspace(workspace_id=workspace_id, brand_id=brand_id, task_id=task_id)
 
-    def delete_custom_query(
+    async def delete_custom_query(
         self,
         *,
         workspace_id: str,
@@ -178,12 +251,15 @@ class DiscoveryService:
         query_id: str,
     ) -> DiscoveryWorkspaceResult:
         self._assert_scope(workspace_id=workspace_id, brand_id=brand_id, task_id=task_id)
-        try:
-            self._storage.delete_custom_query(task_id=task_id, query_id=query_id)
-        except KeyError as exc:
-            raise DiscoveryNotFoundError(f"discovery query not found: {query_id}") from exc
-        except ValueError as exc:
-            raise DiscoveryValidationError(str(exc)) from exc
+        if self._writer is None:
+            try:
+                self._storage.delete_custom_query(task_id=task_id, query_id=query_id)
+            except KeyError as exc:
+                raise DiscoveryNotFoundError(f"discovery query not found: {query_id}") from exc
+            except ValueError as exc:
+                raise DiscoveryValidationError(str(exc)) from exc
+        else:
+            await self._submit("delete_custom_query", task_id=task_id, query_id=query_id)
         return self.get_task_workspace(workspace_id=workspace_id, brand_id=brand_id, task_id=task_id)
 
     def _init_scope_table(self) -> None:
@@ -291,7 +367,11 @@ class DiscoveryService:
         return normalized_version, normalized_source
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self._db_path)
+        if self._writer is not None:
+            connection = open_readonly_database(self._db_path)
+            connection.row_factory = sqlite3.Row
+            return connection
+        connection = open_bootstrap_database(self._db_path)
         connection.row_factory = sqlite3.Row
         return connection
 

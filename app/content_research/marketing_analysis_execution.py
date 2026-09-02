@@ -131,9 +131,17 @@ class MarketingAnalysisExecutionService:
         llm_scope: Mapping[str, object] | None = None,
     ) -> None:
         self._store = store
-        self._repository = SQLiteMarketingAnalysisRepository(store._db_path, bootstrap_schema=False)
+        self._repository = SQLiteMarketingAnalysisRepository(
+            store._db_path,
+            bootstrap_schema=False,
+            writer=store._writer,
+        )
         self._llm = (
-            TrackedDirectionalAnalysisLLM(llm=llm, db_path=store._db_path)
+            TrackedDirectionalAnalysisLLM(
+                llm=llm,
+                db_path=store._db_path,
+                writer=store._writer,
+            )
             if llm is not None
             else None
         )

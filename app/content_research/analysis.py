@@ -7,6 +7,7 @@ from typing import Any, Protocol
 
 from app.content_research.llm_scope import content_research_llm_context
 from app.content_research.runtime import LLMCostLedger
+from app.core.runtime_write_coordinator import RuntimeWriteCoordinator
 from app.services.llm.failures import LLMProviderFailure
 from app.services.llm.pricing import PricingCalculator, UsageCost
 from app.services.llm.types import LLMRequest, LLMResponse, Message, TokenUsage
@@ -20,9 +21,16 @@ class DirectionalAnalysisLLM(Protocol):
 class TrackedDirectionalAnalysisLLM:
     """Record every Task 3.1 model call with its Run-scoped context."""
 
-    def __init__(self, *, llm: DirectionalAnalysisLLM, db_path: str) -> None:
+    def __init__(
+        self,
+        *,
+        llm: DirectionalAnalysisLLM,
+        db_path: str,
+        writer: RuntimeWriteCoordinator | None = None,
+    ) -> None:
         self._llm = llm
         self._db_path = db_path
+        self._writer = writer
 
     async def generate(self, request: LLMRequest) -> LLMResponse:
         try:
@@ -81,7 +89,7 @@ class TrackedDirectionalAnalysisLLM:
             if status == "success"
             else UsageCost()
         )
-        async with LLMUsageTracker(self._db_path) as tracker:
+        async with LLMUsageTracker(self._db_path, writer=self._writer) as tracker:
             await tracker.record(
                 LLMUsageEventInput(
                     context=request.context,
@@ -98,9 +106,16 @@ class TrackedDirectionalAnalysisLLM:
 
 
 class DirectionalAnalysisService:
-    def __init__(self, *, llm: DirectionalAnalysisLLM, db_path: str) -> None:
+    def __init__(
+        self,
+        *,
+        llm: DirectionalAnalysisLLM,
+        db_path: str,
+        writer: RuntimeWriteCoordinator | None = None,
+    ) -> None:
         self._llm = llm
         self._db_path = db_path
+        self._writer = writer
 
     async def analyze(self, *, task, direction: dict[str, Any], query: str, facts: list[dict[str, Any]]) -> dict[str, Any] | None:
         evidence_ids = {str(fact["evidence_id"]) for fact in facts if fact.get("evidence_id")}
@@ -165,14 +180,14 @@ class DirectionalAnalysisService:
             provider=provider, model=model,
             prompt_tokens=usage.prompt_tokens, completion_tokens=usage.completion_tokens,
         ) if status == "success" else UsageCost()
-        async with LLMUsageTracker(self._db_path) as tracker:
+        async with LLMUsageTracker(self._db_path, writer=self._writer) as tracker:
             usage_event_id = await tracker.record(LLMUsageEventInput(
                 context=context, provider=provider, model=model, model_policy="quality",
                 usage=usage, cost=cost, latency_ms=latency_ms, status=status, error_message=error_message,
             ))
         if not task.plan_id:
             return
-        ledger = LLMCostLedger(self._db_path)
+        ledger = LLMCostLedger(self._db_path, writer=self._writer)
         if status == "success":
             ledger.record_actual(
                 research_plan_id=task.plan_id, research_direction_id=task.direction_id,

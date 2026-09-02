@@ -49,6 +49,9 @@ from app.content_research.command import (
 )
 from app.content_research.errors import (
     ContentResearchNotFoundError,
+    ContentResearchRunNotFoundError,
+    ContentResearchSnapshotBehindError,
+    ContentResearchSnapshotUnavailableError,
     ContentResearchStateConflictError,
     ContentResearchValidationError,
 )
@@ -66,6 +69,7 @@ from app.content_research.service import (
     WorkflowRunManagerRuntime,
 )
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
+from app.core.sqlite_connection_roles import open_readonly_async_database
 from app.logging_config import get_logger, log_event
 from app.memory.job_store import JobStore, SessionEventRecord
 from app.memory.session_state import SessionManager
@@ -86,8 +90,6 @@ from app.models.schemas import (
     CreatorThreadSummary,
     CreatorThreadTimelineResponse,
     CreatorThreadUpdateRequest,
-    CreatorWorkflowRequest,
-    CreatorWorkflowResponse,
     EnqueueResponse,
     ErrorResponse,
     GeneratedNoteItem,
@@ -913,6 +915,33 @@ def _require_f003_lite_preview() -> None:
 
 
 def _content_research_error(exc: Exception) -> APIError:
+    if isinstance(exc, ContentResearchSnapshotBehindError):
+        return APIError(
+            status_code=409,
+            error_code="SNAPSHOT_MINIMUM_REVISION_NOT_REACHED",
+            error_message="请求的调研状态尚未完成同步。",
+            error_details={
+                "observed_revision": exc.observed_revision,
+                "minimum_revision": exc.minimum_revision,
+                "retryable_read": True,
+            },
+            retryable=True,
+            suggested_action="retry_trace_read",
+        )
+    if isinstance(exc, ContentResearchSnapshotUnavailableError):
+        projection_failed = exc.code == "DOMAIN_TRACE_PROJECTION_FAILED"
+        return APIError(
+            status_code=500 if projection_failed else 503,
+            error_code=(
+                "DOMAIN_TRACE_PROJECTION_FAILED"
+                if projection_failed
+                else "SNAPSHOT_UNAVAILABLE"
+            ),
+            error_message="当前无法读取可信的调研状态快照。",
+            error_details={"retryable_read": not projection_failed},
+            retryable=not projection_failed,
+            suggested_action="retry_trace_read" if not projection_failed else None,
+        )
     if isinstance(exc, LifecyclePersistenceBusy):
         return APIError(
             status_code=503,
@@ -928,6 +957,12 @@ def _content_research_error(exc: Exception) -> APIError:
             error_message=str(exc),
             retryable=False,
             suggested_action="refresh_run_projection",
+        )
+    if isinstance(exc, ContentResearchRunNotFoundError):
+        return APIError(
+            status_code=404,
+            error_code="CONTENT_RESEARCH_RUN_NOT_FOUND",
+            error_message=str(exc),
         )
     if isinstance(exc, ContentResearchNotFoundError):
         return APIError(
@@ -1056,9 +1091,10 @@ async def save_content_research_llm_configuration(
 async def delete_content_research_llm_configuration(request: Request) -> ContentResearchLLMConfigurationResponse:
     principal = _resolve_workspace_principal_or_error(request)
     assert principal.user_id is not None
-    return ContentResearchLLMConfigurationResponse(**_get_llm_configuration_service(request).delete(
+    summary = await _get_llm_configuration_service(request).delete(
         principal.workspace_id, principal.user_id
-    ).__dict__)
+    )
+    return ContentResearchLLMConfigurationResponse(**summary.__dict__)
 
 
 @app.post("/content-research/providers/xiaohongshu/login/qr", response_model=XHSQRLoginResponse)
@@ -1202,10 +1238,13 @@ async def get_content_research_scope_projection(
 async def get_content_research_workflow_trace(
     workflow_run_id: str,
     request: Request,
+    minimum_revision: int | None = Query(default=None, ge=1),
 ) -> ContentResearchTraceResponse:
     query = _get_content_research_query(request)
     try:
-        return await query.get_workflow_trace(workflow_run_id)
+        return await query.get_workflow_trace(
+            workflow_run_id, minimum_revision=minimum_revision
+        )
     except Exception as exc:  # noqa: BLE001
         raise _content_research_error(exc) from exc
 
@@ -2685,7 +2724,7 @@ async def add_brand_discovery_task_query_v2(
     discovery_service = _get_v2_discovery_service(request)
     try:
         master_data_service.get_brand(workspace_id=principal.workspace_id, brand_id=brand_id)
-        result = discovery_service.add_custom_queries(
+        result = await discovery_service.add_custom_queries(
             workspace_id=principal.workspace_id,
             brand_id=brand_id,
             task_id=task_id,
@@ -2713,7 +2752,7 @@ async def delete_brand_discovery_task_query_v2(
     discovery_service = _get_v2_discovery_service(request)
     try:
         master_data_service.get_brand(workspace_id=principal.workspace_id, brand_id=brand_id)
-        result = discovery_service.delete_custom_query(
+        result = await discovery_service.delete_custom_query(
             workspace_id=principal.workspace_id,
             brand_id=brand_id,
             task_id=task_id,
@@ -3853,58 +3892,6 @@ async def append_thread_message(
                                   assistant_reply=assistant_reply)
 
 
-@app.post("/threads/{thread_id}/workflow", status_code=201)
-async def start_thread_workflow(
-    thread_id: str, body: CreatorWorkflowRequest, request: Request
-) -> CreatorWorkflowResponse:
-    thread_store = _get_thread_store(request)
-
-    thread = await thread_store.get_thread(thread_id)
-    if thread is None:
-        raise APIError(
-            status_code=404,
-            error_code="THREAD_NOT_FOUND",
-            error_message=f"Thread {thread_id} not found",
-            suggested_action="请检查 thread_id 是否正确",
-        )
-
-    user_id = body.user_id or DEFAULT_USER_ID
-    orchestrator = ConversationOrchestrator(
-        db_path=settings.SQLITE_DB_PATH,
-        thread_store=thread_store,
-    )
-    # T10: keep this legacy route as a compatibility wrapper only. New creator
-    # workflow truth must come from workflow-v2 run/snapshot state, not sessions.
-    result = await orchestrator.handle_message(
-        thread=thread,
-        text=body.user_query,
-        user_id=user_id,
-    )
-    active_run_snapshot = result.get("active_run_snapshot") or {}
-    command_result = result.get("command_result") or {}
-    run = active_run_snapshot.get("run") or {}
-    run_id = command_result.get("run_id") or run.get("run_id")
-    if not run_id:
-        raise APIError(
-            status_code=400,
-            error_code="WORKFLOW_V2_START_FAILED",
-            error_message="Legacy workflow endpoint could not start a workflow-v2 run",
-            suggested_action="请改用 POST /threads/{thread_id}/messages 发送自然语言需求",
-        )
-    stage = run.get("current_step") or run.get("phase") or "workflow-v2"
-
-    return CreatorWorkflowResponse(
-        thread_id=thread_id,
-        session_id=run_id,
-        job_id="",
-        stage=stage,
-        run_id=run_id,
-        command_result=command_result,
-        active_run_snapshot=active_run_snapshot,
-        compatibility_mode="workflow-v2",
-    )
-
-
 @app.get("/threads/{thread_id}/events")
 async def stream_thread_events(
     thread_id: str,
@@ -4078,14 +4065,11 @@ async def complete_thread_endpoint(thread_id: str, request: Request) -> Complete
     candidates: list[dict] = []
     if session_id:
         try:
-            import aiosqlite as _aiosqlite
-
             from app.memory.session_data_store import SessionDataStore as _SessionDataStore
 
-            async with _aiosqlite.connect(settings.SQLITE_DB_PATH) as _conn:
-                _conn.row_factory = _aiosqlite.Row
+            _conn = await open_readonly_async_database(settings.SQLITE_DB_PATH)
+            try:
                 _ds = _SessionDataStore(_conn)
-                await _ds.init_tables()
                 notes = await _ds.get_generated_notes(session_id, note_ids=None)
                 candidates = [
                     {
@@ -4096,6 +4080,8 @@ async def complete_thread_endpoint(thread_id: str, request: Request) -> Complete
                     }
                     for n in notes
                 ]
+            finally:
+                await _conn.close()
         except Exception:
             pass
 
@@ -4185,14 +4171,11 @@ async def get_thread_result_endpoint(thread_id: str, request: Request) -> Thread
     strategy_dict: dict | None = None
     notes_list: list[GeneratedNoteItem] = []
     try:
-        import aiosqlite as _aiosqlite
-
         from app.memory.session_data_store import SessionDataStore as _SessionDataStore
 
-        async with _aiosqlite.connect(settings.SQLITE_DB_PATH) as _conn:
-            _conn.row_factory = _aiosqlite.Row
+        _conn = await open_readonly_async_database(settings.SQLITE_DB_PATH)
+        try:
             _ds = _SessionDataStore(_conn)
-            await _ds.init_tables()
             try:
                 strategy, _pref, _sid = await _ds.get_strategy(session_id, None)
                 strategy_dict = strategy.model_dump() if strategy else None
@@ -4208,6 +4191,8 @@ async def get_thread_result_endpoint(thread_id: str, request: Request) -> Thread
                 )
                 for n in notes
             ]
+        finally:
+            await _conn.close()
     except Exception:
         pass
 

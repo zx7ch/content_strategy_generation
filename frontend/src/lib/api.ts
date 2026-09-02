@@ -22,7 +22,7 @@ export const RUNTIME_BASE_URL: string =
       process.env.XHS_API_BASE_URL?.trim())) ||
   "http://127.0.0.1:8000";
 export const MIN_BACKEND_VERSION = "0.1.0";
-export const REQUIRED_API_CONTRACT = "local-runtime-v1";
+export const REQUIRED_API_CONTRACT = "local-runtime-single-writer";
 
 interface RuntimeHealthResponse {
   service: string;
@@ -1521,17 +1521,6 @@ export interface CreatorThreadSummary {
   updated_at: string;
 }
 
-export interface WorkflowStartResult {
-  thread_id: string;
-  session_id: string;
-  job_id: string;
-  stage: string;
-  run_id?: string | null;
-  command_result?: Record<string, unknown> | null;
-  active_run_snapshot?: WorkflowRunSnapshot | null;
-  compatibility_mode?: "workflow-v2" | string | null;
-}
-
 export interface JobStatusResult {
   job_id: string;
   status: string;
@@ -1725,16 +1714,6 @@ export async function appendThreadMessage(
     updated_title: res.updated_title,
     assistant_reply: res.assistant_reply,
   };
-}
-
-export async function startThreadWorkflow(
-  threadId: string,
-  userQuery: string
-): Promise<WorkflowStartResult> {
-  return creatorFetch(`/threads/${threadId}/workflow`, {
-    method: "POST",
-    body: { user_query: userQuery },
-  });
 }
 
 export async function getJobStatus(jobId: string): Promise<JobStatusResult> {

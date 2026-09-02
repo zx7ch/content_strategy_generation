@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-import sqlite3
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -31,6 +31,17 @@ from app.content_research.stores.sqlite_store import (
     _loads_any_list,
     _parse_dt,
 )
+from app.core.runtime_write_coordinator import (
+    DomainMutationRejectedError,
+    RuntimeWriteCoordinator,
+    TypedMutation,
+)
+from app.core.runtime_write_registry import get_runtime_writer
+from app.core.sqlite_connection_roles import (
+    open_bootstrap_async_database,
+    open_bootstrap_database,
+    open_readonly_async_database,
+)
 
 
 def _now() -> datetime:
@@ -40,8 +51,83 @@ def _now() -> datetime:
 class AsyncFormalResearchDispatchRepository:
     """The only queue/lease writer used by the async dispatcher runtime."""
 
-    def __init__(self, db_path: str) -> None:
+    def __init__(
+        self,
+        db_path: str,
+        *,
+        writer: RuntimeWriteCoordinator | None = None,
+    ) -> None:
         self._db_path = db_path
+        self._writer = writer or get_runtime_writer(self._db_path)
+        self._borrowed_connection = None
+
+    def __getattribute__(self, name: str):
+        if not name.startswith("_"):
+            state = object.__getattribute__(self, "__dict__")
+            if state.get("_writer") is not None and state.get("_borrowed_connection") is None:
+                from app.content_research.dispatch_mutations import (
+                    COORDINATED_DISPATCH_ACTIONS,
+                )
+
+                if name in COORDINATED_DISPATCH_ACTIONS["formal"]:
+
+                    async def coordinated(**kwargs):
+                        if name == "claim_next" and not await self._claim_available():
+                            return None
+                        return await self._submit_dispatch_command("formal", name, kwargs)
+
+                    return coordinated
+        return object.__getattribute__(self, name)
+
+    async def _submit_dispatch_command(
+        self,
+        repository: str,
+        action: str,
+        kwargs: dict[str, Any],
+    ) -> Any:
+        from app.content_research.stores.mutations import (
+            decode_store_value,
+            encode_store_value,
+        )
+
+        assert self._writer is not None
+        try:
+            result = await self._writer.submit(
+                TypedMutation.create(
+                    mutation_id=f"content_research_dispatch_{uuid.uuid4().hex}",
+                    mutation_kind="execute_content_research_dispatch_command",
+                    domain_payload={
+                        "repository": repository,
+                        "action": action,
+                        "kwargs": {
+                            key: encode_store_value(value) for key, value in kwargs.items()
+                        },
+                    },
+                    run_id=(
+                        str(kwargs["workflow_run_id"])
+                        if kwargs.get("workflow_run_id") is not None
+                        else None
+                    ),
+                )
+            )
+        except DomainMutationRejectedError as exc:
+            raise ValueError(exc.safe_message) from None
+        return decode_store_value(result.result_fields.get("result"))
+
+    async def _claim_available(self) -> bool:
+        conn = await open_readonly_async_database(self._db_path)
+        try:
+            cursor = await conn.execute(
+                """SELECT 1 FROM content_research_dispatch_jobs
+                   WHERE status='queued'
+                      OR (status='running' AND lease_expires_at IS NOT NULL
+                          AND lease_expires_at < ?)
+                   LIMIT 1""",
+                (_now().isoformat(),),
+            )
+            return await cursor.fetchone() is not None
+        finally:
+            await conn.close()
 
     async def persist_brief(self, conn: aiosqlite.Connection, brief: ResearchBriefRecord) -> None:
         """Persist one brief inside a transaction owned by the caller."""
@@ -378,19 +464,37 @@ class AsyncFormalResearchDispatchRepository:
         # synchronous calls, both sides wait for each other until busy_timeout.
         # Running this tiny transaction atomically off-loop removes that
         # self-deadlock without weakening the lease predicate.
-        return await asyncio.to_thread(
-            self._renew_sync,
-            workflow_run_id=workflow_run_id,
-            owner=owner,
-            token=token,
-            lease_seconds=lease_seconds,
-        )
+        if self._borrowed_connection is None:
+            return await asyncio.to_thread(
+                self._renew_sync,
+                workflow_run_id=workflow_run_id,
+                owner=owner,
+                token=token,
+                lease_seconds=lease_seconds,
+            )
+        now = _now()
+        async with self._connect() as conn:
+            result = await conn.execute(
+                """UPDATE content_research_dispatch_jobs
+                   SET lease_heartbeat_at=?, lease_expires_at=?, updated_at=?
+                   WHERE workflow_run_id=? AND status='running'
+                     AND lease_owner=? AND lease_token=?""",
+                (
+                    now.isoformat(),
+                    (now + timedelta(seconds=lease_seconds)).isoformat(),
+                    now.isoformat(),
+                    workflow_run_id,
+                    owner,
+                    token,
+                ),
+            )
+        return result.rowcount == 1
 
     def _renew_sync(
         self, *, workflow_run_id: str, owner: str, token: str, lease_seconds: int
     ) -> bool:
         now = _now()
-        with sqlite3.connect(self._db_path, timeout=30) as conn:
+        with open_bootstrap_database(self._db_path, timeout=30) as conn:
             conn.execute("PRAGMA busy_timeout=30000")
             result = conn.execute(
                 """UPDATE content_research_dispatch_jobs
@@ -430,8 +534,16 @@ class AsyncFormalResearchDispatchRepository:
             await conn.commit()
         return result.rowcount == 1
 
-    def _connect(self) -> aiosqlite.Connection:
-        return aiosqlite.connect(self._db_path)
+    @asynccontextmanager
+    async def _connect(self):
+        if self._borrowed_connection is not None:
+            yield self._borrowed_connection
+            return
+        connection = await open_bootstrap_async_database(self._db_path)
+        try:
+            yield connection
+        finally:
+            await connection.close()
 
     async def _fetch_job(self, conn: aiosqlite.Connection, workflow_run_id: str) -> dict[str, Any]:
         conn.row_factory = aiosqlite.Row
@@ -448,8 +560,66 @@ class AsyncFormalResearchDispatchRepository:
 class AsyncScopeExecutionContinuationRepository:
     """Lease/claim boundary for authorization-owned continuation commands."""
 
-    def __init__(self, db_path: str) -> None:
+    def __init__(
+        self,
+        db_path: str,
+        *,
+        writer: RuntimeWriteCoordinator | None = None,
+    ) -> None:
         self._db_path = db_path
+        self._writer = writer or get_runtime_writer(self._db_path)
+        self._borrowed_connection = None
+
+    def __getattribute__(self, name: str):
+        if not name.startswith("_"):
+            state = object.__getattribute__(self, "__dict__")
+            if state.get("_writer") is not None and state.get("_borrowed_connection") is None:
+                from app.content_research.dispatch_mutations import (
+                    COORDINATED_DISPATCH_ACTIONS,
+                )
+
+                if name in COORDINATED_DISPATCH_ACTIONS["continuation"]:
+
+                    async def coordinated(**kwargs):
+                        if name == "claim_next" and not await self._claim_available():
+                            return None
+                        return await self._submit_continuation_command(name, kwargs)
+
+                    return coordinated
+        return object.__getattribute__(self, name)
+
+    async def _submit_continuation_command(self, action: str, kwargs: dict[str, Any]) -> Any:
+        helper = AsyncFormalResearchDispatchRepository(
+            self._db_path,
+            writer=self._writer,
+        )
+        return await helper._submit_dispatch_command("continuation", action, kwargs)
+
+    async def _claim_available(self) -> bool:
+        conn = await open_readonly_async_database(self._db_path)
+        try:
+            cursor = await conn.execute(
+                """SELECT 1 FROM content_research_scope_execution_continuations
+                   WHERE state='pending'
+                      OR (state='running' AND lease_expires_at IS NOT NULL
+                          AND lease_expires_at < ?)
+                   LIMIT 1""",
+                (_now().isoformat(),),
+            )
+            return await cursor.fetchone() is not None
+        finally:
+            await conn.close()
+
+    @asynccontextmanager
+    async def _connect(self):
+        if self._borrowed_connection is not None:
+            yield self._borrowed_connection
+            return
+        connection = await open_bootstrap_async_database(self._db_path)
+        try:
+            yield connection
+        finally:
+            await connection.close()
 
     async def claim_next(
         self, *, owner: str, lease_seconds: int = 120
@@ -457,7 +627,7 @@ class AsyncScopeExecutionContinuationRepository:
         now = _now()
         expires = (now + timedelta(seconds=lease_seconds)).isoformat()
         token = uuid.uuid4().hex
-        async with aiosqlite.connect(self._db_path) as conn:
+        async with self._connect() as conn:
             conn.row_factory = aiosqlite.Row
             cursor = await conn.execute(
                 """SELECT 1 FROM content_research_scope_execution_continuations
@@ -520,7 +690,7 @@ class AsyncScopeExecutionContinuationRepository:
         self, *, authorization_id: str, owner: str, token: str, lease_seconds: int = 120
     ) -> bool:
         now = _now()
-        async with aiosqlite.connect(self._db_path) as conn:
+        async with self._connect() as conn:
             result = await conn.execute(
                 """UPDATE content_research_scope_execution_continuations
                    SET lease_expires_at=?, updated_at=?
@@ -546,7 +716,7 @@ class AsyncScopeExecutionContinuationRepository:
         error: str | None = None,
     ) -> bool:
         now = _now().isoformat()
-        async with aiosqlite.connect(self._db_path) as conn:
+        async with self._connect() as conn:
             result = await conn.execute(
                 """UPDATE content_research_scope_execution_continuations
                    SET state=?, last_error=?, lease_owner=NULL, lease_token=NULL,
@@ -595,14 +765,20 @@ class AsyncScopeExecutionUnitRepository:
     while callers migrate to the stable execution-unit identity.
     """
 
-    def __init__(self, db_path: str) -> None:
+    def __init__(
+        self,
+        db_path: str,
+        *,
+        writer: RuntimeWriteCoordinator | None = None,
+    ) -> None:
         self._db_path = db_path
+        self._writer = writer or get_runtime_writer(self._db_path)
 
     async def claim_execution_unit(
         self, *, execution_unit_id: str, owner: str, lease_seconds: int = 120
     ) -> ScopeExecutionAttempt | None:
         return await asyncio.to_thread(
-            SQLiteContentResearchStore(self._db_path).claim_execution_unit,
+            SQLiteContentResearchStore(self._db_path, writer=self._writer).claim_execution_unit,
             execution_unit_id=execution_unit_id,
             owner=owner,
             lease_seconds=lease_seconds,
@@ -618,7 +794,9 @@ class AsyncScopeExecutionUnitRepository:
         lease_seconds: int = 120,
     ) -> bool:
         return await asyncio.to_thread(
-            SQLiteContentResearchStore(self._db_path).renew_execution_unit_lease,
+            SQLiteContentResearchStore(
+                self._db_path, writer=self._writer
+            ).renew_execution_unit_lease,
             execution_unit_id=execution_unit_id,
             attempt_no=attempt_no,
             owner=owner,
@@ -635,7 +813,9 @@ class AsyncScopeExecutionUnitRepository:
         payload: dict[str, object],
     ) -> bool:
         return await asyncio.to_thread(
-            SQLiteContentResearchStore(self._db_path).record_provider_request,
+            SQLiteContentResearchStore(
+                self._db_path, writer=self._writer
+            ).record_provider_request,
             execution_unit_id=execution_unit_id,
             attempt_no=attempt_no,
             lease_token=lease_token,
@@ -652,7 +832,9 @@ class AsyncScopeExecutionUnitRepository:
         payload: dict[str, object],
     ) -> bool:
         return await asyncio.to_thread(
-            SQLiteContentResearchStore(self._db_path).record_provider_outcome,
+            SQLiteContentResearchStore(
+                self._db_path, writer=self._writer
+            ).record_provider_outcome,
             execution_unit_id=execution_unit_id,
             attempt_no=attempt_no,
             lease_token=lease_token,
@@ -670,7 +852,9 @@ class AsyncScopeExecutionUnitRepository:
         state: str,
     ) -> bool:
         return await asyncio.to_thread(
-            SQLiteContentResearchStore(self._db_path).complete_execution_unit,
+            SQLiteContentResearchStore(
+                self._db_path, writer=self._writer
+            ).complete_execution_unit,
             execution_unit_id=execution_unit_id,
             attempt_no=attempt_no,
             owner=owner,
@@ -680,5 +864,8 @@ class AsyncScopeExecutionUnitRepository:
 
     async def execution_trace(self, execution_unit_id: str) -> list[ExecutionFact]:
         return await asyncio.to_thread(
-            SQLiteContentResearchStore(self._db_path).execution_trace, execution_unit_id
+            SQLiteContentResearchStore(
+                self._db_path, writer=self._writer
+            ).execution_trace,
+            execution_unit_id,
         )

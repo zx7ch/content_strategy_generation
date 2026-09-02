@@ -11,6 +11,10 @@ class ContentResearchNotFoundError(ContentResearchError):
     """Raised when a requested Content Research object is missing."""
 
 
+class ContentResearchRunNotFoundError(ContentResearchNotFoundError):
+    """Raised when the exact Run is absent from the active data generation."""
+
+
 class ContentResearchValidationError(ContentResearchError):
     """Raised when a request payload is invalid."""
 
@@ -26,6 +30,23 @@ class ContentResearchStateConflictError(ContentResearchValidationError):
 
 class ContentResearchReportIntegrityError(RuntimeError):
     """Raised when an existing published report cannot be safely projected."""
+
+
+class ContentResearchSnapshotBehindError(RuntimeError):
+    """A bounded causal read ended below the requested revision."""
+
+    def __init__(self, observed_revision: int, minimum_revision: int) -> None:
+        super().__init__("snapshot minimum revision was not reached")
+        self.observed_revision = observed_revision
+        self.minimum_revision = minimum_revision
+
+
+class ContentResearchSnapshotUnavailableError(RuntimeError):
+    """No trustworthy Domain Trace snapshot could be composed."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__("domain trace snapshot is unavailable")
+        self.code = code
 
 
 class ReportPublicationMaterializationError(RuntimeError):

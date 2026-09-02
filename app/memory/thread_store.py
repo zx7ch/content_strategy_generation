@@ -10,6 +10,12 @@ from typing import Any, Optional
 import aiosqlite
 
 from app.config import settings
+from app.core.runtime_write_coordinator import RuntimeWriteCoordinator, TypedMutation
+from app.core.runtime_write_registry import get_runtime_writer
+from app.core.sqlite_connection_roles import (
+    open_bootstrap_async_database,
+    open_readonly_async_database,
+)
 from app.logging_config import get_logger
 from app.memory.workflow_store import ensure_column
 
@@ -25,15 +31,42 @@ def _new_id() -> str:
 class ThreadStore:
     """Persistent store for Creator conversation threads and messages."""
 
-    def __init__(self, db_path: str | None = None, *, read_only: bool = False):
+    def __init__(
+        self,
+        db_path: str | None = None,
+        *,
+        read_only: bool = False,
+        writer: RuntimeWriteCoordinator | None = None,
+    ):
         # Content Research runs, their timeline messages, and Creator threads
         # must share one runtime database.  An explicit path is still useful
         # for isolated tests and migrations.
         self.db_path = db_path or settings.SQLITE_DB_PATH
         self.read_only = read_only
+        self._writer = writer or get_runtime_writer(self.db_path)
         self._thread_table_available = True
         self._conn: Optional[aiosqlite.Connection] = None
         self._logger = get_logger(__name__, component="thread_store")
+
+    async def _submit_thread_mutation(
+        self,
+        action: str,
+        payload: dict[str, Any],
+        *,
+        mutation_id: str | None = None,
+        run_id: str | None = None,
+    ) -> None | dict[str, Any]:
+        if self._writer is None:
+            raise RuntimeError("runtime writer is not configured")
+        result = await self._writer.submit(
+            TypedMutation.create(
+                mutation_id=mutation_id or f"thread_mutation_{uuid.uuid4().hex}",
+                mutation_kind="mutate_creator_thread",
+                domain_payload={"action": action, **payload},
+                run_id=run_id,
+            )
+        )
+        return dict(result.result_fields)
 
     async def __aenter__(self) -> "ThreadStore":
         await self.connect()
@@ -48,18 +81,16 @@ class ThreadStore:
         # Content Research may hold a short SQLite write transaction while a
         # Creator timeline message is appended; wait for that transaction
         # instead of turning a valid run into a spurious startup failure.
-        if self.read_only:
-            self._conn = await aiosqlite.connect(
-                f"file:{self.db_path}?mode=ro", uri=True, timeout=30
-            )
+        if self.read_only or self._writer is not None:
+            self._conn = await open_readonly_async_database(self.db_path, timeout=30)
         else:
-            self._conn = await aiosqlite.connect(self.db_path, timeout=30)
+            self._conn = await open_bootstrap_async_database(self.db_path, timeout=30)
         self._conn.row_factory = aiosqlite.Row
         # WAL is configured once during database bootstrap. Re-applying it on
         # ordinary Creator connections can block behind an active checkpoint.
         await self._conn.execute("PRAGMA busy_timeout=30000")
         await self._conn.execute("PRAGMA synchronous=NORMAL")
-        if self.read_only:
+        if self.read_only or self._writer is not None:
             await self._conn.execute("PRAGMA query_only=ON")
             async with self._conn.execute(
                 "SELECT 1 FROM sqlite_master "
@@ -174,6 +205,21 @@ class ThreadStore:
         now = _now_iso()
         thread_id = _new_id()
         effective_title = title or f"对话 {now[:16].replace('T', ' ')}"
+        if self._writer is not None:
+            await self._submit_thread_mutation(
+                "create_thread",
+                {
+                    "thread_id": thread_id,
+                    "workspace_id": workspace_id,
+                    "brand_id": brand_id,
+                    "title": effective_title,
+                    "now": now,
+                },
+                mutation_id=thread_id,
+            )
+            row = await self._get_thread_row(thread_id)
+            assert row is not None
+            return dict(row)
         await self._conn.execute(
             """
             INSERT INTO creator_threads (id, workspace_id, brand_id, title, status, created_at, updated_at)
@@ -246,6 +292,36 @@ class ThreadStore:
         assert self._conn is not None
         now = _now_iso()
         message_id = _new_id()
+        artifact_refs_json = (
+            json.dumps(artifact_refs, ensure_ascii=False)
+            if artifact_refs is not None
+            else None
+        )
+        if self._writer is not None:
+            await self._submit_thread_mutation(
+                "append_message",
+                {
+                    "message_id": message_id,
+                    "thread_id": thread_id,
+                    "role": role,
+                    "text": text,
+                    "message_type": message_type,
+                    "intent": intent,
+                    "linked_session_id": linked_session_id,
+                    "linked_job_id": linked_job_id,
+                    "run_id": run_id,
+                    "artifact_refs_json": artifact_refs_json,
+                    "now": now,
+                },
+                mutation_id=message_id,
+                run_id=run_id,
+            )
+            async with self._conn.execute(
+                "SELECT * FROM creator_messages WHERE id=?", (message_id,)
+            ) as cursor:
+                row = await cursor.fetchone()
+            assert row is not None
+            return dict(row)
         await self._conn.execute(
             """
             INSERT INTO creator_messages
@@ -266,9 +342,7 @@ class ThreadStore:
                 linked_session_id,
                 linked_job_id,
                 run_id,
-                json.dumps(artifact_refs, ensure_ascii=False)
-                if artifact_refs is not None
-                else None,
+                artifact_refs_json,
                 now,
             ),
         )
@@ -333,6 +407,12 @@ class ThreadStore:
         """Mark thread as accepted. Returns updated thread dict or None if not found."""
         assert self._conn is not None
         now = _now_iso()
+        if self._writer is not None:
+            await self._submit_thread_mutation(
+                "complete_thread",
+                {"thread_id": thread_id, "now": now},
+            )
+            return await self.get_thread(thread_id)
         await self._conn.execute(
             "UPDATE creator_threads SET status='accepted', accepted_at=?, updated_at=? WHERE id=?",
             (now, now, thread_id),
@@ -350,8 +430,29 @@ class ThreadStore:
         assert self._conn is not None
         now = _now_iso()
         ids: list[str] = []
-        for c in candidates:
+        prepared: list[dict[str, Any]] = []
+        for candidate in candidates:
             candidate_id = _new_id()
+            ids.append(candidate_id)
+            prepared.append(
+                {
+                    "candidate_id": candidate_id,
+                    "thread_id": thread_id,
+                    "session_id": session_id,
+                    "note_id": candidate["note_id"],
+                    "title": candidate["title"],
+                    "content": candidate["content"],
+                    "tags": ",".join(candidate.get("tags", [])),
+                    "now": now,
+                }
+            )
+        if self._writer is not None:
+            await self._submit_thread_mutation(
+                "save_publish_candidates",
+                {"candidates": prepared},
+            )
+            return ids
+        for c, candidate_id in zip(candidates, ids):
             await self._conn.execute(
                 """
                 INSERT OR IGNORE INTO publish_candidates
@@ -374,7 +475,6 @@ class ThreadStore:
                     c["note_id"],
                 ),
             )
-            ids.append(candidate_id)
         await self._conn.commit()
         return ids
 
@@ -406,6 +506,12 @@ class ThreadStore:
     async def update_thread_title(self, thread_id: str, title: str) -> None:
         assert self._conn is not None
         now = _now_iso()
+        if self._writer is not None:
+            await self._submit_thread_mutation(
+                "update_title",
+                {"thread_id": thread_id, "title": title, "now": now},
+            )
+            return
         await self._conn.execute(
             "UPDATE creator_threads SET title = ?, updated_at = ? WHERE id = ?",
             (title, now, thread_id),
@@ -414,6 +520,12 @@ class ThreadStore:
 
     async def delete_thread(self, thread_id: str) -> bool:
         assert self._conn is not None
+        if self._writer is not None:
+            result = await self._submit_thread_mutation(
+                "delete_thread", {"thread_id": thread_id}
+            )
+            assert result is not None
+            return result.get("deleted") is True
         await self._conn.execute(
             "DELETE FROM publish_candidates WHERE thread_id = ?",
             (thread_id,),
@@ -437,6 +549,17 @@ class ThreadStore:
     ) -> None:
         assert self._conn is not None
         now = _now_iso()
+        if self._writer is not None:
+            await self._submit_thread_mutation(
+                "update_active_job",
+                {
+                    "thread_id": thread_id,
+                    "session_id": session_id,
+                    "job_id": job_id,
+                    "now": now,
+                },
+            )
+            return
         await self._conn.execute(
             """
             UPDATE creator_threads
@@ -456,6 +579,13 @@ class ThreadStore:
     ) -> None:
         assert self._conn is not None
         now = _now_iso()
+        if self._writer is not None:
+            await self._submit_thread_mutation(
+                "update_active_run",
+                {"thread_id": thread_id, "run_id": run_id, "now": now},
+                run_id=run_id,
+            )
+            return
         await self._conn.execute(
             """
             UPDATE creator_threads

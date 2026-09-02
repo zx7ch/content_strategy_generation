@@ -439,12 +439,16 @@ async def test_presearch_retry_recovers_the_same_run_after_model_repair(tmp_path
         workspace_id="ws-test",
     )
     llm.error = None
+    plan = failed.run.recovery_plan
+    assert plan is not None
 
     recovered = await service.retry_presearch(
         failed.workflow_run_id,
         command_id="retry-presearch-once",
         expected_state=ContentResearchState.RECOVERY_REQUIRED,
         expected_revision=2,
+        recovery_plan_id=str(plan["recovery_plan_id"]),
+        plan_fingerprint=str(plan["plan_fingerprint"]),
     )
 
     assert recovered.workflow_run_id == failed.workflow_run_id

@@ -69,6 +69,10 @@ export class ContentResearchTraceRevisionGuard {
     return this.consecutiveFailures >= 3;
   }
 
+  minimumRevision() {
+    return this.revision >= 0 ? this.revision : undefined;
+  }
+
   reset() {
     this.revision = -1;
     this.consecutiveFailures = 0;

@@ -60,7 +60,6 @@ from app.content_research.errors import (
     ContentResearchNotFoundError,
     ContentResearchStateConflictError,
     ContentResearchValidationError,
-    ReportPublicationMaterializationError,
 )
 from app.content_research.evidence import EvidenceService
 from app.content_research.evidence.governance_reader import (
@@ -195,6 +194,7 @@ from app.content_research.workflow_mutation_authority import (
     legacy_recovery_ownership_unavailable,
     project_legacy_recovery_authority,
 )
+from app.core.runtime_write_coordinator import RuntimeWriteCoordinator
 from app.memory.thread_store import ThreadStore
 from app.memory.workflow_store import WorkflowStore
 from app.services.llm.failures import LLMProviderFailure
@@ -269,30 +269,42 @@ class WorkflowRunManagerRuntime:
         *,
         execution_context: ExecutionContext | None = None,
         dispatch_context: DispatchLeaseContext | None = None,
+        writer: RuntimeWriteCoordinator | None = None,
     ) -> None:
         self._db_path = db_path
         self._execution_context = execution_context
         self._dispatch_context = dispatch_context
+        self._writer = writer
 
     def for_execution_context(self, context: ExecutionContext) -> WorkflowRunManagerRuntime:
-        return WorkflowRunManagerRuntime(self._db_path, execution_context=context)
+        return WorkflowRunManagerRuntime(
+            self._db_path,
+            execution_context=context,
+            writer=self._writer,
+        )
 
     def for_dispatch_context(self, context: DispatchLeaseContext) -> WorkflowRunManagerRuntime:
-        return WorkflowRunManagerRuntime(self._db_path, dispatch_context=context)
+        return WorkflowRunManagerRuntime(
+            self._db_path,
+            dispatch_context=context,
+            writer=self._writer,
+        )
 
     def _manager(self, operation: str) -> WorkflowRunManager:
         if self._execution_context is None:
             if self._dispatch_context is None:
-                return WorkflowRunManager(self._db_path)
+                return WorkflowRunManager(self._db_path, writer=self._writer)
             return DispatchLeaseFencedWorkflowRunManager(
                 self._db_path,
                 dispatch_context=self._dispatch_context,
                 operation=operation,
+                writer=self._writer,
             )
         return LeaseFencedWorkflowRunManager(
             self._db_path,
             execution_context=self._execution_context,
             operation=operation,
+            writer=self._writer,
         )
 
     async def record_step_execution_started(self, workflow_run_id: str, step_name: str) -> None:
@@ -314,7 +326,7 @@ class WorkflowRunManagerRuntime:
         task_specs: list[dict],
         confirmation_writer: Callable[[aiosqlite.Connection, list[str]], Awaitable[None]],
     ) -> list[str]:
-        async with WorkflowRunManager(self._db_path) as manager:
+        async with WorkflowRunManager(self._db_path, writer=self._writer) as manager:
             return await manager.complete_brief_and_plan_atomically(
                 workflow_run_id=workflow_run_id,
                 task_specs=task_specs,
@@ -478,7 +490,7 @@ class WorkflowRunManagerRuntime:
             run = await store.get_run(workflow_run_id)
         status_value = run.status.value if run is not None else ""
         if status_value in {"running", "pausing", "paused", "finalizing_report"}:
-            async with WorkflowRunManager(self._db_path) as manager:
+            async with WorkflowRunManager(self._db_path, writer=self._writer) as manager:
                 cancelled = await manager.cancel_run(
                     workflow_run_id, reason="content_research_ended"
                 )
@@ -592,7 +604,10 @@ class ContentResearchService:
         research_embedding_runtime: ResearchEmbeddingRuntime | None = None,
     ) -> None:
         self._store = store
-        self._lifecycle = ContentResearchPersistenceCoordinator(store._db_path)
+        self._lifecycle = ContentResearchPersistenceCoordinator(
+            store._db_path,
+            writer=store._writer,
+        )
         self._presearch = presearch
         self._workflow_runtime = workflow_runtime
         self._direction_registry = ResearchDirectionRegistry()
@@ -608,7 +623,10 @@ class ContentResearchService:
         self._cross_direction_governance = CrossDirectionGovernanceService(store)
         self._report_execution = ReportExecutionService(store)
         self._analysis_llm = analysis_llm
-        self._dispatch = AsyncFormalResearchDispatchRepository(store._db_path)
+        self._dispatch = AsyncFormalResearchDispatchRepository(
+            store._db_path,
+            writer=store._writer,
+        )
         self._dispatch_wake_event = dispatch_wake_event
         self._analysis_wake_event = analysis_wake_event
         self._research_embedding_runtime = research_embedding_runtime
@@ -683,12 +701,16 @@ class ContentResearchService:
         command_id: str,
         expected_state: ContentResearchState,
         expected_revision: int,
+        recovery_plan_id: str,
+        plan_fingerprint: str,
     ) -> ContentResearchPresearchResponse:
         return await self._command_interface.retry_presearch(
             workflow_run_id,
             command_id=command_id,
             expected_state=expected_state,
             expected_revision=expected_revision,
+            recovery_plan_id=recovery_plan_id,
+            plan_fingerprint=plan_fingerprint,
         )
 
     async def revise_subject(
@@ -750,8 +772,12 @@ class ContentResearchService:
             workflow_run_id, version=version
         )
 
-    async def get_workflow_trace(self, workflow_run_id: str) -> ContentResearchTraceResponse:
-        return await self._query_interface.get_workflow_trace(workflow_run_id)
+    async def get_workflow_trace(
+        self, workflow_run_id: str, *, minimum_revision: int | None = None
+    ) -> ContentResearchTraceResponse:
+        return await self._query_interface.get_workflow_trace(
+            workflow_run_id, minimum_revision=minimum_revision
+        )
 
     async def submit_brand_decision(
         self,
@@ -1378,7 +1404,11 @@ class ContentResearchService:
         claim_cards: list[dict[str, Any]],
     ) -> dict[str, str]:
         """Bind immutable analysis atoms back to manifest-owned admitted claims."""
-        repository = SQLiteMarketingAnalysisRepository(self._store._db_path, bootstrap_schema=False)
+        repository = SQLiteMarketingAnalysisRepository(
+            self._store._db_path,
+            bootstrap_schema=False,
+            writer=self._store._writer,
+        )
         attempt = repository.get_effective_attempt_for_run(workflow_run_id)
         if attempt is None or attempt.state != "succeeded":
             return {}
@@ -1899,16 +1929,16 @@ class ContentResearchService:
     ) -> ContentResearchFormalResearchResponse:
         """Re-materialize a report after a safe, terminal publication failure."""
         runtime_snapshot = await self._workflow_runtime.get_runtime_snapshot(workflow_run_id)
-        runtime_run = runtime_snapshot.get("run") or {}
-        runtime_status = str(runtime_run.get("status") or "")
+        workflow_run = runtime_snapshot.get("run") or {}
+        workflow_status = str(workflow_run.get("status") or "")
         events = await self._workflow_runtime.list_events(workflow_run_id)
-        if runtime_status == "failed":
+        if workflow_status == "failed":
             failed_publication_id = _latest_report_publication_id(
                 events,
                 event_type="run_failed",
                 error_code="report_publication_failed",
             )
-        elif runtime_status == "finalizing_report":
+        elif workflow_status == "finalizing_report":
             failed_publication_id = _latest_report_publication_id(
                 events,
                 event_type="run_report_publication_retry_started",
@@ -1934,27 +1964,15 @@ class ContentResearchService:
             raise ContentResearchValidationError(
                 "Report publication retry requires the exact persisted failed publication"
             )
-        if runtime_status == "failed":
+        if workflow_status == "failed":
             await self._workflow_runtime.retry_failed_report_publication(
                 workflow_run_id=workflow_run_id,
                 publication_id=publication.id,
             )
         try:
-            artifact = await ReportPublicationMaterializer(
-                self._store, self._store._db_path
-            ).materialize(publication.id)
-            report_artifact_ref = {
-                "type": "content_research_report_publication",
-                "id": publication.id,
-                "artifact_id": artifact.artifact_id,
-                "publication_state": publication.publication_state,
-            }
-            await self._workflow_runtime.complete_report_publication(
-                workflow_run_id=workflow_run_id
-            )
             await ReportPublicationMaterializer(
                 self._store, self._store._db_path
-            ).publish_timeline_message(report_artifact_ref["id"])
+            ).commit_publication(publication.id)
         except Exception as exc:
             await self._workflow_runtime.fail_formal_research(
                 workflow_run_id=workflow_run_id,
@@ -2215,9 +2233,10 @@ class ContentResearchService:
         workflow_run_id: str,
         *,
         provider: str,
-        runtime_child_tasks: list[dict] | None = None,
+        workflow_child_states: list[dict] | None = None,
+        apply_changes: bool = True,
     ) -> list[str]:
-        """Make only explicitly recoverable provider failures eligible for a user retry.
+        """Validate and optionally apply an exact provider-task recovery.
 
         A completed dispatch can represent an evidence-only report, so its job
         state alone cannot decide whether replay is safe.  Provider-operation
@@ -2282,15 +2301,15 @@ class ContentResearchService:
                     "Xiaohongshu authentication must succeed before retrying this run."
                 )
 
-        runtime_child_by_id = {
+        workflow_child_by_id = {
             str(item.get("child_task_id") or ""): item
-            for item in runtime_child_tasks or []
+            for item in workflow_child_states or []
             if isinstance(item, dict)
         }
         recovery_child_ids: list[str] = []
         for task, _operations, _fingerprints, _operation_names in recovery_plans:
             child_task_id = str(task.payload.get("workflow_child_task_id") or "")
-            child = runtime_child_by_id.get(child_task_id)
+            child = workflow_child_by_id.get(child_task_id)
             if not child_task_id or child is None:
                 raise ContentResearchValidationError(
                     "Recoverable specialist is missing its workflow child counter."
@@ -2302,6 +2321,9 @@ class ContentResearchService:
                     "Content Research specialist recovery budget is exhausted."
                 )
             recovery_child_ids.append(child_task_id)
+
+        if not apply_changes:
+            return recovery_child_ids
 
         for (
             task,
@@ -2993,7 +3015,9 @@ class ContentResearchService:
                     "Marketing conclusion analysis requires manifest-owned coverage"
                 )
             analysis_repository = SQLiteMarketingAnalysisRepository(
-                self._store._db_path, bootstrap_schema=False
+                self._store._db_path,
+                bootstrap_schema=False,
+                writer=self._store._writer,
             )
             effective_attempt = await asyncio.to_thread(
                 analysis_repository.get_effective_attempt_for_run,
@@ -3088,9 +3112,9 @@ class ContentResearchService:
             report_artifact_ref = None
             try:
                 self._require_live_execution_context(execution_context, "report_publication")
-                # The report artifact is produced while finalizing_report.  It
-                # is not publicly readable until complete_report_publication
-                # commits the workflow's succeeded state.
+                # Composition persists an immutable candidate publication. One
+                # Writer mutation then exposes its artifact, terminal states,
+                # lifecycle projection and Creator timeline atomically.
                 report_artifact_ref = await self._publish_report_after_workflow_completion(
                     workflow_run_id=brief.workflow_run_id,
                     thread_id=brief.thread_id,
@@ -3100,22 +3124,16 @@ class ContentResearchService:
                     manifest=publication_manifest,
                 )
                 if report_artifact_ref is not None:
-                    complete_report = getattr(
-                        self._workflow_runtime, "complete_report_publication", None
-                    )
-                    if complete_report is not None:
-                        await complete_report(workflow_run_id=brief.workflow_run_id)
-                        await ReportPublicationMaterializer(
-                            self._store,
-                            self._store._db_path,
-                            execution_context=execution_context,
-                            dispatch_context=dispatch_context,
-                        ).publish_timeline_message(report_artifact_ref["id"])
-                        await self._advance_lifecycle_if_current(
-                            brief.workflow_run_id,
-                            expected_state=ContentResearchState.REPORT_COMPOSING,
-                            event="report_published",
-                        )
+                    artifact = await ReportPublicationMaterializer(
+                        self._store,
+                        self._store._db_path,
+                        execution_context=execution_context,
+                        dispatch_context=dispatch_context,
+                    ).commit_publication(report_artifact_ref["id"])
+                    report_artifact_ref = {
+                        **report_artifact_ref,
+                        "artifact_id": artifact.artifact_id,
+                    }
             except Exception as exc:
                 failed_publication_id = (
                     report_artifact_ref["id"]
@@ -3360,19 +3378,10 @@ class ContentResearchService:
             None,
         )
         if existing_publication is not None:
-            try:
-                artifact = await ReportPublicationMaterializer(
-                    self._store,
-                    self._store._db_path,
-                    execution_context=execution_context,
-                    dispatch_context=dispatch_context,
-                ).materialize(existing_publication.id)
-            except Exception as exc:
-                raise ReportPublicationMaterializationError(existing_publication.id, exc) from exc
             return {
                 "type": "content_research_report_publication",
                 "id": existing_publication.id,
-                "artifact_id": artifact.artifact_id,
+                "artifact_id": "",
                 "publication_state": existing_publication.publication_state,
             }
         snapshot_response = await self._create_result_snapshot_off_event_loop(
@@ -3388,19 +3397,10 @@ class ContentResearchService:
             if item.id == snapshot_response.snapshot_id
         )
         publication = await self._report_execution.execute(snapshot, self._report_semantic_auditor)
-        try:
-            artifact = await ReportPublicationMaterializer(
-                self._store,
-                self._store._db_path,
-                execution_context=execution_context,
-                dispatch_context=dispatch_context,
-            ).materialize(publication.id)
-        except Exception as exc:
-            raise ReportPublicationMaterializationError(publication.id, exc) from exc
         return {
             "type": "content_research_report_publication",
             "id": publication.id,
-            "artifact_id": artifact.artifact_id,
+            "artifact_id": "",
             "publication_state": publication.publication_state,
         }
 

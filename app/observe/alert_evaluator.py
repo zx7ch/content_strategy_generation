@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Optional
@@ -8,6 +9,12 @@ from typing import Any, Optional
 import aiosqlite
 
 from app.config import settings
+from app.core.runtime_write_coordinator import RuntimeWriteCoordinator, TypedMutation
+from app.core.runtime_write_registry import get_runtime_writer
+from app.core.sqlite_connection_roles import (
+    open_bootstrap_async_database,
+    open_readonly_async_database,
+)
 from app.logging_config import get_logger, log_event
 
 
@@ -60,8 +67,14 @@ class AlertRecord:
 class AlertEvaluator:
     """Evaluate operational alert rules from SQLite fact tables."""
 
-    def __init__(self, db_path: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        db_path: Optional[str] = None,
+        *,
+        writer: RuntimeWriteCoordinator | None = None,
+    ) -> None:
         self.db_path = db_path or settings.SQLITE_DB_PATH
+        self._writer = writer or get_runtime_writer(self.db_path)
         self._conn: Optional[aiosqlite.Connection] = None
         self._logger = get_logger(__name__, component="observe")
         self.rules: dict[str, AlertRule] = {
@@ -94,6 +107,22 @@ class AlertEvaluator:
             ),
         }
 
+    async def _submit_alert_mutation(
+        self,
+        action: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        if self._writer is None:
+            raise RuntimeError("runtime writer is not configured")
+        result = await self._writer.submit(
+            TypedMutation.create(
+                mutation_id=f"alert_mutation_{uuid.uuid4().hex}",
+                mutation_kind="mutate_runtime_accounting",
+                domain_payload={"action": action, **payload},
+            )
+        )
+        return dict(result.result_fields)
+
     async def __aenter__(self) -> "AlertEvaluator":
         await self.connect()
         return self
@@ -105,7 +134,12 @@ class AlertEvaluator:
         if self._conn is not None:
             return
 
-        self._conn = await aiosqlite.connect(self.db_path)
+        if self._writer is not None:
+            self._conn = await open_readonly_async_database(self.db_path)
+            self._conn.row_factory = aiosqlite.Row
+            return
+
+        self._conn = await open_bootstrap_async_database(self.db_path)
         self._conn.row_factory = aiosqlite.Row
         await self._conn.execute("PRAGMA journal_mode=WAL")
         await self._conn.execute("PRAGMA synchronous=NORMAL")
@@ -327,6 +361,16 @@ class AlertEvaluator:
         payload = existing.payload
         payload["resolved_value"] = value
         payload["resolved_at"] = now.isoformat()
+        if self._writer is not None:
+            await self._submit_alert_mutation(
+                "resolve_alert",
+                {
+                    "alert_id": existing.id,
+                    "resolved_at": _sqlite_ts(now),
+                    "payload_json": json.dumps(payload, ensure_ascii=False),
+                },
+            )
+            return await self._get_alert_by_id(existing.id)
         await self._conn.execute(
             """
             UPDATE alerts
@@ -349,23 +393,43 @@ class AlertEvaluator:
         payload: dict[str, Any],
     ) -> AlertRecord:
         assert self._conn is not None
-        await self._conn.execute(
-            """
-            INSERT INTO alerts(rule_name, severity, status, minute_bucket, payload_json)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (
-                rule.rule_name,
-                rule.severity,
-                status,
-                minute_bucket,
-                json.dumps(payload, ensure_ascii=False),
-            ),
-        )
-        await self._conn.commit()
-        async with self._conn.execute("SELECT * FROM alerts ORDER BY id DESC LIMIT 1") as cursor:
-            row = await cursor.fetchone()
-        alert = self._row_to_alert(row)
+        payload_json = json.dumps(payload, ensure_ascii=False)
+        if self._writer is not None:
+            result = await self._submit_alert_mutation(
+                "insert_alert",
+                {
+                    "rule_name": rule.rule_name,
+                    "severity": rule.severity,
+                    "status": status,
+                    "minute_bucket": minute_bucket,
+                    "payload_json": payload_json,
+                },
+            )
+            alert_id = result.get("alert_id")
+            if not isinstance(alert_id, int):
+                raise RuntimeError("invalid alert insert result")
+            alert = await self._get_alert_by_id(alert_id)
+            assert alert is not None
+        else:
+            await self._conn.execute(
+                """
+                INSERT INTO alerts(rule_name, severity, status, minute_bucket, payload_json)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    rule.rule_name,
+                    rule.severity,
+                    status,
+                    minute_bucket,
+                    payload_json,
+                ),
+            )
+            await self._conn.commit()
+            async with self._conn.execute(
+                "SELECT * FROM alerts ORDER BY id DESC LIMIT 1"
+            ) as cursor:
+                row = await cursor.fetchone()
+            alert = self._row_to_alert(row)
         log_event(
             self._logger,
             event_name="alert_opened",
@@ -383,9 +447,16 @@ class AlertEvaluator:
 
     async def _update_alert_payload(self, alert_id: int, payload: dict[str, Any]) -> None:
         assert self._conn is not None
+        payload_json = json.dumps(payload, ensure_ascii=False)
+        if self._writer is not None:
+            await self._submit_alert_mutation(
+                "update_alert_payload",
+                {"alert_id": alert_id, "payload_json": payload_json},
+            )
+            return
         await self._conn.execute(
             "UPDATE alerts SET payload_json = ? WHERE id = ?",
-            (json.dumps(payload, ensure_ascii=False), alert_id),
+            (payload_json, alert_id),
         )
         await self._conn.commit()
 
@@ -397,6 +468,18 @@ class AlertEvaluator:
         payload: dict[str, Any],
     ) -> None:
         assert self._conn is not None
+        payload_json = json.dumps(payload, ensure_ascii=False)
+        if self._writer is not None:
+            await self._submit_alert_mutation(
+                "promote_alert",
+                {
+                    "alert_id": alert_id,
+                    "severity": severity,
+                    "minute_bucket": minute_bucket,
+                    "payload_json": payload_json,
+                },
+            )
+            return
         await self._conn.execute(
             """
             UPDATE alerts
@@ -406,7 +489,7 @@ class AlertEvaluator:
                 payload_json = ?
             WHERE id = ?
             """,
-            (severity, minute_bucket, json.dumps(payload, ensure_ascii=False), alert_id),
+            (severity, minute_bucket, payload_json, alert_id),
         )
         await self._conn.commit()
 

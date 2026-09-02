@@ -10,6 +10,16 @@ from typing import Any, Optional
 import aiosqlite
 
 from app.config import settings
+from app.core.runtime_write_coordinator import (
+    CommitResult,
+    RuntimeWriteCoordinator,
+    TypedMutation,
+)
+from app.core.runtime_write_registry import get_runtime_writer
+from app.core.sqlite_connection_roles import (
+    open_bootstrap_async_database,
+    open_readonly_async_database,
+)
 from app.logging_config import get_logger, log_event
 from app.memory.workflow_store import ensure_column
 
@@ -73,10 +83,34 @@ class SessionEventRecord:
 class JobStore:
     """SQLite-backed job queue with lease-based consumption."""
 
-    def __init__(self, db_path: Optional[str] = None):
+    def __init__(
+        self,
+        db_path: Optional[str] = None,
+        *,
+        writer: RuntimeWriteCoordinator | None = None,
+    ):
         self.db_path = db_path or settings.SQLITE_DB_PATH
+        self._writer = writer or get_runtime_writer(self.db_path)
         self._conn: Optional[aiosqlite.Connection] = None
         self._logger = get_logger(__name__, component="worker")
+
+    async def _submit_job_mutation(
+        self,
+        mutation_kind: str,
+        domain_payload: dict[str, Any],
+        *,
+        run_id: str | None = None,
+    ) -> CommitResult:
+        if self._writer is None:
+            raise RuntimeError("runtime writer is not configured")
+        return await self._writer.submit(
+            TypedMutation.create(
+                mutation_id=f"job_mutation_{uuid.uuid4().hex}",
+                mutation_kind=mutation_kind,
+                domain_payload=domain_payload,
+                run_id=run_id,
+            )
+        )
 
     async def __aenter__(self) -> "JobStore":
         await self.connect()
@@ -89,7 +123,12 @@ class JobStore:
         if self._conn is not None:
             return
 
-        self._conn = await aiosqlite.connect(self.db_path)
+        if self._writer is not None:
+            self._conn = await open_readonly_async_database(self.db_path)
+            self._conn.row_factory = aiosqlite.Row
+            return
+
+        self._conn = await open_bootstrap_async_database(self.db_path)
         self._conn.row_factory = aiosqlite.Row
         await self._conn.execute("PRAGMA journal_mode=WAL")
         await self._conn.execute("PRAGMA synchronous=NORMAL")
@@ -354,6 +393,47 @@ class JobStore:
         payload_json = json.dumps(payload or {}, ensure_ascii=False, default=str)
         effective_max_attempts = settings.JOB_MAX_RETRIES if max_attempts is None else max_attempts
 
+        if self._writer is not None:
+            result = await self._writer.submit(
+                TypedMutation.create(
+                    mutation_id=job_id,
+                    mutation_kind="enqueue_job",
+                    domain_payload={
+                        "job_id": job_id,
+                        "session_id": session_id,
+                        "job_type": job_type,
+                        "payload_json": payload_json,
+                        "priority": priority,
+                        "max_attempts": effective_max_attempts,
+                        "idempotency_key": idempotency_key,
+                        "run_id": run_id,
+                        "step_id": step_id,
+                        "child_task_id": child_task_id,
+                    },
+                    run_id=run_id,
+                )
+            )
+            committed_job_id = result.result_fields.get("job_id")
+            created = result.result_fields.get("created")
+            if not isinstance(committed_job_id, str) or not isinstance(created, bool):
+                raise RuntimeError("invalid job enqueue result")
+            job = await self.get_job(committed_job_id)
+            if job is None:
+                raise RuntimeError("committed job is not readable")
+            if created:
+                log_event(
+                    self._logger,
+                    event_name="job_enqueued",
+                    level="info",
+                    component="worker",
+                    session_id=session_id,
+                    job_id=committed_job_id,
+                    stage=job_type,
+                    status="queued",
+                    idempotency_key=idempotency_key,
+                )
+            return job, created
+
         await self._conn.execute(
             """
             INSERT INTO jobs (
@@ -399,6 +479,32 @@ class JobStore:
         assert self._conn is not None
 
         ttl = lease_seconds or settings.JOB_LEASE_SECONDS
+        if self._writer is not None:
+            result = await self._submit_job_mutation(
+                "lease_job",
+                {"lease_seconds": ttl},
+            )
+            job_id = result.result_fields.get("job_id")
+            if job_id is None:
+                return None
+            if not isinstance(job_id, str):
+                raise RuntimeError("invalid job lease result")
+            job = await self.get_job(job_id)
+            if job is None:
+                raise RuntimeError("leased job is not readable")
+            log_event(
+                self._logger,
+                event_name="job_leased",
+                level="info",
+                component="worker",
+                session_id=job.session_id,
+                job_id=job.id,
+                stage=job.job_type,
+                attempts=job.attempts,
+                lease_expires_at=job.lease_expires_at,
+            )
+            return job
+
         # This generic worker shares the Runtime SQLite database with Content
         # Research.  Empty polling must not reserve SQLite's only writer slot:
         # a synchronous Content Research write on the event loop can otherwise
@@ -474,6 +580,23 @@ class JobStore:
         """Recover expired running jobs to retrying or failed based on retry budget."""
         assert self._conn is not None
 
+        if self._writer is not None:
+            result = await self._submit_job_mutation("recover_expired_jobs", {})
+            recovered = result.result_fields.get("recovered")
+            job_ids = result.result_fields.get("job_ids")
+            if not isinstance(recovered, int) or not isinstance(job_ids, list):
+                raise RuntimeError("invalid expired-job recovery result")
+            jobs: list[JobRecord] = []
+            for job_id in job_ids:
+                if not isinstance(job_id, str):
+                    raise RuntimeError("invalid recovered job identity")
+                job = await self.get_job(job_id)
+                if job is not None:
+                    jobs.append(job)
+            if jobs:
+                await self._sync_expired_workflow_steps(jobs)
+            return recovered
+
         async with self._conn.execute(
             """
             SELECT *
@@ -483,6 +606,7 @@ class JobStore:
             """
         ) as cursor:
             expired_rows = await cursor.fetchall()
+        expired_jobs = [self._row_to_job(row) for row in expired_rows]
 
         async with self._conn.execute(
             """
@@ -507,14 +631,13 @@ class JobStore:
         await self._conn.commit()
 
         if recovered:
-            await self._sync_expired_workflow_steps(expired_rows)
+            await self._sync_expired_workflow_steps(expired_jobs)
         return recovered
 
-    async def _sync_expired_workflow_steps(self, rows: list[aiosqlite.Row]) -> None:
+    async def _sync_expired_workflow_steps(self, jobs: list[JobRecord]) -> None:
         from app.services.workflow_run_manager import WorkflowRunManager, WorkflowTransitionError
 
-        for row in rows:
-            job = self._row_to_job(row)
+        for job in jobs:
             if not job.run_id:
                 continue
             step_name = str(job.payload.get("step_name") or "")
@@ -542,6 +665,25 @@ class JobStore:
         job = await self.get_job(job_id)
         if job is None:
             return False
+
+        if self._writer is not None:
+            result = await self._submit_job_mutation(
+                "mark_job_succeeded",
+                {"job_id": job_id},
+                run_id=job.run_id,
+            )
+            ok = result.result_fields.get("updated") is True
+            if ok:
+                log_event(
+                    self._logger,
+                    event_name="job_completed",
+                    level="info",
+                    component="worker",
+                    session_id=job.session_id,
+                    job_id=job.id,
+                    stage=job.job_type,
+                )
+            return ok
 
         async with self._conn.execute(
             """
@@ -572,6 +714,30 @@ class JobStore:
         job = await self.get_job(job_id)
         if job is None:
             return False
+
+        if self._writer is not None:
+            result = await self._submit_job_mutation(
+                "mark_job_failed",
+                {
+                    "job_id": job_id,
+                    "error_code": error_code,
+                    "error_message": error_message,
+                },
+                run_id=job.run_id,
+            )
+            ok = result.result_fields.get("updated") is True
+            if ok:
+                log_event(
+                    self._logger,
+                    event_name="job_failed",
+                    level="error",
+                    component="worker",
+                    session_id=job.session_id,
+                    job_id=job.id,
+                    stage=job.job_type,
+                    error_code=error_code,
+                )
+            return ok
 
         async with self._conn.execute(
             """
@@ -612,6 +778,32 @@ class JobStore:
             return await self.mark_failed(job_id, error_code=error_code, error_message=error_message)
 
         delay_seconds = settings.XHS_SPIDER_BACKOFF_BASE ** max(1, job.attempts)
+        if self._writer is not None:
+            result = await self._submit_job_mutation(
+                "schedule_job_retry",
+                {
+                    "job_id": job_id,
+                    "delay_seconds": delay_seconds,
+                    "error_code": error_code,
+                    "error_message": error_message,
+                },
+                run_id=job.run_id,
+            )
+            ok = result.result_fields.get("updated") is True
+            if ok:
+                log_event(
+                    self._logger,
+                    event_name="job_retry_scheduled",
+                    level="warning",
+                    component="worker",
+                    session_id=job.session_id,
+                    job_id=job.id,
+                    stage=job.job_type,
+                    error_code=error_code,
+                    retry_delay_seconds=delay_seconds,
+                    attempts=job.attempts,
+                )
+            return ok
         async with self._conn.execute(
             """
             UPDATE jobs
@@ -647,6 +839,9 @@ class JobStore:
         """Pause a single job. Only queued/retrying → paused. Other statuses: no DB change.
         Returns None if job not found; returns job as-is if transition is not applicable."""
         assert self._conn is not None
+        if self._writer is not None:
+            await self._submit_job_mutation("pause_job", {"job_id": job_id})
+            return await self.get_job(job_id)
         async with self._conn.execute(
             """
             UPDATE jobs
@@ -663,6 +858,9 @@ class JobStore:
         """Resume a single paused job → queued. Other statuses: no DB change.
         Returns None if job not found."""
         assert self._conn is not None
+        if self._writer is not None:
+            await self._submit_job_mutation("resume_job", {"job_id": job_id})
+            return await self.get_job(job_id)
         async with self._conn.execute(
             """
             UPDATE jobs
@@ -683,6 +881,12 @@ class JobStore:
         """Cancel a single job. queued/paused/retrying/running → cancelled.
         Terminal statuses: no DB change. Returns None if job not found."""
         assert self._conn is not None
+        if self._writer is not None:
+            await self._submit_job_mutation(
+                "cancel_job",
+                {"job_id": job_id, "reason": reason},
+            )
+            return await self.get_job(job_id)
         async with self._conn.execute(
             """
             UPDATE jobs
@@ -703,6 +907,13 @@ class JobStore:
         """Pause all queued/retrying jobs for a frozen session."""
         assert self._conn is not None
 
+        if self._writer is not None:
+            result = await self._submit_job_mutation(
+                "pause_session_jobs",
+                {"session_id": session_id},
+            )
+            return int(result.result_fields["updated"])
+
         async with self._conn.execute(
             """
             UPDATE jobs
@@ -721,6 +932,13 @@ class JobStore:
         """Resume paused jobs for a resumed session."""
         assert self._conn is not None
 
+        if self._writer is not None:
+            result = await self._submit_job_mutation(
+                "resume_session_jobs",
+                {"session_id": session_id},
+            )
+            return int(result.result_fields["updated"])
+
         async with self._conn.execute(
             """
             UPDATE jobs
@@ -738,6 +956,13 @@ class JobStore:
 
     async def cancel_session_jobs(self, session_id: str, reason: str = "session_purged") -> int:
         assert self._conn is not None
+
+        if self._writer is not None:
+            result = await self._submit_job_mutation(
+                "cancel_session_jobs",
+                {"session_id": session_id, "reason": reason},
+            )
+            return int(result.result_fields["updated"])
 
         async with self._conn.execute(
             """
@@ -758,6 +983,13 @@ class JobStore:
     async def pause_workflow_run_jobs(self, run_id: str) -> int:
         """Pause queued/retrying jobs bound to a workflow run."""
         assert self._conn is not None
+        if self._writer is not None:
+            result = await self._submit_job_mutation(
+                "pause_workflow_jobs",
+                {"run_id": run_id},
+                run_id=run_id,
+            )
+            return int(result.result_fields["updated"])
         async with self._conn.execute(
             """
             UPDATE jobs
@@ -775,6 +1007,13 @@ class JobStore:
     async def resume_workflow_run_jobs(self, run_id: str) -> int:
         """Resume paused jobs bound to a workflow run."""
         assert self._conn is not None
+        if self._writer is not None:
+            result = await self._submit_job_mutation(
+                "resume_workflow_jobs",
+                {"run_id": run_id},
+                run_id=run_id,
+            )
+            return int(result.result_fields["updated"])
         async with self._conn.execute(
             """
             UPDATE jobs
@@ -795,6 +1034,13 @@ class JobStore:
     ) -> int:
         """Cancel unfinished jobs bound to a workflow run."""
         assert self._conn is not None
+        if self._writer is not None:
+            result = await self._submit_job_mutation(
+                "cancel_workflow_jobs",
+                {"run_id": run_id, "reason": reason},
+                run_id=run_id,
+            )
+            return int(result.result_fields["updated"])
         async with self._conn.execute(
             """
             UPDATE jobs
@@ -823,6 +1069,28 @@ class JobStore:
         assert self._conn is not None
 
         payload_json = json.dumps(payload or {}, ensure_ascii=False, default=str)
+        if self._writer is not None:
+            result = await self._submit_job_mutation(
+                "append_session_event",
+                {
+                    "session_id": session_id,
+                    "event_name": event_name,
+                    "payload_json": payload_json,
+                    "job_id": job_id,
+                    "stage": stage,
+                },
+            )
+            event_id = result.result_fields.get("event_id")
+            if not isinstance(event_id, int):
+                raise RuntimeError("invalid session event result")
+            async with self._conn.execute(
+                "SELECT * FROM session_events WHERE event_id = ?",
+                (event_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+            if row is None:
+                raise RuntimeError("committed session event is not readable")
+            return self._row_to_session_event(row)
         async with self._conn.execute(
             """
             INSERT INTO session_events(session_id, job_id, event_name, stage, payload_json)
@@ -864,4 +1132,3 @@ class JobStore:
         async with self._conn.execute(sql, params) as cursor:
             rows = await cursor.fetchall()
         return [self._row_to_session_event(row) for row in rows]
-        return count

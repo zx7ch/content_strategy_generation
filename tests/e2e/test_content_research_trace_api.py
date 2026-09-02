@@ -16,7 +16,10 @@ from app.content_research.persistence_models import StageCheckpointRecord
 from app.content_research.presearch.service import PresearchService
 from app.content_research.service import ContentResearchService, WorkflowRunManagerRuntime
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
+from app.core.runtime_schema_bootstrap import bootstrap_canonical_runtime_schema
+from app.core.runtime_write_coordinator import RuntimeWriteCoordinator
 from app.memory.thread_store import ThreadStore
+from app.runtime_write_handlers import production_runtime_write_handlers
 from app.services.llm.pricing import UsageCost
 from app.services.llm.types import LLMCallContext, LLMResponse, TokenUsage
 from app.services.llm.usage_tracker import LLMUsageEventInput, LLMUsageTracker
@@ -64,6 +67,9 @@ class FakeLLM:
 async def client_with_db(tmp_path):
     original = getattr(app.state, "content_research_service", None)
     db_path = str(tmp_path / "content_research.db")
+    await bootstrap_canonical_runtime_schema(db_path, discovery_secret="trace-api")
+    writer = RuntimeWriteCoordinator(db_path, handlers=production_runtime_write_handlers())
+    await writer.start()
     app.state.content_research_service = ContentResearchService(
         store=SQLiteContentResearchStore(db_path),
         presearch=PresearchService(FakeLLM(), first_feedback_timeout_seconds=0.05, hard_cutoff_seconds=0.1),
@@ -80,6 +86,7 @@ async def client_with_db(tmp_path):
         delattr(app.state, "content_research_service")
     else:
         app.state.content_research_service = original
+    await writer.close()
 
 
 async def _record_usage(db_path: str, workflow_run_id: str) -> None:
@@ -150,10 +157,10 @@ async def test_trace_rejects_a_legacy_run_without_lifecycle_authority(
 
     response = await client.get(f"/content-research/workflows/{workflow_run_id}/trace")
 
-    assert response.status_code == 422, response.text
+    assert response.status_code == 500, response.text
     payload = response.json()
-    assert payload["error_code"] == "INVALID_CONTENT_RESEARCH_PAYLOAD"
-    assert "no current lifecycle authority" in payload["error_message"]
+    assert payload["error_code"] == "DOMAIN_TRACE_PROJECTION_FAILED"
+    assert payload["error_message"] == "当前无法读取可信的调研状态快照。"
 
 
 def test_provider_operations_do_not_merge_identical_calls_from_two_specialists(tmp_path):
@@ -236,7 +243,8 @@ async def test_content_research_trace_api_restores_runtime_observation_and_usage
     assert "child_tasks_created" not in [
         event["event_type"] for event in trace["workflow_events"]
     ]
-    assert trace["runtime_child_tasks"] == []
+    assert "runtime_steps" not in trace
+    assert "runtime_child_tasks" not in trace
     # Lite Trace intentionally exposes execution state, not LLM usage payloads.
     assert trace["usage_summary"] == {}
     assert trace["usage_steps"] == []
@@ -369,12 +377,9 @@ async def test_terminal_trace_timing_is_stable_across_repeated_reads(client_with
 
     assert second["run_status"] == "failed"
     assert second["duration_ms"] == first["duration_ms"]
-    assert [step["timing"] for step in second["runtime_steps"]] == [
-        step["timing"] for step in first["runtime_steps"]
-    ]
-    assert [task["timing"] for task in second["runtime_child_tasks"]] == [
-        task["timing"] for task in first["runtime_child_tasks"]
-    ]
+    assert second["state_transitions"] == first["state_transitions"]
+    assert "runtime_steps" not in second
+    assert "runtime_child_tasks" not in second
 
 
 @pytest.mark.asyncio
@@ -470,18 +475,8 @@ async def test_content_research_trace_api_redacts_persisted_source_results(
         "by_provider": {"xiaohongshu": 1},
         "by_operation": {"discover_candidates": 1},
     }
-    assert set(payload["runtime_steps"][0]) <= {
-        "step_id",
-        "step_name",
-        "phase",
-        "status",
-        "attempt_count",
-        "max_attempts",
-        "started_at",
-            "completed_at",
-            "error_code",
-            "timing",
-    }
+    assert "runtime_steps" not in payload
+    assert "runtime_child_tasks" not in payload
     serialized = response.text
     for forbidden in (
         "RAW_TRACE_REQUEST_MUST_NOT_ESCAPE",
@@ -513,4 +508,65 @@ async def test_content_research_trace_api_missing_workflow_returns_404(client_wi
     response = await client.get("/content-research/workflows/run_missing/trace")
 
     assert response.status_code == 404
-    assert response.json()["error_code"] == "CONTENT_RESEARCH_PRESEARCH_NOT_FOUND"
+    assert response.json()["error_code"] == "CONTENT_RESEARCH_RUN_NOT_FOUND"
+
+
+@pytest.mark.asyncio
+async def test_content_research_trace_api_honors_causal_minimum_revision(
+    client_with_db,
+):
+    client, db_path = client_with_db
+    thread_id = await _create_creator_thread(db_path, "causal trace")
+    presearch_response = await client.post(
+        "/content-research/presearch",
+        json={
+            "command_id": "trace-causal-presearch",
+            "seed_text": "Satisfy Running",
+            "user_note": "",
+            "thread_id": thread_id,
+        },
+    )
+    assert presearch_response.status_code == 201
+    run_id = presearch_response.json()["workflow_run_id"]
+    initial = await client.get(f"/content-research/workflows/{run_id}/trace")
+    assert initial.status_code == 200
+    initial_revision = initial.json()["trace_revision"]
+
+    waiting = asyncio.create_task(
+        client.get(
+            f"/content-research/workflows/{run_id}/trace",
+            params={"minimum_revision": initial_revision + 1},
+        )
+    )
+    await asyncio.sleep(0.03)
+    SQLiteContentResearchStore(db_path).save_trace(
+        TraceRecord(
+            id="trace-causal-revision",
+            workflow_run_id=run_id,
+            thread_id=thread_id,
+            schema_version="content_research_trace",
+            status="running",
+            started_at=utcnow(),
+            payload={
+                "schema_version": "content_research_trace",
+                "stage": "presearch",
+            },
+        )
+    )
+    causal = await waiting
+    assert causal.status_code == 200, causal.text
+    assert causal.json()["trace_revision"] >= initial_revision + 1
+
+    behind = await client.get(
+        f"/content-research/workflows/{run_id}/trace",
+        params={"minimum_revision": causal.json()["trace_revision"] + 1},
+    )
+    assert behind.status_code == 409
+    payload = behind.json()
+    assert payload["error_code"] == "SNAPSHOT_MINIMUM_REVISION_NOT_REACHED"
+    assert payload["retryable"] is True
+    assert payload["error_details"] == {
+        "observed_revision": causal.json()["trace_revision"],
+        "minimum_revision": causal.json()["trace_revision"] + 1,
+        "retryable_read": True,
+    }

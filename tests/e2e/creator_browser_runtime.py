@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -315,50 +316,90 @@ class DeterministicAuthRequiredSource:
 class DeterministicSuccessfulSource:
     """Return complete, relevant note facts and record the exact submitted queries."""
 
-    def __init__(self, call_log: str, *, scenario: str = "complete") -> None:
+    def __init__(
+        self,
+        call_log: str,
+        *,
+        scenario: str = "complete",
+        require_two_active_runs: bool = False,
+    ) -> None:
         self._call_log = Path(call_log)
         self._scenario = scenario
+        self._require_two_active_runs = require_two_active_runs
+        self._active_discoveries: dict[str, int] = {}
+        self._two_active_runs = asyncio.Event()
 
     def capabilities(self):
         return DeterministicAuthRequiredSource().capabilities()
 
     async def discover_candidates(self, request):
+        run_id = request.workflow_run_id
+        self._active_discoveries[run_id] = self._active_discoveries.get(run_id, 0) + 1
+        active_run_ids = sorted(self._active_discoveries)
+        if len(active_run_ids) >= 2:
+            self._two_active_runs.set()
         with self._call_log.open("a", encoding="utf-8") as handle:
             handle.write(
                 json.dumps(
                     {
                         "operation": "discover_candidates",
-                        "workflow_run_id": request.workflow_run_id,
+                        "workflow_run_id": run_id,
                         "query": request.query,
+                        "active_run_ids": active_run_ids,
                     },
                     ensure_ascii=False,
                 )
                 + "\n"
             )
-        query_key = re.sub(r"\s+", "-", request.query.strip())
-        return SourceOperationResult(
-            provider="xiaohongshu",
-            operation="discover_candidates",
-            source_kind="search_result_minimal",
-            status="completed",
-            items=[
-                {
-                    "canonical_id": f"note-{query_key}-{index}",
-                    "canonical_source_id": f"note-{query_key}-{index}",
-                    "source_url": f"https://www.xiaohongshu.com/explore/note-{query_key}-{index}",
-                    "source_kind": "search_result_minimal",
-                    "title": f"T恤真实体验 {index}",
-                    "author_id": f"author-{query_key}-{index}",
-                }
-                for index in range(1, 4)
-            ],
-            cookie_status="valid",
-            completeness="complete",
-        )
+        try:
+            if self._require_two_active_runs:
+                try:
+                    await asyncio.wait_for(self._two_active_runs.wait(), timeout=8)
+                except TimeoutError:
+                    # Let the first Run finish under a one-lane scheduler so the
+                    # browser assertion reports the missing overlap instead of hanging.
+                    pass
+            query_key = re.sub(r"\s+", "-", request.query.strip())
+            object_name = "长袖衬衫" if "长袖衬衫" in request.query else "T恤"
+            items = []
+            for index in range(1, 4):
+                note_id = f"note-{query_key}-{index}"
+                title = f"{object_name}真实体验 {index}"
+                if self._scenario == "concurrent" and index == 1:
+                    note_id = "note-shared-summer-cooling-1"
+                    title = "T恤与长袖衬衫夏季凉感体验"
+                items.append(
+                    {
+                        "canonical_id": note_id,
+                        "canonical_source_id": note_id,
+                        "source_url": f"https://www.xiaohongshu.com/explore/{note_id}",
+                        "source_kind": "search_result_minimal",
+                        "title": title,
+                        "author_id": f"author-{note_id}",
+                    }
+                )
+            return SourceOperationResult(
+                provider="xiaohongshu",
+                operation="discover_candidates",
+                source_kind="search_result_minimal",
+                status="completed",
+                items=items,
+                cookie_status="valid",
+                completeness="complete",
+            )
+        finally:
+            remaining = self._active_discoveries[run_id] - 1
+            if remaining:
+                self._active_discoveries[run_id] = remaining
+            else:
+                del self._active_discoveries[run_id]
 
     async def collect_note_detail(self, request):
         index = request.note_id.rsplit("-", 1)[-1]
-        content_text = f"这件 T恤在夏季通勤中穿着凉爽，样本 {index}。"
+        object_name = "长袖衬衫" if "长袖衬衫" in request.note_id else "T恤"
+        if request.note_id == "note-shared-summer-cooling-1":
+            object_name = "T恤与长袖衬衫"
+        content_text = f"这件 {object_name}在夏季通勤中穿着凉爽，样本 {index}。"
         if self._scenario == "contested" and index in {"2", "3"}:
             content_text = f"这件 T恤在夏季通勤中一点也不凉爽，样本 {index}。"
         item = {
@@ -368,9 +409,9 @@ class DeterministicSuccessfulSource:
             "source_kind": "note_detail",
             "author_id": f"detail-author-{request.note_id}",
             "author": f"体验作者 {index}",
-            "title": f"夏季 T恤凉感体验 {index}",
+            "title": f"夏季 {object_name}凉感体验 {index}",
             "content_text": content_text,
-            "tags": ["T恤", "凉感", "夏季"],
+            "tags": [object_name, "凉感", "夏季"],
             "note_type": "image_text",
             "source_published_at": "2026-08-20T00:00:00+00:00",
             "metrics": {"like_count": 100 + int(index)},
@@ -472,8 +513,11 @@ async def deterministic_lifespan(application):
             DeterministicSuccessfulSource(
                 os.environ["CREATOR_E2E_SOURCE_CALL_LOG"],
                 scenario=source_scenario,
+                require_two_active_runs=(
+                    os.getenv("CREATOR_E2E_REQUIRE_TWO_ACTIVE_RUNS") == "1"
+                ),
             )
-            if source_scenario in {"complete", "contested"}
+            if source_scenario in {"complete", "contested", "concurrent"}
             else DeterministicAuthRequiredSource()
         )
         registry = SourceAdapterRegistry({"xiaohongshu": source})

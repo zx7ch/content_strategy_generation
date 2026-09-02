@@ -33,6 +33,17 @@ from app.content_research.scope_contract import (
     build_scope_contract,
 )
 from app.content_research.workflow.direction_registry import ResearchDirectionRegistry
+from app.core.runtime_write_coordinator import (
+    DomainMutationRejectedError,
+    RuntimeWriteCoordinator,
+    TypedMutation,
+)
+from app.core.runtime_write_registry import get_runtime_writer
+from app.core.sqlite_connection_roles import (
+    open_bootstrap_async_database,
+    open_readonly_async_database,
+    open_readonly_database,
+)
 from app.memory.workflow_store import WorkflowStore
 
 
@@ -45,6 +56,13 @@ class LifecyclePersistenceBusy(RuntimeError):
 
 
 TraceSnapshotT = TypeVar("TraceSnapshotT")
+
+_RECOVERY_COMMANDS = {
+    "retry_presearch",
+    "retry_retrieval",
+    "retry_analysis",
+    "retry_report",
+}
 
 
 def _now() -> str:
@@ -82,11 +100,18 @@ def _fingerprint(command: LifecycleCommand) -> str:
 class ContentResearchPersistenceCoordinator:
     """Own lifecycle transactions; callers cannot partially advance a Run."""
 
-    def __init__(self, db_path: str) -> None:
+    def __init__(
+        self,
+        db_path: str,
+        *,
+        writer: RuntimeWriteCoordinator | None = None,
+    ) -> None:
         self._db_path = db_path
+        self._writer = writer or get_runtime_writer(self._db_path)
+        self._borrowed_connection: Any | None = None
         self._writer_lock = asyncio.Lock()
         self._schema_lock = asyncio.Lock()
-        self._schema_ready = False
+        self._schema_ready = self._writer is not None
 
     async def _ensure_schema(self) -> None:
         if self._schema_ready:
@@ -100,7 +125,14 @@ class ContentResearchPersistenceCoordinator:
             self._schema_ready = True
 
     async def _connect(self) -> aiosqlite.Connection:
-        conn = await aiosqlite.connect(self._db_path, timeout=0.25)
+        if self._borrowed_connection is not None:
+            return self._borrowed_connection
+        if self._writer is not None:
+            conn = await open_readonly_async_database(self._db_path, timeout=0.25)
+            conn.row_factory = aiosqlite.Row
+            await conn.execute("PRAGMA foreign_keys=ON")
+            return conn
+        conn = await open_bootstrap_async_database(self._db_path, timeout=0.25)
         conn.row_factory = aiosqlite.Row
         await conn.execute("PRAGMA busy_timeout=250")
         await conn.execute("PRAGMA foreign_keys=ON")
@@ -126,6 +158,9 @@ class ContentResearchPersistenceCoordinator:
         raise AssertionError("unreachable")
 
     async def apply(self, command: LifecycleCommand) -> RunProjection:
+        if self._writer is not None:
+            projection, _ = await self._submit_lifecycle("apply", command)
+            return projection
         await self._ensure_schema()
         async with self._writer_lock:
             return await self._with_busy_retry(lambda: self._apply_once(command))
@@ -140,6 +175,16 @@ class ContentResearchPersistenceCoordinator:
         """Atomically advance recovery and create the exact analysis successor."""
         if command.kind != "retry_analysis":
             raise LifecycleCommandConflict("analysis retry requires retry_analysis command")
+        if self._writer is not None:
+            projection, attempt_id = await self._submit_lifecycle(
+                "retry_analysis",
+                command,
+                expected_attempt_id=expected_attempt_id,
+                expected_contract_fingerprint=expected_contract_fingerprint,
+            )
+            if attempt_id is None:
+                raise RuntimeError("analysis retry result omitted successor identity")
+            return projection, attempt_id
         await self._ensure_schema()
         async with self._writer_lock:
             return await self._with_busy_retry(
@@ -161,6 +206,15 @@ class ContentResearchPersistenceCoordinator:
         """Atomically close the authoritative attempt and move its Run to recovery."""
         if command.kind != "fail":
             raise LifecycleCommandConflict("analysis failure requires fail command")
+        if self._writer is not None:
+            projection, _ = await self._submit_lifecycle(
+                "fail_analysis_attempt",
+                command,
+                attempt_id=attempt_id,
+                lease_token=lease_token,
+                allow_expired_lease=allow_expired_lease,
+            )
+            return projection
         await self._ensure_schema()
         async with self._writer_lock:
             return await self._with_busy_retry(
@@ -171,6 +225,43 @@ class ContentResearchPersistenceCoordinator:
                     allow_expired_lease=allow_expired_lease,
                 )
             )
+
+    async def _submit_lifecycle(
+        self,
+        action: str,
+        command: LifecycleCommand,
+        **fields: Any,
+    ) -> tuple[RunProjection, str | None]:
+        from app.content_research.lifecycle.mutations import decode_run_projection
+
+        assert self._writer is not None
+        command_payload = {
+            "command_id": command.command_id,
+            "run_id": command.run_id,
+            "expected_state": command.expected_state.value if command.expected_state else None,
+            "expected_revision": command.expected_revision,
+            "kind": command.kind,
+            "payload": dict(command.payload),
+        }
+        try:
+            result = await self._writer.submit(
+                TypedMutation.create(
+                    mutation_id=f"content_research_lifecycle:{command.command_id}",
+                    mutation_kind="execute_content_research_lifecycle",
+                    domain_payload={"action": action, "command": command_payload, **fields},
+                    run_id=command.run_id,
+                )
+            )
+        except DomainMutationRejectedError as exc:
+            raise LifecycleCommandConflict(exc.safe_message) from None
+        projection_payload = result.result_fields.get("projection")
+        if not isinstance(projection_payload, dict):
+            raise RuntimeError("invalid Content Research lifecycle result")
+        attempt_id = result.result_fields.get("attempt_id")
+        return (
+            decode_run_projection(projection_payload),
+            str(attempt_id) if attempt_id is not None else None,
+        )
 
     async def _fail_analysis_attempt_once(
         self,
@@ -450,7 +541,7 @@ class ContentResearchPersistenceCoordinator:
             Awaitable[TraceSnapshotT],
         ],
     ) -> TraceSnapshotT:
-        connection = sqlite3.connect(f"file:{self._db_path}?mode=ro", uri=True, timeout=0.25)
+        connection = open_readonly_database(self._db_path, timeout=0.25)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA busy_timeout=250")
         connection.execute("PRAGMA foreign_keys=ON")
@@ -503,7 +594,8 @@ class ContentResearchPersistenceCoordinator:
             (run_id,),
         ).fetchone()
         dispatch = connection.execute(
-            "SELECT 1 FROM content_research_dispatch_jobs WHERE workflow_run_id=?",
+            "SELECT workflow_run_id, attempt_count "
+            "FROM content_research_dispatch_jobs WHERE workflow_run_id=? LIMIT 1",
             (run_id,),
         ).fetchone()
         attempt = connection.execute(
@@ -526,6 +618,11 @@ class ContentResearchPersistenceCoordinator:
             brief_id=str(brief["id"]) if brief else None,
             scope_contract_id=str(scope["id"]) if scope else None,
             has_dispatch=dispatch is not None,
+            dispatch_attempt_id=(
+                f"{dispatch['workflow_run_id']}:{dispatch['attempt_count']}"
+                if dispatch
+                else None
+            ),
             execution_attempt_id=(
                 f"{attempt['execution_unit_id']}:{attempt['attempt_no']}" if attempt else None
             ),
@@ -574,7 +671,7 @@ class ContentResearchPersistenceCoordinator:
 
         for attempt_no in range(1, 4):
             try:
-                with sqlite3.connect(self._db_path, timeout=0.25) as conn:
+                with open_readonly_database(self._db_path, timeout=0.25) as conn:
                     conn.row_factory = sqlite3.Row
                     conn.execute("PRAGMA busy_timeout=250")
                     row = conn.execute(
@@ -875,6 +972,16 @@ class ContentResearchPersistenceCoordinator:
             raise LifecycleCommandConflict("expected state does not match current state")
         if command.expected_revision != current_revision:
             raise LifecycleCommandConflict("expected revision does not match current revision")
+        if command.kind in _RECOVERY_COMMANDS:
+            current = await self._load_in_transaction(conn, command.run_id)
+            plan = current.recovery_plan
+            if (
+                plan is None
+                or plan.action != command.kind
+                or command.payload.get("recovery_plan_id") != plan.recovery_plan_id
+                or command.payload.get("plan_fingerprint") != plan.plan_fingerprint
+            ):
+                raise LifecycleCommandConflict("recovery plan is unavailable or stale")
         if command.kind == "cancel":
             async with conn.execute(
                 "SELECT 1 FROM content_research_report_publications "
@@ -911,6 +1018,10 @@ class ContentResearchPersistenceCoordinator:
             brief_id = await self._persist_presearch_brief(conn, row, command.payload)
 
         error_payload = dict(command.payload.get("error") or {})
+        if command.kind == "fail" and not error_payload.get("attempt_id"):
+            attempt_id = str(command.payload.get("attempt_id") or "")
+            if attempt_id:
+                error_payload["attempt_id"] = attempt_id
         reason_code = str(error_payload.get("code") or "") or None
         if command.kind == "cancel":
             reason_code = "user_cancelled"
@@ -1732,7 +1843,8 @@ class ContentResearchPersistenceCoordinator:
         ) as cursor:
             scope = await cursor.fetchone()
         async with conn.execute(
-            "SELECT 1 FROM content_research_dispatch_jobs WHERE workflow_run_id=?",
+            "SELECT workflow_run_id, attempt_count "
+            "FROM content_research_dispatch_jobs WHERE workflow_run_id=? LIMIT 1",
             (run_id,),
         ) as cursor:
             dispatch = await cursor.fetchone()
@@ -1758,6 +1870,11 @@ class ContentResearchPersistenceCoordinator:
             brief_id=str(brief["id"]) if brief else None,
             scope_contract_id=str(scope["id"]) if scope else None,
             has_dispatch=dispatch is not None,
+            dispatch_attempt_id=(
+                f"{dispatch['workflow_run_id']}:{dispatch['attempt_count']}"
+                if dispatch
+                else None
+            ),
             execution_attempt_id=(
                 f"{attempt['execution_unit_id']}:{attempt['attempt_no']}" if attempt else None
             ),

@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from app.core.sqlite_connection_roles import open_readonly_database
 from experiments.xhs_extension_mvp.server.candidate_builder import NormalizedItem, build_candidates
 from experiments.xhs_extension_mvp.server.hotspot_service import build_hotspot_snapshot
 from experiments.xhs_extension_mvp.server.logging_utils import get_logger
@@ -21,15 +22,14 @@ from experiments.xhs_extension_mvp.server.models import (
     Candidate,
     CaptureItemIn,
     CollectionSummary,
-    ExpandedQuery,
     ErrorSummary,
-    ExtensionCaptureResponse,
     EvidenceRef,
+    ExpandedQuery,
+    ExtensionCaptureResponse,
     HotspotItem,
     HotspotList,
     HotspotSnapshotResponse,
     QueryCategory,
-    RecommendedNote,
     TaskSnapshotResponse,
     TaskSnapshotVersionResponse,
 )
@@ -50,9 +50,10 @@ class InvalidCaptureToken(ValueError):
 
 
 class MVPStorage:
-    def __init__(self, db_path: str | Path, *, secret: str) -> None:
+    def __init__(self, db_path: str | Path, *, secret: str, read_only: bool = False) -> None:
         self.db_path = Path(db_path)
         self.secret = secret.encode("utf-8")
+        self._read_only = read_only
         self._logger = get_logger()
 
     def init_db(self) -> None:
@@ -827,7 +828,11 @@ class MVPStorage:
         )
         return candidates
 
-    async def refresh_hotspots(self, task_id: str, spider_client: Any | None = None) -> HotspotSnapshotResponse:
+    async def prepare_hotspot_refresh(
+        self,
+        task_id: str,
+        spider_client: Any | None = None,
+    ) -> tuple[HotspotSnapshotResponse, list[HotspotList]]:
         with self._connect() as conn:
             task_row = conn.execute(
                 "SELECT task_id, topic FROM mvp_tasks WHERE task_id = ?",
@@ -861,7 +866,12 @@ class MVPStorage:
                 snapshot.lists = previous_success.lists
                 snapshot.stale_seconds = previous_success.stale_seconds
 
-        self._persist_hotspot_snapshot(snapshot, fallback_lists if snapshot.status == "error" else snapshot.lists)
+        return snapshot, fallback_lists if snapshot.status == "error" else snapshot.lists
+
+    async def refresh_hotspots(self, task_id: str, spider_client: Any | None = None) -> HotspotSnapshotResponse:
+        snapshot, lists_to_store = await self.prepare_hotspot_refresh(task_id, spider_client)
+
+        self._persist_hotspot_snapshot(snapshot, lists_to_store)
         self._logger.info(
             "Refreshed hotspot snapshot",
             extra={
@@ -1143,6 +1153,11 @@ class MVPStorage:
         )
 
     def _connect(self) -> sqlite3.Connection:
+        if self._read_only:
+            conn = open_readonly_database(self.db_path, timeout=30.0)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA foreign_keys = ON")
+            return conn
         conn = sqlite3.connect(self.db_path, timeout=30.0)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")

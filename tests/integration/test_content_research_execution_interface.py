@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -12,6 +13,7 @@ from app.content_research.api_schemas import (
 )
 from app.content_research.async_dispatch import AsyncFormalResearchDispatchRepository
 from app.content_research.execution import ContentResearchExecutionService
+from app.content_research.lifecycle.models import ContentResearchState
 from app.content_research.scope_contract import (
     DispatchLeaseContext,
     ExecutionLeaseFencedError,
@@ -23,6 +25,41 @@ from app.content_research.worker import ContentResearchDispatchWorker
 class _ExecutionApplication:
     def __init__(self, store: SQLiteContentResearchStore) -> None:
         self._store = store
+
+
+class _AnalysisFailureLifecycle:
+    def __init__(self) -> None:
+        self.current = SimpleNamespace(
+            state=ContentResearchState.REPORT_COMPOSING,
+            state_revision=4,
+        )
+        self.commands = []
+
+    async def load(self, workflow_run_id: str):
+        assert workflow_run_id == "run-analysis-failure"
+        return self.current
+
+    async def apply(self, command):
+        self.commands.append(command)
+        self.current = SimpleNamespace(
+            state=ContentResearchState.RECOVERY_REQUIRED,
+            state_revision=5,
+        )
+        return self.current
+
+
+class _TransitionalRecoveryProbe:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def wait_for_user_recovery(self, *, workflow_run_id: str, reason: dict) -> None:
+        self.calls.append(workflow_run_id)
+
+
+class _AnalysisFailureApplication:
+    def __init__(self) -> None:
+        self._lifecycle = _AnalysisFailureLifecycle()
+        self._workflow_runtime = _TransitionalRecoveryProbe()
 
 
 class _CurrentClaimProbe:
@@ -101,6 +138,20 @@ async def test_execution_interface_rejects_stale_claims_and_recovers_current_cla
     assert await worker.run_once() is True
     assert len(current.contexts) == 1
     assert current.contexts[0].lease_token != str(stale["lease_token"])
+
+
+@pytest.mark.asyncio
+async def test_analysis_failure_has_one_lifecycle_authority() -> None:
+    application = _AnalysisFailureApplication()
+    interface = ContentResearchExecutionService(cast(Any, application))
+
+    await interface.record_analysis_failure(
+        "run-analysis-failure",
+        "analysis contract failed",
+    )
+
+    assert len(application._lifecycle.commands) == 1
+    assert application._workflow_runtime.calls == []
 
 
 def test_worker_module_has_no_old_application_dependency() -> None:

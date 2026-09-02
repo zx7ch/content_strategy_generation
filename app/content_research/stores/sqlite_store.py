@@ -44,6 +44,7 @@ from app.content_research.persistence_models import (
     ReportFaithfulnessDecisionRecord,
     ReportIntegrityEventRecord,
     ReportPublicationRecord,
+    SourceObservationRecord,
     StageCheckpointRecord,
     TypedPersistenceRecord,
     WeakSignalRecord,
@@ -69,6 +70,16 @@ from app.content_research.scope_contract import (
     ScopeQueryGroupInput,
     build_scope_contract,
     thaw_execution_payload,
+)
+from app.core.runtime_write_coordinator import (
+    DomainMutationRejectedError,
+    RuntimeWriteCoordinator,
+    TypedMutation,
+)
+from app.core.runtime_write_registry import get_runtime_writer
+from app.core.sqlite_connection_roles import (
+    open_bootstrap_database,
+    open_readonly_database,
 )
 
 
@@ -175,6 +186,15 @@ _TYPED_RECORD_TABLES: dict[type[TypedPersistenceRecord], tuple[str, tuple[str, .
         "content_research_canonical_sources",
         ("platform", "platform_source_kind", "platform_source_id", "canonical_url"),
     ),
+    SourceObservationRecord: (
+        "content_research_source_observations",
+        (
+            "canonical_source_id",
+            "workflow_run_id",
+            "observation_fingerprint",
+            "captured_at",
+        ),
+    ),
     DirectionSourceProjectionRecord: (
         "content_research_direction_source_projections",
         ("workflow_run_id", "research_direction_id", "canonical_source_id", "evidence_packet_id"),
@@ -185,6 +205,7 @@ _TYPED_RECORD_TABLES: dict[type[TypedPersistenceRecord], tuple[str, tuple[str, .
             "workflow_run_id",
             "research_direction_id",
             "canonical_source_id",
+            "source_observation_id",
             "field_projection_hash",
             "scope_contract_id",
             "execution_unit_id",
@@ -330,14 +351,23 @@ class _BorrowedSQLiteConnection:
     def __init__(self, connection: sqlite3.Connection) -> None:
         self._connection = connection
 
-    def __enter__(self) -> sqlite3.Connection:
-        return self._connection
+    def __enter__(self) -> _BorrowedSQLiteConnection:
+        return self
 
     def __exit__(self, _exc_type, _exc_value, _traceback) -> bool:
         return False
 
+    def execute(
+        self,
+        statement: str,
+        parameters: tuple[object, ...] | list[object] = (),
+    ) -> sqlite3.Cursor:
+        if statement.lstrip().upper().startswith("BEGIN"):
+            return self._connection.execute("SELECT 1 WHERE 0")
+        return self._connection.execute(statement, parameters)
+
     def __getattr__(self, name: str) -> Any:
-        if name == "close":
+        if name in {"close", "commit", "rollback"}:
             return lambda: None
         return getattr(self._connection, name)
 
@@ -351,12 +381,73 @@ class SQLiteContentResearchStore:
         *,
         execution_context: ExecutionContext | None = None,
         dispatch_context: DispatchLeaseContext | None = None,
+        writer: RuntimeWriteCoordinator | None = None,
     ) -> None:
         self._db_path = db_path
         self._execution_context = execution_context
         self._dispatch_context = dispatch_context
+        self._writer = writer or get_runtime_writer(self._db_path)
+        self._coordinated_connection: _BorrowedSQLiteConnection | None = None
         self._read_transaction_connection: sqlite3.Connection | None = None
-        bootstrap_content_research_schema(db_path)
+        if self._writer is None:
+            bootstrap_content_research_schema(db_path)
+
+    def __getattribute__(self, name: str):
+        if not name.startswith("_"):
+            state = object.__getattribute__(self, "__dict__")
+            writer = state.get("_writer")
+            if writer is not None and state.get("_coordinated_connection") is None:
+                from app.content_research.stores.mutations import COORDINATED_STORE_ACTIONS
+
+                if name in COORDINATED_STORE_ACTIONS:
+
+                    def coordinated(*args, **kwargs):
+                        return self._submit_store_command(name, args, kwargs)
+
+                    return coordinated
+        return object.__getattribute__(self, name)
+
+    def _submit_store_command(
+        self,
+        action: str,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+    ) -> Any:
+        from app.content_research.stores.mutations import (
+            decode_store_value,
+            encode_store_value,
+        )
+
+        assert self._writer is not None
+        run_id = kwargs.get("workflow_run_id")
+        if run_id is None:
+            for value in (*args, *kwargs.values()):
+                run_id = getattr(value, "workflow_run_id", None)
+                if run_id is not None:
+                    break
+        try:
+            result = self._writer.submit_sync(
+                TypedMutation.create(
+                    mutation_id=f"content_research_store_{uuid.uuid4().hex}",
+                    mutation_kind="execute_content_research_store_command",
+                    domain_payload={
+                        "action": action,
+                        "args": [encode_store_value(value) for value in args],
+                        "kwargs": {
+                            key: encode_store_value(value) for key, value in kwargs.items()
+                        },
+                        "execution_context": encode_store_value(self._execution_context),
+                        "dispatch_context": encode_store_value(self._dispatch_context),
+                    },
+                    run_id=str(run_id) if run_id is not None else None,
+                )
+            )
+        except DomainMutationRejectedError as exc:
+            raise ValueError(exc.safe_message) from None
+        rejected = result.result_fields.get("rejected")
+        if rejected == "execution_lease_fenced":
+            raise ExecutionLeaseFencedError(str(result.result_fields.get("message") or rejected))
+        return decode_store_value(result.result_fields.get("result"))
 
     @classmethod
     def for_read_transaction(
@@ -367,6 +458,8 @@ class SQLiteContentResearchStore:
         store._db_path = db_path
         store._execution_context = None
         store._dispatch_context = None
+        store._writer = None
+        store._coordinated_connection = _BorrowedSQLiteConnection(connection)
         store._read_transaction_connection = connection
         return store
 
@@ -389,9 +482,16 @@ class SQLiteContentResearchStore:
         return scoped
 
     def _raw_connect(self) -> sqlite3.Connection:
+        if self._coordinated_connection is not None:
+            return self._coordinated_connection  # type: ignore[return-value]
         if self._read_transaction_connection is not None:
             return _BorrowedSQLiteConnection(self._read_transaction_connection)  # type: ignore[return-value]
-        conn = sqlite3.connect(self._db_path, timeout=30)
+        if self._writer is not None:
+            conn = open_readonly_database(self._db_path, timeout=30)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA foreign_keys=ON")
+            return conn
+        conn = open_bootstrap_database(self._db_path, timeout=30)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA busy_timeout=30000")
         conn.execute("PRAGMA foreign_keys=ON")
@@ -405,7 +505,8 @@ class SQLiteContentResearchStore:
         context = self._execution_context
         if context is not None:
             try:
-                conn.execute("BEGIN IMMEDIATE")
+                if self._writer is None or self._coordinated_connection is not None:
+                    conn.execute("BEGIN IMMEDIATE")
                 if not self._execution_context_is_live_in_transaction(conn, context):
                     self._append_execution_fact_in_transaction(
                         conn,
@@ -424,7 +525,13 @@ class SQLiteContentResearchStore:
         dispatch_context = self._dispatch_context
         if dispatch_context is not None:
             try:
-                if not conn.in_transaction:
+                if (
+                    not conn.in_transaction
+                    and (
+                        self._writer is None
+                        or self._coordinated_connection is not None
+                    )
+                ):
                     conn.execute("BEGIN IMMEDIATE")
                 if not self._dispatch_context_is_live_in_transaction(conn, dispatch_context):
                     conn.rollback()
@@ -3307,7 +3414,7 @@ class SQLiteContentResearchStore:
     ) -> TypedPersistenceRecord:
         values = {
             field: _parse_dt(row[field])
-            if field in {"started_at", "finished_at"} and row[field]
+            if field in {"started_at", "finished_at", "captured_at"} and row[field]
             else row[field]
             for field in fields
         }
@@ -3366,6 +3473,25 @@ class SQLiteContentResearchStore:
             ("platform", "platform_source_kind", "platform_source_id", "canonical_url"),
         )  # type: ignore[return-value]
 
+    def save_source_observation(
+        self, record: SourceObservationRecord
+    ) -> SourceObservationRecord:
+        self._require_typed_parent(
+            "content_research_canonical_sources",
+            record.canonical_source_id,
+            "canonical source",
+        )
+        return self._save_typed_record(
+            "content_research_source_observations",
+            record,
+            {
+                "canonical_source_id": record.canonical_source_id,
+                "workflow_run_id": record.workflow_run_id,
+                "observation_fingerprint": record.observation_fingerprint,
+                "captured_at": _fmt_dt(record.captured_at),
+            },
+        )  # type: ignore[return-value]
+
     def save_direction_source_projection(
         self, record: DirectionSourceProjectionRecord
     ) -> DirectionSourceProjectionRecord:
@@ -3401,6 +3527,7 @@ class SQLiteContentResearchStore:
                 "workflow_run_id": record.workflow_run_id,
                 "research_direction_id": record.research_direction_id,
                 "canonical_source_id": record.canonical_source_id,
+                "source_observation_id": record.source_observation_id,
                 "field_projection_hash": record.field_projection_hash,
                 "scope_contract_id": record.scope_contract_id,
                 "execution_unit_id": record.execution_unit_id,
