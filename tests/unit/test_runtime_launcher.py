@@ -16,3 +16,9 @@ def test_runtime_bundle_declares_lazy_xhs_login_dependencies() -> None:
 
     assert '"qrcode"' in spec
     assert '"curl_cffi"' in spec
+
+
+def test_runtime_build_reuses_installed_build_tools_offline() -> None:
+    build_script = Path("scripts/build_runtime.sh").read_text(encoding="utf-8")
+
+    assert '"$PYTHON" -m pip install --no-build-isolation -e . --quiet' in build_script

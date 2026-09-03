@@ -44,8 +44,8 @@ fi
 # ── install package in editable mode ─────────────────────────────────────────
 # Required so importlib.metadata can read the version from pyproject.toml
 # and PyInstaller's copy_metadata() can include the dist-info in the bundle.
-echo "→ Installing package ($PYTHON -m pip install -e .)..."
-"$PYTHON" -m pip install -e . --quiet
+echo "→ Installing package ($PYTHON -m pip install --no-build-isolation -e .)..."
+"$PYTHON" -m pip install --no-build-isolation -e . --quiet
 
 # ── check pyinstaller ─────────────────────────────────────────────────────────
 if ! "$PYTHON" -c "import PyInstaller" >/dev/null 2>&1; then
