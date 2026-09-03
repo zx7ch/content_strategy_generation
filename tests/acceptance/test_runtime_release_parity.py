@@ -20,6 +20,15 @@ from tests.acceptance.test_runtime_release_artifact import (
 )
 
 BASELINE_SHA256 = "bdceb4dd687de687aa17a947549d4e47b57907d9e1ba073c682171f071783140"
+RELEASE_PAIR_CONTRACTS = {
+    "local-runtime-v1",
+    "local-runtime-single-writer",
+}
+REMOVED_TRANSITIONAL_PROJECTION_KEYS = {
+    "runtime_child_tasks",
+    "runtime_run",
+    "runtime_steps",
+}
 PARITY_ENDPOINTS = (
     "/health",
     "/workspaces/default",
@@ -97,7 +106,7 @@ def _stop(process: subprocess.Popen[str]) -> None:
         process.wait(timeout=5)
 
 
-def _normalize(value: Any) -> Any:
+def _normalize(value: Any, *, path: str = "$") -> Any:
     timestamp_keys = {
         "built_at",
         "completed_at",
@@ -121,18 +130,70 @@ def _normalize(value: Any) -> Any:
     if isinstance(value, dict):
         normalized: dict[str, Any] = {}
         for key, item in sorted(value.items()):
-            if key in timestamp_keys and item is not None:
-                normalized[key] = "<timestamp>" if isinstance(item, str) else _normalize(item)
+            child_path = f"{path}.{key}"
+            if key in REMOVED_TRANSITIONAL_PROJECTION_KEYS or key == "recovery_plan":
+                continue
+            if key == "attempt_id" and path.endswith(".error"):
+                continue
+            if key == "api_contract" and item in RELEASE_PAIR_CONTRACTS:
+                normalized[key] = "<release-pair-contract>"
+            elif key == "db_size_bytes" and isinstance(item, int):
+                normalized[key] = "<database-size>"
+            elif key in timestamp_keys and item is not None:
+                normalized[key] = (
+                    "<timestamp>"
+                    if isinstance(item, str)
+                    else _normalize(item, path=child_path)
+                )
             elif key in duration_keys and item is not None:
-                normalized[key] = "<duration>" if isinstance(item, (int, float)) else _normalize(item)
+                normalized[key] = (
+                    "<duration>"
+                    if isinstance(item, (int, float))
+                    else _normalize(item, path=child_path)
+                )
             elif key in path_keys and item is not None:
-                normalized[key] = "<runtime-user-path>" if isinstance(item, str) else _normalize(item)
+                normalized[key] = (
+                    "<runtime-user-path>"
+                    if isinstance(item, str)
+                    else _normalize(item, path=child_path)
+                )
             else:
-                normalized[key] = _normalize(item)
+                normalized[key] = _normalize(item, path=child_path)
         return normalized
     if isinstance(value, list):
-        return [_normalize(item) for item in value]
+        return [
+            _normalize(item, path=f"{path}[{index}]")
+            for index, item in enumerate(value)
+        ]
     return value
+
+
+def test_capability_normalization_allows_only_documented_release_pair_deltas() -> None:
+    baseline = {
+        "api_contract": "local-runtime-v1",
+        "db_size_bytes": 1024,
+        "run": {
+            "state": "recovery_required",
+            "error": {"code": "INTERRUPTED"},
+        },
+        "runtime_run": {"status": "waiting_user"},
+        "runtime_steps": [{"status": "failed"}],
+        "runtime_child_tasks": [],
+    }
+    candidate = {
+        "api_contract": "local-runtime-single-writer",
+        "db_size_bytes": 2048,
+        "run": {
+            "state": "recovery_required",
+            "error": {"code": "INTERRUPTED", "attempt_id": "attempt-1"},
+            "recovery_plan": {"action": "retry_presearch"},
+        },
+    }
+
+    assert _normalize(candidate) == _normalize(baseline)
+
+    candidate["run"]["state"] = "report_ready"
+    assert _normalize(candidate) != _normalize(baseline)
 
 
 def _differences(actual: Any, expected: Any, path: str = "$") -> list[str]:
