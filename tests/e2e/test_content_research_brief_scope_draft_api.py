@@ -7,7 +7,10 @@ import httpx
 import pytest
 
 from app.api.routes.router import app
+from app.content_research.async_dispatch import AsyncFormalResearchDispatchRepository
+from app.content_research.lifecycle.models import ContentResearchState, LifecycleCommand
 from app.content_research.presearch.service import PresearchService
+from app.content_research.scope_contract import CoverageSnapshot
 from app.content_research.service import ContentResearchService
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
 from app.memory.thread_store import ThreadStore
@@ -139,9 +142,193 @@ async def _presearch(client: httpx.AsyncClient, thread_id: str) -> dict:
     return response.json()
 
 
+async def _seed_coverage_decision(scope_client) -> tuple[httpx.AsyncClient, str, dict, CoverageSnapshot]:
+    client, _db_path, thread_id = scope_client
+    presearch = await _presearch(client, thread_id)
+    run = presearch["run"]
+    confirmed_brief = await client.post(
+        f"/content-research/workflows/{run['run_id']}/actions",
+        json={
+            "command_id": f"coverage-confirm-brief-{run['run_id']}",
+            "expected_state": run["state"],
+            "expected_revision": run["state_revision"],
+            "action": "confirm_brief",
+            "payload": {
+                "brief_id": presearch["brief_id"],
+                "selected_competitors": [],
+                "custom_competitor_input": "",
+                "selected_directions": ["product_marketing"],
+            },
+        },
+    )
+    assert confirmed_brief.status_code == 200, confirmed_brief.text
+    scope_result = confirmed_brief.json()["result"]["scope"]
+    confirmed_scope = await client.post(
+        f"/content-research/workflows/{run['run_id']}/actions",
+        json={
+            "command_id": f"coverage-confirm-scope-{run['run_id']}",
+            "expected_state": scope_result["run"]["state"],
+            "expected_revision": scope_result["run"]["state_revision"],
+            "action": "confirm_scope",
+            "payload": {"scope_draft_id": scope_result["draft"]["id"]},
+        },
+    )
+    assert confirmed_scope.status_code == 200, confirmed_scope.text
+    service = app.state.content_research_service
+    contract = service._store.get_scope_contract(run["run_id"], version=1)
+    assert contract is not None
+    snapshot = CoverageSnapshot(
+        id=f"scv_api_{run['run_id']}",
+        workflow_run_id=run["run_id"],
+        scope_contract_id=contract.id,
+        scope_contract_version=contract.version,
+        state="awaiting_scope_decision",
+        constraint_counts={
+            contract.constraints[0].id: 0,
+            "_summary": {
+                "reason_codes": [
+                    f"required_constraint_coverage_unmet:{contract.constraints[0].id}"
+                ]
+            },
+        },
+        unmet_constraint_ids=(contract.constraints[0].id,),
+    )
+    service._store.save_coverage_snapshot(snapshot)
+    for event, expected_state in (
+        ("worker_claimed", ContentResearchState.RETRIEVAL_QUEUED),
+        ("retrieval_completed", ContentResearchState.RETRIEVAL_RUNNING),
+        ("coverage_insufficient", ContentResearchState.COVERAGE_EVALUATING),
+    ):
+        current = await service._lifecycle.load(run["run_id"])
+        assert current.state is expected_state
+        await service._lifecycle.apply(
+            LifecycleCommand(
+                command_id=f"seed-{event}-{run['run_id']}",
+                run_id=run["run_id"],
+                expected_state=current.state,
+                expected_revision=current.state_revision,
+                kind=event,
+                payload={},
+            )
+        )
+    current = await service._lifecycle.load(run["run_id"])
+    assert current.state is ContentResearchState.COVERAGE_DECISION_REQUIRED
+    return client, run["run_id"], service._run_projection_payload(current), snapshot
+
+
 def _rows(db_path: str, table: str) -> int:
     with sqlite3.connect(db_path) as conn:
         return int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("action", "resolution", "expected_state"),
+    [
+        ("expand_coverage", "expand_required_constraint", "retrieval_queued"),
+        ("relax_coverage", "relax_constraint", "retrieval_queued"),
+        ("generate_limited_report", "generate_limited_report", "report_composing"),
+    ],
+)
+async def test_current_coverage_decision_action_atomically_authorizes_successor(
+    scope_client,
+    action,
+    resolution,
+    expected_state,
+):
+    client, run_id, run, snapshot = await _seed_coverage_decision(scope_client)
+    payload = {
+        "scope_contract_version": snapshot.scope_contract_version,
+        "coverage_snapshot_id": snapshot.id,
+        "resolution": resolution,
+    }
+    if resolution != "generate_limited_report":
+        payload["constraint_id"] = snapshot.unmet_constraint_ids[0]
+    if resolution == "expand_required_constraint":
+        payload["supplementary_queries"] = ["夏季 凉感 T恤 补充样本"]
+
+    response = await client.post(
+        f"/content-research/workflows/{run_id}/actions",
+        json={
+            "command_id": f"coverage-action-{action}-{run_id}",
+            "expected_state": run["state"],
+            "expected_revision": run["state_revision"],
+            "action": action,
+            "payload": payload,
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    result = response.json()["result"]
+    assert result["run"]["state"] == expected_state
+    assert result["coverage"]["audit_event"]["payload"]["resolution"] == resolution
+    assert result["coverage"]["execution_unit"]["state"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_formal_dispatch_cannot_be_claimed_by_a_late_worker(scope_client):
+    client, run_id, run, _snapshot = await _seed_coverage_decision(scope_client)
+    _client, db_path, _thread_id = scope_client
+
+    cancelled = await client.post(
+        f"/content-research/workflows/{run_id}/actions",
+        json={
+            "command_id": f"cancel-before-late-claim-{run_id}",
+            "expected_state": run["state"],
+            "expected_revision": run["state_revision"],
+            "action": "cancel",
+            "payload": {},
+        },
+    )
+
+    assert cancelled.status_code == 200, cancelled.text
+    assert cancelled.json()["result"]["run"]["state"] == "cancelled_or_failed"
+    assert await AsyncFormalResearchDispatchRepository(db_path).claim_next(
+        owner="late-worker"
+    ) is None
+    with sqlite3.connect(db_path) as connection:
+        assert connection.execute(
+            "SELECT status, last_error FROM content_research_dispatch_jobs "
+            "WHERE workflow_run_id=?",
+            (run_id,),
+        ).fetchone() == ("failed", "user_cancelled")
+        assert connection.execute(
+            "SELECT COUNT(*) FROM content_research_report_publications "
+            "WHERE workflow_run_id=?",
+            (run_id,),
+        ).fetchone() == (0,)
+
+
+@pytest.mark.asyncio
+async def test_stale_coverage_decision_is_rejected_before_any_decision_write(scope_client):
+    client, run_id, run, snapshot = await _seed_coverage_decision(scope_client)
+    _client, db_path, _thread_id = scope_client
+    before = (
+        _rows(db_path, "content_research_scope_execution_authorizations"),
+        _rows(db_path, "content_research_scope_execution_units"),
+        _rows(db_path, "content_research_scope_audit_events"),
+    )
+    response = await client.post(
+        f"/content-research/workflows/{run_id}/actions",
+        json={
+            "command_id": f"stale-coverage-{run_id}",
+            "expected_state": run["state"],
+            "expected_revision": run["state_revision"] - 1,
+            "action": "generate_limited_report",
+            "payload": {
+                "scope_contract_version": snapshot.scope_contract_version,
+                "coverage_snapshot_id": snapshot.id,
+                "resolution": "generate_limited_report",
+            },
+        },
+    )
+
+    assert response.status_code == 409, response.text
+    assert before == (
+        _rows(db_path, "content_research_scope_execution_authorizations"),
+        _rows(db_path, "content_research_scope_execution_units"),
+        _rows(db_path, "content_research_scope_audit_events"),
+    )
 
 
 @pytest.mark.asyncio
@@ -295,6 +482,14 @@ async def test_grounded_term_mapping_reaches_one_editable_server_compiled_scope_
         },
     )
     assert cancelled.status_code == 200
+    with sqlite3.connect(db_path) as connection:
+        assert connection.execute(
+            "SELECT active_run_id FROM creator_threads WHERE id=?",
+            (thread_id,),
+        ).fetchone() == (None,)
+    historical = await client.get(f"/content-research/workflows/{run['run_id']}")
+    assert historical.status_code == 200
+    assert historical.json()["run"]["state"] == "cancelled_or_failed"
     cancelled_scope = (await client.get(
         f"/content-research/workflows/{run['run_id']}/scope"
     )).json()

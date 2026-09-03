@@ -1460,8 +1460,12 @@ class ContentResearchService:
         )
 
     async def _resolve_coverage(
-        self, *, workflow_run_id: str, request: ResolveCoverageRequest
-    ) -> dict[str, Any]:
+        self,
+        *,
+        workflow_run_id: str,
+        request: ResolveCoverageRequest,
+        lifecycle_command: LifecycleCommand,
+    ) -> tuple[dict[str, Any], RunProjection]:
         contract = self._store.get_scope_contract(
             workflow_run_id, version=request.scope_contract_version
         )
@@ -1621,15 +1625,17 @@ class ContentResearchService:
             state="pending",
         )
         try:
-            resulting_contract, event, authorization, continuation, _created = (
-                self._store.resolve_coverage_and_authorize_execution_atomically(
-                    snapshot=snapshot,
-                    authorization=authorization,
-                    continuation=continuation,
-                    event=event,
-                    successor_scope_contract=successor_scope_contract,
-                )
+            projection, coverage_result = await self._lifecycle.resolve_coverage(
+                lifecycle_command,
+                snapshot=snapshot,
+                authorization=authorization,
+                continuation=continuation,
+                event=event,
+                successor_scope_contract=successor_scope_contract,
             )
+            resulting_contract, event, authorization, continuation, _created = coverage_result
+        except LifecycleCommandConflict:
+            raise
         except ValueError as exc:
             raise ContentResearchValidationError(str(exc)) from exc
 
@@ -1642,15 +1648,20 @@ class ContentResearchService:
             if authorization.execution_unit_id
             else None
         )
-        return _coverage_resolution_result(
-            contract=resulting_contract,
-            snapshot=snapshot,
-            event=event,
-            authorization=authorization,
-            execution_unit=execution_unit,
-            execution_facts=(
-                self._store.execution_trace(execution_unit.id) if execution_unit is not None else []
+        return (
+            _coverage_resolution_result(
+                contract=resulting_contract,
+                snapshot=snapshot,
+                event=event,
+                authorization=authorization,
+                execution_unit=execution_unit,
+                execution_facts=(
+                    self._store.execution_trace(execution_unit.id)
+                    if execution_unit is not None
+                    else []
+                ),
             ),
+            projection,
         )
 
     async def _continue_coverage_execution(
@@ -2574,18 +2585,32 @@ class ContentResearchService:
         run_policy = self._store.get_run_policy_snapshot_for_workflow(workflow_run_id)
         if run_policy is None:
             return None
-        direction_contract = next(
-            (
-                item
-                for item in self._store.list_direction_contracts(run_policy.id)
-                if item.direction_id == "product_marketing"
-            ),
-            None,
+        workflow_tasks = self._store.list_subagent_tasks_for_workflow(workflow_run_id)
+        requested_direction_ids = tuple(
+            dict.fromkeys(
+                str(task.direction_id)
+                for task in workflow_tasks
+                if task.direction_id
+            )
         )
-        if direction_contract is None:
+        if execution_authorization is not None:
+            # Coverage continuations currently recollect only the
+            # product-marketing Scope. Keep their manifest isolated from the
+            # immutable initial results of any sibling direction.
+            requested_direction_ids = ("product_marketing",)
+        direction_contracts = [
+            item
+            for item in self._store.list_direction_contracts(run_policy.id)
+            if item.direction_id in requested_direction_ids
+        ]
+        if not direction_contracts:
             return None
-        sample_policy = self._store.get_sample_policy(direction_contract.sample_policy_id)
-        if sample_policy is None:
+        sample_policies = [
+            policy
+            for item in direction_contracts
+            if (policy := self._store.get_sample_policy(item.sample_policy_id)) is not None
+        ]
+        if len(sample_policies) != len(direction_contracts):
             return None
 
         execution_revision = (
@@ -2599,20 +2624,23 @@ class ContentResearchService:
             packet
             for packet in self._store.list_typed_records(DirectionalEvidencePacketRecord)
             if packet.workflow_run_id == workflow_run_id
-            and packet.research_direction_id == "product_marketing"
+            and packet.research_direction_id in requested_direction_ids
             and packet.scope_contract_id == scope_contract.id
             and packet.execution_unit_id == execution_unit_id
             and packet.attempt_no == attempt_no
             and packet.execution_revision == execution_revision
         ]
-        candidates = tuple(
-            {
-                **dict(packet.payload.get("field_projection") or {}),
-                "canonical_source_id": packet.canonical_source_id,
-                "retrieval_context": dict(packet.payload.get("retrieval_context") or {}),
-            }
-            for packet in packets
-        )
+        candidates_by_source: dict[str, dict[str, Any]] = {}
+        for packet in packets:
+            candidates_by_source.setdefault(
+                packet.canonical_source_id,
+                {
+                    **dict(packet.payload.get("field_projection") or {}),
+                    "canonical_source_id": packet.canonical_source_id,
+                    "retrieval_context": dict(packet.payload.get("retrieval_context") or {}),
+                },
+            )
+        candidates = tuple(candidates_by_source.values())
         query_group_outcomes: dict[str, dict[str, Any]] = {
             group.id: {
                 "status": "unknown",
@@ -2635,8 +2663,8 @@ class ContentResearchService:
         )
         coverage_task_ids = {
             task.id
-            for task in self._store.list_subagent_tasks_for_workflow(workflow_run_id)
-            if task.direction_id == "product_marketing"
+            for task in workflow_tasks
+            if task.direction_id in requested_direction_ids
         }
         if execution_task_id is not None:
             coverage_task_ids.add(execution_task_id)
@@ -2694,8 +2722,12 @@ class ContentResearchService:
                     contract=scope_contract,
                     candidates=candidates,
                     query_group_outcomes=query_group_outcomes,
-                    minimum_samples=sample_policy.minimum_samples,
-                    minimum_independent_authors=sample_policy.minimum_independent_authors,
+                    minimum_samples=max(
+                        policy.minimum_samples for policy in sample_policies
+                    ),
+                    minimum_independent_authors=max(
+                        policy.minimum_independent_authors for policy in sample_policies
+                    ),
                     execution_authorization=execution_authorization,
                     source_snapshot=source_snapshot,
                     execution_context=execution_context,

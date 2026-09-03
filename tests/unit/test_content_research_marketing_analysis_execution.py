@@ -39,8 +39,117 @@ from app.content_research.research_embedding import (
     ResearchEmbeddingUnavailableError,
     SentenceTransformerResearchEmbeddingAdapter,
 )
+from app.content_research.scope_contract import (
+    ResearchScopeContract,
+    ScopeExecutionContinuation,
+    ScopeQueryGroup,
+    supplementary_scope_query_group_id,
+)
 
 NOW = datetime(2026, 8, 27, tzinfo=timezone.utc)
+
+
+def test_freeze_snapshot_accepts_authorization_owned_supplementary_query_provenance() -> None:
+    scope = ResearchScopeContract(
+        id="scope",
+        workflow_run_id="run",
+        research_plan_id="plan",
+        version=1,
+        schema_version="content_research_scope_contract_v1",
+        constraints=(),
+        query_groups=(
+            ScopeQueryGroup(
+                id="query-original",
+                suggested_query="T恤",
+                final_query="T恤",
+                origin="system_suggested",
+                execution_role="coverage",
+            ),
+        ),
+        created_at=NOW,
+    )
+    supplementary_query = "T恤 补充样本"
+    supplementary_id = supplementary_scope_query_group_id(
+        scope_contract_id=scope.id,
+        authorization_id="authorization",
+        query=supplementary_query,
+    )
+    packet = DirectionalEvidencePacketRecord(
+        "packet-supplementary",
+        "directional-packet-v1",
+        {
+            "field_projection": {
+                "title": "夏季 T恤凉感体验",
+                "content_text": "这件 T恤在夏季通勤中穿着凉爽。",
+                "source_url": "https://example.test/supplementary",
+                "author_id": "author-supplementary",
+            },
+            "retrieval_context": {"query_group_ids": [supplementary_id]},
+        },
+        workflow_run_id="run",
+        research_direction_id="product_marketing",
+        canonical_source_id="source-supplementary",
+        field_projection_hash="projection-supplementary",
+        scope_contract_id=scope.id,
+        execution_unit_id="execution-unit",
+        attempt_no=1,
+        execution_revision=2,
+        created_at=NOW,
+    )
+    continuation = ScopeExecutionContinuation(
+        id="continuation",
+        authorization_id="authorization",
+        workflow_run_id="run",
+        execution_revision=2,
+        operation="supplementary_collection",
+        supplementary_queries=(supplementary_query,),
+        state="running",
+        execution_unit_id="execution-unit",
+    )
+
+    class CapturingRepository:
+        captured: dict[str, object] | None = None
+
+        def freeze_evidence_snapshot(self, **kwargs):
+            self.captured = kwargs
+            return SimpleNamespace(id="snapshot")
+
+    store = SimpleNamespace(
+        list_scope_contracts=lambda _run_id: [scope],
+        list_scope_execution_authorizations=lambda _run_id: [
+            SimpleNamespace(id="authorization", execution_unit_id="execution-unit")
+        ],
+        list_scope_execution_continuations=lambda _run_id: [continuation],
+        get_typed_record=lambda _record_type, record_id: (
+            packet if record_id == packet.id else None
+        ),
+    )
+    repository = CapturingRepository()
+    service = object.__new__(MarketingAnalysisExecutionService)
+    service._store = store
+    service._repository = repository
+
+    service._freeze_snapshot(
+        "run",
+        CoverageManifest(
+            workflow_run_id="run",
+            scope_contract_id=scope.id,
+            execution_unit_id="execution-unit",
+            attempt_no=1,
+            execution_revision=2,
+            packet_ids=(packet.id,),
+        ),
+    )
+
+    assert repository.captured is not None
+    assert repository.captured["query_groups"][-1] == {
+        "id": supplementary_id,
+        "suggested_query": supplementary_query,
+        "final_query": supplementary_query,
+        "origin": "user_edited",
+        "execution_role": "supplementary",
+    }
+    assert repository.captured["notes"][0].query_provenance == (supplementary_id,)
 
 
 def _analysis_unit(

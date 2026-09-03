@@ -38,6 +38,8 @@ def chrome_executable() -> str:
     candidates = [
         os.getenv("PLAYWRIGHT_CHROME_EXECUTABLE", "").strip(),
         "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
     ]
     for candidate in candidates:
         if candidate and Path(candidate).exists():

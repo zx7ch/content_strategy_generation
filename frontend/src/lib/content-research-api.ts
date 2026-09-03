@@ -296,7 +296,10 @@ export interface ContentResearchWorkflowActionRequest {
     | "revise_subject"
     | "confirm_brief"
     | "replace_scope_draft"
-    | "confirm_scope";
+    | "confirm_scope"
+    | "expand_coverage"
+    | "relax_coverage"
+    | "generate_limited_report";
   payload?: JsonObject;
 }
 
@@ -534,11 +537,14 @@ export interface ContentResearchConfirmScopeResult {
 }
 
 export interface ContentResearchResolveCoverageResult {
-  report_mode: string;
-  scope_contract: ContentResearchScopeContract;
-  unmet_constraint_ids: string[];
-  audit_event: ContentResearchScopeAuditEvent;
-  execution_unit: ContentResearchExecutionUnitProjection;
+  run: ContentResearchRunProjection;
+  coverage: {
+    report_mode: string;
+    scope_contract: ContentResearchScopeContract;
+    unmet_constraint_ids: string[];
+    audit_event: ContentResearchScopeAuditEvent;
+    execution_unit: ContentResearchExecutionUnitProjection;
+  };
 }
 
 export interface XHSQRLoginResponse {
@@ -643,6 +649,9 @@ export interface ContentResearchLiteReportResponse {
   frozen_scope: JsonObject;
   collected_at?: string | null;
   publication: JsonObject & { state?: string | null };
+  integrity_state?: string | null;
+  integrity_reason?: string | null;
+  integrity_recovery?: JsonObject | null;
   sections: {
     main_findings: JsonObject[];
     weak_signals: JsonObject[];
@@ -905,6 +914,21 @@ export async function confirmContentResearchScope(
   return runContentResearchWorkflowAction(
     run.run_id,
     contentResearchCommand(run, "confirm_scope", { scope_draft_id: scopeDraftId }),
+  );
+}
+
+export async function resolveContentResearchCoverage(
+  run: ContentResearchRunProjection,
+  input: ContentResearchResolveCoverageRequest,
+): Promise<ContentResearchWorkflowActionResponse<ContentResearchResolveCoverageResult>> {
+  const action = input.resolution === "expand_required_constraint"
+    ? "expand_coverage"
+    : input.resolution === "relax_constraint"
+      ? "relax_coverage"
+      : "generate_limited_report";
+  return runContentResearchWorkflowAction(
+    run.run_id,
+    contentResearchCommand(run, action, { ...input }),
   );
 }
 

@@ -165,16 +165,16 @@ class _ContentResearchLifecycleMutationHandler:
             coordinator = ContentResearchPersistenceCoordinator(":coordinator:")
             coordinator._borrowed_connection = AsyncSQLiteConnectionFacade(connection)
 
-            async def invoke() -> tuple[RunProjection, str | None]:
+            async def invoke() -> tuple[RunProjection, str | None, Any | None]:
                 if action == "apply":
-                    return await coordinator._apply_once(command), None
+                    return await coordinator._apply_once(command), None, None
                 if action == "retry_analysis":
                     projection, attempt_id = await coordinator._retry_analysis_once(
                         command,
                         expected_attempt_id=str(payload["expected_attempt_id"]),
                         expected_contract_fingerprint=str(payload["expected_contract_fingerprint"]),
                     )
-                    return projection, attempt_id
+                    return projection, attempt_id, None
                 if action == "fail_analysis_attempt":
                     projection = await coordinator._fail_analysis_attempt_once(
                         command,
@@ -182,21 +182,48 @@ class _ContentResearchLifecycleMutationHandler:
                         lease_token=(str(payload["lease_token"]) if payload.get("lease_token") else None),
                         allow_expired_lease=bool(payload.get("allow_expired_lease", False)),
                     )
-                    return projection, None
+                    return projection, None, None
+                if action == "resolve_coverage":
+                    from app.content_research.stores.mutations import decode_store_value
+                    from app.content_research.stores.sqlite_store import (
+                        SQLiteContentResearchStore,
+                        _BorrowedSQLiteConnection,
+                    )
+
+                    store = object.__new__(SQLiteContentResearchStore)
+                    store._db_path = ":coordinator:"
+                    store._execution_context = None
+                    store._dispatch_context = None
+                    store._read_transaction_connection = None
+                    store._writer = None
+                    store._coordinated_connection = _BorrowedSQLiteConnection(connection)
+                    coverage = store.resolve_coverage_and_authorize_execution_atomically(
+                        snapshot=decode_store_value(payload["snapshot"]),
+                        authorization=decode_store_value(payload["authorization"]),
+                        continuation=decode_store_value(payload["continuation"]),
+                        event=decode_store_value(payload["event"]),
+                        successor_scope_contract=decode_store_value(
+                            payload.get("successor_scope_contract")
+                        ),
+                    )
+                    return await coordinator._apply_once(command), None, coverage
                 raise MutationIdentityConflictError()
 
             try:
-                projection, attempt_id = asyncio.run(invoke())
+                projection, attempt_id, coverage = asyncio.run(invoke())
             except (LifecycleCommandConflict, LifecycleTransitionError, ValueError) as exc:
                 raise DomainMutationRejectedError(str(exc)) from exc
         finally:
             connection.row_factory = previous_row_factory
+
+        from app.content_research.stores.mutations import encode_store_value
 
         return MutationApplication(
             result_contract="content_research_lifecycle_result",
             result_fields={
                 "projection": encode_run_projection(projection),
                 "attempt_id": attempt_id,
+                "coverage": encode_store_value(coverage),
             },
             committed_revision=projection.state_revision,
             advances_trace_revision=True,

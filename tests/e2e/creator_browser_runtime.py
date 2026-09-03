@@ -34,9 +34,24 @@ class DeterministicPresearchLLM:
             for item in os.getenv("CREATOR_E2E_INVALID_ANALYSIS_TRACKS", "").split(",")
             if item.strip()
         }
+        self._fail_analysis_once_tracks = {
+            item.strip()
+            for item in os.getenv(
+                "CREATOR_E2E_FAIL_ANALYSIS_ONCE_TRACKS", ""
+            ).split(",")
+            if item.strip()
+        }
+        self._failed_analysis_once_tracks: set[str] = set()
         self._empty_analysis_tracks = {
             item.strip()
             for item in os.getenv("CREATOR_E2E_EMPTY_ANALYSIS_TRACKS", "").split(",")
+            if item.strip()
+        }
+        self._directional_analysis_tracks = {
+            item.strip()
+            for item in os.getenv(
+                "CREATOR_E2E_DIRECTIONAL_ANALYSIS_TRACKS", ""
+            ).split(",")
             if item.strip()
         }
 
@@ -93,6 +108,18 @@ class DeterministicPresearchLLM:
         if request.task_type == "content_research.marketing_conclusion_analysis":
             payload = json.loads(request.messages[-1].content)
             track = payload["tracks"][0]
+            if (
+                track in self._fail_analysis_once_tracks
+                and track not in self._failed_analysis_once_tracks
+            ):
+                self._failed_analysis_once_tracks.add(track)
+                return LLMResponse(
+                    content="not-json",
+                    provider="deterministic-e2e",
+                    model="deterministic-e2e",
+                    usage=TokenUsage(total_tokens=1),
+                    latency_ms=1,
+                )
             if track in self._invalid_analysis_tracks:
                 return LLMResponse(
                     content="not-json",
@@ -109,6 +136,13 @@ class DeterministicPresearchLLM:
                     usage=TokenUsage(total_tokens=1),
                     latency_ms=1,
                 )
+            supporting_claim_ids = [
+                item["claim_id"]
+                for item in payload["claims"]
+                if item.get("polarity") != "counter"
+            ]
+            if track in self._directional_analysis_tracks:
+                supporting_claim_ids = supporting_claim_ids[:1]
             return LLMResponse(
                 content=json.dumps(
                     {
@@ -116,11 +150,7 @@ class DeterministicPresearchLLM:
                             {
                                 "track": track,
                                 "statement": f"样本支持 {track} 方向的夏季凉感体验",
-                                "supporting_claim_ids": [
-                                    item["claim_id"]
-                                    for item in payload["claims"]
-                                    if item.get("polarity") != "counter"
-                                ],
+                                "supporting_claim_ids": supporting_claim_ids,
                             }
                         ]
                     },
@@ -272,6 +302,20 @@ class DeterministicTrackWithholdingEvaluator:
         )
 
 
+class DeterministicFailOnceReportExecution:
+    """Exercise the worker's real report-finalization recovery boundary once."""
+
+    def __init__(self, delegate) -> None:
+        self._delegate = delegate
+        self._failed = False
+
+    async def execute(self, snapshot, semantic_auditor):
+        if not self._failed:
+            self._failed = True
+            raise RuntimeError("deterministic report finalization failure")
+        return await self._delegate.execute(snapshot, semantic_auditor)
+
+
 class DeterministicAuthRequiredSource:
     """A local fake that cannot make network calls and always pauses safely."""
 
@@ -311,6 +355,43 @@ class DeterministicAuthRequiredSource:
 
     async def collect_comments(self, _request):  # pragma: no cover - guarded by discover
         raise AssertionError("comment collection must not follow auth-required discovery")
+
+
+class DeterministicRecoveringSource:
+    """Fail the first discovery per Run, then recover through the real retry path."""
+
+    def __init__(self, delegate: "DeterministicSuccessfulSource", login_session) -> None:
+        self._delegate = delegate
+        self._login_session = login_session
+        self._failed_run_ids: set[str] = set()
+
+    def capabilities(self):
+        return self._delegate.capabilities()
+
+    def authentication_ready(self) -> bool:
+        status = self._login_session.current_status()
+        return bool(status and status["status"] == "authenticated")
+
+    async def discover_candidates(self, request):
+        if request.workflow_run_id not in self._failed_run_ids:
+            self._failed_run_ids.add(request.workflow_run_id)
+            return SourceOperationResult(
+                provider="xiaohongshu",
+                operation="discover_candidates",
+                source_kind="search_result_minimal",
+                status="failed",
+                items=[],
+                failure_reason="auth_required",
+                retryable=True,
+                completeness="unavailable",
+            )
+        return await self._delegate.discover_candidates(request)
+
+    async def collect_note_detail(self, request):
+        return await self._delegate.collect_note_detail(request)
+
+    async def collect_comments(self, request):
+        return await self._delegate.collect_comments(request)
 
 
 class DeterministicSuccessfulSource:
@@ -365,6 +446,12 @@ class DeterministicSuccessfulSource:
             for index in range(1, 4):
                 note_id = f"note-{query_key}-{index}"
                 title = f"{object_name}真实体验 {index}"
+                if (
+                    self._scenario == "coverage_insufficient"
+                    and "补充样本" not in request.query
+                ):
+                    note_id = f"note-unrelated-umbrella-{index}"
+                    title = f"雨伞真实体验 {index}"
                 if self._scenario == "concurrent" and index == 1:
                     note_id = "note-shared-summer-cooling-1"
                     title = "T恤与长袖衬衫夏季凉感体验"
@@ -397,9 +484,14 @@ class DeterministicSuccessfulSource:
     async def collect_note_detail(self, request):
         index = request.note_id.rsplit("-", 1)[-1]
         object_name = "长袖衬衫" if "长袖衬衫" in request.note_id else "T恤"
+        if "unrelated-umbrella" in request.note_id:
+            object_name = "雨伞"
         if request.note_id == "note-shared-summer-cooling-1":
             object_name = "T恤与长袖衬衫"
-        content_text = f"这件 {object_name}在夏季通勤中穿着凉爽，样本 {index}。"
+        content_text = (
+            f"迪卡侬夏季凉感{object_name}在夏季通勤中穿着凉爽，"
+            f"采用 listicle 清单形式，样本 {index}。"
+        )
         if self._scenario == "contested" and index in {"2", "3"}:
             content_text = f"这件 T恤在夏季通勤中一点也不凉爽，样本 {index}。"
         item = {
@@ -409,9 +501,10 @@ class DeterministicSuccessfulSource:
             "source_kind": "note_detail",
             "author_id": f"detail-author-{request.note_id}",
             "author": f"体验作者 {index}",
-            "title": f"夏季 {object_name}凉感体验 {index}",
+            "title": f"迪卡侬夏季凉感{object_name}体验 listicle {index}",
             "content_text": content_text,
-            "tags": [object_name, "凉感", "夏季"],
+            "tags": [object_name, "凉感", "夏季", "迪卡侬", "listicle"],
+            "competitor_names": ["迪卡侬"],
             "note_type": "image_text",
             "source_published_at": "2026-08-20T00:00:00+00:00",
             "metrics": {"like_count": 100 + int(index)},
@@ -509,15 +602,24 @@ async def deterministic_lifespan(application):
         service = application.state.content_research_service
         configuration_store = SQLiteLLMConfigurationStore(os.environ["SQLITE_DB_PATH"])
         source_scenario = os.getenv("CREATOR_E2E_SOURCE_SCENARIO")
+        qr_login_session = DeterministicQRLoginSession()
+        successful_source = DeterministicSuccessfulSource(
+            os.environ["CREATOR_E2E_SOURCE_CALL_LOG"],
+            scenario=source_scenario,
+            require_two_active_runs=(
+                os.getenv("CREATOR_E2E_REQUIRE_TWO_ACTIVE_RUNS") == "1"
+            ),
+        )
         source = (
-            DeterministicSuccessfulSource(
-                os.environ["CREATOR_E2E_SOURCE_CALL_LOG"],
-                scenario=source_scenario,
-                require_two_active_runs=(
-                    os.getenv("CREATOR_E2E_REQUIRE_TWO_ACTIVE_RUNS") == "1"
-                ),
-            )
-            if source_scenario in {"complete", "contested", "concurrent"}
+            DeterministicRecoveringSource(successful_source, qr_login_session)
+            if source_scenario == "retrieval_retry"
+            else successful_source
+            if source_scenario in {
+                "complete",
+                "contested",
+                "concurrent",
+                "coverage_insufficient",
+            }
             else DeterministicAuthRequiredSource()
         )
         registry = SourceAdapterRegistry({"xiaohongshu": source})
@@ -530,6 +632,10 @@ async def deterministic_lifespan(application):
         service._source_registry = registry
         service._task_router._source_registry = registry
         service._analysis_llm = deterministic_llm
+        if os.getenv("CREATOR_E2E_FAIL_REPORT_ONCE") == "1":
+            service._report_execution = DeterministicFailOnceReportExecution(
+                service._report_execution
+            )
         withheld_track = os.getenv("CREATOR_E2E_WITHHOLD_MARKETING_TRACK", "").strip()
         if withheld_track:
             service._report_execution._evaluator = (
@@ -539,7 +645,7 @@ async def deterministic_lifespan(application):
             store=configuration_store,
             probe_adapter=DeterministicConfigurationProbe(),
         )
-        application.state.xhs_qr_login_session = DeterministicQRLoginSession()
+        application.state.xhs_qr_login_session = qr_login_session
         if os.getenv("CREATOR_E2E_FAIL_WORKFLOW_RESTORE") == "1":
             service._workflow_runtime = DeterministicWorkflowRestoreFailure(
                 service._workflow_runtime

@@ -135,7 +135,10 @@ def test_two_runtime_processes_and_path_alias_cannot_share_database(tmp_path: Pa
             process_root=tmp_path / "second",
         )
 
-        deadline = time.monotonic() + 12
+        # Importing the full Runtime can exceed 12 seconds on a cold or busy
+        # release runner. The lock still has to reject the alias before the
+        # competing process can become healthy.
+        deadline = time.monotonic() + 30
         while time.monotonic() < deadline and second.process.poll() is None:
             try:
                 response = httpx.get(
@@ -163,7 +166,8 @@ def test_two_runtime_processes_and_path_alias_cannot_share_database(tmp_path: Pa
             port=third_port,
             process_root=tmp_path / "third",
         )
-        deadline = time.monotonic() + 12
+        # Allow the same cold-import budget as the symlink-alias process.
+        deadline = time.monotonic() + 30
         while time.monotonic() < deadline and third.process.poll() is None:
             try:
                 response = httpx.get(

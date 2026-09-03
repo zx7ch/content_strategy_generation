@@ -82,11 +82,20 @@ def real_creator_stack(tmp_path, request):
         "CREATOR_E2E_INVALID_ANALYSIS_TRACKS": str(
             parameters.get("invalid_analysis_tracks") or ""
         ),
+        "CREATOR_E2E_FAIL_ANALYSIS_ONCE_TRACKS": str(
+            parameters.get("fail_analysis_once_tracks") or ""
+        ),
         "CREATOR_E2E_EMPTY_ANALYSIS_TRACKS": str(
             parameters.get("empty_analysis_tracks") or ""
         ),
+        "CREATOR_E2E_DIRECTIONAL_ANALYSIS_TRACKS": str(
+            parameters.get("directional_analysis_tracks") or ""
+        ),
         "CREATOR_E2E_WITHHOLD_MARKETING_TRACK": str(
             parameters.get("withhold_marketing_track") or ""
+        ),
+        "CREATOR_E2E_FAIL_REPORT_ONCE": (
+            "1" if parameters.get("fail_report_once") else "0"
         ),
     }
     frontend_env = {
@@ -155,14 +164,19 @@ def browser_page(real_creator_stack):
 
 def _goto_creator_after_brand_hydration(page, frontend_url: str) -> None:
     """Wait until Creator's selected brand is effective before user actions."""
-    with page.expect_response(
-        lambda response: "/threads?brand_id=" in response.url and response.status == 200,
-        timeout=15000,
-    ):
-        page.goto(frontend_url + "/creator", wait_until="domcontentloaded")
+    page.goto(frontend_url + "/creator", wait_until="domcontentloaded")
+    brand_select = page.get_by_role("combobox")
+    expect(brand_select).to_be_enabled(timeout=30000)
+    expect(brand_select).not_to_have_value("", timeout=30000)
 
 
-def _start_product_marketing_run(page: Page, frontend_url: str, subject: str) -> str:
+def _start_direction_run(
+    page: Page,
+    frontend_url: str,
+    subject: str,
+    *,
+    direction_label: str,
+) -> str:
     _goto_creator_after_brand_hydration(page, frontend_url)
     with page.expect_response(
         lambda response: response.url.endswith("/threads")
@@ -186,7 +200,7 @@ def _start_product_marketing_run(page: Page, frontend_url: str, subject: str) ->
     run_id = presearch_response.value.json()["workflow_run_id"]
 
     page.get_by_role("button", name="准确，继续").click()
-    page.get_by_role("button", name="产品营销").click()
+    page.get_by_role("button", name=direction_label).click()
     with page.expect_response(
         lambda response: response.url.endswith("/actions")
         and '"action":"confirm_brief"' in (response.request.post_data or ""),
@@ -203,6 +217,95 @@ def _start_product_marketing_run(page: Page, frontend_url: str, subject: str) ->
         scope.get_by_role("button", name="确认并开始调研").click()
     assert confirmation.value.status == 200, confirmation.value.text()
     return run_id
+
+
+def _start_product_marketing_run(page: Page, frontend_url: str, subject: str) -> str:
+    return _start_direction_run(
+        page,
+        frontend_url,
+        subject,
+        direction_label="产品营销",
+    )
+
+
+def test_creator_brand_hydration_does_not_depend_on_thread_history_success(
+    browser_page,
+):
+    page, stack = browser_page
+    page.route(
+        "**/threads?brand_id=*",
+        lambda route: route.fulfill(
+            status=503,
+            content_type="application/json",
+            body='{"detail":"history unavailable"}',
+        ),
+    )
+
+    _goto_creator_after_brand_hydration(page, stack["frontend_url"])
+
+    brand_select = page.get_by_role("combobox")
+    expect(brand_select).to_be_enabled()
+    selected_brand_id = brand_select.input_value()
+    assert selected_brand_id
+    with page.expect_response(
+        lambda response: response.url.endswith("/threads")
+        and response.request.method == "POST"
+        and response.status == 201,
+        timeout=30000,
+    ) as created:
+        page.get_by_role("button", name=re.compile("新建对话")).click()
+    assert created.value.json()["brand_id"] == selected_brand_id
+
+
+@pytest.mark.parametrize(
+    ("real_creator_stack", "direction_id", "direction_label", "result_region"),
+    [
+        ({"source_scenario": "complete"}, "product_marketing", "产品营销", "场景与需求"),
+        ({"source_scenario": "complete"}, "competitor_discovery", "竞品发现", "核心发现"),
+        ({"source_scenario": "complete"}, "content_performance", "内容表现", "样本观察"),
+    ],
+    indirect=["real_creator_stack"],
+)
+def test_each_primary_research_direction_completes_through_the_real_browser(
+    browser_page,
+    direction_id,
+    direction_label,
+    result_region,
+):
+    page, stack = browser_page
+    run_id = _start_direction_run(
+        page,
+        stack["frontend_url"],
+        "夏季凉感T恤",
+        direction_label=direction_label,
+    )
+
+    expect(page.get_by_text("调研报告已完成", exact=True)).to_be_visible(timeout=120000)
+    report = page.get_by_role("article", name="Content Research published report")
+    expect(report).to_be_visible(timeout=30000)
+    expect(report.get_by_role("region", name=result_region)).to_be_visible()
+    with urlopen(
+        Request(
+            f"{stack['backend_url']}/content-research/workflows/{run_id}/lite-report",
+            headers=USER_HEADERS,
+        )
+    ) as response:
+        lite_report = json.load(response)
+    assert lite_report["frozen_scope"]["direction_ids"] == [direction_id]
+    assert lite_report["publication"]["state"] != "evidence_only_report"
+    with sqlite3.connect(stack["db_path"]) as connection:
+        selected_directions = connection.execute(
+            "SELECT json_extract(payload_json, '$.direction_id') "
+            "FROM content_research_directions WHERE workflow_run_id=?",
+            (run_id,),
+        ).fetchall()
+        publication_count = connection.execute(
+            "SELECT COUNT(*) FROM content_research_report_publications "
+            "WHERE workflow_run_id=?",
+            (run_id,),
+        ).fetchone()[0]
+    assert selected_directions == [(direction_id,)]
+    assert publication_count == 1
 
 
 @pytest.mark.parametrize(
@@ -388,6 +491,68 @@ def test_creator_submit_subject_reaches_only_the_approved_brief_and_restores_it(
             (run_id,),
         ).fetchone()[0] == 0
     assert active_run_id == run_id
+
+
+def test_creator_cancels_active_research_and_keeps_history_readable_after_reload(
+    browser_page,
+):
+    page, stack = browser_page
+    _goto_creator_after_brand_hydration(page, stack["frontend_url"])
+    page.get_by_role("button", name=re.compile("内容调研")).click(timeout=15000)
+    research_input = page.get_by_role(
+        "textbox", name="输入品类、品牌或 SKU，发送后开始内容调研"
+    )
+    research_input.fill("夏季凉感T恤")
+    with page.expect_response(
+        lambda response: response.url.endswith("/content-research/presearch")
+        and response.status == 201,
+        timeout=30000,
+    ) as presearch_response:
+        research_input.press("Enter")
+    run_id = presearch_response.value.json()["workflow_run_id"]
+    expect(page.get_by_role("button", name="结束本次调研")).to_be_visible(timeout=30000)
+    page.once("dialog", lambda dialog: dialog.accept())
+    with page.expect_response(
+        lambda response: response.url.endswith("/actions")
+        and '"action":"cancel"' in (response.request.post_data or ""),
+        timeout=30000,
+    ) as cancelled:
+        page.get_by_role("button", name="结束本次调研").click()
+
+    assert cancelled.value.status == 200, cancelled.value.text()
+    expect(
+        page.get_by_text(
+            "已结束本次内容调研，并清除当前线程的调研恢复入口。",
+            exact=True,
+        )
+    ).to_be_visible(timeout=30000)
+    with sqlite3.connect(stack["db_path"]) as connection:
+        thread_id, state = connection.execute(
+            "SELECT thread_id, content_research_state FROM workflow_runs WHERE run_id=?",
+            (run_id,),
+        ).fetchone()
+        assert state == "cancelled_or_failed"
+        assert connection.execute(
+            "SELECT active_run_id FROM creator_threads WHERE id=?", (thread_id,)
+        ).fetchone() == (None,)
+        assert connection.execute(
+            "SELECT COUNT(*) FROM content_research_report_publications WHERE workflow_run_id=?",
+            (run_id,),
+        ).fetchone() == (0,)
+
+    with urlopen(
+        Request(
+            f"{stack['backend_url']}/content-research/workflows/{run_id}",
+            headers=USER_HEADERS,
+        ),
+        timeout=10,
+    ) as response:
+        historical = json.loads(response.read())
+    assert historical["run"]["state"] == "cancelled_or_failed"
+
+    page.reload(wait_until="domcontentloaded")
+    expect(page.get_by_role("heading", name="在开始前，请确认几个关键点")).to_have_count(0)
+    expect(page.get_by_role("button", name="结束本次调研")).to_have_count(0)
 
 
 def test_creator_corrects_search_structure_and_reads_only_the_backend_query_preview(
@@ -929,6 +1094,277 @@ def test_creator_exposes_real_analysis_worker_failure_before_report_composition(
     assert retry_marketing["tracks"]["need"]["execution"] == "completed"
     assert retry_marketing["tracks"]["value"]["failure_detail"] == "invalid_json"
     assert retry_marketing["tracks"]["message"]["failure_detail"] == "invalid_json"
+
+
+@pytest.mark.parametrize(
+    "real_creator_stack",
+    [{"source_scenario": "retrieval_retry"}],
+    indirect=True,
+)
+def test_creator_retrieval_retry_success_renders_report_without_reload(browser_page):
+    page, stack = browser_page
+    run_id = _start_product_marketing_run(
+        page, stack["frontend_url"], "夏季凉感T恤"
+    )
+
+    retry = page.get_by_role("button", name="继续失败的检索")
+    expect(retry).to_be_visible(timeout=30000)
+    login = page.get_by_role("region", name="小红书登录").first
+    with page.expect_response(
+        lambda response: response.url.endswith(
+            "/content-research/providers/xiaohongshu/login/qr"
+        )
+        and response.request.method == "GET"
+        and response.status == 200
+        and response.json()["status"] == "authenticated",
+        timeout=10000,
+    ):
+        login.get_by_role("button", name="扫码登录").click()
+    with page.expect_response(
+        lambda response: response.url.endswith("/actions")
+        and '"action":"retry_retrieval"' in (response.request.post_data or ""),
+        timeout=30000,
+    ) as retried:
+        retry.click()
+    assert retried.value.status == 200, retried.value.text()
+
+    expect(page.get_by_text("调研报告已完成", exact=True)).to_be_visible(
+        timeout=120000
+    )
+    expect(
+        page.get_by_role("article", name="Content Research published report")
+    ).to_be_visible(timeout=30000)
+    expect(page.get_by_text("已继续失败的检索；已完成步骤会直接复用。", exact=True)).to_be_visible()
+
+    with urlopen(
+        Request(
+            f"{stack['backend_url']}/content-research/workflows/{run_id}",
+            headers=USER_HEADERS,
+        )
+    ) as response:
+        workflow = json.load(response)
+    assert workflow["run"]["state"] == "report_ready"
+
+
+@pytest.mark.parametrize(
+    "real_creator_stack",
+    [
+        {
+            "source_scenario": "complete",
+            "fail_analysis_once_tracks": "value,message",
+        }
+    ],
+    indirect=True,
+)
+def test_creator_analysis_retry_success_renders_report_without_reload_or_recollection(
+    browser_page,
+):
+    page, stack = browser_page
+    _start_product_marketing_run(page, stack["frontend_url"], "夏季凉感T恤")
+
+    retry = page.get_by_role("button", name="继续失败的分析")
+    expect(retry).to_be_visible(timeout=30000)
+    source_calls_before = stack["source_call_log"].read_text(encoding="utf-8")
+    with page.expect_response(
+        lambda response: response.url.endswith("/actions")
+        and '"action":"retry_analysis"' in (response.request.post_data or ""),
+        timeout=30000,
+    ) as retried:
+        retry.click()
+    assert retried.value.status == 200, retried.value.text()
+
+    expect(page.get_by_text("调研报告已完成", exact=True)).to_be_visible(
+        timeout=120000
+    )
+    expect(
+        page.get_by_role("article", name="Content Research published report")
+    ).to_be_visible(timeout=30000)
+    assert stack["source_call_log"].read_text(encoding="utf-8") == source_calls_before
+
+
+@pytest.mark.parametrize(
+    "real_creator_stack",
+    [{"source_scenario": "complete", "fail_report_once": True}],
+    indirect=True,
+)
+def test_creator_report_retry_success_renders_report_without_reload_or_reexecution(
+    browser_page,
+):
+    page, stack = browser_page
+    _start_product_marketing_run(page, stack["frontend_url"], "夏季凉感T恤")
+
+    retry = page.get_by_role("button", name="继续生成报告")
+    expect(retry).to_be_visible(timeout=30000)
+    source_calls_before = stack["source_call_log"].read_text(encoding="utf-8")
+    with page.expect_response(
+        lambda response: response.url.endswith("/actions")
+        and '"action":"retry_report"' in (response.request.post_data or ""),
+        timeout=30000,
+    ) as retried:
+        retry.click()
+    assert retried.value.status == 200, retried.value.text()
+
+    expect(page.get_by_text("调研报告已完成", exact=True)).to_be_visible(
+        timeout=120000
+    )
+    expect(
+        page.get_by_role("article", name="Content Research published report")
+    ).to_be_visible(timeout=30000)
+    assert stack["source_call_log"].read_text(encoding="utf-8") == source_calls_before
+
+
+@pytest.mark.parametrize(
+    ("real_creator_stack", "resolution"),
+    [
+        ({"source_scenario": "coverage_insufficient"}, "expand_required_constraint"),
+        ({"source_scenario": "coverage_insufficient"}, "relax_constraint"),
+        ({"source_scenario": "coverage_insufficient"}, "generate_limited_report"),
+    ],
+    indirect=["real_creator_stack"],
+)
+def test_creator_resolves_each_coverage_branch_from_server_projection(
+    browser_page,
+    resolution,
+):
+    page, stack = browser_page
+    run_id = _start_product_marketing_run(
+        page, stack["frontend_url"], "夏季凉感T恤"
+    )
+    card = page.get_by_role("region", name="覆盖不足决策")
+    expect(card).to_be_visible(timeout=60000)
+    source_calls_before = stack["source_call_log"].read_text(encoding="utf-8")
+
+    if resolution == "expand_required_constraint":
+        card.get_by_role("button", name=re.compile("继续补充.*样本")).click()
+        card.get_by_label("补充检索词").fill("T恤 补充样本")
+        action_button = card.get_by_role("button", name="提交补搜决定")
+        action = "expand_coverage"
+    elif resolution == "relax_constraint":
+        action_button = card.get_by_role("button", name=re.compile("放宽.*约束"))
+        action = "relax_coverage"
+    else:
+        action_button = card.get_by_role("button", name="基于现有证据生成受限报告")
+        action = "generate_limited_report"
+
+    with page.expect_response(
+        lambda response: response.url.endswith("/actions")
+        and f'"action":"{action}"' in (response.request.post_data or ""),
+        timeout=30000,
+    ) as decided:
+        action_button.click()
+    assert decided.value.status == 200, decided.value.text()
+    request_payload = decided.value.request.post_data_json
+    assert request_payload["payload"]["resolution"] == resolution
+    assert request_payload["payload"]["coverage_snapshot_id"]
+    assert request_payload["payload"]["scope_contract_version"] == 1
+
+    expect(page.get_by_text("调研报告已完成", exact=True)).to_be_visible(
+        timeout=120000
+    )
+    expect(
+        page.get_by_role("article", name="Content Research published report")
+    ).to_be_visible(timeout=30000)
+    source_calls_after = stack["source_call_log"].read_text(encoding="utf-8")
+    if resolution == "generate_limited_report":
+        assert source_calls_after == source_calls_before
+    elif resolution == "expand_required_constraint":
+        assert "T恤 补充样本" in source_calls_after
+    with urlopen(
+        Request(
+            f"{stack['backend_url']}/content-research/workflows/{run_id}",
+            headers=USER_HEADERS,
+        )
+    ) as response:
+        assert json.load(response)["run"]["state"] == "report_ready"
+    with sqlite3.connect(stack["db_path"]) as connection:
+        publication_state = connection.execute(
+            "SELECT publication_state FROM content_research_report_publications "
+            "WHERE workflow_run_id=? ORDER BY created_at DESC LIMIT 1",
+            (run_id,),
+        ).fetchone()[0]
+    assert publication_state in {
+        "complete_verified_report",
+        "partial_verified_report",
+        "directional_report",
+        "evidence_only_report",
+    }
+
+
+@pytest.mark.parametrize(
+    "real_creator_stack",
+    [{"source_scenario": "complete", "empty_analysis_tracks": "need,value,message"}],
+    indirect=True,
+)
+def test_creator_evidence_only_report_exposes_candidate_audit_and_json_export(
+    browser_page,
+):
+    page, stack = browser_page
+    run_id = _start_product_marketing_run(
+        page, stack["frontend_url"], "夏季凉感T恤"
+    )
+
+    expect(page.get_by_text("调研报告已完成", exact=True)).to_be_visible(timeout=120000)
+    expect(page.get_by_text("仅展示已保存依据", exact=True)).to_be_visible()
+    with page.expect_response(
+        lambda response: f"/workflows/{run_id}/directions/" in response.url
+        and "/evidence?" in response.url,
+        timeout=30000,
+    ) as evidence_response:
+        page.get_by_role("button", name="查看候选与筛选").click()
+    assert evidence_response.value.status == 200, evidence_response.value.text()
+
+    audit = page.locator('aside[aria-label="候选笔记与筛选"]')
+    expect(audit).to_be_visible(timeout=30000)
+    expect(audit.get_by_text("检索来源（命中查询组）", exact=False)).to_be_visible()
+    expect(audit.get_by_text(re.compile("已入选|未入选"))).not_to_have_count(0)
+    with page.expect_download(timeout=30000) as download_info:
+        audit.get_by_role("button", name="导出 JSON").click()
+    download = download_info.value
+    assert download.suggested_filename == f"{run_id}-product_marketing-candidates.json"
+    exported = json.loads(Path(download.path()).read_text(encoding="utf-8"))
+    assert exported["workflow_run_id"] == run_id
+    assert exported["direction_id"] == "product_marketing"
+    assert exported["candidates"]
+    assert exported["selections"] or exported["exclusions"]
+
+    with sqlite3.connect(stack["db_path"]) as connection:
+        assert connection.execute(
+            "SELECT publication_state FROM content_research_report_publications "
+            "WHERE workflow_run_id=? ORDER BY created_at DESC LIMIT 1",
+            (run_id,),
+        ).fetchone() == ("evidence_only_report",)
+
+
+@pytest.mark.parametrize(
+    "real_creator_stack",
+    [
+        {
+            "source_scenario": "complete",
+            "directional_analysis_tracks": "need,value,message",
+        }
+    ],
+    indirect=True,
+)
+def test_creator_directional_report_never_labels_sample_leads_as_verified(
+    browser_page,
+):
+    page, stack = browser_page
+    run_id = _start_product_marketing_run(
+        page, stack["frontend_url"], "夏季凉感T恤"
+    )
+
+    expect(page.get_by_text("调研报告已完成", exact=True)).to_be_visible(timeout=120000)
+    report = page.get_by_role("article", name="Content Research published report")
+    expect(report.get_by_text("方向性样本线索", exact=True)).to_be_visible()
+    expect(report.get_by_text("当前仅形成方向性样本线索", exact=False)).to_be_visible()
+    expect(report.get_by_text("该方向不可作为功效或投放定论", exact=True)).to_have_count(3)
+    expect(report.get_by_text(re.compile("已验证发现"))).to_have_count(0)
+    with sqlite3.connect(stack["db_path"]) as connection:
+        assert connection.execute(
+            "SELECT publication_state FROM content_research_report_publications "
+            "WHERE workflow_run_id=? ORDER BY created_at DESC LIMIT 1",
+            (run_id,),
+        ).fetchone() == ("directional_report",)
 
 
 

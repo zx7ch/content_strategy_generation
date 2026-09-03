@@ -37,6 +37,14 @@ test("Creator exposes retrieval recovery without mislabeling it as a model confi
   assert.doesNotMatch(source, /allowed_actions\.includes\("retry_/);
 });
 
+test("Creator exposes the projected cancel action with explicit confirmation", () => {
+  const source = readFileSync(new URL("./page.tsx", import.meta.url), "utf8");
+
+  assert.match(source, /allowed_actions\.includes\("cancel"\)/);
+  assert.match(source, /window\.confirm\("结束后将停止本次调研，已生成的历史记录仍会保留。确定继续吗？"\)/);
+  assert.match(source, /结束本次调研/);
+});
+
 test("Creator rejects a late presearch response before it can activate an old Run", () => {
   const source = readFileSync(new URL("./page.tsx", import.meta.url), "utf8");
   const guard = source.indexOf("activeThreadIdRef.current !== threadId", source.indexOf("async function sendMessage"));
@@ -56,6 +64,28 @@ test("evidence-only reports expose a candidate audit instead of only an insuffic
   assert.match(source, /表示该笔记由本轮哪组检索发现，不要求正文逐字包含完整检索词/);
   assert.match(source, /导出 JSON/);
   assert.match(source, /getContentResearchDirectionEvidence/);
+});
+
+test("each publishable report state has a distinct user-facing label", () => {
+  const source = readFileSync(new URL("./page.tsx", import.meta.url), "utf8");
+
+  assert.match(source, /complete_verified_report"\) return "已完整核验"/);
+  assert.match(source, /partial_verified_report"\) return "部分内容已核验"/);
+  assert.match(source, /directional_report"\) return "方向性样本线索"/);
+  assert.match(source, /return "仅展示已保存依据"/);
+  assert.doesNotMatch(source, /return "仅展示已验证证据"/);
+  assert.match(source, /当前仅形成方向性样本线索/);
+});
+
+test("integrity-flagged historical reports hide all conclusions and citations", () => {
+  const source = readFileSync(new URL("./page.tsx", import.meta.url), "utf8");
+  const guard = source.indexOf('report.integrity_state === "integrity_flagged"');
+  const reportArticle = source.indexOf('aria-label="Content Research published report"', guard);
+
+  assert.ok(guard > 0);
+  assert.ok(reportArticle > guard);
+  assert.match(source, /该历史报告未通过完整性校验，内容已隐藏/);
+  assert.match(source, /系统不会展示已失效执行产生的结论与引用/);
 });
 
 test("Xiaohongshu login card exposes both setup paths and only redacted status metadata", async () => {

@@ -34,7 +34,7 @@ def test_tag_release_runs_task_3_1_and_artifact_gates_before_upload() -> None:
     assert "tsc --noEmit" in script
     assert "RELEASE_GATE_REQUIRE_ARTIFACT" in script
     assert "RUN_FROZEN_RUNTIME_RESTART_GATE" in script
-    assert "--timeout-seconds 600" in script
+    assert "--timeout-seconds 2400" in script
 
     assert "actions/setup-node@v4" in workflow
     assert "npm ci" in workflow

@@ -89,6 +89,11 @@ def build_workflow_action_dispatcher() -> WorkflowActionDispatcher:
     """Build the complete P0 registry in public contract order."""
 
     from app.content_research.commands.cancel import CancelHandler
+    from app.content_research.commands.coverage import (
+        ExpandCoverageHandler,
+        GenerateLimitedReportHandler,
+        RelaxCoverageHandler,
+    )
     from app.content_research.commands.publication import RepairPublicationHandler
     from app.content_research.commands.recovery import (
         RetryAnalysisHandler,
@@ -115,6 +120,9 @@ def build_workflow_action_dispatcher() -> WorkflowActionDispatcher:
             ConfirmBriefHandler(),
             ReplaceScopeDraftHandler(),
             ConfirmScopeHandler(),
+            ExpandCoverageHandler(),
+            RelaxCoverageHandler(),
+            GenerateLimitedReportHandler(),
         )
     )
     if dispatcher.registered_actions != P0_WORKFLOW_ACTIONS:

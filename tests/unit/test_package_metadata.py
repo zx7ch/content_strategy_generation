@@ -26,7 +26,17 @@ ROOT = Path(__file__).resolve().parents[2]
 
 def test_editable_install_exposes_runtime_distribution_metadata(tmp_path):
     environment = tmp_path / "package-metadata-venv"
-    subprocess.run([sys.executable, "-m", "venv", str(environment)], check=True)
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "venv",
+            "--without-pip",
+            "--system-site-packages",
+            str(environment),
+        ],
+        check=True,
+    )
     python = environment / "bin" / "python"
 
     installed = subprocess.run(
@@ -35,7 +45,9 @@ def test_editable_install_exposes_runtime_distribution_metadata(tmp_path):
             "-m",
             "pip",
             "install",
+            "--no-index",
             "--no-deps",
+            "--no-build-isolation",
             "-e",
             str(ROOT),
         ],

@@ -41,6 +41,7 @@ from app.core.runtime_write_coordinator import (
 from app.core.runtime_write_registry import get_runtime_writer
 from app.core.sqlite_connection_roles import (
     open_bootstrap_async_database,
+    open_bootstrap_database,
     open_readonly_async_database,
     open_readonly_database,
 )
@@ -165,6 +166,80 @@ class ContentResearchPersistenceCoordinator:
         async with self._writer_lock:
             return await self._with_busy_retry(lambda: self._apply_once(command))
 
+    async def resolve_coverage(
+        self,
+        command: LifecycleCommand,
+        *,
+        snapshot: Any,
+        authorization: Any,
+        continuation: Any,
+        event: Any,
+        successor_scope_contract: Any | None,
+    ) -> tuple[RunProjection, tuple[Any, ...]]:
+        """Commit the Coverage decision facts and lifecycle transition together."""
+        if command.kind not in {
+            "expand_coverage",
+            "relax_coverage",
+            "generate_limited_report",
+        }:
+            raise LifecycleCommandConflict("coverage resolution requires a coverage action")
+        if self._writer is not None:
+            from app.content_research.lifecycle.mutations import decode_run_projection
+            from app.content_research.stores.mutations import (
+                decode_store_value,
+                encode_store_value,
+            )
+
+            command_payload = {
+                "command_id": command.command_id,
+                "run_id": command.run_id,
+                "expected_state": command.expected_state.value if command.expected_state else None,
+                "expected_revision": command.expected_revision,
+                "kind": command.kind,
+                "payload": dict(command.payload),
+            }
+            try:
+                result = await self._writer.submit(
+                    TypedMutation.create(
+                        mutation_id=f"content_research_lifecycle:{command.command_id}",
+                        mutation_kind="execute_content_research_lifecycle",
+                        domain_payload={
+                            "action": "resolve_coverage",
+                            "command": command_payload,
+                            "snapshot": encode_store_value(snapshot),
+                            "authorization": encode_store_value(authorization),
+                            "continuation": encode_store_value(continuation),
+                            "event": encode_store_value(event),
+                            "successor_scope_contract": encode_store_value(
+                                successor_scope_contract
+                            ),
+                        },
+                        run_id=command.run_id,
+                    )
+                )
+            except DomainMutationRejectedError as exc:
+                raise LifecycleCommandConflict(exc.safe_message) from None
+            projection_payload = result.result_fields.get("projection")
+            coverage_payload = result.result_fields.get("coverage")
+            if not isinstance(projection_payload, dict):
+                raise RuntimeError("invalid Content Research lifecycle result")
+            coverage_result = decode_store_value(coverage_payload)
+            if not isinstance(coverage_result, tuple):
+                raise RuntimeError("invalid Content Research coverage result")
+            return decode_run_projection(projection_payload), coverage_result
+        await self._ensure_schema()
+        async with self._writer_lock:
+            return await self._with_busy_retry(
+                lambda: self._resolve_coverage_once(
+                    command,
+                    snapshot=snapshot,
+                    authorization=authorization,
+                    continuation=continuation,
+                    event=event,
+                    successor_scope_contract=successor_scope_contract,
+                )
+            )
+
     async def retry_analysis(
         self,
         command: LifecycleCommand,
@@ -262,6 +337,53 @@ class ContentResearchPersistenceCoordinator:
             decode_run_projection(projection_payload),
             str(attempt_id) if attempt_id is not None else None,
         )
+
+    async def _resolve_coverage_once(
+        self,
+        command: LifecycleCommand,
+        *,
+        snapshot: Any,
+        authorization: Any,
+        continuation: Any,
+        event: Any,
+        successor_scope_contract: Any | None,
+    ) -> tuple[RunProjection, tuple[Any, ...]]:
+        from app.content_research.lifecycle.mutations import AsyncSQLiteConnectionFacade
+        from app.content_research.stores.sqlite_store import (
+            SQLiteContentResearchStore,
+            _BorrowedSQLiteConnection,
+        )
+
+        connection = open_bootstrap_database(self._db_path, timeout=0.25)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute("BEGIN IMMEDIATE")
+        previous_borrowed = self._borrowed_connection
+        store = object.__new__(SQLiteContentResearchStore)
+        store._db_path = self._db_path
+        store._execution_context = None
+        store._dispatch_context = None
+        store._writer = None
+        store._read_transaction_connection = None
+        store._coordinated_connection = _BorrowedSQLiteConnection(connection)
+        self._borrowed_connection = AsyncSQLiteConnectionFacade(connection)
+        try:
+            coverage = store.resolve_coverage_and_authorize_execution_atomically(
+                snapshot=snapshot,
+                authorization=authorization,
+                continuation=continuation,
+                event=event,
+                successor_scope_contract=successor_scope_contract,
+            )
+            projection = await self._apply_once(command)
+            connection.commit()
+            return projection, coverage
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            self._borrowed_connection = previous_borrowed
+            connection.close()
 
     async def _fail_analysis_attempt_once(
         self,
@@ -1162,6 +1284,30 @@ class ContentResearchPersistenceCoordinator:
                        WHERE run_id=? AND step_name='report'""",
                     (now, now, command.run_id),
                 )
+        elif command.kind in {"expand_coverage", "relax_coverage"}:
+            await conn.execute(
+                """UPDATE workflow_steps
+                   SET status='running', attempt_count=attempt_count+1,
+                       started_at=COALESCE(started_at, ?), completed_at=NULL,
+                       updated_at=?
+                   WHERE run_id=? AND step_name='formal_research'""",
+                (now, now, command.run_id),
+            )
+            await conn.execute(
+                """UPDATE workflow_steps
+                   SET status='waiting_user', completed_at=NULL, updated_at=?
+                   WHERE run_id=? AND step_name='coverage'""",
+                (now, command.run_id),
+            )
+        elif command.kind == "generate_limited_report":
+            await conn.execute(
+                """UPDATE workflow_steps
+                   SET status='running', attempt_count=CASE WHEN attempt_count=0 THEN 1 ELSE attempt_count END,
+                       started_at=COALESCE(started_at, ?), completed_at=NULL,
+                       updated_at=?
+                   WHERE run_id=? AND step_name='report'""",
+                (now, now, command.run_id),
+            )
         elif command.kind == "report_published":
             await conn.execute(
                 """UPDATE workflow_steps
@@ -1203,6 +1349,12 @@ class ContentResearchPersistenceCoordinator:
                 ),
             )
         elif command.kind == "cancel":
+            await conn.execute(
+                """UPDATE creator_threads
+                   SET active_run_id=NULL, updated_at=?
+                   WHERE id=? AND active_run_id=?""",
+                (now, row["thread_id"], command.run_id),
+            )
             await conn.execute(
                 """UPDATE content_research_dispatch_jobs
                    SET status='failed', lease_expires_at=NULL, lease_owner=NULL,

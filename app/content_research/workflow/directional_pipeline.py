@@ -53,6 +53,7 @@ from app.content_research.scope_contract import (
     ResearchScopeContract,
     ScopeAuditEvent,
     ScopeExecutionAuthorization,
+    supplementary_scope_query_group_id,
 )
 from app.content_research.sources.base import SourceOperationResult
 from app.content_research.sources.canonical_registry import CanonicalSourceRegistry
@@ -640,14 +641,11 @@ def _scope_supplementary_query_groups(
         raise ValueError("supplementary query groups require an execution authorization")
     return tuple(
         QueryGroup(
-            id="qg_"
-            + canonical_fingerprint(
-                {
-                    "scope_contract_id": contract.id,
-                    "authorization_id": authorization_id,
-                    "query": query,
-                }
-            )[:16],
+            id=supplementary_scope_query_group_id(
+                scope_contract_id=contract.id,
+                authorization_id=authorization_id,
+                query=query,
+            ),
             direction_id=direction_id,
             query=query,
             priority=index,
@@ -1775,9 +1773,21 @@ class DirectionalExecutionPipeline:
                     packet=packet,
                     contract=contract,
                     policy_snapshot=snapshot,
-                    scope_contract=self._scope_contract,
-                    scope_query_plan_hash=self._scope_query_plan_hash,
-                    scope_query_group_ids=self._scope_query_group_ids,
+                    scope_contract=(
+                        self._scope_contract
+                        if direction_id == "product_marketing"
+                        else None
+                    ),
+                    scope_query_plan_hash=(
+                        self._scope_query_plan_hash
+                        if direction_id == "product_marketing"
+                        else None
+                    ),
+                    scope_query_group_ids=(
+                        self._scope_query_group_ids
+                        if direction_id == "product_marketing"
+                        else ()
+                    ),
                 )
                 is None
                 for candidate in candidates

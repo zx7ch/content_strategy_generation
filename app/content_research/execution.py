@@ -365,13 +365,34 @@ class ContentResearchExecutionService:
                 (artifact.payload_json or {}).get("report_publication_id") == publication_id
                 for artifact in artifacts
             )
-            if (
+            analysis_repository = SQLiteMarketingAnalysisRepository(
+                application._store._db_path,
+                bootstrap_schema=False,
+                writer=application._store._writer,
+            )
+            effective_attempt = analysis_repository.get_effective_attempt_for_run(
+                continuation.workflow_run_id
+            )
+            analysis_context = (
+                analysis_repository.get_analysis_job_context(
+                    effective_attempt.analysis_unit_id
+                )
+                if effective_attempt is not None
+                else None
+            )
+            analysis_handoff_committed = bool(
+                analysis_context is not None
+                and analysis_context.execution_authorization_id == authorization.id
+                and effective_attempt is not None
+                and effective_attempt.state in {"queued", "running", "succeeded"}
+            )
+            if not analysis_handoff_committed and (
                 publication is None
                 or publication.workflow_run_id != continuation.workflow_run_id
                 or not materialized
             ):
                 raise ContentResearchValidationError(
-                    "execution unit limited report has no terminal publication"
+                    "execution unit limited report has no durable analysis handoff or publication"
                 )
         application._require_live_execution_context(context, "execution_terminal_postcondition")
         return "completed"
@@ -438,6 +459,12 @@ class ContentResearchExecutionService:
         ):
             raise ContentResearchValidationError(
                 "scope execution continuation does not match its authorization"
+            )
+        if continuation.operation == "supplementary_collection":
+            await application._advance_lifecycle_if_current(
+                continuation.workflow_run_id,
+                expected_state=ContentResearchState.RETRIEVAL_QUEUED,
+                event="worker_claimed",
             )
         application._require_scope_execution_authority(
             workflow_run_id=continuation.workflow_run_id,
@@ -601,11 +628,23 @@ class ContentResearchExecutionService:
                 }
             },
         ).execute_claimed(claim)
+        authorization = (
+            application._store.get_scope_execution_authorization(
+                claim.context.execution_authorization_id
+            )
+            if claim.context.execution_authorization_id is not None
+            else None
+        )
+        if claim.context.execution_authorization_id is not None and authorization is None:
+            raise ContentResearchValidationError(
+                "marketing analysis continuation authorization disappeared"
+            )
         await application._execute_formal_research(
             brief=brief,
             provider="xiaohongshu",
             source_kind="search_result",
             limit=50,
+            execution_authorization=authorization,
         )
 
     async def record_analysis_failure(

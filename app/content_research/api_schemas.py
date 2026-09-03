@@ -21,6 +21,9 @@ P0_WORKFLOW_ACTIONS = (
     "confirm_brief",
     "replace_scope_draft",
     "confirm_scope",
+    "expand_coverage",
+    "relax_coverage",
+    "generate_limited_report",
 )
 
 

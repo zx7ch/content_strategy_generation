@@ -42,6 +42,7 @@ COORDINATED_STORE_ACTIONS = frozenset(
         "complete_execution_unit",
         "resolve_coverage_and_authorize_execution_atomically",
         "save_scope_execution_continuation",
+        "requeue_scope_execution_continuation",
         "append_scope_audit_event",
         "save_evidence_record",
         "append_evidence_lineage",

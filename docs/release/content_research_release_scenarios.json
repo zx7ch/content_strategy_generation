@@ -1,0 +1,180 @@
+{
+  "schema_version": "content_research_release_scenarios_v1",
+  "required": {
+    "actions": [
+      "cancel",
+      "retry_presearch",
+      "retry_retrieval",
+      "retry_analysis",
+      "retry_report",
+      "repair_publication",
+      "revise_subject",
+      "confirm_brief",
+      "replace_scope_draft",
+      "confirm_scope",
+      "expand_coverage",
+      "relax_coverage",
+      "generate_limited_report"
+    ],
+    "lifecycle_states": [
+      "presearch_running",
+      "brief_confirmation_required",
+      "scope_confirmation_required",
+      "retrieval_queued",
+      "retrieval_running",
+      "coverage_evaluating",
+      "coverage_decision_required",
+      "report_composing",
+      "report_ready",
+      "recovery_required",
+      "cancelled_or_failed"
+    ],
+    "publication_states": [
+      "complete_verified_report",
+      "partial_verified_report",
+      "directional_report",
+      "evidence_only_report",
+      "integrity_flagged"
+    ],
+    "directions": [
+      "product_marketing",
+      "competitor_discovery",
+      "content_performance"
+    ],
+    "risk_classes": [
+      "happy_path",
+      "validation_or_stale",
+      "failure_and_retry",
+      "concurrency_and_late_result",
+      "reload_and_history",
+      "release_parity"
+    ]
+  },
+  "scenarios": [
+    {
+      "id": "lifecycle_and_public_actions",
+      "risk_classes": ["happy_path", "validation_or_stale"],
+      "actions": ["confirm_brief", "replace_scope_draft", "confirm_scope", "revise_subject"],
+      "lifecycle_states": ["presearch_running", "brief_confirmation_required", "scope_confirmation_required", "retrieval_queued", "retrieval_running", "coverage_evaluating", "report_composing", "report_ready"],
+      "layers": ["unit", "integration", "api"],
+      "tests": [
+        "tests/unit/test_content_research_lifecycle_transitions.py",
+        "tests/integration/test_content_research_lifecycle_coordinator.py",
+        "tests/e2e/test_content_research_brief_scope_draft_api.py"
+      ]
+    },
+    {
+      "id": "three_primary_directions",
+      "risk_classes": ["happy_path"],
+      "directions": ["product_marketing", "competitor_discovery", "content_performance"],
+      "publication_states": ["partial_verified_report"],
+      "layers": ["unit", "integration", "browser"],
+      "tests": [
+        "tests/integration/test_content_research_direction_pipeline_store.py",
+        "tests/e2e/test_content_research_creator_browser.py"
+      ]
+    },
+    {
+      "id": "coverage_decisions",
+      "risk_classes": ["happy_path", "validation_or_stale"],
+      "actions": ["expand_coverage", "relax_coverage", "generate_limited_report"],
+      "lifecycle_states": ["coverage_decision_required"],
+      "layers": ["unit", "integration", "api", "browser"],
+      "tests": [
+        "tests/integration/test_content_research_scope_coverage.py",
+        "tests/e2e/test_content_research_brief_scope_draft_api.py",
+        "tests/e2e/test_content_research_creator_browser.py"
+      ]
+    },
+    {
+      "id": "cancel_and_late_worker",
+      "risk_classes": ["concurrency_and_late_result", "reload_and_history"],
+      "actions": ["cancel"],
+      "lifecycle_states": ["cancelled_or_failed"],
+      "layers": ["integration", "api", "browser"],
+      "tests": [
+        "tests/acceptance/test_scheduler_recovery.py",
+        "tests/e2e/test_content_research_brief_scope_draft_api.py",
+        "tests/e2e/test_content_research_creator_browser.py"
+      ]
+    },
+    {
+      "id": "stage_recovery",
+      "risk_classes": ["failure_and_retry", "reload_and_history"],
+      "actions": ["retry_presearch", "retry_retrieval", "retry_analysis", "retry_report"],
+      "lifecycle_states": ["recovery_required"],
+      "layers": ["unit", "integration", "browser"],
+      "tests": [
+        "tests/unit/test_content_research_recovery.py",
+        "tests/integration/test_content_research_lifecycle_coordinator.py",
+        "tests/e2e/test_content_research_creator_browser.py"
+      ]
+    },
+    {
+      "id": "publication_repair_and_integrity",
+      "risk_classes": ["failure_and_retry", "validation_or_stale"],
+      "actions": ["repair_publication"],
+      "publication_states": ["integrity_flagged"],
+      "layers": ["unit", "integration", "api", "frontend"],
+      "tests": [
+        "tests/integration/test_content_research_report_publication_materializer.py",
+        "tests/e2e/test_content_research_report_publication_timeline_api.py",
+        "frontend/src/app/creator/page.test.tsx"
+      ]
+    },
+    {
+      "id": "publication_state_projection",
+      "risk_classes": ["happy_path", "validation_or_stale"],
+      "publication_states": ["complete_verified_report", "partial_verified_report", "directional_report", "evidence_only_report"],
+      "layers": ["unit", "integration", "browser", "frontend"],
+      "tests": [
+        "tests/unit/test_content_research_lite_read_model.py",
+        "tests/integration/test_content_research_lite_read_model.py",
+        "tests/e2e/test_content_research_creator_browser.py",
+        "frontend/src/app/creator/page.test.tsx"
+      ]
+    },
+    {
+      "id": "candidate_audit_and_export",
+      "risk_classes": ["happy_path"],
+      "publication_states": ["evidence_only_report"],
+      "layers": ["api", "browser", "frontend"],
+      "tests": [
+        "tests/e2e/test_content_research_creator_browser.py",
+        "frontend/src/lib/content-research-api.test.ts",
+        "frontend/src/app/creator/page.test.tsx"
+      ]
+    },
+    {
+      "id": "concurrent_runs_and_history",
+      "risk_classes": ["concurrency_and_late_result", "reload_and_history"],
+      "layers": ["integration", "browser"],
+      "tests": [
+        "tests/acceptance/test_direction_outcome_batches.py",
+        "tests/acceptance/test_lifecycle_command_isolation.py",
+        "tests/e2e/test_content_research_creator_browser.py"
+      ]
+    },
+    {
+      "id": "thread_history_unavailable",
+      "risk_classes": ["validation_or_stale", "reload_and_history"],
+      "layers": ["browser"],
+      "tests": [
+        "tests/e2e/test_content_research_creator_browser.py"
+      ]
+    },
+    {
+      "id": "single_writer_and_release_artifact",
+      "risk_classes": ["release_parity"],
+      "layers": ["acceptance", "artifact"],
+      "tests": [
+        "tests/acceptance/test_single_writer_migration.py",
+        "tests/acceptance/test_single_writer_naming.py",
+        "tests/acceptance/test_single_writer_ownership.py",
+        "tests/acceptance/test_sqlite_single_writer_runtime.py",
+        "tests/acceptance/test_runtime_release_parity.py",
+        "tests/acceptance/test_runtime_release_artifact.py"
+      ]
+    }
+  ]
+}

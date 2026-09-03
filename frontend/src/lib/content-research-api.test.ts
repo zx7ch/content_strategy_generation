@@ -21,6 +21,7 @@ import {
   retryContentResearchPresearch,
   retryContentResearchRetrieval,
   replaceContentResearchScopeDraft,
+  resolveContentResearchCoverage,
   saveLLMConfiguration,
 } from "./content-research-api.ts";
 import { setWorkspaceContext } from "./api.ts";
@@ -362,6 +363,61 @@ test("Brief confirmation and Scope replacement use authoritative command envelop
     product_experience_aspect: "凉感",
     context_audience_aspect: "夏季通勤",
   });
+});
+
+test("Coverage resolution helpers map all three persisted decisions to lifecycle actions", async () => {
+  const bodies: Array<Record<string, unknown>> = [];
+  globalThis.fetch = (async (_input, init) => {
+    const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+    bodies.push(body);
+    return jsonResponse({
+      schema_version: "content_research_workflow_action_response_v1",
+      workflow_run_id: "run_1",
+      action: body.action,
+      status: "completed",
+      result: { run: testRun, coverage: {} },
+      execution_mode: "local",
+      sync_status: "local_only",
+    });
+  }) as typeof fetch;
+  const run = {
+    ...testRun,
+    state: "coverage_decision_required" as const,
+    state_revision: 8,
+  };
+
+  await resolveContentResearchCoverage(run, {
+    scope_contract_version: 1,
+    coverage_snapshot_id: "coverage_1",
+    resolution: "expand_required_constraint",
+    constraint_id: "core_object",
+    supplementary_queries: ["T恤 补充样本"],
+  });
+  await resolveContentResearchCoverage(run, {
+    scope_contract_version: 1,
+    coverage_snapshot_id: "coverage_1",
+    resolution: "relax_constraint",
+    constraint_id: "core_object",
+  });
+  await resolveContentResearchCoverage(run, {
+    scope_contract_version: 1,
+    coverage_snapshot_id: "coverage_1",
+    resolution: "generate_limited_report",
+  });
+
+  assert.deepEqual(
+    bodies.map((body) => body.action),
+    ["expand_coverage", "relax_coverage", "generate_limited_report"],
+  );
+  assert.deepEqual(bodies[0].payload, {
+    scope_contract_version: 1,
+    coverage_snapshot_id: "coverage_1",
+    resolution: "expand_required_constraint",
+    constraint_id: "core_object",
+    supplementary_queries: ["T恤 补充样本"],
+  });
+  assert.equal(bodies[0].expected_state, "coverage_decision_required");
+  assert.equal(bodies[0].expected_revision, 8);
 });
 
 test("getContentResearchScope reads the persisted Scope projection and optional version", async () => {
