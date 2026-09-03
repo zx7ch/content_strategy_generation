@@ -14,6 +14,7 @@ from pathlib import Path, PurePosixPath
 from urllib.error import HTTPError
 
 import pytest
+from playwright.sync_api import expect, sync_playwright
 
 from app.content_research.lifecycle.coordinator import ContentResearchPersistenceCoordinator
 from app.content_research.lifecycle.models import LifecycleCommand
@@ -21,6 +22,7 @@ from app.content_research.models import ResearchBriefRecord, TraceRecord, utcnow
 from app.content_research.persistence_models import StageCheckpointRecord
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
 from app.memory.thread_store import ThreadStore
+from tests.browser_process import chrome_executable, reserve_port, run_process
 
 RELEASE_GATE_HEADERS = {
     "X-Workspace-Id": "00000000-0000-0000-0000-000000000001",
@@ -388,3 +390,118 @@ def test_frozen_runtime_restart_preserves_content_research_fixture(tmp_path):
         assert len(checkpoints[0].payload["candidates"]) == 28
     finally:
         _stop(second)
+
+
+@pytest.mark.acceptance
+def test_frozen_runtime_and_same_sha_frontend_restore_run_in_real_browser(
+    tmp_path: Path,
+) -> None:
+    if os.getenv("RUN_FROZEN_RUNTIME_RESTART_GATE") != "1":
+        pytest.skip("set RUN_FROZEN_RUNTIME_RESTART_GATE=1 after packaging")
+
+    archive = _release_archive()
+    assert archive.is_file(), f"release gate requires {archive}"
+    extracted = tmp_path / "browser-runtime"
+    subprocess.run(
+        ["/usr/bin/unzip", "-q", str(archive), "-d", str(extracted)],
+        check=True,
+    )
+    runtime_dir = extracted / "xhs-runtime"
+    executable = runtime_dir / "xhs-runtime"
+    executable.chmod(executable.stat().st_mode | 0o111)
+
+    home = tmp_path / "browser-home"
+    data_home = home / "Library" / "Application Support" / "xhs-growth-agent"
+    data_home.mkdir(parents=True)
+    workflow_run_id = _seed_persisted_content_research_fixture(
+        str(data_home / "xhs_agent.db")
+    )
+
+    repository = Path(__file__).resolve().parents[2]
+    frontend_root = repository / "frontend"
+    tsconfig_path = frontend_root / "tsconfig.json"
+    tsconfig_before = tsconfig_path.read_bytes()
+    runtime_port = reserve_port()
+    frontend_port = reserve_port()
+    runtime_url = f"http://127.0.0.1:{runtime_port}"
+    frontend_url = f"http://127.0.0.1:{frontend_port}"
+    runtime_environment = {
+        **os.environ,
+        "HOME": str(home),
+        "RUNTIME_PORT": str(runtime_port),
+        "CORS_ALLOWED_ORIGINS": frontend_url,
+        "HF_HUB_OFFLINE": "1",
+        "TRANSFORMERS_OFFLINE": "1",
+        "TOKENIZERS_PARALLELISM": "false",
+    }
+    for inherited in ("PYTHONHOME", "PYTHONPATH", "VIRTUAL_ENV", "CONDA_PREFIX"):
+        runtime_environment.pop(inherited, None)
+    frontend_environment = {
+        **os.environ,
+        "NEXT_DIST_DIR": f".next/artifact-{frontend_port}",
+        "NEXT_PUBLIC_XHS_API_BASE_URL": runtime_url,
+        "XHS_API_BASE_URL": runtime_url,
+        "NEXT_TELEMETRY_DISABLED": "1",
+    }
+
+    try:
+        with run_process(
+            cmd=[str(executable)],
+            cwd=runtime_dir,
+            env=runtime_environment,
+            ready_url=f"{runtime_url}/health",
+            ready_timeout=60,
+            name="frozen Runtime",
+        ):
+            with run_process(
+                cmd=[
+                    "npm",
+                    "run",
+                    "dev",
+                    "--",
+                    "--hostname",
+                    "127.0.0.1",
+                    "--port",
+                    str(frontend_port),
+                ],
+                cwd=frontend_root,
+                env=frontend_environment,
+                ready_url=f"{frontend_url}/creator",
+                ready_timeout=90,
+                name="same-SHA frontend",
+            ):
+                with sync_playwright() as playwright:
+                    browser = playwright.chromium.launch(
+                        headless=True,
+                        executable_path=chrome_executable(),
+                    )
+                    page = browser.new_page(viewport={"width": 1440, "height": 960})
+                    try:
+                        with page.expect_response(
+                            lambda response: response.url.endswith(
+                                f"/content-research/workflows/{workflow_run_id}"
+                            )
+                            and response.status == 200,
+                            timeout=30000,
+                        ) as workflow_response:
+                            page.goto(
+                                f"{frontend_url}/creator?contentResearchRunId={workflow_run_id}",
+                                wait_until="domcontentloaded",
+                            )
+                        workflow = workflow_response.value.json()
+                        assert workflow["workflow_run_id"] == workflow_run_id
+                        assert workflow["run"]["state"] == "recovery_required"
+                        assert (
+                            workflow["run"]["recovery_plan"]["action"]
+                            == "retry_presearch"
+                        )
+                        expect(
+                            page.get_by_text(
+                                "模型服务配置需要更新。请在右侧保存并验证新配置后继续本次预检索。",
+                                exact=True,
+                            )
+                        ).to_be_visible(timeout=30000)
+                    finally:
+                        browser.close()
+    finally:
+        tsconfig_path.write_bytes(tsconfig_before)

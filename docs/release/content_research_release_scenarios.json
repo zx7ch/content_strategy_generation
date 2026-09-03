@@ -166,7 +166,7 @@
     {
       "id": "single_writer_and_release_artifact",
       "risk_classes": ["release_parity"],
-      "layers": ["acceptance", "artifact"],
+      "layers": ["acceptance", "artifact", "browser"],
       "tests": [
         "tests/acceptance/test_single_writer_migration.py",
         "tests/acceptance/test_single_writer_naming.py",

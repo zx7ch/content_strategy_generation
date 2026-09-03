@@ -11,6 +11,9 @@ def test_tag_release_runs_task_3_1_and_artifact_gates_before_upload() -> None:
     browser_suite = (root / "scripts" / "run_creator_browser_e2e_suite.py").read_text(
         encoding="utf-8"
     )
+    artifact_gate = (
+        root / "tests" / "acceptance" / "test_runtime_release_artifact.py"
+    ).read_text(encoding="utf-8")
     workflow = (root / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
 
     assert "tests/unit/test_content_research" in script
@@ -35,6 +38,10 @@ def test_tag_release_runs_task_3_1_and_artifact_gates_before_upload() -> None:
     assert "RELEASE_GATE_REQUIRE_ARTIFACT" in script
     assert "RUN_FROZEN_RUNTIME_RESTART_GATE" in script
     assert "--timeout-seconds 2400" in script
+    assert (
+        "test_frozen_runtime_and_same_sha_frontend_restore_run_in_real_browser"
+        in artifact_gate
+    )
 
     assert "actions/setup-node@v4" in workflow
     assert "npm ci" in workflow
