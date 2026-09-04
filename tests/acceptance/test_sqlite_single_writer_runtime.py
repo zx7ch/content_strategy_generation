@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import signal
 import subprocess
+import sys
 import time
 from collections import deque
 from pathlib import Path
@@ -65,7 +66,7 @@ def _start_runtime(
     }
     process = subprocess.Popen(
         [
-            str(repo_root / ".venv/bin/python"),
+            sys.executable,
             "-m",
             "uvicorn",
             "app.main:app",
