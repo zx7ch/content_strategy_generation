@@ -393,6 +393,69 @@ def test_frozen_runtime_restart_preserves_content_research_fixture(tmp_path):
 
 
 @pytest.mark.acceptance
+def test_second_frozen_runtime_exits_with_a_readable_lock_message(
+    tmp_path: Path,
+) -> None:
+    if os.getenv("RUN_FROZEN_RUNTIME_RESTART_GATE") != "1":
+        pytest.skip("set RUN_FROZEN_RUNTIME_RESTART_GATE=1 after packaging")
+
+    archive = _release_archive()
+    assert archive.is_file(), f"release gate requires {archive}"
+    extracted = tmp_path / "duplicate-runtime"
+    subprocess.run(
+        ["/usr/bin/unzip", "-q", str(archive), "-d", str(extracted)],
+        check=True,
+    )
+    runtime_dir = extracted / "xhs-runtime"
+    executable = runtime_dir / "xhs-runtime"
+    executable.chmod(executable.stat().st_mode | 0o111)
+    home = tmp_path / "home"
+    (home / "Library" / "Application Support" / "xhs-growth-agent").mkdir(
+        parents=True
+    )
+
+    first_port = _free_local_port()
+    second_port = _free_local_port()
+
+    def environment(port: int) -> dict[str, str]:
+        result = {**os.environ, "HOME": str(home), "RUNTIME_PORT": str(port)}
+        for inherited in ("PYTHONHOME", "PYTHONPATH", "VIRTUAL_ENV", "CONDA_PREFIX"):
+            result.pop(inherited, None)
+        return result
+
+    first = subprocess.Popen(
+        [str(executable)],
+        cwd=runtime_dir,
+        env=environment(first_port),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    try:
+        first_health = _wait_for_health(first_port, first)
+        second = subprocess.run(
+            [str(executable)],
+            cwd=runtime_dir,
+            env=environment(second_port),
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        second_output = second.stdout + second.stderr
+
+        assert second.returncode == 2
+        assert "LOCAL_RUNTIME_DATABASE_LOCKED" in second_output
+        assert "已有 XHS Growth Agent Runtime 正在运行" in second_output
+        assert "无需重复启动" in second_output
+        assert "Traceback" not in second_output
+        assert "BlockingIOError" not in second_output
+        assert _wait_for_health(first_port, first)["service"] == first_health["service"]
+    finally:
+        _stop(first)
+
+
+@pytest.mark.acceptance
 def test_frozen_runtime_and_same_sha_frontend_restore_run_in_real_browser(
     tmp_path: Path,
 ) -> None:

@@ -164,6 +164,22 @@
       ]
     },
     {
+      "id": "duplicate_runtime_startup",
+      "risk_classes": [
+        "release_parity"
+      ],
+      "layers": [
+        "unit",
+        "acceptance",
+        "artifact"
+      ],
+      "tests": [
+        "tests/unit/test_runtime_launcher.py",
+        "tests/acceptance/test_sqlite_single_writer_runtime.py",
+        "tests/acceptance/test_runtime_release_artifact.py"
+      ]
+    },
+    {
       "id": "single_writer_and_release_artifact",
       "risk_classes": ["release_parity"],
       "layers": ["acceptance", "artifact", "browser"],

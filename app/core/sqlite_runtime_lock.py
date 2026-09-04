@@ -6,6 +6,7 @@ import fcntl
 import hashlib
 import os
 import tempfile
+import threading
 from pathlib import Path
 
 
@@ -111,3 +112,56 @@ class SQLiteRuntimeProcessLock:
         self.platform_file_identity = None
         for descriptor in reversed(descriptors):
             self._unlock_descriptor(descriptor)
+
+
+_reserved_lock_guard = threading.Lock()
+_reserved_runtime_locks: dict[str, SQLiteRuntimeProcessLock] = {}
+
+
+def _reservation_key(database_path: str) -> str | None:
+    identity = canonical_database_identity(database_path)
+    return str(identity) if identity is not None else None
+
+
+def reserve_runtime_process_lock(database_path: str) -> SQLiteRuntimeProcessLock:
+    """Acquire before the packaged server starts and expose it to its lifespan."""
+
+    lock = SQLiteRuntimeProcessLock(database_path)
+    lock.acquire()
+    key = _reservation_key(database_path)
+    if key is None:
+        return lock
+    with _reserved_lock_guard:
+        if key in _reserved_runtime_locks:
+            lock.release()
+            raise RuntimeError("SQLite Runtime process lock is already reserved")
+        _reserved_runtime_locks[key] = lock
+    return lock
+
+
+def claim_runtime_process_lock(database_path: str) -> SQLiteRuntimeProcessLock:
+    """Adopt a packaged preflight lock or acquire for a normal source server."""
+
+    key = _reservation_key(database_path)
+    if key is not None:
+        with _reserved_lock_guard:
+            reserved = _reserved_runtime_locks.pop(key, None)
+        if reserved is not None:
+            return reserved
+    lock = SQLiteRuntimeProcessLock(database_path)
+    lock.acquire()
+    return lock
+
+
+def release_reserved_runtime_process_lock(
+    database_path: str,
+    lock: SQLiteRuntimeProcessLock,
+) -> None:
+    """Release a preflight lock if startup ended before or after adoption."""
+
+    key = _reservation_key(database_path)
+    if key is not None:
+        with _reserved_lock_guard:
+            if _reserved_runtime_locks.get(key) is lock:
+                del _reserved_runtime_locks[key]
+    lock.release()

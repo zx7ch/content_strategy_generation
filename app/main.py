@@ -19,7 +19,7 @@ from app.content_research.worker import (
 )
 from app.core.runtime_schema_bootstrap import bootstrap_canonical_runtime_schema
 from app.core.runtime_write_coordinator import RuntimeWriteCoordinator
-from app.core.sqlite_runtime_lock import SQLiteRuntimeProcessLock
+from app.core.sqlite_runtime_lock import claim_runtime_process_lock
 from app.memory.job_store import JobStore
 from app.memory.thread_store import ThreadStore
 from app.runtime_write_handlers import production_runtime_write_handlers
@@ -264,8 +264,7 @@ async def _unlocked_worker_lifespan(application):
 
 @asynccontextmanager
 async def _worker_lifespan(application):
-    database_lock = SQLiteRuntimeProcessLock(settings.SQLITE_DB_PATH)
-    database_lock.acquire()
+    database_lock = claim_runtime_process_lock(settings.SQLITE_DB_PATH)
     try:
         async with _unlocked_worker_lifespan(application):
             yield

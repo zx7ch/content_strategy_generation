@@ -42,6 +42,7 @@ def test_tag_release_runs_task_3_1_and_artifact_gates_before_upload() -> None:
         "test_frozen_runtime_and_same_sha_frontend_restore_run_in_real_browser"
         in artifact_gate
     )
+    assert "test_second_frozen_runtime_exits_with_a_readable_lock_message" in artifact_gate
 
     assert "actions/setup-node@v4" in workflow
     assert "npm ci" in workflow

@@ -105,6 +105,28 @@ fi
 
 # ── 启动 ─────────────────────────────────────────────────────
 
+RUNTIME_PORT="${RUNTIME_PORT:-8000}"
+RUNTIME_HEALTH_URL="http://127.0.0.1:${RUNTIME_PORT}/health"
+
+# A compatible Runtime may already own the durable SQLite database. Reuse it
+# instead of launching a competing process and exposing an internal lock trace.
+if command -v curl >/dev/null 2>&1; then
+    RUNNING_RUNTIME_HEALTH="$(curl -fsS --max-time 1 "$RUNTIME_HEALTH_URL" 2>/dev/null || true)"
+else
+    RUNNING_RUNTIME_HEALTH=""
+fi
+
+case "$RUNNING_RUNTIME_HEALTH" in
+    *'"status":"healthy"'*'"api_contract":"local-runtime-single-writer"'*)
+        echo ""
+        echo "✅ 已有 XHS Growth Agent Runtime 正在运行"
+        echo "   地址：$RUNTIME_HEALTH_URL"
+        echo "   请保留现有 Runtime 窗口，无需重复启动。"
+        echo ""
+        exit 0
+        ;;
+esac
+
 echo ""
 echo "✅ 正在启动 XHS Growth Agent Runtime..."
 echo ""
