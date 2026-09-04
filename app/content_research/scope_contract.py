@@ -643,3 +643,21 @@ def _fingerprint(value: dict[str, object]) -> str:
     return hashlib.sha256(
         json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
+
+
+def supplementary_scope_query_group_id(
+    *, scope_contract_id: str, authorization_id: str, query: str
+) -> str:
+    """Return the durable query identity owned by one Expand authorization."""
+    normalized_query = _clean_query(query, field_name="supplementary_query")
+    if not scope_contract_id.strip() or not authorization_id.strip():
+        raise ValueError(
+            "supplementary query group requires scope and authorization identity"
+        )
+    return "qg_" + _fingerprint(
+        {
+            "scope_contract_id": scope_contract_id,
+            "authorization_id": authorization_id,
+            "query": normalized_query,
+        }
+    )[:16]

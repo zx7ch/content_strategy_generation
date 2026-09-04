@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import json
 import importlib.util
+import json
 import os
 import sys
 import time
@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from app.config import settings
+from app.config import settings  # noqa: E402
 
 
 def _has_llm_credentials() -> bool:
@@ -69,12 +69,26 @@ def rag_ready(acceptance_enabled: None) -> None:
 @pytest.fixture
 def acceptance_storage(tmp_path, monkeypatch):
     db_path = tmp_path / "acceptance.db"
+    discovery_db_path = tmp_path / "discovery.db"
     chroma_dir = tmp_path / "chroma"
     monkeypatch.setattr(settings, "SQLITE_DB_PATH", str(db_path))
+    monkeypatch.setattr(settings, "V2_DISCOVERY_SQLITE_PATH", str(discovery_db_path))
     monkeypatch.setattr(settings, "CHROMA_PERSIST_DIR", str(chroma_dir))
+    monkeypatch.setattr(
+        settings,
+        "RAG_EMBEDDING_MODEL",
+        str(tmp_path / "missing-embedding-model"),
+    )
     monkeypatch.setattr(settings, "JOB_POLL_INTERVAL_MS", 50)
     monkeypatch.setattr(settings, "SSE_HEARTBEAT_SECONDS", 1)
-    return {"db_path": str(db_path), "chroma_dir": str(chroma_dir), "root": tmp_path}
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    monkeypatch.setenv("TRANSFORMERS_OFFLINE", "1")
+    return {
+        "db_path": str(db_path),
+        "discovery_db_path": str(discovery_db_path),
+        "chroma_dir": str(chroma_dir),
+        "root": tmp_path,
+    }
 
 
 @pytest.fixture

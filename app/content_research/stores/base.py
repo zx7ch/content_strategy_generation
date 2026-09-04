@@ -35,6 +35,7 @@ from app.content_research.persistence_models import (
     ReportFaithfulnessDecisionRecord,
     ReportIntegrityEventRecord,
     ReportPublicationRecord,
+    SourceObservationRecord,
     StageCheckpointRecord,
     WeakSignalRecord,
 )
@@ -211,6 +212,9 @@ class ContentResearchStore(Protocol):
     def save_canonical_source(self, source: CanonicalSourceRecord) -> CanonicalSourceRecord: ...
     def resolve_canonical_source(self, source: CanonicalSourceRecord) -> CanonicalSourceRecord: ...
     def get_canonical_source(self, source_id: str) -> CanonicalSourceRecord | None: ...
+    def save_source_observation(
+        self, record: SourceObservationRecord
+    ) -> SourceObservationRecord: ...
     def get_typed_record(
         self, record_type: type[TypedRecordT], record_id: str
     ) -> TypedRecordT | None: ...

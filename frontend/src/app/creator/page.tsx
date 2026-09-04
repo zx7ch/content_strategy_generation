@@ -39,6 +39,7 @@ import {
   isHistoricalContentResearchWorkflow,
   reviseContentResearchSubject,
   replaceContentResearchScopeDraft,
+  resolveContentResearchCoverage,
   requireMutableContentResearchWorkflow,
   retryContentResearchPresearch,
   retryContentResearchRetrieval,
@@ -51,13 +52,13 @@ import {
   type ContentResearchRunProjection,
   type ContentResearchScopeDraft,
   type ContentResearchScopeProjection,
+  type ContentResearchResolveCoverageRequest,
   type ContentResearchTrace,
   type ContentResearchWorkflowSummary,
 } from "@/lib/content-research-api";
 import { ModelServiceCard } from "@/components/content-research/ModelServiceCard";
 import { XiaohongshuLoginCard } from "@/components/content-research/XiaohongshuLoginCard";
 import {
-  traceExecutionDurationText,
   traceStepGroup,
   traceStepTitle,
   workflowStatusLabel,
@@ -735,6 +736,8 @@ function ContentResearchIntentCard({
   intent,
   busy,
   onConfirm,
+  onCancel,
+  cancelPending,
 }: {
   intent: ContentResearchIntentState;
   busy: boolean;
@@ -744,6 +747,8 @@ function ContentResearchIntentCard({
     custom_competitor_input: string;
     selected_directions: string[];
   }) => void;
+  onCancel: () => void;
+  cancelPending: boolean;
 }) {
   const structure = intent.presearch.subject_structure ?? {};
   const canonicalSubject = structure.canonical_subject?.trim() || intent.seed || "本轮调研";
@@ -774,7 +779,7 @@ function ContentResearchIntentCard({
 
   if (
     intent.presearch.run.state === "recovery_required"
-    && intent.presearch.run.allowed_actions.includes("retry_presearch")
+    && intent.presearch.run.recovery_plan?.action === "retry_presearch"
   ) {
     return (
       <div className="flex justify-start">
@@ -888,7 +893,15 @@ function ContentResearchIntentCard({
               </button>
             ))}
           </div>
-          <div className="mt-5 flex justify-end">
+          <div className="mt-5 flex items-center justify-between gap-3">
+            <button
+              type="button"
+              onClick={onCancel}
+              disabled={busy || cancelPending}
+              className="rounded-xl border border-red-200 px-4 py-2.5 text-sm font-semibold text-red-700 disabled:opacity-50"
+            >
+              {cancelPending ? "正在结束…" : "结束本次调研"}
+            </button>
             <button
               type="button"
               disabled={busy || subjectConfirmed !== "yes" || selectedDirections.length === 0}
@@ -1063,6 +1076,75 @@ function ContentResearchScopeDraftCard({
   );
 }
 
+function ContentResearchCoverageDecisionCard({
+  projection,
+  busy,
+  onResolve,
+}: {
+  projection: ContentResearchScopeProjection;
+  busy: boolean;
+  onResolve: (input: ContentResearchResolveCoverageRequest) => void;
+}) {
+  const [showExpand, setShowExpand] = useState(false);
+  const [supplementaryQuery, setSupplementaryQuery] = useState("");
+  const snapshot = projection.coverage_snapshot;
+  const contract = projection.scope_contract;
+  if (!snapshot || !contract) return null;
+  const available = projection.allowed_resolutions.filter((item) => item.available);
+  const expand = available.find((item) => item.action === "expand_required_constraint");
+  const relax = available.find((item) => item.action === "relax_constraint");
+  const limited = available.find((item) => item.action === "generate_limited_report");
+  const expandConstraint = expand?.valid_constraint_ids[0];
+  const relaxConstraint = relax?.valid_constraint_ids[0];
+  const labelFor = (constraintId?: string) => {
+    const constraint = contract.constraints.find((item) => item.id === constraintId);
+    return constraint?.value || constraint?.label || "必要范围";
+  };
+  const reasonCodes = arrayField(
+    snapshot.constraint_counts._summary as Record<string, unknown> | undefined,
+    "reason_codes",
+  );
+
+  return (
+    <div className="flex justify-start">
+      <section className="w-full max-w-[92%] rounded-2xl border border-amber-200 bg-amber-50 px-5 py-5 text-amber-950 shadow-sm" aria-label="覆盖不足决策">
+        <p className="text-xs font-semibold uppercase tracking-wider text-amber-700">证据覆盖</p>
+        <h2 className="mt-2 text-xl font-semibold">样本覆盖不足，需要你决定下一步</h2>
+        <p className="mt-2 text-sm leading-6 text-amber-900">这里只显示服务端针对当前 Coverage 快照允许的操作。</p>
+        {reasonCodes.map((reason) => (
+          <p key={reason} className="mt-1 text-xs text-amber-800">{coverageReasonLabel(reason)}</p>
+        ))}
+        <div className="mt-4 flex flex-wrap gap-2">
+          {expand && expandConstraint ? (
+            <button type="button" disabled={busy} onClick={() => setShowExpand(true)} className="rounded-lg bg-amber-900 px-3 py-2 text-xs font-medium text-white disabled:opacity-40">
+              继续补充{labelFor(expandConstraint)}样本
+            </button>
+          ) : null}
+          {limited ? (
+            <button type="button" disabled={busy} onClick={() => onResolve({ scope_contract_version: contract.version, coverage_snapshot_id: snapshot.id, resolution: "generate_limited_report" })} className="rounded-lg border border-amber-300 bg-white px-3 py-2 text-xs font-medium disabled:opacity-40">
+              基于现有证据生成受限报告
+            </button>
+          ) : null}
+          {relax && relaxConstraint ? (
+            <button type="button" disabled={busy} onClick={() => onResolve({ scope_contract_version: contract.version, coverage_snapshot_id: snapshot.id, resolution: "relax_constraint", constraint_id: relaxConstraint })} className="rounded-lg border border-amber-300 bg-white px-3 py-2 text-xs font-medium disabled:opacity-40">
+              放宽{labelFor(relaxConstraint)}约束
+            </button>
+          ) : null}
+        </div>
+        {showExpand && expandConstraint ? (
+          <div className="mt-4 rounded-xl border border-amber-200 bg-white p-3">
+            <label className="text-xs font-medium" htmlFor="coverage-supplementary-query">补充检索词</label>
+            <input id="coverage-supplementary-query" value={supplementaryQuery} onChange={(event) => setSupplementaryQuery(event.target.value)} className="mt-2 w-full rounded-lg border border-amber-200 px-3 py-2 text-sm" />
+            <button type="button" disabled={busy || !supplementaryQuery.trim()} onClick={() => onResolve({ scope_contract_version: contract.version, coverage_snapshot_id: snapshot.id, resolution: "expand_required_constraint", constraint_id: expandConstraint, supplementary_queries: [supplementaryQuery.trim()] })} className="mt-3 rounded-lg bg-amber-900 px-3 py-2 text-xs font-medium text-white disabled:opacity-40">
+              提交补搜决定
+            </button>
+          </div>
+        ) : null}
+      </section>
+    </div>
+  );
+}
+
 interface ScopeDraftEdit {
   core_object: string;
   product_experience_aspect: string | null;
@@ -1077,7 +1159,8 @@ interface ScopeDraftSaveAuthority {
 function reportStateLabel(state: LitePublicationState) {
   if (state === "complete_verified_report") return "已完整核验";
   if (state === "partial_verified_report") return "部分内容已核验";
-  return "仅展示已验证证据";
+  if (state === "directional_report") return "方向性样本线索";
+  return "仅展示已保存依据";
 }
 
 function publicationReasonLabel(reason: string) {
@@ -1206,6 +1289,27 @@ function ContentResearchReportMessage({
     setSelectedCitation(null);
   }, [report.workflow_run_id, report.citations]);
 
+  const integrityFlagged = report.integrity_state === "integrity_flagged";
+  if (integrityFlagged) {
+    const replacementId = stringField(
+      report.integrity_recovery,
+      "superseded_by_publication_id",
+    );
+    return (
+      <section
+        role="alert"
+        aria-label="Content Research report integrity warning"
+        className="w-full max-w-[92%] rounded-2xl border border-red-200 bg-red-50 px-5 py-4 text-sm text-red-950 shadow-sm"
+      >
+        <h3 className="font-semibold">该历史报告未通过完整性校验，内容已隐藏</h3>
+        <p className="mt-2 text-xs">
+          请返回当前有效报告或重新运行调研；系统不会展示已失效执行产生的结论与引用。
+        </p>
+        {replacementId ? <p className="mt-2 text-xs">已有后继报告可供查看。</p> : null}
+      </section>
+    );
+  }
+
   if (!publicationState) {
     if (!publicationIsNone || !recovery) return null;
     const completedStages = arrayField(recovery, "completed_stages");
@@ -1226,6 +1330,7 @@ function ContentResearchReportMessage({
 
   const evidenceOnly = publicationState === "evidence_only_report";
   const partial = publicationState === "partial_verified_report";
+  const directionalReport = publicationState === "directional_report";
   const citations = recordList(report.citations);
   const marketingTracks = ([
     ["need", "场景与需求"],
@@ -1254,6 +1359,8 @@ function ContentResearchReportMessage({
   const citationsById = new Map(citations.map((citation) => [stringField(citation, "citation_group_id"), citation]));
   const statusText = evidenceOnly
     ? `${numberField(statusStrip, "saved_evidence_count")} 条已保存依据`
+    : directionalReport
+    ? `${numberField(statusStrip, "completed_direction_count")} 个方向已完成分析 · 当前仅形成方向性样本线索`
     : `${numberField(statusStrip, "completed_direction_count")} 个方向完成 · ${numberField(statusStrip, "admitted_finding_count")} 条已验证发现 · ${numberField(statusStrip, "observation_count")} 条样本观察 · ${numberField(statusStrip, "lead_count")} 条线索`;
   const auditDirection = stringField(recordList(report.run_direction_states)[0], "direction", "product_marketing");
   const auditDecisions = new Map<string, Record<string, unknown>>(
@@ -1408,7 +1515,7 @@ function ContentResearchReportMessage({
           <div className="mt-1 flex flex-wrap items-start justify-between gap-3">
             <div>
               <h3 className="text-lg font-semibold leading-7">
-                {report.subject || "本轮调研"} · {evidenceOnly ? "已保存依据" : "调研结果"}
+                {report.subject || "本轮调研"} · {evidenceOnly ? "已保存依据" : directionalReport ? "方向性样本" : "调研结果"}
               </h3>
               <p className="mt-1 text-xs text-quiet">{liteCollectedDate(report.collected_at)}</p>
             </div>
@@ -1421,7 +1528,7 @@ function ContentResearchReportMessage({
         <div className="space-y-5 px-5 py-5">
           <p className="rounded-xl bg-slate-50 px-3 py-2 text-xs text-quiet">{statusText}</p>
 
-          {(partial || evidenceOnly) && stringField(report.publication, "publication_reason") && (
+          {(partial || directionalReport || evidenceOnly) && stringField(report.publication, "publication_reason") && (
             <p className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900">
               {publicationReasonLabel(stringField(report.publication, "publication_reason"))}
             </p>
@@ -1654,24 +1761,70 @@ type TraceProviderOperation = ContentResearchTrace["provider_operations"][number
 
 interface ContentResearchRecoveryState {
   providerFailure: TraceProviderOperation | null;
-  childFailure: Record<string, unknown> | null;
   authRequired: boolean;
   recoverable: boolean;
 }
 
 function contentResearchTraceTimeline(trace: ContentResearchTrace | null): TraceTimelineStep[] {
-  const workflowEvents = recordList(trace?.workflow_events);
-  return recordList(trace?.runtime_steps).map((step, index) => {
-    const stepName = stringField(step, "step_name", "执行阶段");
-    const status = stringField(step, "status", "pending");
+  const transitions = recordList(trace?.state_transitions);
+  const stepByState: Record<string, string> = {
+    presearch_running: "presearch",
+    brief_confirmation_required: "brief_confirm",
+    scope_confirmation_required: "scope_confirm",
+    retrieval_queued: "formal_research",
+    retrieval_running: "formal_research",
+    coverage_evaluating: "coverage",
+    coverage_decision_required: "coverage",
+    report_composing: "report",
+    report_ready: "report",
+  };
+  const stateLabels: Record<string, string> = {
+    presearch_running: "正在识别调研主体",
+    brief_confirmation_required: "等待确认调研需求",
+    scope_confirmation_required: "等待确认检索范围",
+    retrieval_queued: "内容检索等待开始",
+    retrieval_running: "内容检索进行中",
+    coverage_evaluating: "正在评估证据覆盖",
+    coverage_decision_required: "等待覆盖范围决策",
+    report_composing: "正在生成调研报告",
+    report_ready: "调研报告已完成",
+    recovery_required: "本轮调研需要恢复",
+    cancelled_or_failed: "本轮调研已结束",
+  };
+  const eventLabels: Record<string, string> = {
+    start_presearch: "开始预检索",
+    confirm_subject: "已确认调研主体",
+    confirm_brief: "已确认调研需求",
+    confirm_scope: "已确认检索范围",
+    start_retrieval: "开始内容检索",
+    evaluate_coverage: "开始证据评估",
+    confirm_coverage: "已确认证据范围",
+    start_report: "开始生成报告",
+    publish_report: "已发布调研报告",
+    fail: "运行需要恢复",
+    cancel: "运行已结束",
+  };
+  return transitions.map((transition, index) => {
+    const state = stringField(transition, "to_state", "pending");
+    const stepName = stepByState[state] ?? "执行阶段";
+    const startedAt = Date.parse(stringField(transition, "created_at"));
+    const nextAt = Date.parse(stringField(transitions[index + 1], "created_at"));
+    const durationText = Number.isFinite(startedAt) && Number.isFinite(nextAt)
+      ? `${Math.max(0, (nextAt - startedAt) / 1000).toFixed(1)}s`
+      : index === transitions.length - 1
+        ? "当前阶段"
+        : "耗时未记录";
+    const status = index === transitions.length - 1
+      ? workflowStatusLabel(trace?.run_status ?? state)
+      : "已完成";
     return {
-      id: stringField(step, "step_id", `${stepName}-${index}`),
+      id: `${stringField(transition, "state_revision", String(index + 1))}-${stepName}`,
       number: index + 1,
       stage: traceStepGroup(stepName),
       title: traceStepTitle(stepName),
-      durationText: traceExecutionDurationText(step, workflowEvents),
-      status: workflowStatusLabel(status),
-      output: `状态：${workflowStatusLabel(status)}\n尝试：${numberField(step, "attempt_count")} / ${numberField(step, "max_attempts")}`,
+      durationText,
+      status,
+      output: `阶段状态：${stateLabels[state] ?? "状态已更新"}\n动作：${eventLabels[stringField(transition, "event")] ?? "状态已更新"}\n修订：${numberField(transition, "state_revision")}`,
     };
   });
 }
@@ -1686,30 +1839,22 @@ function contentResearchRecoveryState(run: ContentResearchRunState): ContentRese
       ? providerFailures[0] ?? null
       : null
   );
-  const childFailures = [...recordList(run.trace?.runtime_child_tasks)]
-    .reverse()
-    .filter((task) => stringField(task, "status") === "failed");
-  const childFailure = childFailures[0] ?? null;
   const reportRecoveryReason = run.report?.recovery_projection
     ? stringField(run.report.recovery_projection, "reason_code")
     : "";
   const authCodes = new Set(["auth_expired", "auth_required"]);
-  const childFailureCode = stringField(childFailure, "error_code");
-  const authChildFailure = childFailures.find((task) => authCodes.has(stringField(task, "error_code"))) ?? null;
   const authProviderFailure = providerFailures.find((operation) => authCodes.has(operation.failure_code ?? "")) ?? null;
   const authRequired = !published && Boolean(
-    authProviderFailure || authChildFailure || authCodes.has(reportRecoveryReason)
+    authProviderFailure || authCodes.has(reportRecoveryReason)
   );
   const selectedProviderFailure = authProviderFailure ?? providerFailure;
   const recoverableCodes = new Set(["auth_expired", "auth_required", "timeout", "transient_error", "rate_limited", "unavailable"]);
   const providerRecoverable = Boolean(selectedProviderFailure?.retryable && recoverableCodes.has(selectedProviderFailure.failure_code ?? ""));
-  const childRecoverable = childFailures.some((task) => recoverableCodes.has(stringField(task, "error_code")));
   const reportRecoverable = recoverableCodes.has(reportRecoveryReason);
   return {
     providerFailure: selectedProviderFailure,
-    childFailure,
     authRequired,
-    recoverable: !published && (providerRecoverable || childRecoverable || reportRecoverable),
+    recoverable: !published && (providerRecoverable || reportRecoverable),
   };
 }
 
@@ -1751,19 +1896,6 @@ function contentResearchContextStatus(run: ContentResearchRunState): string {
   return "等待启动";
 }
 
-function contentResearchChildTaskTitle(task: Record<string, unknown>) {
-  const taskType = stringField(task, "task_type", "专家任务");
-  if (taskType.includes("product_marketing")) return "产品营销专家";
-  if (taskType.includes("competitor_discovery")) return "竞品发现专家";
-  if (taskType.includes("content_performance")) return "内容表现专家";
-  return taskType.replaceAll("_", " ");
-}
-
-function contentResearchChildTaskStatus(task: Record<string, unknown>) {
-  if (["auth_expired", "auth_required"].includes(stringField(task, "error_code"))) return "需要登录";
-  return workflowStatusLabel(stringField(task, "status", "pending"));
-}
-
 function ContentResearchTraceInspector({
   run,
   expanded,
@@ -1779,7 +1911,6 @@ function ContentResearchTraceInspector({
   const timeline = contentResearchTraceTimeline(run.trace);
   const displayTimeline = [...timeline].reverse();
   const recovery = contentResearchRecoveryState(run);
-  const childTasks = recordList(run.trace?.runtime_child_tasks);
   const logicalCheckpoints = recordList(run.trace?.logical_checkpoints);
   const terminalPublished = run.report ? litePublicationState(run.report) !== null : false;
   const [expandedStepId, setExpandedStepId] = useState<string | null>(null);
@@ -1998,20 +2129,6 @@ function ContentResearchTraceInspector({
             )}
           </section>
 
-          {childTasks.length > 0 && (
-            <section className="mt-4" aria-label="内容调研子任务状态">
-              <p className="mb-2 text-xs font-semibold text-quiet">专家子任务</p>
-              <div className="space-y-2">
-                {childTasks.map((task, index) => (
-                  <article key={stringField(task, "child_task_id", String(index))} className="rounded-xl border border-line bg-white px-3 py-3 text-xs" aria-label="内容调研子任务">
-                    <div className="flex items-center justify-between gap-3"><p className="font-medium text-ink">{contentResearchChildTaskTitle(task)}</p><span className="text-quiet">{contentResearchChildTaskStatus(task)}</span></div>
-                    <p className="mt-1 text-quiet">尝试 {numberField(task, "attempt_count")} / {numberField(task, "max_attempts")}</p>
-                  </article>
-                ))}
-              </div>
-            </section>
-          )}
-
         </div>
       </div>
     </section>
@@ -2047,6 +2164,8 @@ function ContentResearchContextSidebar({
   run,
   onExpandedChange,
   onModifyDirections,
+  onEndResearch,
+  endResearchPending = false,
   recoveryPending = false,
   recoveryRequiredSince = null,
   onContinuePresearch = async () => {},
@@ -2060,6 +2179,8 @@ function ContentResearchContextSidebar({
   run: ContentResearchRunState;
   onExpandedChange: (expanded: boolean) => void;
   onModifyDirections: () => void;
+  onEndResearch: () => void;
+  endResearchPending?: boolean;
   recoveryPending?: boolean;
   recoveryRequiredSince?: string | null;
   onContinuePresearch?: () => void | Promise<void>;
@@ -2094,12 +2215,22 @@ function ContentResearchContextSidebar({
         {!published && <p className="mt-3 border-t border-line pt-3 text-xs leading-5 text-quiet">研究摘要将在正式报告发布后显示。</p>}
         {run.formalResearchStatus === "invalid" ? <p className="mt-3 text-xs leading-5 text-quiet">该历史任务不能继续。请新建或选择有效对话后重新发起调研。</p> : null}
         {run.formalResearchStatus === "failed" && <button type="button" onClick={onModifyDirections} className="mt-3 rounded-lg border border-line px-3 py-1.5 text-xs">返回 checklist</button>}
+        {run.summary.run.allowed_actions.includes("cancel") && (
+          <button
+            type="button"
+            onClick={onEndResearch}
+            disabled={endResearchPending}
+            className="mt-3 w-full rounded-lg border border-red-200 px-3 py-2 text-xs font-semibold text-red-700 disabled:opacity-50"
+          >
+            {endResearchPending ? "正在结束…" : "结束本次调研"}
+          </button>
+        )}
         {run.reportStatus === "failed" && run.reportError && (
           <p className="mt-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs leading-5 text-red-700">
             正式报告暂不可读取：{run.reportError}
           </p>
         )}
-        {run.summary.run.allowed_actions.includes("retry_analysis") && (
+        {run.summary.run.recovery_plan?.action === "retry_analysis" && (
           <button
             type="button"
             onClick={() => void onRetryAnalysis()}
@@ -2109,7 +2240,7 @@ function ContentResearchContextSidebar({
             {analysisRetryPending ? "正在恢复分析…" : "继续失败的分析"}
           </button>
         )}
-        {run.summary.run.allowed_actions.includes("retry_retrieval") && (
+        {run.summary.run.recovery_plan?.action === "retry_retrieval" && (
           <button
             type="button"
             onClick={() => void onRetryRetrieval()}
@@ -2119,7 +2250,7 @@ function ContentResearchContextSidebar({
             {retrievalRetryPending ? "正在恢复检索…" : "继续失败的检索"}
           </button>
         )}
-        {run.summary.run.allowed_actions.includes("retry_report") && (
+        {run.summary.run.recovery_plan?.action === "retry_report" && (
           <button
             type="button"
             onClick={() => void onRetryReport()}
@@ -2173,6 +2304,7 @@ function ContentResearchContextSidebar({
   const [retrievalRetryPending, setRetrievalRetryPending] = useState(false);
   const [analysisRetryPending, setAnalysisRetryPending] = useState(false);
   const [reportRetryPending, setReportRetryPending] = useState(false);
+  const [endResearchPending, setEndResearchPending] = useState(false);
   const [traceExpanded, setTraceExpanded] = useState(false);
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
   const [editingText, setEditingText] = useState("");
@@ -2451,16 +2583,28 @@ function ContentResearchContextSidebar({
     setIsAccepted(false);
   }
 
-  async function refreshContentResearchTrace(workflowRunId: string) {
+  function minimumTraceRevision(workflowRunId: string) {
     if (contentResearchTraceRevisionRunRef.current !== workflowRunId) {
       contentResearchTraceRevisionRunRef.current = workflowRunId;
       contentResearchTraceRevisionGuardRef.current.reset();
     }
+    return contentResearchTraceRevisionGuardRef.current.minimumRevision();
+  }
+
+  function acceptTraceRevision(workflowRunId: string, revision: number) {
+    minimumTraceRevision(workflowRunId);
+    return contentResearchTraceRevisionGuardRef.current.accept(revision);
+  }
+
+  async function refreshContentResearchTrace(workflowRunId: string) {
     const ticket = contentResearchRequestEpochRef.current.ticket(workflowRunId, "trace");
     try {
-      const trace = await getContentResearchTrace(workflowRunId);
+      const trace = await getContentResearchTrace(
+        workflowRunId,
+        minimumTraceRevision(workflowRunId),
+      );
       if (!contentResearchRequestEpochRef.current.accepts(ticket)) return null;
-      if (!contentResearchTraceRevisionGuardRef.current.accept(trace.trace_revision)) {
+      if (!acceptTraceRevision(workflowRunId, trace.trace_revision)) {
         return null;
       }
       setContentResearchRun((current) =>
@@ -2518,9 +2662,10 @@ function ContentResearchContextSidebar({
       }));
       const [workflowResponse, trace] = await Promise.all([
         getContentResearchWorkflow(runId),
-        getContentResearchTrace(runId),
+        getContentResearchTrace(runId, minimumTraceRevision(runId)),
       ]);
       if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
+      if (!acceptTraceRevision(runId, trace.trace_revision)) return;
       const workflow = requireMutableContentResearchWorkflow(workflowResponse);
       setContentResearchIntent(null);
       setContentResearchRun(contentResearchRunWithReport(runId, workflow, trace, null, null));
@@ -2645,15 +2790,25 @@ function ContentResearchContextSidebar({
       try {
         const [workflowResponse, trace] = await Promise.all([
           getContentResearchWorkflow(workflowRunId),
-          getContentResearchTrace(workflowRunId),
+          getContentResearchTrace(
+            workflowRunId,
+            minimumTraceRevision(workflowRunId),
+          ),
         ]);
         if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
         const workflow = requireMutableContentResearchWorkflow(workflowResponse);
+        if (!acceptTraceRevision(workflowRunId, trace.trace_revision)) {
+          continue;
+        }
         setContentResearchRun((current) => current && current.workflowRunId === workflowRunId
           ? { ...current, summary: workflow, trace }
           : current);
         if (workflow.run.state === "report_ready") {
           await refreshContentResearchReport(workflowRunId);
+          return;
+        }
+        if (workflow.run.state === "coverage_decision_required") {
+          await refreshContentResearchScope(workflowRunId);
           return;
         }
         if (["recovery_required", "cancelled_or_failed"].includes(workflow.run.state)) return;
@@ -2678,8 +2833,12 @@ function ContentResearchContextSidebar({
         return false;
       }
       const workflow = workflowResponse;
-      const trace = await getContentResearchTrace(workflowRunId);
+      const trace = await getContentResearchTrace(
+        workflowRunId,
+        minimumTraceRevision(workflowRunId),
+      );
       if (!contentResearchRequestEpochRef.current.accepts(ticket)) return false;
+      if (!acceptTraceRevision(workflowRunId, trace.trace_revision)) return false;
       if (
         ["brief_confirmation_required", "recovery_required"].includes(workflow.run.state)
         && workflow.brief
@@ -2796,18 +2955,20 @@ function ContentResearchContextSidebar({
   }
 
   async function endActiveContentResearch() {
-    const run = contentResearchRun;
-    if (!run) return;
+    const projection = contentResearchRun?.summary.run ?? contentResearchIntent?.presearch.run;
+    if (!projection) return;
+    if (!window.confirm("结束后将停止本次调研，已生成的历史记录仍会保留。确定继续吗？")) return;
+    setEndResearchPending(true);
     try {
-      await endContentResearchWorkflow(run.summary.run);
-      if (run.summary.brief) removeContentResearchRunForThread(run.summary.brief.thread_id);
+      await endContentResearchWorkflow(projection);
+      removeContentResearchRunForThread(projection.thread_id);
       setContentResearchRun(null);
       setContentResearchIntent(null);
       setPreparedScope(null);
       contentResearchRequestEpochRef.current.activate(null);
       setScopeProjectionsByRun((current) => {
         const next = { ...current };
-        delete next[run.workflowRunId];
+        delete next[projection.run_id];
         return next;
       });
       setTraceExpanded(false);
@@ -2817,6 +2978,8 @@ function ContentResearchContextSidebar({
         role: "system",
         text: `结束本次调研失败：${error instanceof Error ? error.message : "请稍后重试。"}`,
       });
+    } finally {
+      setEndResearchPending(false);
     }
   }
 
@@ -2844,7 +3007,7 @@ function ContentResearchContextSidebar({
 
   async function retryFailedMarketingAnalysis() {
     const run = contentResearchRun?.summary.run;
-    if (!run || !run.allowed_actions.includes("retry_analysis") || analysisRetryPending) {
+    if (!run || run.recovery_plan?.action !== "retry_analysis" || analysisRetryPending) {
       return;
     }
     const ticket = contentResearchRequestEpochRef.current.ticket(run.run_id, "retry-analysis");
@@ -2860,6 +3023,7 @@ function ContentResearchContextSidebar({
         : current);
       await refreshContentResearchTrace(run.run_id);
       appendMessage({ role: "assistant", text: "已继续失败的分析；已完成轨道会直接复用。" });
+      void pollContentResearchMainline(run.run_id);
     } catch (error) {
       if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
       appendMessage({
@@ -2873,9 +3037,39 @@ function ContentResearchContextSidebar({
     }
   }
 
+  async function resolvePendingContentResearchCoverage(
+    input: ContentResearchResolveCoverageRequest,
+  ) {
+    const run = contentResearchRun?.summary.run;
+    if (!run || run.state !== "coverage_decision_required" || scopeActionBusy) return;
+    const ticket = contentResearchRequestEpochRef.current.ticket(run.run_id, "coverage-decision");
+    setScopeActionBusy(true);
+    try {
+      const response = await resolveContentResearchCoverage(run, input);
+      if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
+      setContentResearchRun((current) => current?.workflowRunId === run.run_id
+        ? { ...current, summary: { ...current.summary, run: response.result.run } }
+        : current);
+      await refreshContentResearchScope(run.run_id);
+      await refreshContentResearchTrace(run.run_id);
+      appendMessage({ role: "assistant", text: "覆盖范围决策已保存，正在继续本轮调研。" });
+      void pollContentResearchMainline(run.run_id);
+    } catch (error) {
+      if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
+      appendMessage({
+        role: "system",
+        text: contentResearchErrorFeedback(error, "覆盖范围决策失败"),
+      });
+    } finally {
+      if (contentResearchRequestEpochRef.current.accepts(ticket)) {
+        setScopeActionBusy(false);
+      }
+    }
+  }
+
   async function retryFailedRetrieval() {
     const run = contentResearchRun?.summary.run;
-    if (!run || !run.allowed_actions.includes("retry_retrieval") || retrievalRetryPending) {
+    if (!run || run.recovery_plan?.action !== "retry_retrieval" || retrievalRetryPending) {
       return;
     }
     const ticket = contentResearchRequestEpochRef.current.ticket(run.run_id, "retry-retrieval");
@@ -2892,6 +3086,7 @@ function ContentResearchContextSidebar({
         : current);
       await refreshContentResearchTrace(run.run_id);
       appendMessage({ role: "assistant", text: "已继续失败的检索；已完成步骤会直接复用。" });
+      void pollContentResearchMainline(run.run_id);
     } catch (error) {
       if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
       appendMessage({
@@ -2907,7 +3102,7 @@ function ContentResearchContextSidebar({
 
   async function retryFailedReportFinalization() {
     const run = contentResearchRun?.summary.run;
-    if (!run || !run.allowed_actions.includes("retry_report") || reportRetryPending) {
+    if (!run || run.recovery_plan?.action !== "retry_report" || reportRetryPending) {
       return;
     }
     const ticket = contentResearchRequestEpochRef.current.ticket(run.run_id, "retry-report");
@@ -2923,6 +3118,7 @@ function ContentResearchContextSidebar({
         : current);
       await refreshContentResearchTrace(run.run_id);
       appendMessage({ role: "assistant", text: "已继续生成报告；已完成的检索和分析会直接复用。" });
+      void pollContentResearchMainline(run.run_id);
     } catch (error) {
       if (!contentResearchRequestEpochRef.current.accepts(ticket)) return;
       appendMessage({
@@ -3037,7 +3233,13 @@ function ContentResearchContextSidebar({
           setPreparedScope(null);
           let trace: ContentResearchTrace | null = null;
           try {
-            trace = await getContentResearchTrace(runIdForThread);
+            trace = await getContentResearchTrace(
+              runIdForThread,
+              minimumTraceRevision(runIdForThread),
+            );
+            if (!acceptTraceRevision(runIdForThread, trace.trace_revision)) {
+              trace = null;
+            }
           } catch {
             // Workflow/report restoration remains usable when Trace is temporarily unavailable.
           }
@@ -3574,6 +3776,8 @@ function ContentResearchContextSidebar({
                 intent={contentResearchIntent}
                 busy={scopeActionBusy}
                 onConfirm={(input) => void confirmCurrentContentResearchBrief(input)}
+                onCancel={() => void endActiveContentResearch()}
+                cancelPending={endResearchPending}
               />
             )}
 
@@ -3583,6 +3787,14 @@ function ContentResearchContextSidebar({
                 busy={scopeActionBusy || scopeDraftSaveBusy}
                 onReplace={(input) => void replaceCurrentScopeDraft(input)}
                 onConfirm={(input) => void confirmCurrentContentResearchScope(input)}
+              />
+            )}
+
+            {scopeProjection && contentResearchRun?.summary.run.state === "coverage_decision_required" && (
+              <ContentResearchCoverageDecisionCard
+                projection={scopeProjection}
+                busy={scopeActionBusy}
+                onResolve={(input) => void resolvePendingContentResearchCoverage(input)}
               />
             )}
 
@@ -3838,6 +4050,8 @@ function ContentResearchContextSidebar({
         run={contentResearchRun}
         onExpandedChange={setTraceExpanded}
         onModifyDirections={() => void modifyContentResearchDirections()}
+        onEndResearch={() => void endActiveContentResearch()}
+        endResearchPending={endResearchPending}
         recoveryPending={projectedModelRecoveryPending}
         recoveryRequiredSince={modelRecovery.requiredSince}
         onContinuePresearch={continueModelRecovery}

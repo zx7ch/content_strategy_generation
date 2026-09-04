@@ -1,18 +1,18 @@
 from __future__ import annotations
 
-from fastapi.testclient import TestClient
 import pytest
+from fastapi.testclient import TestClient
 
 from app.api.routes.router import app
 from app.v2.decision import DecisionService, InMemoryDecisionStore
 from app.v2.feedback import FeedbackService, InMemoryFeedbackStore
 from app.v2.foundation import InMemoryMasterDataStore, MasterDataService
-from app.v2.ingestion import InMemoryIngestionStore, IngestionService
+from app.v2.ingestion import IngestionService, InMemoryIngestionStore
 from app.v2.topic_pool import InMemoryTopicPoolStore, ScorerService, TopicPoolService
 
 
 @pytest.fixture(autouse=True)
-def reset_v2_feedback_app_state():
+def reset_v2_feedback_app_state(isolated_router_lifespan):
     master_store = InMemoryMasterDataStore()
     master_service = MasterDataService(master_store)
     ingestion_store = InMemoryIngestionStore()

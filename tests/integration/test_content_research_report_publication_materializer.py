@@ -1,4 +1,5 @@
 import asyncio
+import json
 import sqlite3
 from dataclasses import replace
 from pathlib import Path
@@ -11,7 +12,7 @@ from app.content_research.bootstrap import _bootstrap_legacy_content_research_sc
 from app.content_research.contracts import build_default_snapshot
 from app.content_research.evidence.models import EvidenceRecord
 from app.content_research.lifecycle.coordinator import ContentResearchPersistenceCoordinator
-from app.content_research.lifecycle.models import LifecycleCommand
+from app.content_research.lifecycle.models import ContentResearchState, LifecycleCommand
 from app.content_research.migrations import apply_content_research_migrations
 from app.content_research.models import TraceRecord, utcnow
 from app.content_research.persistence_models import (
@@ -34,6 +35,10 @@ from app.content_research.scope_contract import (
 )
 from app.content_research.service import ContentResearchService, WorkflowRunManagerRuntime
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
+from app.core.runtime_write_coordinator import (
+    PersistenceUnavailableError,
+    RuntimeWriteCoordinator,
+)
 from app.memory.thread_store import ThreadStore
 from app.memory.workflow_store import WorkflowStore
 from app.models.workflow import (
@@ -41,6 +46,7 @@ from app.models.workflow import (
     WorkflowArtifactPayloadMode,
     WorkflowArtifactType,
 )
+from app.runtime_write_handlers import production_runtime_write_handlers
 from app.services.workflow_run_manager import WorkflowRunManager
 from tests.content_research_test_constants import LEGACY_EVIDENCE_BUNDLE_FRAGMENT
 from tests.integration.test_content_research_report_store import (
@@ -419,6 +425,189 @@ async def test_materializes_published_report_as_one_creator_snapshot_and_timelin
         assert [item.artifact_id for item in artifacts].count(artifact.artifact_id) == 1
     finally:
         await thread_store.close()
+
+
+@pytest.mark.asyncio
+async def test_materializes_report_artifact_through_single_writer_typed_mutation(tmp_path):
+    database = tmp_path / "published-report-single-writer.db"
+    db_path = str(database)
+    bootstrap_store = SQLiteContentResearchStore(db_path)
+    async with ThreadStore(db_path) as threads:
+        thread = await threads.create_thread(title="single writer report")
+    async with WorkflowRunManager(db_path) as manager:
+        run = await manager.start_run(thread_id=thread["id"], user_id="user-1")
+    snapshot = replace(_snapshot(), workflow_run_id=run.run_id)
+    draft = replace(_draft(), workflow_run_id=run.run_id)
+    decision = replace(_decision(draft), workflow_run_id=run.run_id)
+    publication = replace(_publication(draft, decision), workflow_run_id=run.run_id)
+    bootstrap_store.save_result_snapshot(snapshot)
+    bootstrap_store.save_report_draft(draft.to_record())
+    bootstrap_store.save_report_faithfulness_decision(decision.to_record())
+    bootstrap_store.save_report_publication(publication.to_record())
+    async with WorkflowRunManager(db_path) as manager:
+        await manager.begin_report_finalization(run.run_id)
+
+    writer = RuntimeWriteCoordinator(
+        database,
+        handlers=production_runtime_write_handlers(),
+    )
+    await writer.start()
+    try:
+        store = SQLiteContentResearchStore(db_path, writer=writer)
+        materializer = ReportPublicationMaterializer(store, db_path)
+
+        artifact = await materializer.materialize(publication.id)
+        replay = await materializer.materialize(publication.id)
+
+        assert replay.artifact_id == artifact.artifact_id
+        assert artifact.payload_json["report_publication_id"] == publication.id
+        async with WorkflowStore(db_path) as workflow_store:
+            artifacts = await workflow_store.list_artifacts(run.run_id)
+        assert [item.artifact_id for item in artifacts] == [artifact.artifact_id]
+    finally:
+        await writer.close()
+
+
+async def _seed_atomic_publication_commit(db_path: str):
+    store = SQLiteContentResearchStore(db_path)
+    async with ThreadStore(db_path) as threads:
+        thread = await threads.create_thread(title="atomic report publication")
+    async with WorkflowRunManager(db_path) as manager:
+        run = await manager.start_run(thread_id=thread["id"], user_id="user-1")
+    snapshot = replace(_snapshot(), workflow_run_id=run.run_id)
+    draft = replace(_draft(), workflow_run_id=run.run_id)
+    decision = replace(_decision(draft), workflow_run_id=run.run_id)
+    publication = replace(_publication(draft, decision), workflow_run_id=run.run_id)
+    store.save_result_snapshot(snapshot)
+    store.save_report_draft(draft.to_record())
+    store.save_report_faithfulness_decision(decision.to_record())
+    store.save_report_publication(publication.to_record())
+    async with WorkflowRunManager(db_path) as manager:
+        await manager.begin_report_finalization(run.run_id)
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """INSERT INTO content_research_evidence_snapshots
+               (id, schema_version, workflow_run_id, scope_contract_id,
+                retrieval_execution_unit_id, retrieval_attempt_no,
+                snapshot_fingerprint, query_groups_json, created_at)
+               VALUES ('snapshot-atomic', 'evidence-snapshot', ?, 'scope-atomic',
+                       'retrieval-atomic', 1, 'snapshot-fingerprint', '[]',
+                       '2040-01-01T00:00:00+00:00')""",
+            (run.run_id,),
+        )
+        connection.execute(
+            """INSERT INTO content_research_analysis_units
+               (id, schema_version, workflow_run_id, evidence_snapshot_id,
+                contract_fingerprint, policy_version, prompt_hash,
+                response_schema_hash, embedding_fingerprint_json,
+                algorithm_version, verifier_version, created_at)
+               VALUES ('analysis-unit-atomic', 'analysis-unit', ?,
+                       'snapshot-atomic', 'contract-fingerprint', 'policy',
+                       'prompt', 'response', '{}', 'algorithm', 'verifier',
+                       '2040-01-01T00:00:00+00:00')""",
+            (run.run_id,),
+        )
+        connection.execute(
+            """INSERT INTO content_research_analysis_attempts
+               (id, analysis_unit_id, attempt_no, state, created_at, terminal_at)
+               VALUES ('analysis-attempt-atomic', 'analysis-unit-atomic', 1,
+                       'succeeded', '2040-01-01T00:00:00+00:00',
+                       '2040-01-01T00:00:01+00:00')"""
+        )
+        connection.execute(
+            """UPDATE workflow_runs
+               SET effective_analysis_attempt_id='analysis-attempt-atomic',
+                   content_research_state='report_composing', state_revision=7,
+                   state_entered_at='2040-01-01T00:00:00+00:00'
+               WHERE run_id=?""",
+            (run.run_id,),
+        )
+    return store, thread, run, publication
+
+
+@pytest.mark.asyncio
+async def test_commits_effective_publication_artifact_state_and_timeline_atomically(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "atomic-report-publication.db"
+    db_path = str(database)
+    _store, thread, run, publication = await _seed_atomic_publication_commit(db_path)
+    writer = RuntimeWriteCoordinator(database, handlers=production_runtime_write_handlers())
+    await writer.start()
+    try:
+        store = SQLiteContentResearchStore(db_path, writer=writer)
+        artifact = await ReportPublicationMaterializer(
+            store, db_path
+        ).commit_publication(publication.id)
+    finally:
+        await writer.close()
+
+    assert artifact.payload_json["report_publication_id"] == publication.id
+    with sqlite3.connect(db_path) as connection:
+        status, state, revision, effective_attempt = connection.execute(
+            """SELECT status, content_research_state, state_revision,
+                      effective_analysis_attempt_id
+               FROM workflow_runs WHERE run_id=?""",
+            (run.run_id,),
+        ).fetchone()
+        messages = connection.execute(
+            """SELECT run_id, artifact_refs_json FROM creator_messages
+               WHERE thread_id=? AND message_type='artifact_result'""",
+            (thread["id"],),
+        ).fetchall()
+    assert (status, state, revision, effective_attempt) == (
+        "succeeded",
+        ContentResearchState.REPORT_READY.value,
+        8,
+        "analysis-attempt-atomic",
+    )
+    assert len(messages) == 1
+    assert messages[0][0] == run.run_id
+    assert json.loads(messages[0][1])[0]["artifact_id"] == artifact.artifact_id
+
+
+@pytest.mark.asyncio
+async def test_publication_commit_rolls_back_every_projection_when_timeline_write_fails(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "atomic-report-publication-rollback.db"
+    db_path = str(database)
+    _store, thread, run, publication = await _seed_atomic_publication_commit(db_path)
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """CREATE TRIGGER reject_atomic_publication_timeline
+               BEFORE INSERT ON creator_messages
+               WHEN NEW.run_id IS NOT NULL
+               BEGIN
+                   SELECT RAISE(ABORT, 'timeline write rejected');
+               END"""
+        )
+    writer = RuntimeWriteCoordinator(database, handlers=production_runtime_write_handlers())
+    await writer.start()
+    try:
+        store = SQLiteContentResearchStore(db_path, writer=writer)
+        with pytest.raises(PersistenceUnavailableError, match="PERSISTENCE_UNAVAILABLE"):
+            await ReportPublicationMaterializer(
+                store, db_path
+            ).commit_publication(publication.id)
+    finally:
+        await writer.close()
+
+    with sqlite3.connect(db_path) as connection:
+        status, state, revision = connection.execute(
+            "SELECT status, content_research_state, state_revision "
+            "FROM workflow_runs WHERE run_id=?",
+            (run.run_id,),
+        ).fetchone()
+        assert connection.execute(
+            "SELECT COUNT(*) FROM workflow_artifacts WHERE run_id=?",
+            (run.run_id,),
+        ).fetchone() == (0,)
+        assert connection.execute(
+            "SELECT COUNT(*) FROM creator_messages WHERE thread_id=? AND run_id=?",
+            (thread["id"], run.run_id),
+        ).fetchone() == (0,)
+    assert (status, state, revision) == ("finalizing_report", "report_composing", 7)
 
 
 @pytest.mark.asyncio

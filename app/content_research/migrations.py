@@ -12,6 +12,7 @@ import hashlib
 import json
 import sqlite3
 from collections.abc import Callable
+from contextlib import closing
 from datetime import datetime, timezone
 
 from app.content_research.execution_decision_identity import (
@@ -19,6 +20,7 @@ from app.content_research.execution_decision_identity import (
     build_execution_decision_identity,
     build_legacy_execution_decision_identity,
 )
+from app.core.sqlite_connection_roles import open_migration_database
 
 _TYPED_TABLES = (
     "content_research_canonical_sources",
@@ -1824,6 +1826,56 @@ def _apply_0038(conn: sqlite3.Connection) -> None:
     conn.executescript(_V38_ATTEMPT_SCOPED_ANALYSIS_FAILURES_SQL)
 
 
+_V39_SOURCE_OBSERVATIONS_SQL = """
+CREATE TABLE content_research_source_observations (
+    id TEXT PRIMARY KEY,
+    schema_version TEXT NOT NULL,
+    canonical_source_id TEXT NOT NULL,
+    workflow_run_id TEXT NOT NULL,
+    observation_fingerprint TEXT NOT NULL,
+    captured_at TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    UNIQUE(canonical_source_id, workflow_run_id, observation_fingerprint)
+);
+CREATE INDEX idx_cr_source_observation_source_captured
+    ON content_research_source_observations(canonical_source_id, captured_at, id);
+ALTER TABLE content_research_directional_evidence_packets
+    ADD COLUMN source_observation_id TEXT;
+"""
+
+
+def _apply_0039(conn: sqlite3.Connection) -> None:
+    conn.executescript(_V39_SOURCE_OBSERVATIONS_SQL)
+
+
+_TRACE_REVISION_WRITER_AUTHORITY_SQL = """
+DROP TRIGGER IF EXISTS cr_trace_revision_transition_insert;
+DROP TRIGGER IF EXISTS cr_trace_revision_trace_insert;
+DROP TRIGGER IF EXISTS cr_trace_revision_observation_insert;
+DROP TRIGGER IF EXISTS cr_trace_revision_execution_unit_insert;
+DROP TRIGGER IF EXISTS cr_trace_revision_execution_unit_update;
+DROP TRIGGER IF EXISTS cr_trace_revision_execution_fact_insert;
+DROP TRIGGER IF EXISTS cr_trace_revision_stage_checkpoint_insert;
+DROP TRIGGER IF EXISTS cr_trace_revision_stage_checkpoint_update;
+DROP TRIGGER IF EXISTS cr_trace_revision_analysis_attempt_insert;
+DROP TRIGGER IF EXISTS cr_trace_revision_analysis_attempt_update;
+DROP TRIGGER IF EXISTS cr_trace_revision_analysis_checkpoint_insert;
+DROP TRIGGER IF EXISTS cr_trace_revision_publication_insert;
+DROP TRIGGER IF EXISTS cr_trace_revision_integrity_event_insert;
+"""
+
+
+def _activate_writer_owned_trace_revision(conn: sqlite3.Connection) -> None:
+    for statement in (
+        item.strip()
+        for item in _TRACE_REVISION_WRITER_AUTHORITY_SQL.split(";")
+        if item.strip()
+    ):
+        conn.execute(statement)
+
+
 def _apply_0015(conn: sqlite3.Connection) -> None:
     conn.execute(_V15_LLM_CONFIGURATION_SQL)
 
@@ -1899,6 +1951,10 @@ def _expected_checksums(migration_0002_sql: str, legacy_checksum: str) -> dict[s
         "0038": hashlib.sha256(
             _V38_ATTEMPT_SCOPED_ANALYSIS_FAILURES_SQL.encode("utf-8")
         ).hexdigest(),
+        "0039": hashlib.sha256(_V39_SOURCE_OBSERVATIONS_SQL.encode("utf-8")).hexdigest(),
+        "0040": hashlib.sha256(
+            _TRACE_REVISION_WRITER_AUTHORITY_SQL.encode("utf-8")
+        ).hexdigest(),
     }
 
 
@@ -1936,7 +1992,7 @@ def apply_content_research_migrations(
     # Store construction occurs on normal read paths too.  A concurrent formal
     # collection may briefly own the writer lock.  A current schema must only
     # read its migration ledger, never contend for that writer lock.
-    with sqlite3.connect(db_path, timeout=30) as conn:
+    with closing(open_migration_database(db_path, timeout=30)) as conn:
         conn.execute("PRAGMA busy_timeout=30000")
         conn.execute("PRAGMA foreign_keys=ON")
         migration_table = conn.execute(
@@ -2244,6 +2300,20 @@ def apply_content_research_migrations(
                 name="attempt_scoped_analysis_failures",
                 checksum=expected_checksums["0038"],
                 apply=lambda: _apply_0038(conn),
+            )
+            _apply_migration(
+                conn,
+                version="0039",
+                name="versioned_source_observations",
+                checksum=expected_checksums["0039"],
+                apply=lambda: _apply_0039(conn),
+            )
+            _apply_migration(
+                conn,
+                version="0040",
+                name="writer_owned_trace_revision",
+                checksum=expected_checksums["0040"],
+                apply=lambda: _activate_writer_owned_trace_revision(conn),
             )
         except Exception:
             conn.rollback()

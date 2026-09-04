@@ -10,6 +10,12 @@ from typing import Optional
 import aiosqlite
 
 from app.config import settings
+from app.core.runtime_write_coordinator import RuntimeWriteCoordinator, TypedMutation
+from app.core.runtime_write_registry import get_runtime_writer
+from app.core.sqlite_connection_roles import (
+    open_bootstrap_async_database,
+    open_readonly_async_database,
+)
 from app.services.llm.pricing import UsageCost
 from app.services.llm.types import LLMCallContext, TokenUsage
 
@@ -76,9 +82,16 @@ class LLMUsageEvent:
 
 
 class LLMUsageTracker:
-    def __init__(self, db_path: Optional[str] = None, *, read_only: bool = False) -> None:
+    def __init__(
+        self,
+        db_path: Optional[str] = None,
+        *,
+        read_only: bool = False,
+        writer: RuntimeWriteCoordinator | None = None,
+    ) -> None:
         self.db_path = db_path or settings.SQLITE_DB_PATH
         self.read_only = read_only
+        self._writer = writer or get_runtime_writer(self.db_path)
         self._conn: aiosqlite.Connection | None = None
         self._table_available = True
 
@@ -92,14 +105,14 @@ class LLMUsageTracker:
     async def connect(self) -> None:
         if self._conn is not None:
             return
-        if self.read_only:
-            self._conn = await aiosqlite.connect(f"file:{self.db_path}?mode=ro", uri=True)
+        if self.read_only or self._writer is not None:
+            self._conn = await open_readonly_async_database(self.db_path)
         else:
-            self._conn = await aiosqlite.connect(self.db_path)
+            self._conn = await open_bootstrap_async_database(self.db_path)
         self._conn.row_factory = aiosqlite.Row
         await self._conn.execute("PRAGMA synchronous=NORMAL")
         await self._conn.execute("PRAGMA busy_timeout=5000")
-        if self.read_only:
+        if self.read_only or self._writer is not None:
             await self._conn.execute("PRAGMA query_only=ON")
             async with self._conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='llm_usage_events'"
@@ -160,6 +173,40 @@ class LLMUsageTracker:
         event_id = str(uuid.uuid4())
         created_at = datetime.now(timezone.utc).isoformat()
         context = event.context
+        fields = [
+            event_id,
+            context.session_id if context else None,
+            context.job_id if context else None,
+            context.step_id if context else None,
+            context.step_name if context else None,
+            context.agent_name if context else None,
+            context.tenant_id if context else None,
+            context.user_id if context else None,
+            event.provider,
+            event.model,
+            event.model_policy,
+            event.usage.prompt_tokens,
+            event.usage.completion_tokens,
+            event.usage.total_tokens,
+            event.cost.input_cost,
+            event.cost.output_cost,
+            event.cost.total_cost,
+            event.cost.currency,
+            event.latency_ms,
+            event.status,
+            event.error_message,
+            created_at,
+        ]
+        if self._writer is not None:
+            await self._writer.submit(
+                TypedMutation.create(
+                    mutation_id=event_id,
+                    mutation_kind="mutate_runtime_accounting",
+                    domain_payload={"action": "record_llm_usage", "fields": fields},
+                    run_id=context.job_id if context else None,
+                )
+            )
+            return event_id
         await self._conn.execute(
             """
             INSERT INTO llm_usage_events (
@@ -171,30 +218,7 @@ class LLMUsageTracker:
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (
-                event_id,
-                context.session_id if context else None,
-                context.job_id if context else None,
-                context.step_id if context else None,
-                context.step_name if context else None,
-                context.agent_name if context else None,
-                context.tenant_id if context else None,
-                context.user_id if context else None,
-                event.provider,
-                event.model,
-                event.model_policy,
-                event.usage.prompt_tokens,
-                event.usage.completion_tokens,
-                event.usage.total_tokens,
-                event.cost.input_cost,
-                event.cost.output_cost,
-                event.cost.total_cost,
-                event.cost.currency,
-                event.latency_ms,
-                event.status,
-                event.error_message,
-                created_at,
-            ),
+            fields,
         )
         await self._conn.commit()
         return event_id

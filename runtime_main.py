@@ -218,9 +218,16 @@ if getattr(sys, "frozen", False):
 
 import uvicorn
 
-if __name__ == "__main__":
+
+def _run_runtime() -> int:
+    runtime_process_lock = None
     if getattr(sys, "frozen", False):
         from app.core.logging import configure_logging
+        from app.core.sqlite_runtime_lock import (
+            RuntimeDatabaseLockedError,
+            release_reserved_runtime_process_lock,
+            reserve_runtime_process_lock,
+        )
 
         _runtime_log = os.path.join(_data_home, "runtime.log")
         configure_logging(log_file=_runtime_log, force=True)
@@ -239,14 +246,36 @@ if __name__ == "__main__":
             )
 
         sys.excepthook = _log_unhandled_exception
+        try:
+            runtime_process_lock = reserve_runtime_process_lock(_sqlite_db_path)
+        except RuntimeDatabaseLockedError:
+            print(
+                "❌ 已有 XHS Growth Agent Runtime 正在运行。\n"
+                "   请保留现有 Runtime 窗口，无需重复启动。\n"
+                "   错误代码：LOCAL_RUNTIME_DATABASE_LOCKED",
+                file=sys.stderr,
+            )
+            return 2
     try:
         _runtime_port = int(os.environ.get("RUNTIME_PORT", "8000"))
     except ValueError:
         _runtime_port = 8000
-    uvicorn.run(
-        "app.main:create_app",
-        factory=True,
-        host="127.0.0.1",
-        port=_runtime_port,
-        log_level="info",
-    )
+    try:
+        uvicorn.run(
+            "app.main:create_app",
+            factory=True,
+            host="127.0.0.1",
+            port=_runtime_port,
+            log_level="info",
+        )
+    finally:
+        if runtime_process_lock is not None:
+            release_reserved_runtime_process_lock(
+                _sqlite_db_path,
+                runtime_process_lock,
+            )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_run_runtime())

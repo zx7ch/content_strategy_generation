@@ -49,6 +49,19 @@ export interface ContentResearchRunProjection {
   state_revision: number;
   entered_at: string;
   allowed_actions: string[];
+  recovery_plan?: {
+    recoverable: true;
+    action: "retry_presearch" | "retry_retrieval" | "retry_analysis" | "retry_report";
+    reason_code: string;
+    recovery_plan_id: string;
+    plan_fingerprint: string;
+    failed_stage: string;
+    failure_class: string;
+    expected_attempt_id: string;
+    attempt_no?: number;
+    expected_state_revision: number;
+    checkpoint_references: string[];
+  } | null;
   reason_code?: string | null;
   error?: JsonObject | null;
   brief_id?: string | null;
@@ -123,9 +136,6 @@ export interface ContentResearchWorkflowSummary {
     status: string;
     payload: JsonObject;
   }>;
-  runtime_run?: JsonObject | null;
-  runtime_steps: JsonObject[];
-  runtime_child_tasks: JsonObject[];
 }
 
 export interface ContentResearchHistoricalWorkflowSummary {
@@ -144,9 +154,6 @@ export interface ContentResearchHistoricalWorkflowSummary {
   plan?: ContentResearchWorkflowSummary["plan"];
   directions: ContentResearchWorkflowSummary["directions"];
   subagent_tasks: ContentResearchWorkflowSummary["subagent_tasks"];
-  runtime_run?: JsonObject | null;
-  runtime_steps: JsonObject[];
-  runtime_child_tasks: JsonObject[];
 }
 
 export type ContentResearchWorkflowReadResponse =
@@ -198,8 +205,6 @@ export interface ContentResearchTrace {
   traces: JsonObject[];
   observation_events: JsonObject[];
   workflow_events: JsonObject[];
-  runtime_steps: JsonObject[];
-  runtime_child_tasks: JsonObject[];
   execution_units: Array<{
     id: string;
     state: string;
@@ -291,7 +296,10 @@ export interface ContentResearchWorkflowActionRequest {
     | "revise_subject"
     | "confirm_brief"
     | "replace_scope_draft"
-    | "confirm_scope";
+    | "confirm_scope"
+    | "expand_coverage"
+    | "relax_coverage"
+    | "generate_limited_report";
   payload?: JsonObject;
 }
 
@@ -327,6 +335,25 @@ export function contentResearchCommand(
     action,
     payload,
   };
+}
+
+function contentResearchRecoveryCommand(
+  run: ContentResearchRunProjection,
+  action: NonNullable<ContentResearchRunProjection["recovery_plan"]>["action"],
+): ContentResearchWorkflowActionRequest {
+  const plan = run.recovery_plan;
+  if (
+    !plan
+    || !plan.recoverable
+    || plan.action !== action
+    || plan.expected_state_revision !== run.state_revision
+  ) {
+    throw new Error("当前 Run 没有可执行的恢复计划，请刷新后重试。");
+  }
+  return contentResearchCommand(run, action, {
+    recovery_plan_id: plan.recovery_plan_id,
+    plan_fingerprint: plan.plan_fingerprint,
+  });
 }
 
 export interface ContentResearchWorkflowActionResponse<T = JsonObject> {
@@ -510,11 +537,14 @@ export interface ContentResearchConfirmScopeResult {
 }
 
 export interface ContentResearchResolveCoverageResult {
-  report_mode: string;
-  scope_contract: ContentResearchScopeContract;
-  unmet_constraint_ids: string[];
-  audit_event: ContentResearchScopeAuditEvent;
-  execution_unit: ContentResearchExecutionUnitProjection;
+  run: ContentResearchRunProjection;
+  coverage: {
+    report_mode: string;
+    scope_contract: ContentResearchScopeContract;
+    unmet_constraint_ids: string[];
+    audit_event: ContentResearchScopeAuditEvent;
+    execution_unit: ContentResearchExecutionUnitProjection;
+  };
 }
 
 export interface XHSQRLoginResponse {
@@ -619,6 +649,9 @@ export interface ContentResearchLiteReportResponse {
   frozen_scope: JsonObject;
   collected_at?: string | null;
   publication: JsonObject & { state?: string | null };
+  integrity_state?: string | null;
+  integrity_reason?: string | null;
+  integrity_recovery?: JsonObject | null;
   sections: {
     main_findings: JsonObject[];
     weak_signals: JsonObject[];
@@ -710,7 +743,7 @@ export async function deleteLLMConfiguration(): Promise<LLMConfiguration> {
 }
 
 export async function retryContentResearchPresearch(run: ContentResearchRunProjection): Promise<ContentResearchPresearchResponse> {
-  const response = await runContentResearchWorkflowAction<ContentResearchPresearchResponse>(run.run_id, contentResearchCommand(run, "retry_presearch"));
+  const response = await runContentResearchWorkflowAction<ContentResearchPresearchResponse>(run.run_id, contentResearchRecoveryCommand(run, "retry_presearch"));
   return response.result;
 }
 
@@ -719,7 +752,7 @@ export async function retryContentResearchRetrieval(
 ): Promise<ContentResearchWorkflowActionResponse<JsonObject>> {
   return runContentResearchWorkflowAction<JsonObject>(
     run.run_id,
-    contentResearchCommand(run, "retry_retrieval")
+    contentResearchRecoveryCommand(run, "retry_retrieval")
   );
 }
 
@@ -728,7 +761,7 @@ export async function retryContentResearchAnalysis(
 ): Promise<ContentResearchWorkflowActionResponse<JsonObject>> {
   return runContentResearchWorkflowAction<JsonObject>(
     run.run_id,
-    contentResearchCommand(run, "retry_analysis")
+    contentResearchRecoveryCommand(run, "retry_analysis")
   );
 }
 
@@ -737,7 +770,7 @@ export async function retryContentResearchReport(
 ): Promise<ContentResearchWorkflowActionResponse<JsonObject>> {
   return runContentResearchWorkflowAction<JsonObject>(
     run.run_id,
-    contentResearchCommand(run, "retry_report")
+    contentResearchRecoveryCommand(run, "retry_report")
   );
 }
 
@@ -768,8 +801,16 @@ export async function getContentResearchScope(
   };
 }
 
-export async function getContentResearchTrace(workflowRunId: string): Promise<ContentResearchTrace> {
-  return contentResearchFetch(`/content-research/workflows/${encodeURIComponent(workflowRunId)}/trace`);
+export async function getContentResearchTrace(
+  workflowRunId: string,
+  minimumRevision?: number,
+): Promise<ContentResearchTrace> {
+  const suffix = minimumRevision === undefined
+    ? ""
+    : `?minimum_revision=${encodeURIComponent(String(minimumRevision))}`;
+  return contentResearchFetch(
+    `/content-research/workflows/${encodeURIComponent(workflowRunId)}/trace${suffix}`,
+  );
 }
 
 export async function getContentResearchLiteReport(
@@ -873,6 +914,21 @@ export async function confirmContentResearchScope(
   return runContentResearchWorkflowAction(
     run.run_id,
     contentResearchCommand(run, "confirm_scope", { scope_draft_id: scopeDraftId }),
+  );
+}
+
+export async function resolveContentResearchCoverage(
+  run: ContentResearchRunProjection,
+  input: ContentResearchResolveCoverageRequest,
+): Promise<ContentResearchWorkflowActionResponse<ContentResearchResolveCoverageResult>> {
+  const action = input.resolution === "expand_required_constraint"
+    ? "expand_coverage"
+    : input.resolution === "relax_constraint"
+      ? "relax_coverage"
+      : "generate_limited_report";
+  return runContentResearchWorkflowAction(
+    run.run_id,
+    contentResearchCommand(run, action, { ...input }),
   );
 }
 

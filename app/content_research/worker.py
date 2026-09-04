@@ -18,12 +18,10 @@ from app.content_research.async_dispatch import (
     AsyncScopeExecutionContinuationRepository,
     AsyncScopeExecutionUnitRepository,
 )
+from app.content_research.errors import ReportPublicationMaterializationError
+from app.content_research.execution import ContentResearchExecution
 from app.content_research.models import utcnow
 from app.content_research.scope_contract import DispatchLeaseContext
-from app.content_research.service import (
-    ContentResearchService,
-    ReportPublicationMaterializationError,
-)
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
 
 logger = logging.getLogger(__name__)
@@ -36,21 +34,31 @@ class ContentResearchDispatchWorker:
         self,
         *,
         store: SQLiteContentResearchStore,
-        service_factory: Callable[[], ContentResearchService],
+        execution_factory: Callable[[], ContentResearchExecution],
         wake_event: asyncio.Event | None = None,
         recovery_scan_seconds: float = 5.0,
         lease_seconds: int = 120,
         clock: Callable[[], datetime] = utcnow,
+        max_concurrent_runs: int = 1,
     ) -> None:
+        if max_concurrent_runs < 1:
+            raise ValueError("max_concurrent_runs must be positive")
         self._store = store
-        self._dispatch = AsyncFormalResearchDispatchRepository(store._db_path)
-        self._continuations = AsyncScopeExecutionContinuationRepository(store._db_path)
-        self._execution_units = AsyncScopeExecutionUnitRepository(store._db_path)
-        self._service_factory = service_factory
+        self._dispatch = AsyncFormalResearchDispatchRepository(
+            store._db_path, writer=store._writer
+        )
+        self._continuations = AsyncScopeExecutionContinuationRepository(
+            store._db_path, writer=store._writer
+        )
+        self._execution_units = AsyncScopeExecutionUnitRepository(
+            store._db_path, writer=store._writer
+        )
+        self._execution_factory = execution_factory
         self._wake_event = wake_event or asyncio.Event()
         self._recovery_scan_seconds = recovery_scan_seconds
         self._lease_seconds = lease_seconds
         self._clock = clock
+        self._max_concurrent_runs = max_concurrent_runs
         self._owner = f"content-research-worker:{uuid.uuid4().hex}"
 
     async def run_once(self) -> bool:
@@ -88,7 +96,7 @@ class ContentResearchDispatchWorker:
             )
         )
         result = None
-        service = None
+        execution = None
         execution_error: Exception | None = None
         try:
             dispatch_context = DispatchLeaseContext(
@@ -106,23 +114,16 @@ class ContentResearchDispatchWorker:
             if not recovered:
                 lease_lost.set()
                 return True
-            service = self._service_factory()
-            execute_claimed = getattr(service, "execute_claimed_dispatch", None)
+            execution = self._execution_factory()
             request = ContentResearchSourceCollectionRequest(
                 provider=str(job["provider"]),
                 source_kind=str(job["source_kind"]),
                 limit=int(job["limit_per_specialist"]),
             )
-            if callable(execute_claimed):
-                result = await execute_claimed(
-                    context=dispatch_context,
-                    request=request,
-                )
-            else:
-                result = await service.start_formal_research(
-                    workflow_run_id=dispatch_context.workflow_run_id,
-                    request=request,
-                )
+            result = await execution.execute_claimed_dispatch(
+                context=dispatch_context,
+                request=request,
+            )
         except Exception as exc:  # preserve a durable diagnostic for retry/recovery
             execution_error = exc
             logger.exception(
@@ -140,8 +141,8 @@ class ContentResearchDispatchWorker:
             return True
         if execution_error is not None:
             try:
-                if service is not None:
-                    await service.record_dispatch_failure(
+                if execution is not None:
+                    await execution.record_dispatch_failure(
                         str(job["workflow_run_id"]), execution_error
                     )
             except Exception:
@@ -166,7 +167,7 @@ class ContentResearchDispatchWorker:
                 else None
             )
             if error:
-                await service.record_dispatch_failure(
+                await execution.record_dispatch_failure(
                     str(job["workflow_run_id"]), error
                 )
         finally:
@@ -208,11 +209,13 @@ class ContentResearchDispatchWorker:
         error: Exception | None = None
         terminal_state = "completed"
         try:
-            service = self._service_factory()
+            execution = self._execution_factory()
             if unit_claim is not None:
-                terminal_state = await service.execute_execution_unit(unit_claim, continuation)
+                terminal_state = await execution.execute_execution_unit(
+                    unit_claim, continuation
+                )
             else:
-                await service.execute_scope_continuation(continuation)
+                await execution.execute_scope_continuation(continuation)
         except Exception as exc:
             error = exc
             terminal_state = (
@@ -352,6 +355,22 @@ class ContentResearchDispatchWorker:
         )
 
     async def run_loop(self, *, stop_event: asyncio.Event) -> None:
+        lanes = [
+            asyncio.create_task(
+                self._run_lane(stop_event=stop_event),
+                name=f"content-research-dispatch-lane-{lane_no + 1}",
+            )
+            for lane_no in range(self._max_concurrent_runs)
+        ]
+        try:
+            await asyncio.gather(*lanes)
+        finally:
+            for lane in lanes:
+                if not lane.done():
+                    lane.cancel()
+            await asyncio.gather(*lanes, return_exceptions=True)
+
+    async def _run_lane(self, *, stop_event: asyncio.Event) -> None:
         while not stop_event.is_set():
             try:
                 processed = await self.run_once()
@@ -362,10 +381,14 @@ class ContentResearchDispatchWorker:
                 processed = False
             if not processed:
                 self._wake_event.clear()
+                if stop_event.is_set():
+                    return
                 # Closing the clear/wait race matters: a confirmed job may be
                 # committed between the empty claim and `clear()`.
                 if await self.run_once():
                     continue
+                if stop_event.is_set():
+                    return
                 try:
                     await asyncio.wait_for(
                         self._wake_event.wait(), timeout=self._recovery_scan_seconds
@@ -381,16 +404,18 @@ class ContentResearchAnalysisWorker:
         self,
         *,
         store: SQLiteContentResearchStore,
-        service_factory: Callable[[], ContentResearchService],
+        execution_factory: Callable[[], ContentResearchExecution],
         wake_event: asyncio.Event | None = None,
         recovery_scan_seconds: float = 5.0,
         lease_seconds: int = 120,
         clock: Callable[[], datetime] = utcnow,
     ) -> None:
         self._repository = SQLiteMarketingAnalysisRepository(
-            store._db_path, bootstrap_schema=False
+            store._db_path,
+            bootstrap_schema=False,
+            writer=store._writer,
         )
-        self._service_factory = service_factory
+        self._execution_factory = execution_factory
         self._wake_event = wake_event or asyncio.Event()
         self._recovery_scan_seconds = recovery_scan_seconds
         self._lease_seconds = lease_seconds
@@ -403,14 +428,14 @@ class ContentResearchAnalysisWorker:
             now=self._clock(),
         )
         if expired:
-            service = self._service_factory()
+            execution = self._execution_factory()
             for attempt in expired:
                 context = await asyncio.to_thread(
                     self._repository.get_analysis_job_context,
                     attempt.analysis_unit_id,
                 )
                 if context is not None:
-                    await service.record_analysis_failure(
+                    await execution.record_analysis_failure(
                         context.workflow_run_id,
                         "analysis_lease_expired",
                         attempt_id=attempt.id,
@@ -440,9 +465,9 @@ class ContentResearchAnalysisWorker:
             )
         )
         error: Exception | None = None
-        service = self._service_factory()
+        execution = self._execution_factory()
         try:
-            await service.execute_claimed_analysis(claim)
+            await execution.execute_claimed_analysis(claim)
         except Exception as exc:  # durable attempt owns the safe diagnostic
             error = exc
             logger.exception(
@@ -493,12 +518,12 @@ class ContentResearchAnalysisWorker:
                 # Analysis is immutable once succeeded.  A later composer,
                 # audit, or materializer error belongs to report recovery and
                 # must not rewrite the successful attempt as failed.
-                await service.record_report_finalization_failure(
+                await execution.record_report_finalization_failure(
                     claim.context.workflow_run_id,
                     error,
                 )
             else:
-                await service.record_analysis_failure(
+                await execution.record_analysis_failure(
                     claim.context.workflow_run_id,
                     error,
                     attempt_id=claim.attempt.id,

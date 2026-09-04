@@ -387,7 +387,7 @@ async def test_startup_reconciliation_converges_interrupted_presearch_without_re
 
 
 @pytest.mark.asyncio
-async def test_retrieval_dispatch_failure_projects_retrieval_retry_instead_of_presearch_retry(
+async def test_retrieval_label_without_a_persisted_checkpoint_does_not_grant_retry(
     tmp_path,
 ) -> None:
     db_path = str(tmp_path / "retrieval-recovery-projection.db")
@@ -427,7 +427,104 @@ async def test_retrieval_dispatch_failure_projects_retrieval_retry_instead_of_pr
     )
 
     assert failed.state is ContentResearchState.RECOVERY_REQUIRED
-    assert failed.allowed_actions == ("retry_retrieval", "cancel")
+    assert failed.allowed_actions == ("cancel",)
+    assert failed.recovery_plan is None
+
+
+@pytest.mark.asyncio
+async def test_recovery_command_requires_the_current_plan_identity(tmp_path) -> None:
+    db_path = str(tmp_path / "recovery-plan-authority.db")
+    thread_id = await _create_thread(db_path)
+    coordinator = ContentResearchPersistenceCoordinator(db_path)
+    run_id = "run-recovery-plan-authority"
+    await coordinator.apply(
+        LifecycleCommand(
+            command_id="submit-recovery-plan-authority",
+            run_id=run_id,
+            expected_state=None,
+            expected_revision=0,
+            kind="submit_research_subject",
+            payload={
+                "thread_id": thread_id,
+                "user_id": "user",
+                "seed_text": "夏季凉感T恤",
+            },
+        )
+    )
+    failed = await coordinator.apply(
+        LifecycleCommand(
+            command_id="fail-recovery-plan-authority",
+            run_id=run_id,
+            expected_state=ContentResearchState.PRESEARCH_RUNNING,
+            expected_revision=1,
+            kind="fail",
+            payload={
+                "brief_id": "brief-recovery-plan-authority",
+                "schema_version": "content_research_brief_v1",
+                "status": "failed",
+                "subject": "夏季凉感T恤",
+                "directions": ["product_marketing"],
+                "attempt_id": "attempt-recovery-plan-authority",
+                "error": {
+                    "code": "PROVIDER_TIMEOUT",
+                    "stage": "presearch",
+                    "operation": "llm_presearch",
+                    "message": "模型调用超时",
+                    "retryable": True,
+                    "recovery_action": "retry_presearch",
+                    "attempt_id": "attempt-recovery-plan-authority",
+                    "attempt_no": 1,
+                },
+            },
+        )
+    )
+    plan = failed.recovery_plan
+    assert plan is not None
+
+    with pytest.raises(LifecycleCommandConflict, match="recovery plan"):
+        await coordinator.apply(
+            LifecycleCommand(
+                command_id="retry-without-plan",
+                run_id=run_id,
+                expected_state=ContentResearchState.RECOVERY_REQUIRED,
+                expected_revision=2,
+                kind="retry_presearch",
+                payload={},
+            )
+        )
+    with pytest.raises(LifecycleCommandConflict, match="recovery plan"):
+        await coordinator.apply(
+            LifecycleCommand(
+                command_id="retry-forged-plan",
+                run_id=run_id,
+                expected_state=ContentResearchState.RECOVERY_REQUIRED,
+                expected_revision=2,
+                kind="retry_presearch",
+                payload={
+                    "recovery_plan_id": plan.recovery_plan_id,
+                    "plan_fingerprint": "sha256:forged",
+                },
+            )
+        )
+
+    unchanged = await coordinator.load(run_id)
+    assert unchanged.state is ContentResearchState.RECOVERY_REQUIRED
+    assert unchanged.state_revision == 2
+    accepted = await coordinator.apply(
+        LifecycleCommand(
+            command_id="retry-current-plan",
+            run_id=run_id,
+            expected_state=ContentResearchState.RECOVERY_REQUIRED,
+            expected_revision=2,
+            kind="retry_presearch",
+            payload={
+                "recovery_plan_id": plan.recovery_plan_id,
+                "plan_fingerprint": plan.plan_fingerprint,
+            },
+        )
+    )
+    assert accepted.state is ContentResearchState.PRESEARCH_RUNNING
+    assert accepted.state_revision == 3
 
 
 @pytest.mark.asyncio
@@ -449,21 +546,6 @@ async def test_retry_analysis_atomically_advances_run_and_creates_one_successor(
                 "thread_id": thread_id,
                 "user_id": "user",
                 "seed_text": "凉感T恤",
-            },
-        )
-    )
-    failed_run = await coordinator.apply(
-        LifecycleCommand(
-            command_id="fail-retry-analysis",
-            run_id=run_id,
-            expected_state=ContentResearchState.PRESEARCH_RUNNING,
-            expected_revision=1,
-            kind="fail",
-            payload={
-                "error": {
-                    "code": "MARKETING_ANALYSIS_FAILED",
-                    "recovery_action": "retry_analysis",
-                }
             },
         )
     )
@@ -524,13 +606,39 @@ async def test_retry_analysis_atomically_advances_run_and_creates_one_successor(
         lease_token="lease",
         now=datetime(2026, 8, 26, 9, 1, tzinfo=timezone.utc),
     )
+    failed_run = await coordinator.apply(
+        LifecycleCommand(
+            command_id="fail-retry-analysis",
+            run_id=run_id,
+            expected_state=ContentResearchState.PRESEARCH_RUNNING,
+            expected_revision=1,
+            kind="fail",
+            payload={
+                "attempt_id": predecessor.id,
+                "error": {
+                    "code": "MARKETING_ANALYSIS_FAILED",
+                    "stage": "marketing_analysis",
+                    "retryable": True,
+                    "recovery_action": "retry_analysis",
+                    "attempt_id": predecessor.id,
+                    "attempt_no": predecessor.attempt_no,
+                },
+            },
+        )
+    )
+    plan = failed_run.recovery_plan
+    assert plan is not None
     command = LifecycleCommand(
         command_id="retry-analysis-command",
         run_id=run_id,
         expected_state=ContentResearchState.RECOVERY_REQUIRED,
         expected_revision=failed_run.state_revision,
         kind="retry_analysis",
-        payload={"predecessor_attempt_id": predecessor.id},
+        payload={
+            "recovery_plan_id": plan.recovery_plan_id,
+            "plan_fingerprint": plan.plan_fingerprint,
+            "predecessor_attempt_id": predecessor.id,
+        },
     )
 
     with sqlite3.connect(db_path) as connection:

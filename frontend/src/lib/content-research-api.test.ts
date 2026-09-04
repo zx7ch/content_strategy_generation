@@ -21,6 +21,7 @@ import {
   retryContentResearchPresearch,
   retryContentResearchRetrieval,
   replaceContentResearchScopeDraft,
+  resolveContentResearchCoverage,
   saveLLMConfiguration,
 } from "./content-research-api.ts";
 import { setWorkspaceContext } from "./api.ts";
@@ -34,6 +35,20 @@ const testRun = {
   state_revision: 2,
   entered_at: "2026-08-23T00:00:00Z",
   allowed_actions: [],
+};
+
+const retrievalRecoveryPlan = {
+  recoverable: true as const,
+  action: "retry_retrieval" as const,
+  reason_code: "provider_timeout",
+  recovery_plan_id: "recovery_plan_1",
+  plan_fingerprint: "sha256:plan-1",
+  failed_stage: "retrieval_running",
+  failure_class: "provider",
+  expected_attempt_id: "attempt_1",
+  attempt_no: 1,
+  expected_state_revision: 7,
+  checkpoint_references: ["scope_1", "attempt_1"],
 };
 
 test("projected action retries retain command identity until state revision changes", () => {
@@ -88,9 +103,6 @@ test("historical workflow summaries expose their owning thread without a mutable
     plan: null,
     directions: [],
     subagent_tasks: [],
-    runtime_run: null,
-    runtime_steps: [],
-    runtime_child_tasks: [],
   };
 
   assert.equal(contentResearchWorkflowThreadId(workflow), "thread_historical");
@@ -108,8 +120,6 @@ test("trace contract exposes stored decision identity and ordered safe execution
     traces: [],
     observation_events: [],
     workflow_events: [],
-    runtime_steps: [],
-    runtime_child_tasks: [],
     execution_units: [{
       id: "seu_1",
       state: "outcome_unknown",
@@ -152,6 +162,24 @@ test("retries a transient Lite report network failure but not an HTTP failure", 
 
   assert.equal(calls, 2);
   assert.equal(report.workflow_run_id, "run_1");
+});
+
+test("requests a causal Trace snapshot from the last accepted revision", async () => {
+  let requestedUrl = "";
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    requestedUrl = String(input);
+    return new Response(JSON.stringify({ trace_revision: 12 }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  }) as typeof fetch;
+
+  await getContentResearchTrace("run causal", 12);
+
+  assert.match(
+    requestedUrl,
+    /\/content-research\/workflows\/run%20causal\/trace\?minimum_revision=12$/,
+  );
 });
 
 test("createContentResearchPresearch posts seed to real P0 endpoint", async () => {
@@ -246,6 +274,12 @@ test("retry presearch returns the same persisted identifiers", async () => {
   const result = await retryContentResearchPresearch({
     ...testRun,
     state: "recovery_required",
+    recovery_plan: {
+      ...retrievalRecoveryPlan,
+      action: "retry_presearch",
+      failed_stage: "presearch",
+      expected_state_revision: 2,
+    },
   });
   assert.match(requestBody, /"action":"retry_presearch"/);
   assert.equal(result.attempt_id, "att_1");
@@ -272,11 +306,17 @@ test("retry retrieval sends the authoritative same-run recovery action", async (
     state: "recovery_required",
     state_revision: 7,
     allowed_actions: ["retry_retrieval", "cancel"],
+    recovery_plan: retrievalRecoveryPlan,
   });
 
-  assert.match(requestBody, /"action":"retry_retrieval"/);
-  assert.match(requestBody, /"expected_state":"recovery_required"/);
-  assert.match(requestBody, /"expected_revision":7/);
+  const request = JSON.parse(requestBody);
+  assert.equal(request.action, "retry_retrieval");
+  assert.equal(request.expected_state, "recovery_required");
+  assert.equal(request.expected_revision, 7);
+  assert.deepEqual(request.payload, {
+    recovery_plan_id: "recovery_plan_1",
+    plan_fingerprint: "sha256:plan-1",
+  });
 });
 
 test("Brief confirmation and Scope replacement use authoritative command envelopes", async () => {
@@ -323,6 +363,61 @@ test("Brief confirmation and Scope replacement use authoritative command envelop
     product_experience_aspect: "凉感",
     context_audience_aspect: "夏季通勤",
   });
+});
+
+test("Coverage resolution helpers map all three persisted decisions to lifecycle actions", async () => {
+  const bodies: Array<Record<string, unknown>> = [];
+  globalThis.fetch = (async (_input, init) => {
+    const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+    bodies.push(body);
+    return jsonResponse({
+      schema_version: "content_research_workflow_action_response_v1",
+      workflow_run_id: "run_1",
+      action: body.action,
+      status: "completed",
+      result: { run: testRun, coverage: {} },
+      execution_mode: "local",
+      sync_status: "local_only",
+    });
+  }) as typeof fetch;
+  const run = {
+    ...testRun,
+    state: "coverage_decision_required" as const,
+    state_revision: 8,
+  };
+
+  await resolveContentResearchCoverage(run, {
+    scope_contract_version: 1,
+    coverage_snapshot_id: "coverage_1",
+    resolution: "expand_required_constraint",
+    constraint_id: "core_object",
+    supplementary_queries: ["T恤 补充样本"],
+  });
+  await resolveContentResearchCoverage(run, {
+    scope_contract_version: 1,
+    coverage_snapshot_id: "coverage_1",
+    resolution: "relax_constraint",
+    constraint_id: "core_object",
+  });
+  await resolveContentResearchCoverage(run, {
+    scope_contract_version: 1,
+    coverage_snapshot_id: "coverage_1",
+    resolution: "generate_limited_report",
+  });
+
+  assert.deepEqual(
+    bodies.map((body) => body.action),
+    ["expand_coverage", "relax_coverage", "generate_limited_report"],
+  );
+  assert.deepEqual(bodies[0].payload, {
+    scope_contract_version: 1,
+    coverage_snapshot_id: "coverage_1",
+    resolution: "expand_required_constraint",
+    constraint_id: "core_object",
+    supplementary_queries: ["T恤 补充样本"],
+  });
+  assert.equal(bodies[0].expected_state, "coverage_decision_required");
+  assert.equal(bodies[0].expected_revision, 8);
 });
 
 test("getContentResearchScope reads the persisted Scope projection and optional version", async () => {
@@ -542,9 +637,6 @@ function workflowPayload() {
     plan: null,
     directions: [],
     subagent_tasks: [],
-    runtime_run: { run_id: "run_1", current_step: "formal_research", status: "running" },
-    runtime_steps: [],
-    runtime_child_tasks: [],
   };
 }
 

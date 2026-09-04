@@ -180,7 +180,7 @@ def test_capture_token_expiry_and_validation(tmp_path) -> None:
         raise AssertionError("Expected expired capture token to be rejected")
 
 
-def test_create_task_response_includes_immediately_usable_capture_token(tmp_path) -> None:
+def test_create_task_activates_capture_without_exposing_token_in_task_response(tmp_path) -> None:
     db_path = tmp_path / "mvp.db"
     app = create_app(database_path=db_path, secret="secret")
     client = TestClient(app)
@@ -190,11 +190,17 @@ def test_create_task_response_includes_immediately_usable_capture_token(tmp_path
     assert response.status_code == 200
     payload = response.json()
     assert payload["task_id"]
-    assert payload["token"]
-    assert payload["expires_at"]
+    assert "token" not in payload
+    assert "expires_at" not in payload
+
+    active = client.get("/api/extension/active-task")
+    assert active.status_code == 200
+    active_payload = active.json()["active_task"]
+    assert active_payload["task_id"] == payload["task_id"]
+    assert active_payload["capture_token"]
 
     storage = MVPStorage(db_path, secret="secret")
-    assert storage.validate_capture_token(payload["token"]) == payload["task_id"]
+    assert storage.validate_capture_token(active_payload["capture_token"]) == payload["task_id"]
 
 
 def test_capture_endpoint_dedupes_by_note_id(tmp_path) -> None:
@@ -205,13 +211,16 @@ def test_capture_endpoint_dedupes_by_note_id(tmp_path) -> None:
     assert create_response.status_code == 200
     create_payload = create_response.json()
     task_id = create_payload["task_id"]
-    token = create_payload["token"]
+    token = client.get("/api/extension/active-task").json()["active_task"][
+        "capture_token"
+    ]
 
     payload = {
-        "token": token,
+        "task_id": task_id,
+        "request_id": "capture-dedupe",
         "page_type": "search_result",
         "query_text": "租房收纳",
-        "items": [
+        "visible_items": [
             {
                 "source_url": "https://www.xiaohongshu.com/explore/abc123",
                 "raw_href": "/explore/abc123?xsec_token=test-token&xsec_source=pc_search",
@@ -251,9 +260,13 @@ def test_capture_endpoint_dedupes_by_note_id(tmp_path) -> None:
         ]
     }
 
-    capture_response = client.post("/mvp/captures", json=payload)
+    capture_response = client.post(
+        "/api/extension/capture",
+        headers={"X-Capture-Token": token},
+        json=payload,
+    )
     assert capture_response.status_code == 200
-    assert capture_response.json()["imported_count"] == 1
+    assert capture_response.json()["new_count"] == 1
 
     snapshot_response = client.get(f"/mvp/tasks/{task_id}")
     snapshot = snapshot_response.json()
@@ -279,8 +292,15 @@ def test_invalid_capture_token_returns_401(tmp_path) -> None:
     client = TestClient(app)
 
     response = client.post(
-        "/mvp/captures",
-        json={"token": "bad.token", "page_type": "search_result", "query_text": "", "items": []},
+        "/api/extension/capture",
+        headers={"X-Capture-Token": "bad.token"},
+        json={
+            "task_id": "missing-task",
+            "request_id": "invalid-token",
+            "page_type": "search_result",
+            "query_text": "",
+            "visible_items": [],
+        },
     )
 
     assert response.status_code == 401
@@ -291,11 +311,11 @@ def test_capture_endpoint_supports_extension_cors_preflight(tmp_path) -> None:
     client = TestClient(app)
 
     response = client.options(
-        "/mvp/captures",
+        "/api/extension/capture",
         headers={
             "Origin": "chrome-extension://test-extension-id",
             "Access-Control-Request-Method": "POST",
-            "Access-Control-Request-Headers": "content-type",
+            "Access-Control-Request-Headers": "content-type,x-capture-token",
         },
     )
 
@@ -349,7 +369,9 @@ def test_recommended_notes_accumulate_query_coverage(tmp_path) -> None:
 
     create_payload = client.post("/mvp/tasks", json={"topic": "敏感肌修护"}).json()
     task_id = create_payload["task_id"]
-    token = create_payload["token"]
+    token = client.get("/api/extension/active-task").json()["active_task"][
+        "capture_token"
+    ]
 
     base_item = {
         "source_url": "https://www.xiaohongshu.com/explore/note123",
@@ -370,21 +392,25 @@ def test_recommended_notes_accumulate_query_coverage(tmp_path) -> None:
     }
 
     response_one = client.post(
-        "/mvp/captures",
+        "/api/extension/capture",
+        headers={"X-Capture-Token": token},
         json={
-            "token": token,
+            "task_id": task_id,
+            "request_id": "coverage-one",
             "page_type": "search_result",
             "query_text": "敏感肌修护",
-            "items": [{**base_item, "query_text": "敏感肌修护"}],
+            "visible_items": [{**base_item, "query_text": "敏感肌修护"}],
         },
     )
     response_two = client.post(
-        "/mvp/captures",
+        "/api/extension/capture",
+        headers={"X-Capture-Token": token},
         json={
-            "token": token,
+            "task_id": task_id,
+            "request_id": "coverage-two",
             "page_type": "search_result",
             "query_text": "敏感肌修护避坑",
-            "items": [{**base_item, "query_text": "敏感肌修护避坑"}],
+            "visible_items": [{**base_item, "query_text": "敏感肌修护避坑"}],
         },
     )
 
@@ -406,15 +432,19 @@ def test_mvp_logging_emits_capture_events(tmp_path, monkeypatch) -> None:
     create_response = client.post("/mvp/tasks", json={"topic": "敏感肌修护"})
     create_payload = create_response.json()
     task_id = create_payload["task_id"]
-    token = create_payload["token"]
+    token = client.get("/api/extension/active-task").json()["active_task"][
+        "capture_token"
+    ]
 
     capture_response = client.post(
-        "/mvp/captures",
+        "/api/extension/capture",
+        headers={"X-Capture-Token": token},
         json={
-            "token": token,
+            "task_id": task_id,
+            "request_id": "logging-capture",
             "page_type": "search_result",
             "query_text": "敏感肌修护",
-            "items": [
+            "visible_items": [
                 {
                     "source_url": "https://www.xiaohongshu.com/explore/log123",
                     "raw_href": "/explore/log123?xsec_token=log-token&xsec_source=pc_search",

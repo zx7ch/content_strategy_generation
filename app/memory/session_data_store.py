@@ -12,16 +12,43 @@ from typing import Any, Iterable, Optional
 
 import aiosqlite
 
-from app.models.session import ContentStrategy, GeneratedNote, PlatformPreference, Proposal, SpiderNote
+from app.core.runtime_write_coordinator import RuntimeWriteCoordinator, TypedMutation
+from app.models.session import (
+    ContentStrategy,
+    GeneratedNote,
+    PlatformPreference,
+    Proposal,
+    SpiderNote,
+)
 
 
 class SessionDataStore:
     """Store/load heavy business payloads with idempotent UPSERT semantics."""
 
-    def __init__(self, conn: aiosqlite.Connection):
+    def __init__(
+        self,
+        conn: aiosqlite.Connection,
+        *,
+        writer: RuntimeWriteCoordinator | None = None,
+    ):
         self._conn = conn
+        self._writer = writer
+
+    async def _submit(self, action: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if self._writer is None:
+            raise RuntimeError("runtime writer is not configured")
+        result = await self._writer.submit(
+            TypedMutation.create(
+                mutation_id=f"session_data_{uuid.uuid4().hex}",
+                mutation_kind="mutate_session_record",
+                domain_payload={"action": action, **payload},
+            )
+        )
+        return dict(result.result_fields)
 
     async def init_tables(self) -> None:
+        if self._writer is not None:
+            return
         await self._conn.execute(
             """
             CREATE TABLE IF NOT EXISTS spider_data (
@@ -91,12 +118,24 @@ class SessionDataStore:
     async def save_spider_results(self, session_id: str, posts: Iterable[Any]) -> list[str]:
         note_ids: list[str] = []
         now = datetime.utcnow().isoformat()
+        prepared: list[dict[str, str]] = []
         for post in posts:
             note_id = getattr(post, "note_id", None)
             if not note_id:
                 continue
             payload = post.model_dump() if hasattr(post, "model_dump") else dict(post)
             payload_json = json.dumps(payload, ensure_ascii=False, default=str)
+            prepared.append(
+                {"note_id": note_id, "data": payload_json, "created_at": now}
+            )
+            note_ids.append(note_id)
+        if self._writer is not None:
+            result = await self._submit(
+                "save_spider_data",
+                {"session_id": session_id, "posts": prepared},
+            )
+            return list(result["note_ids"])
+        for post in prepared:
             await self._conn.execute(
                 """
                 INSERT INTO spider_data (session_id, note_id, data, created_at)
@@ -104,9 +143,8 @@ class SessionDataStore:
                 ON CONFLICT(session_id, note_id) DO UPDATE SET
                     data=excluded.data
                 """,
-                (session_id, note_id, payload_json, now),
+                (session_id, post["note_id"], post["data"], post["created_at"]),
             )
-            note_ids.append(note_id)
         await self._conn.commit()
         return note_ids
 
@@ -153,6 +191,18 @@ class SessionDataStore:
     ) -> str:
         sid = strategy_id or f"strat_{uuid.uuid4().hex[:12]}"
         now = datetime.utcnow().isoformat()
+        if self._writer is not None:
+            await self._submit(
+                "save_strategy_data",
+                {
+                    "strategy_id": sid,
+                    "session_id": session_id,
+                    "content_strategy": content_strategy.model_dump_json(),
+                    "platform_preference": platform_preference.model_dump_json(),
+                    "created_at": now,
+                },
+            )
+            return sid
         await self._conn.execute(
             """
             INSERT INTO strategy_data (
@@ -204,7 +254,23 @@ class SessionDataStore:
     async def save_proposals(self, session_id: str, proposals: Iterable[Proposal]) -> list[str]:
         ids: list[str] = []
         now = datetime.utcnow().isoformat()
-        for proposal in proposals:
+        prepared = [
+            {
+                "proposal_id": proposal.proposal_id,
+                "proposal": proposal.model_dump_json(),
+                "overall_score": proposal.score,
+                "scored_at": now,
+                "created_at": now,
+            }
+            for proposal in proposals
+        ]
+        if self._writer is not None:
+            result = await self._submit(
+                "save_proposal_data",
+                {"session_id": session_id, "proposals": prepared},
+            )
+            return list(result["proposal_ids"])
+        for proposal in prepared:
             await self._conn.execute(
                 """
                 INSERT INTO proposal_data (
@@ -217,15 +283,15 @@ class SessionDataStore:
                     scored_at=excluded.scored_at
                 """,
                 (
-                    proposal.proposal_id,
+                    proposal["proposal_id"],
                     session_id,
-                    proposal.model_dump_json(),
-                    proposal.score,
-                    now,
-                    now,
+                    proposal["proposal"],
+                    proposal["overall_score"],
+                    proposal["scored_at"],
+                    proposal["created_at"],
                 ),
             )
-            ids.append(proposal.proposal_id)
+            ids.append(str(proposal["proposal_id"]))
         await self._conn.commit()
         return ids
 
@@ -253,12 +319,30 @@ class SessionDataStore:
     async def save_generated_notes(self, session_id: str, notes: Iterable[GeneratedNote]) -> list[str]:
         ids: list[str] = []
         now = datetime.utcnow().isoformat()
+        prepared: list[dict[str, Any]] = []
         for note in notes:
             proposal_id = None
             params = note.generation_params or {}
             if isinstance(params, dict):
                 proposal_id = params.get("proposal_id")
             similarity = json.dumps(note.similarity_check, ensure_ascii=False, default=str)
+            prepared.append(
+                {
+                    "note_id": note.note_id,
+                    "proposal_id": proposal_id,
+                    "generated_note": note.model_dump_json(),
+                    "similarity_check": similarity,
+                    "created_at": now,
+                }
+            )
+            ids.append(note.note_id)
+        if self._writer is not None:
+            result = await self._submit(
+                "save_generation_data",
+                {"session_id": session_id, "notes": prepared},
+            )
+            return list(result["note_ids"])
+        for note in prepared:
             await self._conn.execute(
                 """
                 INSERT INTO generation_data (
@@ -270,15 +354,14 @@ class SessionDataStore:
                     similarity_check=excluded.similarity_check
                 """,
                 (
-                    note.note_id,
+                    note["note_id"],
                     session_id,
-                    proposal_id,
-                    note.model_dump_json(),
-                    similarity,
-                    now,
+                    note["proposal_id"],
+                    note["generated_note"],
+                    note["similarity_check"],
+                    note["created_at"],
                 ),
             )
-            ids.append(note.note_id)
         await self._conn.commit()
         return ids
 
@@ -304,6 +387,9 @@ class SessionDataStore:
         return result
 
     async def delete_session_data(self, session_id: str) -> None:
+        if self._writer is not None:
+            await self._submit("delete_session_data", {"session_id": session_id})
+            return
         await self._conn.execute("DELETE FROM spider_data WHERE session_id = ?", (session_id,))
         await self._conn.execute("DELETE FROM strategy_data WHERE session_id = ?", (session_id,))
         await self._conn.execute("DELETE FROM proposal_data WHERE session_id = ?", (session_id,))

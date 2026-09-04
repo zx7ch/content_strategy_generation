@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from app.agents.orchestrator import Orchestrator
 from app.api.routes.router import app, schedule_embedding_prewarm
@@ -16,8 +17,12 @@ from app.content_research.worker import (
     ContentResearchAnalysisWorker,
     ContentResearchDispatchWorker,
 )
+from app.core.runtime_schema_bootstrap import bootstrap_canonical_runtime_schema
+from app.core.runtime_write_coordinator import RuntimeWriteCoordinator
+from app.core.sqlite_runtime_lock import claim_runtime_process_lock
 from app.memory.job_store import JobStore
 from app.memory.thread_store import ThreadStore
+from app.runtime_write_handlers import production_runtime_write_handlers
 from app.services.llm.configuration_service import LiteLLMConfigurationService
 from app.services.llm.configuration_store import SQLiteLLMConfigurationStore
 from app.services.llm.providers.openai_compatible import OpenAICompatibleAdapter
@@ -35,9 +40,53 @@ from app.v2.topic_pool.bootstrap import build_topic_pool_runtime
 from app.v2.topic_pool.scorer import ScorerService
 from app.workers.job_worker import JobWorker
 
+_RUNTIME_STATE_FIELDS = (
+    "job_store",
+    "runtime_writer",
+    "orchestrator",
+    "job_worker",
+    "worker_stop_event",
+    "worker_task",
+    "content_research_llm_service",
+    "llm_configuration_service",
+    "content_research_service",
+    "content_research_query",
+    "content_research_command",
+    "xhs_qr_login_session",
+    "xhs_credential_store",
+    "content_research_dispatch_worker",
+    "content_research_dispatch_worker_task",
+    "content_research_analysis_worker",
+    "content_research_analysis_worker_task",
+    "content_research_embedding_runtime",
+    "content_research_embedding_task",
+    "worker_started",
+    "v2_master_data_store",
+    "v2_master_data_service",
+    "v2_ingestion_store",
+    "v2_ingestion_service",
+    "v2_discovery_service",
+    "v2_topic_pool_store",
+    "v2_topic_pool_service",
+    "v2_decision_store",
+    "v2_decision_service",
+    "v2_feedback_store",
+    "v2_feedback_service",
+    "thread_store",
+)
+
 
 @asynccontextmanager
-async def _worker_lifespan(application):
+async def _unlocked_worker_lifespan(application):
+    await bootstrap_canonical_runtime_schema(
+        settings.SQLITE_DB_PATH,
+        discovery_secret=settings.V2_DISCOVERY_TOKEN_SECRET,
+    )
+    runtime_writer = RuntimeWriteCoordinator(
+        Path(settings.SQLITE_DB_PATH),
+        handlers=production_runtime_write_handlers(),
+    )
+    await runtime_writer.start()
     job_store = JobStore(settings.SQLITE_DB_PATH)
     await job_store.connect()
     thread_store = ThreadStore()
@@ -76,17 +125,22 @@ async def _worker_lifespan(application):
     await content_research_service.reconcile_startup()
     content_research_worker = ContentResearchDispatchWorker(
         store=content_research_service._store,
-        service_factory=lambda: content_research_service,
+        execution_factory=lambda: content_research_service.execution_interface,
         wake_event=content_research_dispatch_event,
+        max_concurrent_runs=settings.CONTENT_RESEARCH_MAX_CONCURRENT_RUNS,
     )
     content_research_analysis_worker = ContentResearchAnalysisWorker(
         store=content_research_service._store,
-        service_factory=lambda: content_research_service,
+        execution_factory=lambda: content_research_service.execution_interface,
         wake_event=content_research_analysis_event,
     )
     v2_master_data_store, v2_master_data_service = build_master_data_runtime(settings)
     v2_ingestion_store, v2_ingestion_service = build_ingestion_runtime(settings)
-    v2_discovery_service = build_discovery_runtime(settings)
+    v2_discovery_service = build_discovery_runtime(
+        settings,
+        database_path=settings.SQLITE_DB_PATH,
+        writer=runtime_writer,
+    )
     v2_topic_pool_store, v2_topic_pool_service = build_topic_pool_runtime(
         settings,
         master_data_service=v2_master_data_service,
@@ -130,6 +184,7 @@ async def _worker_lifespan(application):
     schedule_embedding_prewarm()
 
     application.state.job_store = job_store
+    application.state.runtime_writer = runtime_writer
     application.state.orchestrator = orchestrator
     application.state.job_worker = worker
     application.state.worker_stop_event = stop_event
@@ -137,6 +192,8 @@ async def _worker_lifespan(application):
     application.state.content_research_llm_service = content_research_llm_service
     application.state.llm_configuration_service = llm_configuration_service
     application.state.content_research_service = content_research_service
+    application.state.content_research_query = content_research_service.query_interface
+    application.state.content_research_command = content_research_service.command_interface
     application.state.xhs_qr_login_session = xhs_qr_login_session
     application.state.xhs_credential_store = xhs_credential_store
     application.state.content_research_dispatch_worker = content_research_worker
@@ -199,7 +256,20 @@ async def _worker_lifespan(application):
 
         await job_store.close()
         await thread_store.close()
-        application.state.worker_started = False
+        await runtime_writer.close()
+        for field in _RUNTIME_STATE_FIELDS:
+            if hasattr(application.state, field):
+                delattr(application.state, field)
+
+
+@asynccontextmanager
+async def _worker_lifespan(application):
+    database_lock = claim_runtime_process_lock(settings.SQLITE_DB_PATH)
+    try:
+        async with _unlocked_worker_lifespan(application):
+            yield
+    finally:
+        database_lock.release()
 
 
 app.router.lifespan_context = _worker_lifespan

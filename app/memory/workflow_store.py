@@ -10,6 +10,12 @@ from typing import Any, Optional
 import aiosqlite
 
 from app.config import settings
+from app.core.runtime_write_coordinator import RuntimeWriteCoordinator, TypedMutation
+from app.core.runtime_write_registry import get_runtime_writer
+from app.core.sqlite_connection_roles import (
+    open_bootstrap_async_database,
+    open_readonly_async_database,
+)
 from app.logging_config import get_logger
 from app.models.workflow import (
     WorkflowArtifact,
@@ -99,11 +105,38 @@ async def migrate_workflow_compat_columns(conn: aiosqlite.Connection) -> None:
 class WorkflowStore:
     """Persistence boundary for workflow tables introduced by restructure T1."""
 
-    def __init__(self, db_path: Optional[str] = None, *, read_only: bool = False):
+    def __init__(
+        self,
+        db_path: Optional[str] = None,
+        *,
+        read_only: bool = False,
+        writer: RuntimeWriteCoordinator | None = None,
+    ):
         self.db_path = db_path or settings.SQLITE_DB_PATH
         self.read_only = read_only
+        self._writer = writer or get_runtime_writer(self.db_path)
         self._conn: Optional[aiosqlite.Connection] = None
         self._logger = get_logger(__name__, component="workflow_store")
+
+    async def _submit_workflow_mutation(
+        self,
+        action: str,
+        payload: dict[str, Any],
+        *,
+        mutation_id: str | None = None,
+        run_id: str | None = None,
+    ) -> dict[str, Any]:
+        if self._writer is None:
+            raise RuntimeError("runtime writer is not configured")
+        result = await self._writer.submit(
+            TypedMutation.create(
+                mutation_id=mutation_id or f"workflow_mutation_{uuid.uuid4().hex}",
+                mutation_kind="mutate_workflow_record",
+                domain_payload={"action": action, **payload},
+                run_id=run_id,
+            )
+        )
+        return dict(result.result_fields)
 
     async def __aenter__(self) -> "WorkflowStore":
         await self.connect()
@@ -115,14 +148,14 @@ class WorkflowStore:
     async def connect(self) -> None:
         if self._conn is not None:
             return
-        if self.read_only:
-            self._conn = await aiosqlite.connect(f"file:{self.db_path}?mode=ro", uri=True)
+        if self.read_only or self._writer is not None:
+            self._conn = await open_readonly_async_database(self.db_path)
         else:
-            self._conn = await aiosqlite.connect(self.db_path)
+            self._conn = await open_bootstrap_async_database(self.db_path)
         self._conn.row_factory = aiosqlite.Row
         await self._conn.execute("PRAGMA synchronous=NORMAL")
         await self._conn.execute("PRAGMA busy_timeout=5000")
-        if self.read_only:
+        if self.read_only or self._writer is not None:
             await self._conn.execute("PRAGMA query_only=ON")
         else:
             await self.initialize_schema()
@@ -140,6 +173,11 @@ class WorkflowStore:
 
     async def delete_run(self, run_id: str) -> None:
         assert self._conn is not None
+        if self._writer is not None:
+            await self._submit_workflow_mutation(
+                "delete_run", {"run_id": run_id}, run_id=run_id
+            )
+            return
         for table in ("workflow_constraints", "workflow_artifacts", "workflow_events", "workflow_child_tasks", "workflow_steps", "workflow_runs"):
             await self._conn.execute(f"DELETE FROM {table} WHERE run_id = ?", (run_id,))
         await self._conn.commit()
@@ -477,6 +515,21 @@ class WorkflowStore:
     ) -> WorkflowRun:
         assert self._conn is not None
         run_id = _new_id("run")
+        if self._writer is not None:
+            await self._submit_workflow_mutation(
+                "create_run",
+                {
+                    "run_id": run_id,
+                    "thread_id": thread_id,
+                    "user_id": user_id,
+                    "source_message_id": source_message_id,
+                },
+                mutation_id=run_id,
+                run_id=run_id,
+            )
+            run = await self.get_run(run_id)
+            assert run is not None
+            return run
         await self._conn.execute(
             """
             INSERT INTO workflow_runs (
@@ -510,6 +563,24 @@ class WorkflowStore:
         assert self._conn is not None
         step_id = _new_id("step")
         phase_value = phase.value if isinstance(phase, WorkflowPhase) else phase
+        checkpoint_json = _json_dump(checkpoint) if checkpoint else None
+        if self._writer is not None:
+            await self._submit_workflow_mutation(
+                "create_step",
+                {
+                    "step_id": step_id,
+                    "run_id": run_id,
+                    "step_name": step_name,
+                    "phase": phase_value,
+                    "max_attempts": max_attempts,
+                    "checkpoint_json": checkpoint_json,
+                },
+                mutation_id=step_id,
+                run_id=run_id,
+            )
+            step = await self.get_step(step_id)
+            assert step is not None
+            return step
         await self._conn.execute(
             """
             INSERT INTO workflow_steps (
@@ -517,7 +588,7 @@ class WorkflowStore:
             )
             VALUES (?, ?, ?, ?, 'pending', ?, ?)
             """,
-            (step_id, run_id, step_name, phase_value, max_attempts, _json_dump(checkpoint) if checkpoint else None),
+            (step_id, run_id, step_name, phase_value, max_attempts, checkpoint_json),
         )
         await self._conn.commit()
         step = await self.get_step(step_id)
@@ -556,6 +627,24 @@ class WorkflowStore:
     ) -> WorkflowChildTask:
         assert self._conn is not None
         child_task_id = _new_id("child")
+        if self._writer is not None:
+            await self._submit_workflow_mutation(
+                "create_child_task",
+                {
+                    "child_task_id": child_task_id,
+                    "run_id": run_id,
+                    "step_id": step_id,
+                    "task_type": task_type,
+                    "slot_index": slot_index,
+                    "proposal_id": proposal_id,
+                    "max_attempts": max_attempts,
+                },
+                mutation_id=child_task_id,
+                run_id=run_id,
+            )
+            child_task = await self.get_child_task(child_task_id)
+            assert child_task is not None
+            return child_task
         await self._conn.execute(
             """
             INSERT INTO workflow_child_tasks (
@@ -606,6 +695,31 @@ class WorkflowStore:
         job_id: Optional[str] = None,
     ) -> WorkflowEvent:
         assert self._conn is not None
+        payload_json = _json_dump(payload)
+        if self._writer is not None:
+            result = await self._submit_workflow_mutation(
+                "append_event",
+                {
+                    "run_id": run_id,
+                    "thread_id": thread_id,
+                    "step_id": step_id,
+                    "child_task_id": child_task_id,
+                    "job_id": job_id,
+                    "event_type": event_type,
+                    "event_level": event_level,
+                    "payload_json": payload_json,
+                },
+                run_id=run_id,
+            )
+            event_id = result.get("event_id")
+            if not isinstance(event_id, int):
+                raise RuntimeError("invalid workflow event result")
+            async with self._conn.execute(
+                "SELECT * FROM workflow_events WHERE event_id=?", (event_id,)
+            ) as cursor:
+                row = await cursor.fetchone()
+            assert row is not None
+            return self._row_to_event(row)
         async with self._conn.execute(
             """
             INSERT INTO workflow_events (
@@ -623,7 +737,7 @@ class WorkflowStore:
                 job_id,
                 event_type,
                 event_level,
-                _json_dump(payload),
+                payload_json,
             ),
         ) as cursor:
             row = await cursor.fetchone()
@@ -667,6 +781,30 @@ class WorkflowStore:
         artifact_id = _new_id("artifact")
         type_value = artifact_type.value if isinstance(artifact_type, WorkflowArtifactType) else artifact_type
         mode_value = payload_mode.value if isinstance(payload_mode, WorkflowArtifactPayloadMode) else str(payload_mode)
+        payload_json = _json_dump(payload) if payload is not None else None
+        if self._writer is not None:
+            await self._submit_workflow_mutation(
+                "create_artifact",
+                {
+                    "artifact_id": artifact_id,
+                    "run_id": run_id,
+                    "thread_id": thread_id,
+                    "artifact_type": type_value,
+                    "artifact_version": artifact_version,
+                    "parent_artifact_id": parent_artifact_id,
+                    "payload_mode": mode_value,
+                    "storage_table": storage_table,
+                    "storage_key": storage_key,
+                    "payload_json": payload_json,
+                    "summary_text": summary_text,
+                    "created_by_step_id": created_by_step_id,
+                },
+                mutation_id=artifact_id,
+                run_id=run_id,
+            )
+            artifact = await self.get_artifact(artifact_id)
+            assert artifact is not None
+            return artifact
         await self._conn.execute(
             """
             INSERT INTO workflow_artifacts (
@@ -686,7 +824,7 @@ class WorkflowStore:
                 mode_value,
                 storage_table,
                 storage_key,
-                _json_dump(payload) if payload is not None else None,
+                payload_json,
                 summary_text,
                 created_by_step_id,
             ),
@@ -735,6 +873,12 @@ class WorkflowStore:
 
     async def update_artifact_status(self, artifact_id: str, status: str) -> Optional[WorkflowArtifact]:
         assert self._conn is not None
+        if self._writer is not None:
+            await self._submit_workflow_mutation(
+                "update_artifact_status",
+                {"artifact_id": artifact_id, "status": status},
+            )
+            return await self.get_artifact(artifact_id)
         await self._conn.execute(
             "UPDATE workflow_artifacts SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE artifact_id = ?",
             (status, artifact_id),
@@ -758,6 +902,28 @@ class WorkflowStore:
         assert self._conn is not None
         constraint_id = _new_id("constraint")
         type_value = constraint_type.value if isinstance(constraint_type, WorkflowConstraintType) else constraint_type
+        normalized_json = _json_dump(normalized)
+        if self._writer is not None:
+            await self._submit_workflow_mutation(
+                "create_constraint",
+                {
+                    "constraint_id": constraint_id,
+                    "run_id": run_id,
+                    "thread_id": thread_id,
+                    "message_id": message_id,
+                    "constraint_version": constraint_version,
+                    "raw_text": raw_text,
+                    "constraint_type": type_value,
+                    "scope": scope,
+                    "confidence": confidence,
+                    "normalized_json": normalized_json,
+                },
+                mutation_id=constraint_id,
+                run_id=run_id,
+            )
+            constraint = await self.get_constraint(constraint_id)
+            assert constraint is not None
+            return constraint
         await self._conn.execute(
             """
             INSERT INTO workflow_constraints (
@@ -777,7 +943,7 @@ class WorkflowStore:
                 type_value,
                 scope,
                 confidence,
-                _json_dump(normalized),
+                normalized_json,
             ),
         )
         await self._conn.commit()

@@ -34,6 +34,7 @@ from app.content_research.workflow.directional_pipeline import (
     OperationOutcomeUnknownError,
     QueryGroup,
 )
+from app.core.runtime_write_coordinator import RuntimeWriteCoordinator
 
 
 def _provider_execution_context(context: ExecutionContext | None) -> dict[str, object]:
@@ -159,6 +160,7 @@ class SubagentTaskRouter:
                 source_result=source_result,
                 execution_context=execution_context,
                 dispatch_context=dispatch_context,
+                writer=getattr(self._store, "_writer", None),
             )
         except OperationOutcomeUnknownError as exc:
             self._require_live_execution(execution_context, "subagent_outcome_unknown")
@@ -242,6 +244,7 @@ class SubagentTaskRouter:
         source_result: SourceOperationResult | None,
         execution_context: ExecutionContext | None = None,
         dispatch_context: DispatchLeaseContext | None = None,
+        writer: RuntimeWriteCoordinator | None = None,
     ) -> SubagentExecutionResult:
         input_payload = dict(task.payload.get("input_payload") or {})
         scope_execution = dict(input_payload.get("scope_execution") or {})
@@ -359,6 +362,7 @@ class SubagentTaskRouter:
                 workflow_run_id=task.workflow_run_id,
                 execution_context=execution_context,
                 dispatch_context=dispatch_context,
+                writer=writer,
             )
         ).execute(
             workflow_run_id=task.workflow_run_id,

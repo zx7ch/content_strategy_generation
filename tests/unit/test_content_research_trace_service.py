@@ -2,8 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime, timedelta, timezone
-from types import SimpleNamespace
+from datetime import timedelta
 
 import pytest
 
@@ -15,8 +14,6 @@ from app.content_research.observation.trace_service import (
     _duration_ms,
     _llm_recovery_projection,
     _logical_checkpoint_projection,
-    _project_timing,
-    _runtime_step_projection,
     _safe_marketing_conclusion_checkpoint,
 )
 from app.content_research.persistence_models import StageCheckpointRecord
@@ -144,7 +141,7 @@ def test_llm_recovery_exposes_only_the_durable_failure_boundary():
     recovery = _llm_recovery_projection(
         run_status="waiting_user",
         current_stage="presearch",
-        runtime_steps=[{"step_name": "presearch", "error_code": "llm_auth_invalid"}],
+        workflow_steps=[{"step_name": "presearch", "error_code": "llm_auth_invalid"}],
         workflow_events=[
             {
                 "event_type": "run_waiting_user",
@@ -415,7 +412,7 @@ def test_final_timeout_recovery_keeps_a_safe_reload_boundary():
     recovery = _llm_recovery_projection(
         run_status="waiting_user",
         current_stage="presearch",
-        runtime_steps=[{"step_name": "presearch", "error_code": "PRESEARCH_FINAL_TIMEOUT"}],
+        workflow_steps=[{"step_name": "presearch", "error_code": "PRESEARCH_FINAL_TIMEOUT"}],
         workflow_events=[
             {
                 "event_type": "run_waiting_user",
@@ -587,48 +584,6 @@ async def test_trace_reader_failure_rolls_back_and_closes_snapshot_connection(se
         observed_connections[0].execute("SELECT 1")
 
 
-def test_trace_timing_marks_legacy_step_estimated_without_precision_invention():
-    timing = _project_timing(
-        {
-            "status": "succeeded",
-            "started_at": "2026-08-03 01:00:00",
-            "completed_at": "2026-08-03 01:00:03",
-        },
-        as_of="2026-08-03T01:00:10.123456+00:00",
-    )
-
-    assert timing == {
-        "execution_started_at": "2026-08-03T01:00:00+00:00",
-        "execution_finished_at": "2026-08-03T01:00:03+00:00",
-        "active_duration_ms": 3000,
-        "timing_source": "estimated",
-    }
-
-
-def test_trace_timing_projects_open_queue_only_record_as_recorded_at_server_as_of():
-    timing = _project_timing(
-        {
-            "status": "pending",
-            "timing_json": {
-                "queued_at": "2026-08-03T01:00:00.000001+00:00",
-                "queue_spans": [
-                    {
-                        "started_at": "2026-08-03T01:00:00.000001+00:00",
-                        "finished_at": None,
-                    }
-                ],
-            },
-        },
-        as_of="2026-08-03T01:00:01.500001+00:00",
-    )
-
-    assert timing == {
-        "queued_at": "2026-08-03T01:00:00.000001+00:00",
-        "queue_duration_ms": 1500,
-        "timing_source": "recorded",
-    }
-
-
 def test_terminal_trace_duration_ignores_later_metadata_timestamps():
     duration_ms = _duration_ms(
         traces=[],
@@ -643,67 +598,6 @@ def test_terminal_trace_duration_ignores_later_metadata_timestamps():
     )
 
     assert duration_ms == 1_000
-
-
-def test_runtime_step_projection_clears_stale_report_error_after_analysis_success():
-    now = datetime(2026, 8, 26, 16, 34, tzinfo=timezone.utc)
-
-    projected = _runtime_step_projection(
-        [
-            {
-                "step_id": "step_report",
-                "step_name": "report",
-                "phase": "finalization",
-                "status": "succeeded",
-                "attempt_count": 1,
-                "max_attempts": 3,
-                "started_at": now - timedelta(seconds=5),
-                "completed_at": now,
-                "error_code": "MARKETING_ANALYSIS_FAILED",
-            }
-        ],
-        effective_attempt=SimpleNamespace(
-            id="analysis_attempt_3",
-            attempt_no=3,
-            state="succeeded",
-            created_at=now - timedelta(seconds=40),
-            terminal_at=now - timedelta(seconds=6),
-        ),
-        as_of=now,
-    )
-
-    report_step = next(step for step in projected if step["step_name"] == "report")
-    assert report_step["status"] == "succeeded"
-    assert report_step["error_code"] is None
-
-
-@pytest.mark.parametrize(
-    ("status", "stale_key"),
-    [
-        ("succeeded", "waiting_started_at"),
-        ("running", "retry_backoff_started_at"),
-    ],
-)
-def test_trace_timing_does_not_project_stale_inactive_boundaries(status, stale_key):
-    timing = _project_timing(
-        {
-            "status": status,
-            "timing_json": {
-                "queued_at": "2026-08-03T01:00:00.000001+00:00",
-                "execution_spans": [
-                    {
-                        "started_at": "2026-08-03T01:00:00.100001+00:00",
-                        "finished_at": "2026-08-03T01:00:00.900001+00:00",
-                    }
-                ],
-                stale_key: "2026-08-03T01:00:00.900001+00:00",
-            },
-        },
-        as_of="2026-08-03T01:00:10.000001+00:00",
-    )
-
-    assert timing["timing_source"] == "recorded"
-    assert stale_key not in timing
 
 
 @pytest.mark.asyncio

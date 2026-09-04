@@ -144,6 +144,37 @@ test("initializeWorkspaceContext succeeds when health and workspace both respond
   assert.equal(callCount, 3, "should call /health, /runtime/prewarm, then /workspaces/default");
 });
 
+test("master frontend and runtime zip share single writer contract", async () => {
+  setWorkspaceContext("", "");
+  const requestedUrls: string[] = [];
+  globalThis.fetch = (async (input) => {
+    const url =
+      typeof input === "string"
+        ? input
+        : input instanceof URL
+          ? input.href
+          : (input as Request).url;
+    requestedUrls.push(url);
+    return new Response(
+      JSON.stringify({
+        status: "healthy",
+        version: "0.1.0",
+        api_contract: "local-runtime-previous"
+      }),
+      { status: 200, headers: { "Content-Type": "application/json" } }
+    );
+  }) as typeof fetch;
+
+  await assert.rejects(
+    () => initializeWorkspaceContext(),
+    /API 契约不匹配.*local-runtime-single-writer/
+  );
+
+  assert.equal(REQUIRED_API_CONTRACT, "local-runtime-single-writer");
+  assert.deepEqual(requestedUrls, [`${RUNTIME_BASE_URL}/health`]);
+  assert.deepEqual(getWorkspaceContext(), { workspaceId: "", userId: "" });
+});
+
 test("initializeWorkspaceContext accepts local dev runtime version", async () => {
   setWorkspaceContext("", "");
   globalThis.fetch = (async (input) => {

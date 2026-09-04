@@ -13,8 +13,10 @@ import pytest
 from app.content_research.api_schemas import ContentResearchFormalResearchResponse
 from app.content_research.async_dispatch import AsyncFormalResearchDispatchRepository
 from app.content_research.async_pipeline_store import AsyncDirectionalPersistenceSession
+from app.content_research.errors import ReportPublicationMaterializationError
+from app.content_research.execution import ContentResearchExecution
 from app.content_research.models import SubagentTaskRecord
-from app.content_research.persistence_models import StageCheckpointRecord
+from app.content_research.persistence_models import CanonicalSourceRecord, StageCheckpointRecord
 from app.content_research.scope_contract import (
     CoverageSnapshot,
     DispatchLeaseContext,
@@ -27,10 +29,6 @@ from app.content_research.scope_contract import (
     ScopeExecutionContinuation,
     ScopeQueryGroupInput,
     build_scope_contract,
-)
-from app.content_research.service import (
-    ContentResearchService,
-    ReportPublicationMaterializationError,
 )
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
 from app.content_research.worker import ContentResearchDispatchWorker
@@ -70,10 +68,10 @@ class FakeFormalResearchService:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str, int]] = []
 
-    async def start_formal_research(self, *, workflow_run_id, request):
-        self.calls.append((workflow_run_id, request.provider, request.limit))
+    async def execute_claimed_dispatch(self, *, context, request):
+        self.calls.append((context.workflow_run_id, request.provider, request.limit))
         return ContentResearchFormalResearchResponse(
-            workflow_run_id=workflow_run_id,
+            workflow_run_id=context.workflow_run_id,
             status="completed",
             task_count=1,
             completed_task_count=1,
@@ -206,7 +204,7 @@ async def test_expired_dispatch_lease_is_recovered_by_a_new_worker(tmp_path):
             ((datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(), "run-recover"),
         )
     service = FakeFormalResearchService()
-    worker = ContentResearchDispatchWorker(store=store, service_factory=lambda: service)
+    worker = ContentResearchDispatchWorker(store=store, execution_factory=lambda: service)
 
     assert await worker.run_once() is True
     assert service.calls == [("run-recover", "xiaohongshu", 12)]
@@ -261,7 +259,7 @@ async def test_worker_claims_persisted_scope_continuation_with_its_queries(tmp_p
     )
     store.save_scope_execution_continuation(continuation)
     service = FakeContinuationService()
-    worker = ContentResearchDispatchWorker(store=store, service_factory=lambda: service)
+    worker = ContentResearchDispatchWorker(store=store, execution_factory=lambda: service)
 
     assert await worker.run_once() is True
     assert service.calls == []
@@ -282,7 +280,7 @@ async def test_worker_passes_the_claimed_execution_attempt_to_the_service(tmp_pa
     service = ExecutionUnitContinuationService()
     worker = ContentResearchDispatchWorker(
         store=store,
-        service_factory=lambda: cast(ContentResearchService, service),
+        execution_factory=lambda: cast(ContentResearchExecution, service),
     )
 
     assert await worker.run_once() is True
@@ -306,14 +304,12 @@ async def test_publication_only_failure_keeps_successful_execution_attempt_truth
     service = PublicationFailureExecutionService()
     worker = ContentResearchDispatchWorker(
         store=store,
-        service_factory=lambda: cast(ContentResearchService, service),
+        execution_factory=lambda: cast(ContentResearchExecution, service),
     )
 
     assert await worker.run_once() is True
 
-    attempt = store.get_scope_execution_attempt(
-        str(authorization.execution_unit_id), 0
-    )
+    attempt = store.get_scope_execution_attempt(str(authorization.execution_unit_id), 0)
     assert attempt is not None
     assert attempt.state == "completed"
     persisted_continuation = store.list_scope_execution_continuations(
@@ -343,7 +339,7 @@ async def test_failed_scope_continuation_is_reclaimed_only_by_exact_action_repla
     )
     store.save_scope_execution_continuation(continuation)
     failing = FailingContinuationService()
-    worker = ContentResearchDispatchWorker(store=store, service_factory=lambda: failing)
+    worker = ContentResearchDispatchWorker(store=store, execution_factory=lambda: failing)
 
     assert await worker.run_once() is True
     failed = store.list_scope_execution_continuations("run-failure")[0]
@@ -359,7 +355,7 @@ async def test_failed_scope_continuation_is_reclaimed_only_by_exact_action_repla
     recovered = store.list_scope_execution_continuations("run-failure")[0]
     assert recovered.state == "pending"
     succeeding = FakeContinuationService()
-    retry_worker = ContentResearchDispatchWorker(store=store, service_factory=lambda: succeeding)
+    retry_worker = ContentResearchDispatchWorker(store=store, execution_factory=lambda: succeeding)
     assert await retry_worker.run_once() is True
     assert store.list_scope_execution_continuations("run-failure")[0].state == "completed"
 
@@ -507,7 +503,7 @@ async def test_event_wakeup_dispatches_without_waiting_for_recovery_scan(tmp_pat
     wake_event = asyncio.Event()
     worker = ContentResearchDispatchWorker(
         store=store,
-        service_factory=lambda: service,
+        execution_factory=lambda: service,
         wake_event=wake_event,
         recovery_scan_seconds=60,
     )
@@ -557,6 +553,138 @@ async def test_async_pipeline_session_flushes_checkpoint_without_sync_store_io(t
 
     reloaded = await AsyncDirectionalPersistenceSession.open(db_path, workflow_run_id="run-async")
     assert reloaded.get_typed_record(StageCheckpointRecord, "scp-async") == checkpoint
+
+
+@pytest.mark.asyncio
+async def test_concurrent_direction_sessions_reconcile_same_scope_audit_event(tmp_path):
+    """Two directions may discover the same deterministic Scope fact concurrently."""
+    db_path = str(tmp_path / "concurrent-scope-audit.db")
+    store = SQLiteContentResearchStore(db_path)
+    contract = build_scope_contract(
+        workflow_run_id="run-concurrent-scope-audit",
+        research_plan_id="plan-concurrent-scope-audit",
+        version=1,
+        constraints=(ScopeConstraint("core_object", "核心对象", "衬衫", "required"),),
+        query_groups=(ScopeQueryGroupInput("衬衫", "衬衫", ("衬衫",)),),
+    )
+    store.save_scope_contract(contract)
+    first = await AsyncDirectionalPersistenceSession.open(
+        db_path, workflow_run_id=contract.workflow_run_id
+    )
+    second = await AsyncDirectionalPersistenceSession.open(
+        db_path, workflow_run_id=contract.workflow_run_id
+    )
+    event = ScopeAuditEvent(
+        id="sae-shared-query-group",
+        workflow_run_id=contract.workflow_run_id,
+        scope_contract_id=contract.id,
+        scope_contract_version=contract.version,
+        event_name="query_group_collected",
+        payload={
+            "schema_version": "content_research_scope_audit_event_v1",
+            "query_group_id": contract.query_groups[0].id,
+            "request_outcome": "completed",
+        },
+    )
+    first.append_scope_audit_event(event)
+    second.append_scope_audit_event(event)
+
+    await asyncio.gather(first.flush(), second.flush())
+
+    assert store.list_scope_audit_events(contract.workflow_run_id, version=1) == [event]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_direction_sessions_reject_changed_scope_audit_payload(tmp_path):
+    """A deterministic event ID cannot hide a different immutable Scope fact."""
+    db_path = str(tmp_path / "conflicting-scope-audit.db")
+    store = SQLiteContentResearchStore(db_path)
+    contract = build_scope_contract(
+        workflow_run_id="run-conflicting-scope-audit",
+        research_plan_id="plan-conflicting-scope-audit",
+        version=1,
+        constraints=(ScopeConstraint("core_object", "核心对象", "衬衫", "required"),),
+        query_groups=(ScopeQueryGroupInput("衬衫", "衬衫", ("衬衫",)),),
+    )
+    store.save_scope_contract(contract)
+    first = await AsyncDirectionalPersistenceSession.open(
+        db_path, workflow_run_id=contract.workflow_run_id
+    )
+    stale = await AsyncDirectionalPersistenceSession.open(
+        db_path, workflow_run_id=contract.workflow_run_id
+    )
+    event = ScopeAuditEvent(
+        id="sae-conflicting-query-group",
+        workflow_run_id=contract.workflow_run_id,
+        scope_contract_id=contract.id,
+        scope_contract_version=contract.version,
+        event_name="query_group_collected",
+        payload={
+            "schema_version": "content_research_scope_audit_event_v1",
+            "query_group_id": contract.query_groups[0].id,
+            "request_outcome": "completed",
+        },
+    )
+    first.append_scope_audit_event(event)
+    stale.append_scope_audit_event(
+        replace(event, payload={**event.payload, "request_outcome": "failed"})
+    )
+    await first.flush()
+
+    with pytest.raises(RuntimeError, match="immutable scope audit event conflict"):
+        await stale.flush()
+
+    assert store.list_scope_audit_events(contract.workflow_run_id, version=1) == [event]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_direction_sessions_reconcile_same_canonical_source(tmp_path):
+    """Canonical sources are shared facts even when two directions discover them."""
+    db_path = str(tmp_path / "concurrent-canonical-source.db")
+    SQLiteContentResearchStore(db_path)
+    first = await AsyncDirectionalPersistenceSession.open(db_path)
+    second = await AsyncDirectionalPersistenceSession.open(db_path)
+    source = CanonicalSourceRecord(
+        id="cs-shared-note",
+        schema_version="content_research_canonical_source_v1",
+        payload={"schema_version": "content_research_canonical_source_v1"},
+        platform="xiaohongshu",
+        platform_source_kind="note",
+        platform_source_id="note-shared",
+        canonical_url="https://www.xiaohongshu.com/explore/note-shared",
+    )
+    first.resolve_canonical_source(source)
+    second.resolve_canonical_source(
+        replace(source, created_at=source.created_at + timedelta(milliseconds=1))
+    )
+
+    await asyncio.gather(first.flush(), second.flush())
+
+    reloaded = await AsyncDirectionalPersistenceSession.open(db_path)
+    assert reloaded.get_typed_record(CanonicalSourceRecord, source.id) is not None
+
+
+@pytest.mark.asyncio
+async def test_concurrent_direction_sessions_reject_changed_canonical_source(tmp_path):
+    db_path = str(tmp_path / "conflicting-canonical-source.db")
+    SQLiteContentResearchStore(db_path)
+    first = await AsyncDirectionalPersistenceSession.open(db_path)
+    stale = await AsyncDirectionalPersistenceSession.open(db_path)
+    source = CanonicalSourceRecord(
+        id="cs-conflicting-note",
+        schema_version="content_research_canonical_source_v1",
+        payload={"schema_version": "content_research_canonical_source_v1"},
+        platform="xiaohongshu",
+        platform_source_kind="note",
+        platform_source_id="note-conflicting",
+        canonical_url="https://www.xiaohongshu.com/explore/note-conflicting",
+    )
+    first.resolve_canonical_source(source)
+    stale.resolve_canonical_source(replace(source, canonical_url="https://example.invalid/changed"))
+    await first.flush()
+
+    with pytest.raises(RuntimeError, match="immutable persistence conflict"):
+        await stale.flush()
 
 
 @pytest.mark.asyncio
@@ -617,9 +745,7 @@ async def test_async_pipeline_rejects_superseded_checkpoint_ownership_reassignme
         execution_revision=2,
     )
     store.save_stage_checkpoint(original)
-    session = await AsyncDirectionalPersistenceSession.open(
-        db_path, workflow_run_id="run-recovery"
-    )
+    session = await AsyncDirectionalPersistenceSession.open(db_path, workflow_run_id="run-recovery")
 
     with pytest.raises(ValueError, match="immutable execution ownership"):
         session.save_stage_checkpoint(
@@ -769,12 +895,12 @@ async def test_live_context_write_serializes_takeover_and_rejects_later_stale_ch
         status="completed",
     )
 
-    first_write = asyncio.create_task(asyncio.to_thread(scoped.save_stage_checkpoint, before_takeover))
+    first_write = asyncio.create_task(
+        asyncio.to_thread(scoped.save_stage_checkpoint, before_takeover)
+    )
     assert await asyncio.to_thread(entered_insert.wait, 2)
     assert claim_a.lease_expires_at is not None
-    seconds_until_expiry = (
-        claim_a.lease_expires_at - datetime.now(timezone.utc)
-    ).total_seconds()
+    seconds_until_expiry = (claim_a.lease_expires_at - datetime.now(timezone.utc)).total_seconds()
     await asyncio.sleep(max(0.0, seconds_until_expiry) + 0.25)
     takeover = asyncio.create_task(
         asyncio.to_thread(

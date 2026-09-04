@@ -34,9 +34,31 @@ run_prebuild_gate() {
     tests/integration/test_content_research_lite_read_model.py
   )
   local test_file
-  for test_file in "${task_3_1_core_files[@]}"; do
+  local api_e2e_files=(
+    tests/e2e/test_content_research_brief_scope_draft_api.py
+    tests/e2e/test_content_research_model_configuration_api.py
+    tests/e2e/test_content_research_presearch_api.py
+    tests/e2e/test_content_research_report_publication_timeline_api.py
+    tests/e2e/test_content_research_trace_api.py
+    tests/e2e/test_content_research_workflow_events_api.py
+  )
+  local single_writer_acceptance_files=(
+    tests/acceptance/test_direction_outcome_batches.py
+    tests/acceptance/test_lifecycle_command_isolation.py
+    tests/acceptance/test_scheduler_recovery.py
+    tests/acceptance/test_single_writer_migration.py
+    tests/acceptance/test_single_writer_naming.py
+    tests/acceptance/test_single_writer_ownership.py
+    tests/acceptance/test_sqlite_single_writer_runtime.py
+    tests/acceptance/test_runtime_release_parity.py
+  )
+  for test_file in \
+    "${task_3_1_core_files[@]}" \
+    "${api_e2e_files[@]}" \
+    "${single_writer_acceptance_files[@]}" \
+    docs/release/content_research_release_scenarios.json; do
     if [[ ! -f "$test_file" ]]; then
-      echo "Missing Task 3.1 release-gate test: $test_file" >&2
+      echo "Missing release-gate contract or test: $test_file" >&2
       exit 2
     fi
   done
@@ -47,11 +69,13 @@ run_prebuild_gate() {
     tests/unit/test_llm_openai_compatible_adapter.py \
     tests/unit/test_runtime_launcher.py \
     tests/unit/test_package_metadata.py \
-    tests/unit/test_task_3_1_release_gate.py
+    tests/unit/test_task_3_1_release_gate.py \
+    "${api_e2e_files[@]}" \
+    "${single_writer_acceptance_files[@]}"
 
   CREATOR_BROWSER_E2E_REQUIRED=1 \
     "$PYTHON" scripts/run_creator_browser_e2e.py \
-    --timeout-seconds 600 \
+    --timeout-seconds 2400 \
     --log-path .logs/release/creator-browser.log \
     --status-path .logs/release/creator-browser-status.json \
     -- "$PYTHON" scripts/run_creator_browser_e2e_suite.py
@@ -69,7 +93,9 @@ run_artifact_gate() {
     exit 2
   fi
   RUN_FROZEN_RUNTIME_RESTART_GATE="${RUN_FROZEN_RUNTIME_RESTART_GATE:-1}" \
-    "$PYTHON" -m pytest -q tests/acceptance/test_runtime_release_artifact.py
+    "$PYTHON" -m pytest -q \
+      tests/acceptance/test_runtime_release_artifact.py \
+      tests/acceptance/test_runtime_release_parity.py
 }
 
 if [[ "$PHASE" == "all" || "$PHASE" == "prebuild" ]]; then

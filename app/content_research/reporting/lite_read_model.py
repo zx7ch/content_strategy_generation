@@ -332,7 +332,12 @@ class LiteReportReader:
             )
         requested_directions = set(_frozen_scope(report)["direction_ids"])
         raw_claim_cards = report.get("claim_cards")
-        claim_cards = _records_in_directions(raw_claim_cards, requested_directions)
+        scoped_claim_cards = _records_in_directions(
+            raw_claim_cards, requested_directions
+        )
+        claim_cards = [
+            card for card in scoped_claim_cards if _card_has_lite_quote(card)
+        ]
         weak_signal_records = _records_in_directions(
             report.get("weak_signals"), requested_directions
         )
@@ -364,7 +369,7 @@ class LiteReportReader:
         if publication_state != "evidence_only_report" and (
             not isinstance(raw_claim_cards, list)
             or any(not isinstance(card, dict) for card in raw_claim_cards)
-            or len(claim_cards) != len(raw_claim_cards)
+            or len(scoped_claim_cards) != len(raw_claim_cards)
             or any(card is None for card in cards)
         ):
             raise PublishedReportNotFoundError(
@@ -1314,6 +1319,41 @@ def _validated_card(
             citation["citation_group_id"] for citation in matching_citations
         ],
     }
+
+
+def _card_has_lite_quote(card: dict[str, Any]) -> bool:
+    """Return whether an admitted card has evidence Lite is allowed to expose.
+
+    Formal direction contracts may admit fields such as ``tags``. Lite keeps
+    those decisions in the immutable audit lineage but intentionally projects
+    only title/body evidence, so a tags-only card is filtered rather than
+    misclassified as a corrupted citation identity.
+    """
+    direction_id = str(card.get("direction_id") or "")
+    claim_type = str(card.get("claim_type") or "")
+    eligible_fields = (
+        {"title", "content_text"}
+        if direction_id == "product_marketing" and claim_type == "message_angle"
+        else {"content_text"}
+        if direction_id == "product_marketing"
+        else _LITE_FIELDS
+    )
+    refs = card.get("evidence_refs")
+    if not isinstance(refs, list) or not refs:
+        # Legacy/materialized fixtures keep quote identity only on citation
+        # groups. They must still pass through the strict citation validator.
+        return True
+    fields = [
+        str(ref.get("field_path") or "")
+        for ref in refs
+        if isinstance(ref, dict)
+    ]
+    if not fields or any(not field for field in fields):
+        return True
+    return any(
+        isinstance(ref, dict) and ref.get("field_path") in eligible_fields
+        for ref in refs
+    )
 
 
 def _finding(card: dict[str, Any]) -> dict[str, Any]:

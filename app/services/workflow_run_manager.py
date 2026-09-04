@@ -8,6 +8,7 @@ tables directly.
 from __future__ import annotations
 
 import json
+import uuid
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from typing import Any, Optional, TypeVar
@@ -15,6 +16,16 @@ from typing import Any, Optional, TypeVar
 import aiosqlite
 
 from app.config import settings
+from app.core.runtime_write_coordinator import (
+    DomainMutationRejectedError,
+    RuntimeWriteCoordinator,
+    TypedMutation,
+)
+from app.core.runtime_write_registry import get_runtime_writer
+from app.core.sqlite_connection_roles import (
+    open_bootstrap_async_database,
+    open_readonly_async_database,
+)
 from app.memory.workflow_store import WorkflowStore, _json_dump, _new_id
 from app.models.workflow import (
     WorkflowArtifact,
@@ -131,10 +142,95 @@ class WorkflowRunManager:
         WorkflowRunStatus.FAILED.value,
     }
 
-    def __init__(self, db_path: Optional[str] = None):
+    def __init__(
+        self,
+        db_path: Optional[str] = None,
+        *,
+        writer: RuntimeWriteCoordinator | None = None,
+    ):
         self.db_path = db_path or settings.SQLITE_DB_PATH
+        self._writer = writer or get_runtime_writer(self.db_path)
         self._conn: Optional[aiosqlite.Connection] = None
         self._transaction_depth = 0
+
+    def __getattribute__(self, name: str):
+        if not name.startswith("_"):
+            writer = object.__getattribute__(self, "__dict__").get("_writer")
+            if writer is not None:
+                from app.services.workflow_run_mutations import (
+                    COORDINATED_WORKFLOW_ACTIONS,
+                )
+
+                if name in COORDINATED_WORKFLOW_ACTIONS:
+
+                    async def coordinated(*args, **kwargs):
+                        return await self._submit_workflow_command(name, args, kwargs)
+
+                    return coordinated
+        return object.__getattribute__(self, name)
+
+    async def _submit_workflow_command(
+        self,
+        action: str,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+    ) -> Any:
+        from app.services.workflow_run_mutations import decode_workflow_result
+
+        if any(callable(value) for value in (*args, *kwargs.values())):
+            raise RuntimeError("workflow callbacks must be converted to typed mutations")
+        run_id = kwargs.get("run_id") or kwargs.get("workflow_run_id")
+        if run_id is None and args and action not in {
+            "start_run",
+            "start_child_task",
+            "complete_child_task",
+            "retry_child_task",
+            "fail_child_task",
+            "cancel_child_task",
+        }:
+            run_id = args[0]
+        try:
+            state = object.__getattribute__(self, "__dict__")
+            execution_context = state.get("_execution_context")
+            dispatch_context = state.get("_dispatch_context")
+            result = await self._writer.submit(  # type: ignore[union-attr]
+                TypedMutation.create(
+                    mutation_id=f"workflow_command_{uuid.uuid4().hex}",
+                    mutation_kind="execute_workflow_command",
+                    domain_payload={
+                        "action": action,
+                        "args": list(args),
+                        "kwargs": kwargs,
+                        "execution_context": (
+                            {
+                                "execution_unit_id": execution_context.execution_unit_id,
+                                "attempt_no": execution_context.attempt_no,
+                                "lease_token": execution_context.lease_token,
+                                "scope_contract_id": execution_context.scope_contract_id,
+                            }
+                            if execution_context is not None
+                            else None
+                        ),
+                        "dispatch_context": (
+                            {
+                                "workflow_run_id": dispatch_context.workflow_run_id,
+                                "lease_owner": dispatch_context.lease_owner,
+                                "lease_token": dispatch_context.lease_token,
+                            }
+                            if dispatch_context is not None
+                            else None
+                        ),
+                    },
+                    run_id=str(run_id) if run_id is not None else None,
+                )
+            )
+        except DomainMutationRejectedError as exc:
+            raise WorkflowTransitionError(exc.safe_message) from None
+        if result.result_fields.get("rejected") == "execution_lease_fenced":
+            from app.content_research.scope_contract import ExecutionLeaseFencedError
+
+            raise ExecutionLeaseFencedError(str(result.result_fields.get("message") or "lease fenced"))
+        return decode_workflow_result(dict(result.result_fields))
 
     async def __aenter__(self) -> "WorkflowRunManager":
         await self.connect()
@@ -146,9 +242,13 @@ class WorkflowRunManager:
     async def connect(self) -> None:
         if self._conn is not None:
             return
+        if self._writer is not None:
+            self._conn = await open_readonly_async_database(self.db_path)
+            self._conn.row_factory = aiosqlite.Row
+            return
         async with WorkflowStore(self.db_path):
             pass
-        self._conn = await aiosqlite.connect(self.db_path)
+        self._conn = await open_bootstrap_async_database(self.db_path)
         self._conn.row_factory = aiosqlite.Row
         await self._conn.execute("PRAGMA synchronous=NORMAL")
         await self._conn.execute("PRAGMA busy_timeout=5000")
@@ -2156,11 +2256,11 @@ class WorkflowRunManager:
         run_id: str,
         after_event_id: Optional[int] = None,
     ) -> list[WorkflowEvent]:
-        async with WorkflowStore(self.db_path) as store:
+        async with WorkflowStore(self.db_path, read_only=self._writer is not None) as store:
             return await store.list_events(run_id, after_event_id=after_event_id)
 
     async def get_run_snapshot(self, run_id: str) -> dict[str, Any]:
-        async with WorkflowStore(self.db_path) as store:
+        async with WorkflowStore(self.db_path, read_only=self._writer is not None) as store:
             run = await store.get_run(run_id)
             if run is None:
                 raise WorkflowTransitionError(f"Workflow run not found: {run_id}")

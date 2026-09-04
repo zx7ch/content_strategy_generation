@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import uuid
 from datetime import datetime, timedelta
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
@@ -11,7 +12,14 @@ import aiosqlite
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 from app.config import settings
+from app.core.runtime_write_coordinator import RuntimeWriteCoordinator, TypedMutation
+from app.core.runtime_write_registry import get_runtime_writer
+from app.core.sqlite_connection_roles import (
+    open_bootstrap_async_database,
+    open_readonly_async_database,
+)
 from app.logging_config import get_logger, log_event
+from app.memory.checkpoint_mutations import CoordinatorCheckpointSaver
 from app.memory.session_data_store import SessionDataStore
 from app.models.session import (
     ContentStrategy,
@@ -37,12 +45,36 @@ class SessionManager:
         "error",
     }
 
-    def __init__(self, db_path: Optional[str] = None):
+    def __init__(
+        self,
+        db_path: Optional[str] = None,
+        *,
+        writer: RuntimeWriteCoordinator | None = None,
+    ):
         self.db_path = db_path or settings.SQLITE_DB_PATH
+        self._writer = writer or get_runtime_writer(self.db_path)
         self._conn: Optional[aiosqlite.Connection] = None
         self._checkpointer: Optional[AsyncSqliteSaver] = None
         self.data_store: Optional[SessionDataStore] = None
         self._logger = get_logger(__name__, component="session")
+
+    async def _submit_session_mutation(
+        self,
+        action: str,
+        payload: dict[str, Any],
+        *,
+        mutation_id: str | None = None,
+    ) -> dict[str, Any]:
+        if self._writer is None:
+            raise RuntimeError("runtime writer is not configured")
+        result = await self._writer.submit(
+            TypedMutation.create(
+                mutation_id=mutation_id or f"session_mutation_{uuid.uuid4().hex}",
+                mutation_kind="mutate_session_record",
+                domain_payload={"action": action, **payload},
+            )
+        )
+        return dict(result.result_fields)
 
     async def __aenter__(self):
         await self.connect()
@@ -55,7 +87,14 @@ class SessionManager:
         if self._conn is not None:
             return
 
-        self._conn = await aiosqlite.connect(self.db_path)
+        if self._writer is not None:
+            self._conn = await open_readonly_async_database(self.db_path)
+            self._conn.row_factory = aiosqlite.Row
+            self.data_store = SessionDataStore(self._conn, writer=self._writer)
+            self._checkpointer = CoordinatorCheckpointSaver(self._conn, self._writer)
+            return
+
+        self._conn = await open_bootstrap_async_database(self.db_path)
         self._conn.row_factory = aiosqlite.Row
 
         await self._conn.execute("PRAGMA journal_mode=WAL")
@@ -283,6 +322,36 @@ class SessionManager:
         alive_until = now + timedelta(hours=settings.SESSION_ALIVE_HOURS)
         purge_after = now + timedelta(days=settings.SESSION_PURGE_AFTER_DAYS)
 
+        if self._writer is not None:
+            now_iso = now.isoformat()
+            await self._submit_session_mutation(
+                "create_session",
+                {
+                    "session_id": session_id,
+                    "user_id": user_id,
+                    "user_query": user_query,
+                    "platform": platform,
+                    "mode": mode,
+                    "stage": SessionStage.INIT.value,
+                    "lifecycle_state": SessionLifecycleState.ALIVE.value,
+                    "alive_until": alive_until.isoformat(),
+                    "purge_after": purge_after.isoformat(),
+                    "quality_score": 0.0,
+                    "used_fallback": False,
+                    "retry_stats": self._serialize_json(RetryStats()),
+                    "reindex_state": "ok",
+                    "reindex_attempts": 0,
+                    "created_at": now_iso,
+                    "updated_at": now_iso,
+                    "last_activity_at": now_iso,
+                    "last_user_activity_at": now_iso,
+                },
+                mutation_id=f"create_session_{session_id}",
+            )
+            session = await self.get_session(session_id)
+            assert session is not None
+            return session
+
         await self._conn.execute(
             """
             INSERT INTO sessions (
@@ -361,6 +430,78 @@ class SessionManager:
             now=now,
         )
         state_changed = lifecycle.value != current_state
+        if self._writer is not None:
+            event: dict[str, Any] | None = None
+            if state_changed and lifecycle == SessionLifecycleState.FROZEN:
+                event = {
+                    "event_name": "session_frozen",
+                    "stage": row["stage"],
+                    "payload_json": json.dumps(
+                        {
+                            "message": "session frozen",
+                            "progress": None,
+                            "error_code": None,
+                            "details": {"frozen_at": now.isoformat()},
+                        },
+                        ensure_ascii=False,
+                    ),
+                }
+            if state_changed and lifecycle == SessionLifecycleState.PURGED:
+                event = {
+                    "event_name": "session_purged",
+                    "stage": row["stage"],
+                    "payload_json": json.dumps(
+                        {
+                            "message": "session purged",
+                            "progress": None,
+                            "error_code": None,
+                            "details": {"purged_at": now.isoformat()},
+                        },
+                        ensure_ascii=False,
+                    ),
+                }
+            result = await self._submit_session_mutation(
+                "refresh_lifecycle",
+                {
+                    "session_id": session_id,
+                    "lifecycle_state": lifecycle.value,
+                    "now": now.isoformat(),
+                    "alive_until": (
+                        last_user_activity + timedelta(hours=settings.SESSION_ALIVE_HOURS)
+                    ).isoformat(),
+                    "purge_after": (
+                        last_user_activity
+                        + timedelta(days=settings.SESSION_PURGE_AFTER_DAYS)
+                    ).isoformat(),
+                    "frozen_at": now.isoformat(),
+                    "purged_at": now.isoformat(),
+                    "event": event,
+                },
+            )
+            cancelled_jobs = int(result.get("cancelled_jobs", 0))
+            if state_changed and lifecycle == SessionLifecycleState.FROZEN:
+                log_event(
+                    self._logger,
+                    event_name="session_frozen",
+                    level="warning",
+                    component="session",
+                    session_id=session_id,
+                    stage=None,
+                    frozen_at=now.isoformat(),
+                )
+            if state_changed and lifecycle == SessionLifecycleState.PURGED:
+                log_event(
+                    self._logger,
+                    event_name="session_purged",
+                    level="warning",
+                    component="session",
+                    session_id=session_id,
+                    stage=None,
+                    purged_at=now.isoformat(),
+                    cancelled_jobs=cancelled_jobs,
+                )
+            return lifecycle
+
         cancelled_jobs = 0
         if lifecycle == SessionLifecycleState.PURGED:
             cancelled_jobs = await self._cancel_unfinished_jobs_for_purge(session_id)
@@ -619,6 +760,19 @@ class SessionManager:
         update_fields.extend(["updated_at = ?", "last_activity_at = ?"])
         params.extend([now.isoformat(), now.isoformat()])
 
+        if self._writer is not None:
+            field_values = {
+                assignment.split(" =", 1)[0]: json.loads(
+                    json.dumps(value, ensure_ascii=False, default=str)
+                )
+                for assignment, value in zip(update_fields, params)
+            }
+            await self._submit_session_mutation(
+                "update_session",
+                {"session_id": session_id, "fields": field_values},
+            )
+            return await self.get_session(session_id)
+
         params.append(session_id)
         await self._conn.execute(
             f"UPDATE sessions SET {', '.join(update_fields)} WHERE session_id = ?",
@@ -631,6 +785,12 @@ class SessionManager:
     async def delete_session(self, session_id: str) -> bool:
         assert self._conn is not None
         assert self.data_store is not None
+
+        if self._writer is not None:
+            result = await self._submit_session_mutation(
+                "delete_session", {"session_id": session_id}
+            )
+            return result.get("deleted") is True
 
         await self.data_store.delete_session_data(session_id)
         async with self._conn.execute(
@@ -658,17 +818,30 @@ class SessionManager:
 
         note_ids = await self.data_store.save_spider_results(session_id, posts or [])
         now = datetime.utcnow().isoformat()
-        await self._conn.execute(
-            """
-            UPDATE sessions
-            SET spider_note_ids = ?,
-                updated_at = ?,
-                last_activity_at = ?
-            WHERE session_id = ?
-            """,
-            (self._serialize_json(note_ids), now, now, session_id),
-        )
-        await self._conn.commit()
+        if self._writer is not None:
+            await self._submit_session_mutation(
+                "update_session",
+                {
+                    "session_id": session_id,
+                    "fields": {
+                        "spider_note_ids": self._serialize_json(note_ids),
+                        "updated_at": now,
+                        "last_activity_at": now,
+                    },
+                },
+            )
+        else:
+            await self._conn.execute(
+                """
+                UPDATE sessions
+                SET spider_note_ids = ?,
+                    updated_at = ?,
+                    last_activity_at = ?
+                WHERE session_id = ?
+                """,
+                (self._serialize_json(note_ids), now, now, session_id),
+            )
+            await self._conn.commit()
 
         if rag_indexer is not None:
             try:
@@ -726,6 +899,30 @@ class SessionManager:
     async def update_activity(self, session_id: str) -> bool:
         """Record user activity and force session back to alive (resume path)."""
         now = datetime.utcnow().isoformat()
+        alive_until = (
+            datetime.utcnow() + timedelta(hours=settings.SESSION_ALIVE_HOURS)
+        ).isoformat()
+        purge_after = (
+            datetime.utcnow() + timedelta(days=settings.SESSION_PURGE_AFTER_DAYS)
+        ).isoformat()
+        if self._writer is not None:
+            result = await self._submit_session_mutation(
+                "update_session",
+                {
+                    "session_id": session_id,
+                    "fields": {
+                        "last_activity_at": now,
+                        "last_user_activity_at": now,
+                        "updated_at": now,
+                        "lifecycle_state": "alive",
+                        "alive_until": alive_until,
+                        "pause_requested": False,
+                        "pause_requested_at": None,
+                        "purge_after": purge_after,
+                    },
+                },
+            )
+            return result.get("updated") is True
         async with self._conn.execute(
             """
             UPDATE sessions
@@ -743,8 +940,8 @@ class SessionManager:
                 now,
                 now,
                 now,
-                (datetime.utcnow() + timedelta(hours=settings.SESSION_ALIVE_HOURS)).isoformat(),
-                (datetime.utcnow() + timedelta(days=settings.SESSION_PURGE_AFTER_DAYS)).isoformat(),
+                alive_until,
+                purge_after,
                 session_id,
             ),
         ) as cursor:
@@ -754,6 +951,27 @@ class SessionManager:
     async def touch_user_activity(self, session_id: str) -> bool:
         """Record user-triggered touch without forcing lifecycle transitions."""
         now = datetime.utcnow().isoformat()
+        alive_until = (
+            datetime.utcnow() + timedelta(hours=settings.SESSION_ALIVE_HOURS)
+        ).isoformat()
+        purge_after = (
+            datetime.utcnow() + timedelta(days=settings.SESSION_PURGE_AFTER_DAYS)
+        ).isoformat()
+        if self._writer is not None:
+            result = await self._submit_session_mutation(
+                "update_session",
+                {
+                    "session_id": session_id,
+                    "fields": {
+                        "last_user_activity_at": now,
+                        "last_activity_at": now,
+                        "updated_at": now,
+                        "alive_until": alive_until,
+                        "purge_after": purge_after,
+                    },
+                },
+            )
+            return result.get("updated") is True
         async with self._conn.execute(
             """
             UPDATE sessions
@@ -768,8 +986,8 @@ class SessionManager:
                 now,
                 now,
                 now,
-                (datetime.utcnow() + timedelta(hours=settings.SESSION_ALIVE_HOURS)).isoformat(),
-                (datetime.utcnow() + timedelta(days=settings.SESSION_PURGE_AFTER_DAYS)).isoformat(),
+                alive_until,
+                purge_after,
                 session_id,
             ),
         ) as cursor:
@@ -801,6 +1019,29 @@ class SessionManager:
     async def mark_reindex_pending(self, session_id: str) -> bool:
         assert self._conn is not None
 
+        if self._writer is not None:
+            result = await self._submit_session_mutation(
+                "update_session",
+                {
+                    "session_id": session_id,
+                    "fields": {
+                        "reindex_state": "pending",
+                        "updated_at": datetime.utcnow().isoformat(),
+                    },
+                },
+            )
+            updated = result.get("updated") is True
+            if updated:
+                log_event(
+                    self._logger,
+                    event_name="reindex_scheduled",
+                    level="warning",
+                    component="session",
+                    session_id=session_id,
+                    stage=None,
+                )
+            return updated
+
         async with self._conn.execute(
             """
             UPDATE sessions
@@ -830,6 +1071,29 @@ class SessionManager:
         assert self._conn is not None
 
         if success:
+            if self._writer is not None:
+                result = await self._submit_session_mutation(
+                    "update_session",
+                    {
+                        "session_id": session_id,
+                        "fields": {
+                            "reindex_state": "ok",
+                            "reindex_attempts": 0,
+                            "updated_at": datetime.utcnow().isoformat(),
+                        },
+                    },
+                )
+                updated = result.get("updated") is True
+                if updated:
+                    log_event(
+                        self._logger,
+                        event_name="reindex_succeeded",
+                        level="info",
+                        component="session",
+                        session_id=session_id,
+                        stage=None,
+                    )
+                return updated
             async with self._conn.execute(
                 """
                 UPDATE sessions
@@ -865,6 +1129,31 @@ class SessionManager:
         status = "pending"
         if attempts >= settings.REINDEX_MAX_ATTEMPTS:
             status = "deadletter"
+
+        if self._writer is not None:
+            result = await self._submit_session_mutation(
+                "update_session",
+                {
+                    "session_id": session_id,
+                    "fields": {
+                        "reindex_state": status,
+                        "reindex_attempts": attempts,
+                        "updated_at": datetime.utcnow().isoformat(),
+                    },
+                },
+            )
+            updated = result.get("updated") is True
+            if updated and status == "deadletter":
+                log_event(
+                    self._logger,
+                    event_name="reindex_deadlettered",
+                    level="error",
+                    component="session",
+                    session_id=session_id,
+                    stage=None,
+                    attempts=attempts,
+                )
+            return updated
 
         async with self._conn.execute(
             """

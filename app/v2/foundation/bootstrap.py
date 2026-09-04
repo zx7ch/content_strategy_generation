@@ -6,13 +6,14 @@ import sqlite3
 from typing import Any
 
 from app.config import Settings
+from app.core.sqlite_connection_roles import open_readonly_database
 from app.v2.db.runner import run_p1_1_migrations
 from app.v2.foundation.models import BrandRecord, WorkspaceRecord, utcnow
 from app.v2.foundation.postgres_store import PostgresMasterDataStore
-from app.v2.foundation.sqlite_store import SQLiteMasterDataStore
-from app.v2.runtime import resolve_v2_backend
 from app.v2.foundation.service import MasterDataService
+from app.v2.foundation.sqlite_store import SQLiteMasterDataStore
 from app.v2.foundation.store import InMemoryMasterDataStore
+from app.v2.runtime import resolve_v2_backend
 
 # Default workspace seeded on startup so single-deployment users need no configuration.
 # Frontend discovers this id via GET /workspaces/default on startup.
@@ -115,7 +116,7 @@ def _reconcile_orphaned_brands(service: MasterDataService, db_path: str) -> None
     """Re-create brand records for any brand_id referenced in PUBLISH_CANDIDATE artifacts
     that are missing from the store (e.g. brands created under the old InMemoryMasterDataStore)."""
     try:
-        conn = sqlite3.connect(db_path)
+        conn = open_readonly_database(db_path)
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             """SELECT DISTINCT

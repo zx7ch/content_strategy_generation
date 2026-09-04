@@ -2,20 +2,32 @@
 
 from __future__ import annotations
 
-import sqlite3
 from datetime import datetime, timezone
 
 from app.content_research.bootstrap import bootstrap_content_research_schema
+from app.core.runtime_write_coordinator import RuntimeWriteCoordinator, TypedMutation
+from app.core.runtime_write_registry import get_runtime_writer
+from app.core.sqlite_connection_roles import (
+    open_bootstrap_database,
+    open_readonly_database,
+)
 from app.services.llm.configuration import UserLLMConfiguration
 
 
 class SQLiteLLMConfigurationStore:
-    def __init__(self, db_path: str) -> None:
+    def __init__(
+        self,
+        db_path: str,
+        *,
+        writer: RuntimeWriteCoordinator | None = None,
+    ) -> None:
         self._db_path = db_path
-        bootstrap_content_research_schema(db_path)
+        self._writer = writer or get_runtime_writer(self._db_path)
+        if self._writer is None:
+            bootstrap_content_research_schema(db_path)
 
     def get(self, workspace_id: str, user_id: str) -> UserLLMConfiguration | None:
-        with sqlite3.connect(self._db_path) as conn:
+        with open_readonly_database(self._db_path) as conn:
             row = conn.execute(
                 """
                 SELECT workspace_id, user_id, base_url, model, api_key,
@@ -43,7 +55,33 @@ class SQLiteLLMConfigurationStore:
             created_at=created_at,
             updated_at=datetime.now(timezone.utc),
         )
-        with sqlite3.connect(self._db_path) as conn:
+        if self._writer is not None:
+            self._writer.submit_sync(
+                TypedMutation.create(
+                    mutation_id=(
+                        f"llm_configuration_{saved.workspace_id}_{saved.user_id}_"
+                        f"{saved.updated_at.isoformat()}"
+                    ),
+                    mutation_kind="mutate_runtime_accounting",
+                    domain_payload={
+                        "action": "upsert_llm_configuration",
+                        "fields": [
+                            saved.workspace_id,
+                            saved.user_id,
+                            saved.base_url,
+                            saved.model,
+                            saved.api_key,
+                            saved.validation_status,
+                            saved.validated_at.isoformat(),
+                            saved.last_validation_error_code,
+                            saved.created_at.isoformat(),
+                            saved.updated_at.isoformat(),
+                        ],
+                    },
+                )
+            )
+            return saved
+        with open_bootstrap_database(self._db_path) as conn:
             conn.execute(
                 """
                 INSERT INTO content_research_llm_configurations (
@@ -66,13 +104,87 @@ class SQLiteLLMConfigurationStore:
             )
         return saved
 
+    async def upsert_async(
+        self,
+        configuration: UserLLMConfiguration,
+    ) -> UserLLMConfiguration:
+        if self._writer is None:
+            return self.upsert(configuration)
+        existing = self.get(configuration.workspace_id, configuration.user_id)
+        saved = UserLLMConfiguration(
+            workspace_id=configuration.workspace_id,
+            user_id=configuration.user_id,
+            base_url=configuration.base_url,
+            model=configuration.model,
+            api_key=configuration.api_key,
+            validation_status=configuration.validation_status,
+            validated_at=configuration.validated_at,
+            last_validation_error_code=configuration.last_validation_error_code,
+            created_at=existing.created_at if existing else configuration.created_at,
+            updated_at=datetime.now(timezone.utc),
+        )
+        await self._writer.submit(
+            TypedMutation.create(
+                mutation_id=(
+                    f"llm_configuration_{saved.workspace_id}_{saved.user_id}_"
+                    f"{saved.updated_at.isoformat()}"
+                ),
+                mutation_kind="mutate_runtime_accounting",
+                domain_payload={
+                    "action": "upsert_llm_configuration",
+                    "fields": [
+                        saved.workspace_id,
+                        saved.user_id,
+                        saved.base_url,
+                        saved.model,
+                        saved.api_key,
+                        saved.validation_status,
+                        saved.validated_at.isoformat(),
+                        saved.last_validation_error_code,
+                        saved.created_at.isoformat(),
+                        saved.updated_at.isoformat(),
+                    ],
+                },
+            )
+        )
+        return saved
+
     def delete(self, workspace_id: str, user_id: str) -> bool:
-        with sqlite3.connect(self._db_path) as conn:
+        if self._writer is not None:
+            result = self._writer.submit_sync(
+                TypedMutation.create(
+                    mutation_id=f"delete_llm_configuration_{workspace_id}_{user_id}",
+                    mutation_kind="mutate_runtime_accounting",
+                    domain_payload={
+                        "action": "delete_llm_configuration",
+                        "workspace_id": workspace_id,
+                        "user_id": user_id,
+                    },
+                )
+            )
+            return result.result_fields.get("deleted") is True
+        with open_bootstrap_database(self._db_path) as conn:
             cursor = conn.execute(
                 "DELETE FROM content_research_llm_configurations WHERE workspace_id = ? AND user_id = ?",
                 (workspace_id, user_id),
             )
         return cursor.rowcount > 0
+
+    async def delete_async(self, workspace_id: str, user_id: str) -> bool:
+        if self._writer is None:
+            return self.delete(workspace_id, user_id)
+        result = await self._writer.submit(
+            TypedMutation.create(
+                mutation_id=f"delete_llm_configuration_{workspace_id}_{user_id}",
+                mutation_kind="mutate_runtime_accounting",
+                domain_payload={
+                    "action": "delete_llm_configuration",
+                    "workspace_id": workspace_id,
+                    "user_id": user_id,
+                },
+            )
+        )
+        return result.result_fields.get("deleted") is True
 
     @staticmethod
     def _from_row(row: tuple[object, ...]) -> UserLLMConfiguration:

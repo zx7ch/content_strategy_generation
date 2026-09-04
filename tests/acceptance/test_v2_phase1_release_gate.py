@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import sqlite3
 import time
 from dataclasses import replace
 
-from fastapi.testclient import TestClient
 import pytest
+from fastapi.testclient import TestClient
 
 from app.main import app
 from tests.acceptance.conftest import write_acceptance_artifact
@@ -27,6 +28,7 @@ from tests.acceptance.v2_phase1_helpers import (
 
 @pytest.mark.acceptance
 def test_v2_phase1_second_batch_reflects_feedback_updates(
+    acceptance_storage,
     acceptance_artifact_dir,
 ) -> None:
     started = time.perf_counter()
@@ -85,6 +87,7 @@ def test_v2_phase1_second_batch_reflects_feedback_updates(
 
 @pytest.mark.acceptance
 def test_v2_phase1_evaluation_fails_closed_on_missing_feedback_event(
+    acceptance_storage,
     acceptance_artifact_dir,
 ) -> None:
     with TestClient(app) as client:
@@ -132,6 +135,7 @@ def test_v2_phase1_evaluation_fails_closed_on_missing_feedback_event(
 
 @pytest.mark.acceptance
 def test_v2_phase1_evaluation_fails_closed_on_missing_state_snapshot_lineage(
+    acceptance_storage,
     acceptance_artifact_dir,
 ) -> None:
     with TestClient(app) as client:
@@ -152,12 +156,17 @@ def test_v2_phase1_evaluation_fails_closed_on_missing_state_snapshot_lineage(
         import_performance(client, workspace_id=workspace["id"], publish_record_id=publish["publish_record_id"])
 
         decision_store = client.app.state.v2_decision_store
-        master_store = client.app.state.v2_master_data_store
         event_id = batch["items"][0]["decision_event_id"]
         event = decision_store.get_decision_event(event_id)
         assert event is not None
         decision_store.save_decision_event(replace(event, brand_state_snapshot_id="missing-snapshot-id"))
-        master_store._snapshots.pop(snapshot["id"], None)  # type: ignore[attr-defined]
+        # Fault injection operates on the persisted runtime implementation; the
+        # old in-memory dictionary is no longer a supported release shape.
+        with sqlite3.connect(acceptance_storage["db_path"]) as connection:
+            connection.execute(
+                "DELETE FROM md_state_snapshots WHERE id = ?",
+                (snapshot["id"],),
+            )
 
         evaluation = create_evaluation_run(client, workspace_id=workspace["id"], brand_id=brand["id"])
 
@@ -183,6 +192,7 @@ def test_v2_phase1_evaluation_fails_closed_on_missing_state_snapshot_lineage(
 
 @pytest.mark.acceptance
 def test_v2_phase1_workspace_scope_isolation_holds_across_v2_routes(
+    acceptance_storage,
     acceptance_artifact_dir,
 ) -> None:
     with TestClient(app) as client:

@@ -14,6 +14,7 @@ from pathlib import Path, PurePosixPath
 from urllib.error import HTTPError
 
 import pytest
+from playwright.sync_api import expect, sync_playwright
 
 from app.content_research.lifecycle.coordinator import ContentResearchPersistenceCoordinator
 from app.content_research.lifecycle.models import LifecycleCommand
@@ -21,11 +22,14 @@ from app.content_research.models import ResearchBriefRecord, TraceRecord, utcnow
 from app.content_research.persistence_models import StageCheckpointRecord
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
 from app.memory.thread_store import ThreadStore
+from tests.browser_process import chrome_executable, reserve_port, run_process
 
 RELEASE_GATE_HEADERS = {
     "X-Workspace-Id": "00000000-0000-0000-0000-000000000001",
     "X-User-Id": "release-gate",
 }
+HEALTH_PROBE_TIMEOUT_SECONDS = 1
+FROZEN_RUNTIME_READ_TIMEOUT_SECONDS = 5
 
 
 def _release_archive() -> Path:
@@ -107,20 +111,74 @@ def test_release_archive_contains_runtime_and_launcher():
             )
 
 
+@pytest.mark.acceptance
+def test_master_frontend_and_runtime_zip_share_single_writer_contract() -> None:
+    archive = _release_archive()
+    if os.getenv("RELEASE_GATE_REQUIRE_ARTIFACT") != "1":
+        pytest.skip("release artifact is built by the release gate")
+    assert archive.exists(), f"release artifact not found: {archive}"
+
+    required_contract = "local-runtime-single-writer"
+    frontend_source = Path("frontend/src/lib/api.ts").read_text(encoding="utf-8")
+    assert f'REQUIRED_API_CONTRACT = "{required_contract}"' in frontend_source
+
+    with zipfile.ZipFile(archive) as bundle:
+        runtime_config = bundle.read("xhs-runtime/config.env").decode("utf-8")
+        packaged_config = bundle.read("xhs-runtime/_internal/app/config.py").decode("utf-8")
+    assert f"RUNTIME_API_CONTRACT={required_contract}" in runtime_config
+    assert f'default="{required_contract}"' in packaged_config
+
+
 def _free_local_port() -> int:
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         return int(listener.getsockname()[1])
 
 
-def _get_json(url: str, *, headers: dict[str, str] | None = None) -> dict:
+def _get_json(
+    url: str,
+    *,
+    headers: dict[str, str] | None = None,
+    timeout_seconds: float = FROZEN_RUNTIME_READ_TIMEOUT_SECONDS,
+) -> dict:
     request = urllib.request.Request(url, headers=headers or {})
     try:
-        with urllib.request.urlopen(request, timeout=1) as response:  # noqa: S310 -- local Runtime only
+        with urllib.request.urlopen(  # noqa: S310 -- local Runtime only
+            request,
+            timeout=timeout_seconds,
+        ) as response:
             return json.loads(response.read().decode("utf-8"))
     except HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
         raise AssertionError(f"{url} returned HTTP {exc.code}: {detail}") from exc
+
+
+def test_release_gate_business_reads_tolerate_bounded_cold_start_jitter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed_timeouts: list[float] = []
+
+    class JSONResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, _exc_type, _exc_value, _traceback) -> bool:
+            return False
+
+        @staticmethod
+        def read() -> bytes:
+            return b'{"status":"ready"}'
+
+    def delayed_local_response(_request, *, timeout: float):
+        observed_timeouts.append(timeout)
+        if timeout < FROZEN_RUNTIME_READ_TIMEOUT_SECONDS:
+            raise TimeoutError("simulated frozen Runtime scheduling jitter")
+        return JSONResponse()
+
+    monkeypatch.setattr(urllib.request, "urlopen", delayed_local_response)
+
+    assert _get_json("http://127.0.0.1:8000/trace") == {"status": "ready"}
+    assert observed_timeouts == [FROZEN_RUNTIME_READ_TIMEOUT_SECONDS]
 
 
 def _wait_for_health(port: int, process: subprocess.Popen) -> dict:
@@ -132,7 +190,10 @@ def _wait_for_health(port: int, process: subprocess.Popen) -> dict:
                 "frozen Runtime exited before health became available:\n" + output[-2000:]
             )
         try:
-            return _get_json(f"http://127.0.0.1:{port}/health")
+            return _get_json(
+                f"http://127.0.0.1:{port}/health",
+                timeout_seconds=HEALTH_PROBE_TIMEOUT_SECONDS,
+            )
         except OSError:
             time.sleep(0.2)
     raise AssertionError("frozen Runtime did not become healthy within 20 seconds")
@@ -329,3 +390,181 @@ def test_frozen_runtime_restart_preserves_content_research_fixture(tmp_path):
         assert len(checkpoints[0].payload["candidates"]) == 28
     finally:
         _stop(second)
+
+
+@pytest.mark.acceptance
+def test_second_frozen_runtime_exits_with_a_readable_lock_message(
+    tmp_path: Path,
+) -> None:
+    if os.getenv("RUN_FROZEN_RUNTIME_RESTART_GATE") != "1":
+        pytest.skip("set RUN_FROZEN_RUNTIME_RESTART_GATE=1 after packaging")
+
+    archive = _release_archive()
+    assert archive.is_file(), f"release gate requires {archive}"
+    extracted = tmp_path / "duplicate-runtime"
+    subprocess.run(
+        ["/usr/bin/unzip", "-q", str(archive), "-d", str(extracted)],
+        check=True,
+    )
+    runtime_dir = extracted / "xhs-runtime"
+    executable = runtime_dir / "xhs-runtime"
+    executable.chmod(executable.stat().st_mode | 0o111)
+    home = tmp_path / "home"
+    (home / "Library" / "Application Support" / "xhs-growth-agent").mkdir(
+        parents=True
+    )
+
+    first_port = _free_local_port()
+    second_port = _free_local_port()
+
+    def environment(port: int) -> dict[str, str]:
+        result = {**os.environ, "HOME": str(home), "RUNTIME_PORT": str(port)}
+        for inherited in ("PYTHONHOME", "PYTHONPATH", "VIRTUAL_ENV", "CONDA_PREFIX"):
+            result.pop(inherited, None)
+        return result
+
+    first = subprocess.Popen(
+        [str(executable)],
+        cwd=runtime_dir,
+        env=environment(first_port),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    try:
+        first_health = _wait_for_health(first_port, first)
+        second = subprocess.run(
+            [str(executable)],
+            cwd=runtime_dir,
+            env=environment(second_port),
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        second_output = second.stdout + second.stderr
+
+        assert second.returncode == 2
+        assert "LOCAL_RUNTIME_DATABASE_LOCKED" in second_output
+        assert "已有 XHS Growth Agent Runtime 正在运行" in second_output
+        assert "无需重复启动" in second_output
+        assert "Traceback" not in second_output
+        assert "BlockingIOError" not in second_output
+        assert _wait_for_health(first_port, first)["service"] == first_health["service"]
+    finally:
+        _stop(first)
+
+
+@pytest.mark.acceptance
+def test_frozen_runtime_and_same_sha_frontend_restore_run_in_real_browser(
+    tmp_path: Path,
+) -> None:
+    if os.getenv("RUN_FROZEN_RUNTIME_RESTART_GATE") != "1":
+        pytest.skip("set RUN_FROZEN_RUNTIME_RESTART_GATE=1 after packaging")
+
+    archive = _release_archive()
+    assert archive.is_file(), f"release gate requires {archive}"
+    extracted = tmp_path / "browser-runtime"
+    subprocess.run(
+        ["/usr/bin/unzip", "-q", str(archive), "-d", str(extracted)],
+        check=True,
+    )
+    runtime_dir = extracted / "xhs-runtime"
+    executable = runtime_dir / "xhs-runtime"
+    executable.chmod(executable.stat().st_mode | 0o111)
+
+    home = tmp_path / "browser-home"
+    data_home = home / "Library" / "Application Support" / "xhs-growth-agent"
+    data_home.mkdir(parents=True)
+    workflow_run_id = _seed_persisted_content_research_fixture(
+        str(data_home / "xhs_agent.db")
+    )
+
+    repository = Path(__file__).resolve().parents[2]
+    frontend_root = repository / "frontend"
+    tsconfig_path = frontend_root / "tsconfig.json"
+    tsconfig_before = tsconfig_path.read_bytes()
+    runtime_port = reserve_port()
+    frontend_port = reserve_port()
+    runtime_url = f"http://127.0.0.1:{runtime_port}"
+    frontend_url = f"http://127.0.0.1:{frontend_port}"
+    runtime_environment = {
+        **os.environ,
+        "HOME": str(home),
+        "RUNTIME_PORT": str(runtime_port),
+        "CORS_ALLOWED_ORIGINS": frontend_url,
+        "HF_HUB_OFFLINE": "1",
+        "TRANSFORMERS_OFFLINE": "1",
+        "TOKENIZERS_PARALLELISM": "false",
+    }
+    for inherited in ("PYTHONHOME", "PYTHONPATH", "VIRTUAL_ENV", "CONDA_PREFIX"):
+        runtime_environment.pop(inherited, None)
+    frontend_environment = {
+        **os.environ,
+        "NEXT_DIST_DIR": f".next/artifact-{frontend_port}",
+        "NEXT_PUBLIC_XHS_API_BASE_URL": runtime_url,
+        "XHS_API_BASE_URL": runtime_url,
+        "NEXT_TELEMETRY_DISABLED": "1",
+    }
+
+    try:
+        with run_process(
+            cmd=[str(executable)],
+            cwd=runtime_dir,
+            env=runtime_environment,
+            ready_url=f"{runtime_url}/health",
+            ready_timeout=60,
+            name="frozen Runtime",
+        ):
+            with run_process(
+                cmd=[
+                    "npm",
+                    "run",
+                    "dev",
+                    "--",
+                    "--hostname",
+                    "127.0.0.1",
+                    "--port",
+                    str(frontend_port),
+                ],
+                cwd=frontend_root,
+                env=frontend_environment,
+                ready_url=f"{frontend_url}/creator",
+                ready_timeout=90,
+                name="same-SHA frontend",
+            ):
+                with sync_playwright() as playwright:
+                    browser = playwright.chromium.launch(
+                        headless=True,
+                        executable_path=chrome_executable(),
+                    )
+                    page = browser.new_page(viewport={"width": 1440, "height": 960})
+                    try:
+                        with page.expect_response(
+                            lambda response: response.url.endswith(
+                                f"/content-research/workflows/{workflow_run_id}"
+                            )
+                            and response.status == 200,
+                            timeout=30000,
+                        ) as workflow_response:
+                            page.goto(
+                                f"{frontend_url}/creator?contentResearchRunId={workflow_run_id}",
+                                wait_until="domcontentloaded",
+                            )
+                        workflow = workflow_response.value.json()
+                        assert workflow["workflow_run_id"] == workflow_run_id
+                        assert workflow["run"]["state"] == "recovery_required"
+                        assert (
+                            workflow["run"]["recovery_plan"]["action"]
+                            == "retry_presearch"
+                        )
+                        expect(
+                            page.get_by_text(
+                                "模型服务配置需要更新。请在右侧保存并验证新配置后继续本次预检索。",
+                                exact=True,
+                            )
+                        ).to_be_visible(timeout=30000)
+                    finally:
+                        browser.close()
+    finally:
+        tsconfig_path.write_bytes(tsconfig_before)

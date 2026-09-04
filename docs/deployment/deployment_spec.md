@@ -232,7 +232,7 @@ Shape:
   "service": "xhs-agent-runtime",
   "status": "healthy",
   "version": "0.1.0",
-  "api_contract": "local-runtime-v1",
+  "api_contract": "local-runtime-single-writer",
   "runtime_id": "local-dev",
   "features": {
     "sse": true,
@@ -799,4 +799,3 @@ Recommended project statement:
 Key clarification:
 
 > Saying "strategy generation and content generation run in the cloud" can be misunderstood as "the Agent service runs in the cloud." The precise statement is: `StrategyAgent` and `GenerationAgent` are orchestrated by the local worker; only LLM inference calls happen in the cloud.
-

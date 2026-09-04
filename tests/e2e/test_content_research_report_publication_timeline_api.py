@@ -248,10 +248,10 @@ async def test_publication_dedupe_keeps_identical_nonempty_claims_distinct_acros
 
 
 @pytest.mark.asyncio
-async def test_failed_materialization_retry_reuses_the_exact_persisted_execution_publication(
+async def test_report_retry_rejects_historical_run_without_canonical_lifecycle_authority(
     tmp_path,
 ):
-    """A newer valid publication must not replace the exact failed publication on retry."""
+    """Historical workflow-only state cannot acquire current report mutation authority."""
     db_path = str(tmp_path / "failed-materialization-lineage-retry.db")
     store = SQLiteContentResearchStore(db_path)
     async with ThreadStore(db_path) as threads:
@@ -468,41 +468,20 @@ async def test_failed_materialization_retry_reuses_the_exact_persisted_execution
             run.run_id, publication_id=publication.id
         )
 
-    await service._retry_failed_report_publication(
-        workflow_run_id=run.run_id,
-        request=ContentResearchSourceCollectionRequest(
-            provider="xiaohongshu", source_kind="search_result", limit=20
-        ),
-    )
+    with pytest.raises(
+        ValueError,
+        match="historical workflow run has no current lifecycle authority",
+    ):
+        await service._retry_failed_report_publication(
+            workflow_run_id=run.run_id,
+            request=ContentResearchSourceCollectionRequest(
+                provider="xiaohongshu", source_kind="search_result", limit=20
+            ),
+        )
 
-    persisted = [
-        item
-        for item in store.list_typed_records(ReportPublicationRecord)
-        if item.workflow_run_id == run.run_id
-    ]
-    assert {item.id for item in persisted} == {publication.id, newer_publication.id}
-    assert (
-        publication.scope_contract_id,
-        publication.execution_unit_id,
-        publication.coverage_snapshot_id,
-        publication.attempt_no,
-    ) == (scope.id, unit.id, coverage.id, attempt.attempt_no)
-    report = await PublishedReportReader(store, db_path).read(
-        workflow_run_id=run.run_id,
-        publication_id=publication.id,
-    )
-    assert report["publication"]["report_publication_id"] == publication.id
-    assert report["scope_contract_id"] == scope.id
     async with WorkflowRunManager(db_path) as manager:
-        events = await manager.list_events(run.run_id)
         runtime_snapshot = await manager.get_run_snapshot(run.run_id)
-    failure = next(event for event in events if event.event_type == "run_failed")
-    assert failure.payload_json["publication_id"] == publication.id
-    assert [
-        (artifact.get("payload_json") or {}).get("report_publication_id")
-        for artifact in runtime_snapshot["artifacts"]
-        if (artifact.get("payload_json") or {}).get("report_publication_id") is not None
-    ] == [publication.id]
+    assert runtime_snapshot["artifacts"] == []
 
 
 @pytest.mark.asyncio

@@ -138,6 +138,22 @@ class CanonicalSourceRecord(TypedPersistenceRecord):
 
 
 @dataclass(frozen=True)
+class SourceObservationRecord(TypedPersistenceRecord):
+    canonical_source_id: str = ""
+    workflow_run_id: str = ""
+    observation_fingerprint: str = ""
+    captured_at: datetime = field(default_factory=utcnow)
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        _required(
+            self.canonical_source_id,
+            self.workflow_run_id,
+            self.observation_fingerprint,
+        )
+
+
+@dataclass(frozen=True)
 class DirectionSourceProjectionRecord(TypedPersistenceRecord):
     workflow_run_id: str = ""
     research_direction_id: str = ""
@@ -159,6 +175,7 @@ class DirectionalEvidencePacketRecord(TypedPersistenceRecord):
     workflow_run_id: str = ""
     research_direction_id: str = ""
     canonical_source_id: str = ""
+    source_observation_id: str = ""
     field_projection_hash: str = ""
     scope_contract_id: str | None = None
     execution_unit_id: str | None = None

@@ -7,7 +7,7 @@ from pathlib import Path
 
 import httpx
 import pytest
-from playwright.sync_api import Page, sync_playwright
+from playwright.sync_api import sync_playwright
 
 from tests.acceptance.conftest import write_acceptance_artifact
 from tests.browser_process import chrome_executable, reserve_port, run_process
@@ -135,25 +135,19 @@ def _seed_phase1_setup(base_url: str) -> dict[str, str]:
         )
         assert source_sync.status_code == 202
 
+        refresh = client.post(
+            f"/brands/{brand_payload['id']}/topic-pool/refresh",
+            headers=_headers(workspace_id),
+            json={"archive_threshold_days": 60},
+        )
+        assert refresh.status_code == 202
+
     return {
         "workspace_id": workspace_id,
         "brand_id": brand_payload["id"],
         "brand_name": brand_payload["name"],
         "channel_id": channel_payload["id"],
     }
-
-
-def _wait_for_topic_rows(page: Page) -> int:
-    page.wait_for_function(
-        """
-        () => {
-          const rows = document.querySelectorAll('tbody tr');
-          return rows.length > 0 && !document.body.innerText.includes('当前品牌还没有候选选题');
-        }
-        """,
-        timeout=15000,
-    )
-    return page.locator("tbody tr").count()
 
 
 @pytest.mark.acceptance
@@ -174,6 +168,7 @@ def test_v2_phase1_console_walkthrough(
         "CHROMA_PERSIST_DIR": acceptance_storage["chroma_dir"],
         "JOB_POLL_INTERVAL_MS": "50",
         "SSE_HEARTBEAT_SECONDS": "1",
+        "CORS_ALLOWED_ORIGINS": frontend_url,
         "PYTHONPATH": str(repo_root),
     }
     frontend_env = {
@@ -240,23 +235,18 @@ def test_v2_phase1_console_walkthrough(
                 page.wait_for_url(re.compile(r".*/data-sources$"))
                 page.get_by_role("heading", name="数据源").wait_for()
 
-                page.get_by_role("link", name=re.compile("选题库")).click()
-                page.wait_for_url(re.compile(r".*/topic-pool$"))
-                page.get_by_role("heading", name="选题候选库").wait_for()
-                page.get_by_role("button", name="刷新选题").click()
-                topic_row_count = _wait_for_topic_rows(page)
-                page.get_by_role("button", name="展开依据").first.click()
-                evidence_link = page.get_by_role("link", name="打开小红书原帖").first
-                expect_href = evidence_link.get_attribute("href") or ""
-                assert expect_href.startswith("https://www.xiaohongshu.com/explore/")
-
-                page.get_by_role("button", name="执行决策").click()
+                # The supported console now separates Creator publish
+                # candidates from the persisted strategy decision flow.
+                page.goto(f"{frontend_url}/decisions", wait_until="networkidle")
+                page.get_by_role("heading", name="决策批次").wait_for()
+                page.get_by_role("button", name="执行决策流").click()
                 page.wait_for_function(
                     "() => window.location.pathname === '/decisions' && window.location.search.includes('batch_id=')",
                     timeout=15000,
                 )
                 page.get_by_role("heading", name="决策批次").wait_for()
                 page.wait_for_function("() => document.body.innerText.includes('Slot 1')", timeout=15000)
+                topic_row_count = page.locator("tbody tr").count()
                 page.get_by_role("button", name="接受").first.click()
                 page.wait_for_function("() => document.body.innerText.includes('review=accept')", timeout=15000)
 
@@ -324,6 +314,7 @@ def test_v2_brand_creation_from_console(
         "CHROMA_PERSIST_DIR": acceptance_storage["chroma_dir"],
         "JOB_POLL_INTERVAL_MS": "50",
         "SSE_HEARTBEAT_SECONDS": "1",
+        "CORS_ALLOWED_ORIGINS": frontend_url,
         "PYTHONPATH": str(repo_root),
     }
     frontend_env = {

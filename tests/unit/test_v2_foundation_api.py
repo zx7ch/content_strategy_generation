@@ -1,14 +1,14 @@
 from __future__ import annotations
 
-from fastapi.testclient import TestClient
 import pytest
+from fastapi.testclient import TestClient
 
 from app.api.routes.router import app
 from app.v2.foundation import InMemoryMasterDataStore, MasterDataService
 
 
 @pytest.fixture(autouse=True)
-def reset_v2_app_state():
+def reset_v2_app_state(isolated_router_lifespan):
     store = InMemoryMasterDataStore()
     service = MasterDataService(store)
     app.state.v2_master_data_store = store

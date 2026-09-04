@@ -14,6 +14,7 @@ from app.content_research.scope_contract import (
     ExecutionContext,
     ExecutionLeaseFencedError,
 )
+from app.core.runtime_write_coordinator import RuntimeWriteCoordinator
 from app.services.workflow_run_manager import WorkflowRunManager
 
 T = TypeVar("T")
@@ -28,8 +29,10 @@ class LeaseFencedWorkflowRunManager(WorkflowRunManager):
         *,
         execution_context: ExecutionContext,
         operation: str,
+        writer: RuntimeWriteCoordinator | None = None,
     ) -> None:
-        super().__init__(db_path)
+        super().__init__(db_path, writer=writer)
+        self._execution_context = execution_context
         self._execution_guard = workflow_execution_guard(
             execution_context,
             operation=operation,
@@ -69,8 +72,10 @@ class DispatchLeaseFencedWorkflowRunManager(WorkflowRunManager):
         *,
         dispatch_context: DispatchLeaseContext,
         operation: str,
+        writer: RuntimeWriteCoordinator | None = None,
     ) -> None:
-        super().__init__(db_path)
+        super().__init__(db_path, writer=writer)
+        self._dispatch_context = dispatch_context
         self._dispatch_guard = workflow_dispatch_guard(
             dispatch_context,
             operation=operation,

@@ -63,6 +63,7 @@ from app.content_research.research_embedding import (
     safe_research_embedding_error_code,
 )
 from app.content_research.runtime import canonical_fingerprint
+from app.content_research.scope_contract import supplementary_scope_query_group_id
 from app.content_research.stores.sqlite_store import SQLiteContentResearchStore
 from app.services.llm.failures import LLMProviderFailure
 
@@ -131,9 +132,17 @@ class MarketingAnalysisExecutionService:
         llm_scope: Mapping[str, object] | None = None,
     ) -> None:
         self._store = store
-        self._repository = SQLiteMarketingAnalysisRepository(store._db_path, bootstrap_schema=False)
+        self._repository = SQLiteMarketingAnalysisRepository(
+            store._db_path,
+            bootstrap_schema=False,
+            writer=store._writer,
+        )
         self._llm = (
-            TrackedDirectionalAnalysisLLM(llm=llm, db_path=store._db_path)
+            TrackedDirectionalAnalysisLLM(
+                llm=llm,
+                db_path=store._db_path,
+                writer=store._writer,
+            )
             if llm is not None
             else None
         )
@@ -489,6 +498,48 @@ class MarketingAnalysisExecutionService:
         if scope is None:
             raise ValueError("marketing analysis Scope contract was not found")
         query_groups = tuple(asdict(group) for group in scope.query_groups)
+        if manifest.execution_unit_id is not None:
+            authorization = next(
+                (
+                    item
+                    for item in self._store.list_scope_execution_authorizations(
+                        workflow_run_id
+                    )
+                    if item.execution_unit_id == manifest.execution_unit_id
+                ),
+                None,
+            )
+            continuation = next(
+                (
+                    item
+                    for item in self._store.list_scope_execution_continuations(
+                        workflow_run_id
+                    )
+                    if authorization is not None
+                    and item.authorization_id == authorization.id
+                    and item.execution_unit_id == manifest.execution_unit_id
+                    and item.execution_revision == manifest.execution_revision
+                ),
+                None,
+            )
+            if continuation is not None and continuation.operation == "supplementary_collection":
+                query_groups = (
+                    *query_groups,
+                    *(
+                        {
+                            "id": supplementary_scope_query_group_id(
+                                scope_contract_id=scope.id,
+                                authorization_id=continuation.authorization_id,
+                                query=query,
+                            ),
+                            "suggested_query": query,
+                            "final_query": query,
+                            "origin": "user_edited",
+                            "execution_role": "supplementary",
+                        }
+                        for query in continuation.supplementary_queries
+                    ),
+                )
         allowed_query_ids = {str(group["id"]) for group in query_groups}
         frozen: dict[str, FrozenEvidenceNoteInput] = {}
         for packet_id in manifest.packet_ids:

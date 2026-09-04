@@ -17,6 +17,12 @@ jobs:
         with:
           python-version: '3.11'
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
       - name: Cache pip
         uses: actions/cache@v4
         with:
@@ -53,21 +59,11 @@ jobs:
       - name: Collect all Python tests in a clean environment
         run: pytest --collect-only tests/ -q
 
-      - name: Unit tests
-        run: >-
-          pytest
-          tests/unit/test_content_research_*.py
-          tests/unit/test_runtime_config_migration.py
-          tests/unit/test_runtime_launcher.py
-          tests/unit/test_package_metadata.py
-          tests/unit/test_xhs_credentials.py
-          tests/unit/test_xhs_qr_auth.py
-          tests/e2e/test_content_research_brief_confirm_api.py
-          tests/e2e/test_content_research_formal_workflow_e2e.py
-          tests/e2e/test_content_research_model_configuration_api.py
-          tests/e2e/test_content_research_presearch_api.py
-          tests/e2e/test_content_research_report_publication_timeline_api.py
-          tests/e2e/test_content_research_trace_api.py
-          tests/e2e/test_xhs_login_api.py
-          tests/e2e/test_xhs_qr_login_api.py
-          -v --tb=short -q
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Content Research prebuild release gate
+        env:
+          PLAYWRIGHT_CHROME_EXECUTABLE: /usr/bin/google-chrome
+        run: RELEASE_GATE_PHASE=prebuild bash scripts/run_release_gate.sh

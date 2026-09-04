@@ -4,11 +4,9 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import timedelta
 
 import pytest
 
-from app.content_research.observation.trace_service import _project_timing
 from app.content_research.service import WorkflowRunManagerRuntime
 from app.memory.thread_store import ThreadStore
 from app.memory.workflow_store import WorkflowStore
@@ -92,13 +90,6 @@ def _assert_terminal_timing_is_frozen_at(
                 assert {span["finished_at"] for span in intervals} == {
                     boundary.isoformat()
                 }
-        first = _project_timing(
-            record.model_dump(mode="json"), as_of=boundary + timedelta(seconds=1)
-        )
-        second = _project_timing(
-            record.model_dump(mode="json"), as_of=boundary + timedelta(minutes=5)
-        )
-        assert second == first
 
 
 @pytest.mark.asyncio

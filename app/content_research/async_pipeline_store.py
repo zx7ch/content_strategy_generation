@@ -7,7 +7,9 @@ boundaries.  Provider-operation facts are flushed before and after calls.
 
 from __future__ import annotations
 
+import uuid
 from collections import defaultdict
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import TypeVar
 
@@ -31,6 +33,12 @@ from app.content_research.stores.sqlite_store import (
     _loads,
     _parse_dt,
 )
+from app.core.runtime_write_coordinator import RuntimeWriteCoordinator, TypedMutation
+from app.core.runtime_write_registry import get_runtime_writer
+from app.core.sqlite_connection_roles import (
+    open_bootstrap_async_database,
+    open_readonly_async_database,
+)
 
 T = TypeVar("T", bound=TypedPersistenceRecord)
 
@@ -44,10 +52,13 @@ class AsyncDirectionalPersistenceSession:
         *,
         execution_context: ExecutionContext | None = None,
         dispatch_context: DispatchLeaseContext | None = None,
+        writer: RuntimeWriteCoordinator | None = None,
     ) -> None:
         self._db_path = db_path
         self._execution_context = execution_context
         self._dispatch_context = dispatch_context
+        self._writer = writer or get_runtime_writer(self._db_path)
+        self._borrowed_connection = None
         self._records: dict[type[TypedPersistenceRecord], dict[str, TypedPersistenceRecord]] = (
             defaultdict(dict)
         )
@@ -63,13 +74,15 @@ class AsyncDirectionalPersistenceSession:
         workflow_run_id: str | None = None,
         execution_context: ExecutionContext | None = None,
         dispatch_context: DispatchLeaseContext | None = None,
+        writer: RuntimeWriteCoordinator | None = None,
     ) -> AsyncDirectionalPersistenceSession:
         session = cls(
             db_path,
             execution_context=execution_context,
             dispatch_context=dispatch_context,
+            writer=writer,
         )
-        async with aiosqlite.connect(db_path) as conn:
+        async with session._connection() as conn:
             conn.row_factory = aiosqlite.Row
             for record_type, (table, fields) in _TYPED_RECORD_TABLES.items():
                 if workflow_run_id is not None and "workflow_run_id" in fields:
@@ -116,6 +129,9 @@ class AsyncDirectionalPersistenceSession:
         return source
 
     def save_direction_source_projection(self, record: T) -> T:
+        return self._save(record)
+
+    def save_source_observation(self, record: T) -> T:
         return self._save(record)
 
     def save_directional_evidence_packet(self, record: T) -> T:
@@ -166,11 +182,61 @@ class AsyncDirectionalPersistenceSession:
         return record
 
     async def flush(self) -> None:
+        if self._writer is not None:
+            if not self._pending and not self._pending_scope_events:
+                return
+            from app.content_research.stores.mutations import encode_store_value
+
+            pending_count = len(self._pending)
+            event_count = len(self._pending_scope_events)
+            await self._writer.submit(
+                TypedMutation.create(
+                    mutation_id=f"content_research_directional_flush_{uuid.uuid4().hex}",
+                    mutation_kind="flush_content_research_directional_records",
+                    domain_payload={
+                        "pending": [encode_store_value(item) for item in self._pending],
+                        "events": [
+                            encode_store_value(item) for item in self._pending_scope_events
+                        ],
+                        "execution_context": encode_store_value(self._execution_context),
+                        "dispatch_context": encode_store_value(self._dispatch_context),
+                    },
+                    run_id=(
+                        str(getattr(self._pending[0], "workflow_run_id", "")) or None
+                        if self._pending
+                        else None
+                    ),
+                )
+            )
+            del self._pending[:pending_count]
+            del self._pending_scope_events[:event_count]
+            return
+        await self._flush_once()
+
+    @asynccontextmanager
+    async def _connection(self):
+        if self._borrowed_connection is not None:
+            yield self._borrowed_connection
+            return
+        if self._writer is None:
+            conn = await open_bootstrap_async_database(self._db_path)
+            try:
+                yield conn
+            finally:
+                await conn.close()
+            return
+        conn = await open_readonly_async_database(self._db_path)
+        try:
+            yield conn
+        finally:
+            await conn.close()
+
+    async def _flush_once(self) -> None:
         if not self._pending and not self._pending_scope_events:
             return
         pending, self._pending = self._pending, []
         pending_scope_events, self._pending_scope_events = self._pending_scope_events, []
-        async with aiosqlite.connect(self._db_path) as conn:
+        async with self._connection() as conn:
             conn.row_factory = aiosqlite.Row
             await conn.execute("BEGIN IMMEDIATE")
             try:
@@ -246,7 +312,7 @@ class AsyncDirectionalPersistenceSession:
                     values = [getattr(record, field) for field in fields]
                     values = [
                         _fmt_dt(value)
-                        if field in {"started_at", "finished_at"} and value
+                        if field in {"started_at", "finished_at", "captured_at"} and value
                         else value
                         for field, value in zip(fields, values, strict=True)
                     ]
@@ -295,15 +361,32 @@ class AsyncDirectionalPersistenceSession:
                         ),
                     )
                     if result.rowcount != 1:
-                        raise RuntimeError(
-                            f"immutable persistence conflict for {table}:{record.id}"
+                        cursor = await conn.execute(
+                            f"SELECT schema_version, {', '.join(fields)}, "
+                            f"payload_json, metadata_json FROM {table} WHERE id=?",
+                            (record.id,),
                         )
+                        existing = await cursor.fetchone()
+                        fields_match = existing is not None and all(
+                            existing[field] == value
+                            for field, value in zip(fields, values, strict=True)
+                        )
+                        if existing is None or not (
+                            str(existing["schema_version"]) == record.schema_version
+                            and fields_match
+                            and _loads(existing["payload_json"]) == record.payload
+                            and _loads(existing["metadata_json"]) == record.metadata
+                        ):
+                            raise RuntimeError(
+                                f"immutable persistence conflict for {table}:{record.id}"
+                            )
                 for event in pending_scope_events:
-                    await conn.execute(
+                    result = await conn.execute(
                         """INSERT INTO content_research_scope_audit_events
                            (id, workflow_run_id, scope_contract_id, scope_contract_version,
                             event_name, payload_json, metadata_json, created_at)
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                           ON CONFLICT(id) DO NOTHING""",
                         (
                             event.id,
                             event.workflow_run_id,
@@ -315,6 +398,28 @@ class AsyncDirectionalPersistenceSession:
                             _fmt_dt(event.created_at),
                         ),
                     )
+                    if result.rowcount != 1:
+                        cursor = await conn.execute(
+                            """SELECT workflow_run_id, scope_contract_id,
+                                      scope_contract_version, event_name,
+                                      payload_json, metadata_json
+                               FROM content_research_scope_audit_events
+                               WHERE id=?""",
+                            (event.id,),
+                        )
+                        existing = await cursor.fetchone()
+                        if existing is None or (
+                            str(existing["workflow_run_id"]) != event.workflow_run_id
+                            or str(existing["scope_contract_id"]) != event.scope_contract_id
+                            or int(existing["scope_contract_version"])
+                            != event.scope_contract_version
+                            or str(existing["event_name"]) != event.event_name
+                            or _loads(existing["payload_json"]) != event.payload
+                            or _loads(existing["metadata_json"]) != (event.metadata or {})
+                        ):
+                            raise RuntimeError(
+                                "immutable scope audit event conflict for " + event.id
+                            )
                 await conn.commit()
             except Exception:
                 await conn.rollback()
